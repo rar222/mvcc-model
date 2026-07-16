@@ -292,6 +292,34 @@ int main() {
                     m.snapshot().size(), before);
     }
 
+    // Guarantee at least one Conflict deterministically, independent of how
+    // the random concurrent phase below happens to schedule: two
+    // Transactions built from the SAME Snapshot (Snapshot::begin(), so both
+    // share one base version), both touching the same Account. The first
+    // try_commit() succeeds; the second's base is now stale for that id, so
+    // it MUST come back Conflict -- no thread scheduling involved, entirely
+    // single-threaded and 100% reproducible. Without this, the assert at the
+    // bottom of main() was flaky: with enough luck, three racing writer
+    // threads can go a whole run without ever actually colliding.
+    {
+        Snapshot s = m.snapshot();
+        Transaction first = s.begin();
+        Transaction second = s.begin();
+        first.update(accounts[0])->balance += 1;
+        second.update(accounts[0])->balance += 2;
+
+        const CommitResult r1 = m.try_commit(first);
+        assert(r1.status == CommitStatus::Committed);
+        g_committed.fetch_add(1);
+        g_updated.fetch_add(1);
+
+        const CommitResult r2 = m.try_commit(second);
+        assert(r2.status == CommitStatus::Conflict);
+        g_conflicts.fetch_add(1);
+        std::printf("guaranteed conflict: two txns from the same snapshot, same id -> %s\n\n",
+                    r2.conflict->reason == ConflictReason::IdSetOverlap ? "IdSetOverlap" : "RefIntegrity");
+    }
+
     auto sub = m.subscribe(/*queue_depth=*/4);
     std::thread subt(subscriber_thread, sub);
     std::thread r1(reader_thread, std::ref(m), 1);

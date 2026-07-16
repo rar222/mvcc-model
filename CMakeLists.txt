@@ -56,6 +56,11 @@ target_link_libraries(model PUBLIC Threads::Threads)
 add_executable(demo examples/demo.cpp)
 target_link_libraries(demo PRIVATE model)
 
+# Two writers racing ~10-change transactions on a small shared pool (so
+# conflicts are common), one subscriber printing every object it receives.
+add_executable(two_writer_demo examples/two_writer_demo.cpp)
+target_link_libraries(two_writer_demo PRIVATE model)
+
 # Why View holds its Snapshot by pointer and not by value.
 add_executable(bench examples/bench.cpp)
 target_link_libraries(bench PRIVATE model)
@@ -88,3 +93,6 @@ set_tests_properties(persistent_map_tests PROPERTIES TIMEOUT 120)
 # (needs a Debug-ish build for asserts).
 add_test(NAME demo_integration COMMAND demo)
 set_tests_properties(demo_integration PROPERTIES TIMEOUT 300)
+
+add_test(NAME two_writer_demo_integration COMMAND two_writer_demo)
+set_tests_properties(two_writer_demo_integration PROPERTIES TIMEOUT 300)

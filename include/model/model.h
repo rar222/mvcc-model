@@ -704,15 +704,19 @@ private:
 
 enum class ChangeKind : std::uint8_t { Created, Updated, Deleted };
 
-/// Changesets span every type in the model, so they carry the untyped Id.
-/// Recover a type with snapshot.find_raw(c.id) plus a tag check (or, on a
-/// Snapshot, snapshot.find<T>(Ref<T>(c.id)) does that check for you). From a
-/// Transaction, use Transaction::peek_as<T>(c.id), not peek(Ref<T>(c.id)):
-/// wrapping an untyped Id in Ref<T> and calling the Ref<T> overload skips the
-/// type check entirely.
+/// Changesets span every type in the model, so they carry the untyped Id --
+/// and, since a Deleted change's object is already gone by the time a
+/// subscriber looks (there is no Snapshot it can still be found in), `tag`
+/// too: it's the one piece of type information that survives the object
+/// itself. Compare it against type_tag<T>() directly, same as any other tag
+/// check in this API. For a live (Created/Updated) change you can still go
+/// the long way -- snapshot.find_raw(c.id) plus a tag check, or
+/// snapshot.find<T>(Ref<T>(c.id)), or Transaction::peek_as<T>(c.id) -- but
+/// `tag` means you never need a Snapshot just to find out WHAT changed.
 struct Change {
     Id id;
     ChangeKind kind;
+    TypeTag tag;
 };
 
 /// Registered once via Model::set_pre_commit, called on every try_commit()
@@ -1084,7 +1088,7 @@ public:
         const Id local_id{kLocalIdBit | next_local_id_++, 1};
         o->id = local_id;
         local_created_.push_back(std::move(o));
-        pending_changes_.push_back({local_id, ChangeKind::Created});
+        pending_changes_.push_back({local_id, ChangeKind::Created, type_tag<T>()});
         return Ref<T>(local_id);
     }
 
@@ -1214,7 +1218,7 @@ private:
         update_baseline_.try_emplace(id.index, base_obj);
         ObjectBase* raw = clone.get();
         local_updated_.emplace(id.index, std::move(clone));
-        pending_changes_.push_back({id, ChangeKind::Updated});
+        pending_changes_.push_back({id, ChangeKind::Updated, raw->tag()});
         return raw;
     }
 

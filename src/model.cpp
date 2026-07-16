@@ -95,12 +95,17 @@ void Subscription::push(Update u) {
 }
 
 void Subscription::collapse(Update tail) {
+    // tag never changes across merges: a given Id (generation included) names
+    // one object for its whole life, so whichever Change first put it in the
+    // map already carries the right tag.
     std::unordered_map<Id, ChangeKind, IdHash> merged;
+    std::unordered_map<Id, TypeTag, IdHash> tags;
 
     auto apply = [&](const Change& c) {
         auto it = merged.find(c.id);
         if (it == merged.end()) {
             merged.emplace(c.id, c.kind);
+            tags.emplace(c.id, c.tag);
             return;
         }
         switch (c.kind) {
@@ -111,8 +116,12 @@ void Subscription::collapse(Update tail) {
                 // Created + Deleted cancels out entirely. This is only correct
                 // because the generation is part of the Id, so a recycled slot
                 // is a genuinely different Id and cannot be confused with this one.
-                if (it->second == ChangeKind::Created) merged.erase(it);
-                else it->second = ChangeKind::Deleted;
+                if (it->second == ChangeKind::Created) {
+                    merged.erase(it);
+                    tags.erase(c.id);
+                } else {
+                    it->second = ChangeKind::Deleted;
+                }
                 break;
             case ChangeKind::Created:
                 it->second = ChangeKind::Created;
@@ -128,7 +137,7 @@ void Subscription::collapse(Update tail) {
     out.snapshot = std::move(tail.snapshot);
     out.coalesced = true;
     out.changes.reserve(merged.size());
-    for (auto& [id, kind] : merged) out.changes.push_back({id, kind});
+    for (auto& [id, kind] : merged) out.changes.push_back({id, kind, tags.at(id)});
 
     q_.clear();  // drops the intermediate snapshots -- the whole point
     q_.push_back(std::move(out));
@@ -516,7 +525,7 @@ void Model::apply_create(std::unique_ptr<ObjectBase> o, std::unordered_map<std::
     add_out_refs(raw);
     add_field_keys(raw);
 
-    changes_.push_back({id, ChangeKind::Created});
+    changes_.push_back({id, ChangeKind::Created, tag});
     log([this] { changes_.pop_back(); });
 
     // Never published, nothing else owns it: rollback_apply() deletes
@@ -551,7 +560,7 @@ void Model::apply_update(std::unique_ptr<ObjectBase> clone, std::unordered_map<s
 
     set_slot(id.index, raw, id.gen);  // logs restore of baseline + its generation
 
-    changes_.push_back({id, ChangeKind::Updated});
+    changes_.push_back({id, ChangeKind::Updated, raw->tag()});
     log([this] { changes_.pop_back(); });
 
     // Unlike the single-writer design this project's sibling uses, `raw` is
@@ -591,7 +600,7 @@ ObjectBase* Model::clone_for_cascade_null(Id id) {
 
     set_slot(id.index, copy, id.gen);
 
-    changes_.push_back({id, ChangeKind::Updated});
+    changes_.push_back({id, ChangeKind::Updated, copy->tag()});
     log([this] { changes_.pop_back(); });
 
     return copy;
@@ -660,7 +669,7 @@ std::vector<Id> Model::remove_raw(Id id) {
         free_slots_.push_back(x.index);
         log([this] { free_slots_.pop_back(); });
 
-        changes_.push_back({x, ChangeKind::Deleted});
+        changes_.push_back({x, ChangeKind::Deleted, tag});
         log([this] { changes_.pop_back(); });
 
         killed.push_back(x);
