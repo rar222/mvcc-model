@@ -68,7 +68,17 @@ struct Id {
 
 struct IdHash {
     std::size_t operator()(Id id) const noexcept {
-        return (static_cast<std::size_t>(id.gen) << 32) | id.index;
+        // Compute in uint64_t, NOT size_t: on a 32-bit size_t platform the
+        // old `size_t(gen) << 32` was a shift past the type's width -- UB.
+        // The full 64-bit pack is a perfect (collision-free) hash of Id.
+        const std::uint64_t h = (static_cast<std::uint64_t>(id.gen) << 32) | id.index;
+        if constexpr (sizeof(std::size_t) >= sizeof(std::uint64_t)) {
+            return static_cast<std::size_t>(h);  // 64-bit size_t: identical to before
+        } else {
+            // 32-bit size_t: fold, so gen still participates instead of
+            // being silently truncated away.
+            return static_cast<std::size_t>(h ^ (h >> 32));
+        }
     }
 };
 

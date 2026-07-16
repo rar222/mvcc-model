@@ -103,6 +103,7 @@ public:
     template <class Self>
     static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
         v.key<&Order::qty>(s.qty);
+        v.key<&Order::computed_key>(s.computed_key());
     }
 };
 
