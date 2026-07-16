@@ -1,0 +1,48 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "configure",
+      "type": "shell",
+      "command": "cmake --preset default",
+      "problemMatcher": []
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "cmake --build --preset default -j",
+      "group": { "kind": "build", "isDefault": true },
+      "dependsOn": "configure",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "command": "ctest --preset default",
+      "group": { "kind": "test", "isDefault": true },
+      "dependsOn": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "test: asan",
+      "detail": "Use-after-free -- catches the reaper freeing an object a reader can still see",
+      "type": "shell",
+      "command": "cmake --preset asan && cmake --build --preset asan -j && ctest --preset asan",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "test: tsan",
+      "detail": "Data races between the writer(s) and readers",
+      "type": "shell",
+      "command": "cmake --preset tsan && cmake --build --preset tsan -j && ctest --preset tsan",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "run demo",
+      "type": "shell",
+      "command": "./build/default/demo",
+      "dependsOn": "build",
+      "problemMatcher": []
+    }
+  ]
+}

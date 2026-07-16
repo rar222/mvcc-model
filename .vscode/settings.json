@@ -1,0 +1,11 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": true,
+  "C_Cpp.default.cppStandard": "c++20",
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/default/compile_commands.json",
+  "clangd.arguments": ["--compile-commands-dir=${workspaceFolder}/build/default"],
+  "files.associations": { "*.h": "cpp" },
+  "editor.formatOnSave": true,
+  "C_Cpp.clang_format_style": "file",
+  "files.exclude": { "**/build": true }
+}
