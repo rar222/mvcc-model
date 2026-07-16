@@ -1138,37 +1138,101 @@ TEST(view_of_a_stale_handle_is_empty) {
     CHECK(!s.view_by_key<&Order::computed_key>("ord:O1").has_value());
 }
 
-TEST(view_by_field_returns_every_match_not_just_the_indexed_winner) {
+TEST(find_by_scan_field_returns_every_match_and_only_for_declared_fields) {
     Model m;
-    const Ref<Account> a = make_account(m, "DUP", 1);  // Account::name IS indexed
-    const Ref<Account> b = make_account(m, "DUP", 2);  // duplicate name: the index keeps only this one
+    const Ref<Account> a = make_account(m, "DUP", 1);  // Account::name: define_keys AND define_scan_fields
+    const Ref<Account> b = make_account(m, "DUP", 2);  // duplicate name: the unique index keeps only this one
     make_account(m, "OTHER", 3);
     make_order(m, "O1", a, {}, 5);
-    make_order(m, "O2", a, {}, 5);  // Order::qty is NOT in any define_keys()
+    make_order(m, "O2", a, {}, 5);
     make_order(m, "O3", a, {}, 7);
 
     Snapshot s = m.snapshot();
 
     // The unique-key index sees one winner for a duplicate value...
     CHECK(s.find_by_key<&Account::name>("DUP") == s.find(b));
-    // ...view_by_field sees every object, on the same field.
-    auto dups = s.view_by_field<&Account::name>("DUP");
+    // ...the scan family sees every object, on the same field.
+    auto dups = s.view_by_scan_field<&Account::name>("DUP");
     CHECK_EQ(dups.size(), std::size_t{2});
     std::int64_t balances = 0;
     for (const auto& v : dups) balances += v->balance;
     CHECK_EQ(balances, std::int64_t{3});  // 1 + 2: both objects, not the winner twice
-    CHECK(s.view_by_field<&Account::name>("NOBODY").empty());
+    CHECK(s.find_by_scan_field<&Account::name>("NOBODY").empty());
 
-    // Works on a field no define_keys() ever mentioned -- it's a scan, not an
-    // index lookup -- and the Views traverse like any other.
-    auto q5 = s.view_by_field<&Order::qty>(5);
+    // The find form, on a field define_keys() never mentioned, and the Views
+    // traverse like any other.
+    CHECK_EQ(s.find_by_scan_field<&Order::qty>(5).size(), std::size_t{2});
+    auto q5 = s.view_by_scan_field<&Order::qty>(5);
     CHECK_EQ(q5.size(), std::size_t{2});
     for (const auto& v : q5) CHECK_EQ(v[&Order::account]->balance, std::int64_t{1});
 
-    // And on a computed (nullary const method) field, same as view_by_key.
-    auto o3 = s.view_by_field<&Order::computed_key>("ord:O3");
+    // A computed (nullary const method) field, same as view_by_key.
+    auto o3 = s.view_by_scan_field<&Order::computed_key>("ord:O3");
     CHECK_EQ(o3.size(), std::size_t{1});
     CHECK_EQ(o3[0]->qty, std::int64_t{7});
+
+    // The gate: a field NOT declared in define_scan_fields() is invisible to
+    // this family -- empty, even though an account with balance == 1 plainly
+    // exists -- exactly as find_by_key is empty for a field define_keys()
+    // never mentioned. All three lookup families share that rule.
+    CHECK(s.find_by_scan_field<&Account::balance>(1).empty());
+    CHECK(s.view_by_scan_field<&Account::balance>(1).empty());
+}
+
+TEST(find_by_cached_field_tracks_creates_updates_and_cascades_and_is_versioned) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o1 = make_order(m, "O1", a, {}, 5);
+    make_order(m, "O2", a, {}, 5);
+    make_order(m, "O3", a, {}, 7);
+
+    Snapshot before = m.snapshot();
+    CHECK_EQ(before.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(before.find_by_cached_field<&Order::qty>(7).size(), std::size_t{1});
+    CHECK(before.find_by_cached_field<&Order::qty>(6).empty());
+
+    // An update moves the object between buckets (reconcile)...
+    {
+        Transaction txn = m.begin();
+        txn.update(o1)->qty = 7;
+        commit_ok(m, txn);
+    }
+    Snapshot mid = m.snapshot();
+    CHECK_EQ(mid.find_by_cached_field<&Order::qty>(5).size(), std::size_t{1});
+    CHECK_EQ(mid.find_by_cached_field<&Order::qty>(7).size(), std::size_t{2});
+    // ...and the index is versioned like everything else: the old snapshot
+    // still sees the old buckets.
+    CHECK_EQ(before.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
+
+    // The view form traverses like any other view.
+    auto views = mid.view_by_cached_field<&Order::qty>(7);
+    CHECK_EQ(views.size(), std::size_t{2});
+    for (const auto& v : views) CHECK_EQ(v[&Order::account]->name, std::string("A1"));
+
+    // A cascade (removing the account kills every order) drops each victim
+    // from its bucket, leaving no tombstones behind.
+    remove_and_commit(m, a);
+    Snapshot after = m.snapshot();
+    CHECK(after.find_by_cached_field<&Order::qty>(5).empty());
+    CHECK(after.find_by_cached_field<&Order::qty>(7).empty());
+}
+
+TEST(veto_rollback_restores_the_cached_field_index) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a, {}, 5);
+
+    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    Transaction txn = m.begin();
+    txn.update(o)->qty = 9;
+    CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
+    m.set_pre_commit({});
+
+    make_account(m, "UNRELATED");  // publish a fresh root carrying the index
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.find_by_cached_field<&Order::qty>(5).size(), std::size_t{1});
+    CHECK(s.find_by_cached_field<&Order::qty>(9).empty());
+    CHECK_EQ(s.find(o)->qty, std::int64_t{5});
 }
 
 TEST(a_view_always_traverses_its_own_snapshot) {

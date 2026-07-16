@@ -341,6 +341,20 @@ struct has_define_keys<D, std::void_t<decltype(D::define_keys(
                               std::declval<const D&>(), std::declval<const FieldKeyReader&>()))>>
     : std::true_type {};
 
+template <class D, class = void>
+struct has_define_cached_fields : std::false_type {};
+template <class D>
+struct has_define_cached_fields<D, std::void_t<decltype(D::define_cached_fields(
+                                       std::declval<const D&>(), std::declval<const FieldKeyReader&>()))>>
+    : std::true_type {};
+
+template <class D, class = void>
+struct has_define_scan_fields : std::false_type {};
+template <class D>
+struct has_define_scan_fields<D, std::void_t<decltype(D::define_scan_fields(
+                                     std::declval<const D&>(), std::declval<const FieldKeyReader&>()))>>
+    : std::true_type {};
+
 /// Demangles a typeid name for use as a diagnostic label (Object<Derived>::type()).
 /// Itanium ABI (GCC/Clang) only; passed through unchanged elsewhere (already
 /// readable on MSVC). Defined in model.cpp so <cxxabi.h> doesn't leak into every
@@ -378,6 +392,19 @@ public:
     /// NOT assumed stable: the model diffs old vs. new value at apply time and
     /// keeps the index in sync.
     virtual void each_field_key(const FieldKeyFn&) const {}
+
+    /// Fields declared in define_cached_fields(), for indexed MULTI-match
+    /// lookup (Snapshot::find_by_cached_field). Same visitor shape and same
+    /// diff-at-apply-time maintenance as each_field_key; see Object<> for the
+    /// contract and the cost model.
+    virtual void each_cached_field(const FieldKeyFn&) const {}
+
+    /// Fields declared in define_scan_fields(), for UNINDEXED multi-match
+    /// lookup (Snapshot::find_by_scan_field). Nothing in the model maintains
+    /// anything for these -- the declaration is purely the visibility gate
+    /// that keeps the three lookup families uniform (undeclared == invisible
+    /// to the lookup). See Object<>.
+    virtual void each_scan_field(const FieldKeyFn&) const {}
 };
 
 /// CRTP base. Derive from it and declare your reference fields ONCE, in
@@ -418,10 +445,35 @@ public:
 ///         find_by_key<&Order::computed_key>("ord:O1")
 ///     }
 ///
-/// Each indexed field is assumed unique within its type; a duplicate value
-/// silently overwrites the earlier entry. For "give me every match, not just
-/// one," use the slow Snapshot::view_by_field<&T::field>(value) scan (or the
-/// predicate form, Snapshot::find_all()) instead.
+/// Each define_keys() field is assumed unique within its type; a duplicate
+/// value silently overwrites the earlier entry. For "give me every match,
+/// not just one," there are two MULTI-match families, declared with the same
+/// visitor shape and named the same way -- each define_X drives find_by_X
+/// and view_by_X, and in every family a field you did NOT declare is
+/// invisible to its lookup (empty result, same as find_by_key on a field
+/// define_keys() never mentioned):
+///
+///   define_keys()          -> find_by_key         / view_by_key
+///       unique, indexed: O(log n); later write wins on duplicates.
+///   define_scan_fields()   -> find_by_scan_field  / view_by_scan_field
+///       every match, UNINDEXED: O(#T objects) per query, but zero
+///       write-side cost -- nothing is maintained per commit. For fields
+///       queried rarely.
+///   define_cached_fields() -> find_by_cached_field / view_by_cached_field
+///       every match, INDEXED: O(log n + #matches) per query, paid for by
+///       one index entry per object per field, maintained on every
+///       create/delete/value-change inside the serialized commit path (each
+///       cached field costs about what by_type does). For fields queried
+///       often at scale.
+///
+///     template <class Self>
+///     static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
+///         v.key<&Order::qty>(s.qty);  // find_by_scan_field<&Order::qty>(5) -> ALL matches
+///     }
+///
+/// (define_cached_fields is declared identically; a field may appear in more
+/// than one family.) The fully undeclared escape hatch remains the
+/// Snapshot::find_all() predicate scan.
 template <class Derived>
 class Object : public ObjectBase {
 public:
@@ -454,6 +506,16 @@ public:
     void each_field_key(const FieldKeyFn& fn) const override {
         if constexpr (detail::has_define_keys<Derived>::value)
             Derived::define_keys(static_cast<const Derived&>(*this), FieldKeyReader{fn});
+    }
+
+    void each_cached_field(const FieldKeyFn& fn) const override {
+        if constexpr (detail::has_define_cached_fields<Derived>::value)
+            Derived::define_cached_fields(static_cast<const Derived&>(*this), FieldKeyReader{fn});
+    }
+
+    void each_scan_field(const FieldKeyFn& fn) const override {
+        if constexpr (detail::has_define_scan_fields<Derived>::value)
+            Derived::define_scan_fields(static_cast<const Derived&>(*this), FieldKeyReader{fn});
     }
 };
 
@@ -497,9 +559,19 @@ struct Root {
     /// field's own field_tag<>() -- which already encodes both the type and
     /// the field, so there's no separate per-type grouping needed here the
     /// way by_type needs TypeTag. Empty for types that declare none. This is
-    /// the only lookup-by-value index in the model; there is no separate
-    /// mandatory "primary key" index.
+    /// the unique lookup-by-value index (later write wins); there is no
+    /// separate mandatory "primary key" index.
     std::unordered_map<const void*, pmap::PersistentMap<Id>> by_field;
+
+    /// One persistent MULTIMAP per define_cached_fields()-declared field:
+    /// canonical value string -> a persistent set of every Id whose field
+    /// currently holds that value (inner map keyed by the Id's own bytes,
+    /// the same encoding by_type uses). Unlike by_field, every match is
+    /// kept. The bucket is a persistent map, NEVER a flat vector: a flat
+    /// bucket would make each mutation O(#duplicates of that value), which
+    /// for a low-cardinality field (a status, a category) is O(n) per op --
+    /// the exact size-proportional cost this design exists to avoid.
+    std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_field;
 };
 
 class Model;
@@ -576,9 +648,10 @@ public:
     /// type is member_value_t<decltype(Field)>, not a bare std::string), so
     /// passing "222" for an int64_t field or 222 for a string field is a
     /// compile error, not a lookup that silently never matches. A duplicate
-    /// value across two objects means the later write wins -- use
-    /// view_by_field() for "every match." Null if the key is absent, or the
-    /// field wasn't declared as indexed.
+    /// value across two objects means the later write wins -- use the
+    /// multi-match families (find_by_scan_field / find_by_cached_field) for
+    /// "every match." Null if the key is absent, or the field wasn't
+    /// declared as indexed.
     template <auto Field>
     const member_class_t<decltype(Field)>* find_by_key(
         const member_value_t<decltype(Field)>& value) const {
@@ -591,18 +664,79 @@ public:
     std::optional<View<member_class_t<decltype(Field)>>> view_by_key(
         const member_value_t<decltype(Field)>& value) const;
 
-    /// EVERY object whose `Field` currently equals `value`, as Views bound to
-    /// this snapshot -- the multi-match counterpart of view_by_key. Named the
-    /// same way: `s.view_by_field<&Order::qty>(5)`, and `Field` may also be a
-    /// nullary const method (`s.view_by_field<&Order::computed_key>(...)`).
+    /// UNINDEXED multi-match lookup: every object whose `Field` -- declared
+    /// via define_scan_fields() -- currently equals `value`. Named like
+    /// find_by_key: `s.find_by_scan_field<&Order::qty>(5)`, and `Field` may
+    /// also be a nullary const method.
     ///
-    /// This is a SLOW SCAN, O(#ClassT objects), NOT an indexed lookup: the
-    /// by_field index deliberately keeps exactly one Id per key value
-    /// (duplicates overwrite -- see Object<>), so "all matches" can only come
-    /// from the same scan find_all() does. The upside of not touching the
-    /// index: this works on ANY field, declared in define_keys() or not.
+    /// This is a SLOW SCAN, O(#ClassT objects) per query, comparing the
+    /// field's actual typed value -- no index is consulted OR maintained, so
+    /// a scan field costs nothing on the write side. Declaring it in
+    /// define_scan_fields() is purely what makes it queryable: an undeclared
+    /// field returns empty, exactly as find_by_key does for a field
+    /// define_keys() never mentioned -- the three lookup families share that
+    /// rule. For a field queried often enough to deserve an index, declare
+    /// it in define_cached_fields() and use find_by_cached_field instead.
     template <auto Field>
-    std::vector<View<member_class_t<decltype(Field)>>> view_by_field(
+    std::vector<const member_class_t<decltype(Field)>*> find_by_scan_field(
+        const member_value_t<decltype(Field)>& value) const {
+        using ClassT = member_class_t<decltype(Field)>;
+        std::vector<const ClassT*> out;
+        bool checked = false, declared = false;
+        for_each<ClassT>([&](const ClassT& o) {
+            if (!checked) {
+                // define_scan_fields() is static per type: ask the first
+                // object once, on behalf of the whole scan.
+                checked = true;
+                o.each_scan_field([&](const void* field, std::string) {
+                    if (field == field_tag<Field>()) declared = true;
+                });
+            }
+            if (!declared) return;
+            // Field is either a data member or a nullary const method -- the
+            // same two shapes member_class/member_value accept everywhere else.
+            if constexpr (std::is_member_object_pointer_v<decltype(Field)>) {
+                if (o.*Field == value) out.push_back(&o);
+            } else {
+                if ((o.*Field)() == value) out.push_back(&o);
+            }
+        });
+        return out;
+    }
+
+    /// View-returning form of find_by_scan_field.
+    template <auto Field>
+    std::vector<View<member_class_t<decltype(Field)>>> view_by_scan_field(
+        const member_value_t<decltype(Field)>& value) const;
+
+    /// INDEXED multi-match lookup: every object whose `Field` -- declared via
+    /// define_cached_fields() -- currently equals `value`. O(log n + #matches),
+    /// backed by Root::by_cached_field, so it needs no scan; compare
+    /// find_by_scan_field, the unindexed O(#ClassT) form for fields not
+    /// worth an index. Named like find_by_key: `s.find_by_cached_field<&Order::qty>(5)`,
+    /// with class and value type both deduced from the field itself. Empty if
+    /// nothing matches -- or if the field was never declared cached (an
+    /// undeclared field is invisible to this index, same as find_by_key).
+    /// Result order is unspecified (index order, not insertion order).
+    template <auto Field>
+    std::vector<const member_class_t<decltype(Field)>*> find_by_cached_field(
+        const member_value_t<decltype(Field)>& value) const {
+        using ClassT = member_class_t<decltype(Field)>;
+        std::vector<const ClassT*> out;
+        if (!root_) return out;
+        auto it = root_->by_cached_field.find(field_tag<Field>());
+        if (it == root_->by_cached_field.end()) return out;
+        const pmap::PersistentMap<Id>* bucket = it->second.get(to_field_key(value));
+        if (!bucket) return out;
+        bucket->for_each([&](const std::string&, Id id) {
+            if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
+        });
+        return out;
+    }
+
+    /// View-returning form of find_by_cached_field.
+    template <auto Field>
+    std::vector<View<member_class_t<decltype(Field)>>> view_by_cached_field(
         const member_value_t<decltype(Field)>& value) const;
 
     /// Visit every object of type T. O(#T objects): backed by a per-type
@@ -948,6 +1082,9 @@ private:
     void add_field_keys(const ObjectBase* o);
     void drop_field_keys(const ObjectBase* o);
     void reconcile_field_keys(const ObjectBase* before, const ObjectBase* after);
+    void add_cached_fields(const ObjectBase* o);
+    void drop_cached_fields(const ObjectBase* o);
+    void reconcile_cached_fields(const ObjectBase* before, const ObjectBase* after);
     void retire(const ObjectBase* o);
     void release_version(std::uint64_t v);
     void reaper_loop();  ///< body of the background reaper thread
@@ -1021,6 +1158,7 @@ private:
     std::unordered_set<std::uint32_t> dirty_;
     std::unordered_map<TypeTag, pmap::PersistentMap<Id>> by_type_;
     std::unordered_map<const void*, pmap::PersistentMap<Id>> by_field_;
+    std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_field_;
     std::unordered_map<std::uint32_t, std::vector<RefEdge>> referrers_;
     std::vector<std::uint32_t> free_slots_;
     std::uint32_t next_slot_ = 0;
@@ -1415,19 +1553,20 @@ std::optional<View<member_class_t<decltype(Field)>>> Snapshot::view_by_key(
 }
 
 template <auto Field>
-std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_by_field(
+std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_by_scan_field(
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
     std::vector<View<ClassT>> out;
-    for_each_view<ClassT>([&](View<ClassT> v) {
-        // Field is either a data member or a nullary const method -- the same
-        // two shapes member_class/member_value accept everywhere else.
-        if constexpr (std::is_member_object_pointer_v<decltype(Field)>) {
-            if ((*v).*Field == value) out.push_back(v);
-        } else {
-            if (((*v).*Field)() == value) out.push_back(v);
-        }
-    });
+    for (const ClassT* p : find_by_scan_field<Field>(value)) out.push_back(View<ClassT>(*this, *p));
+    return out;
+}
+
+template <auto Field>
+std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_by_cached_field(
+    const member_value_t<decltype(Field)>& value) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    std::vector<View<ClassT>> out;
+    for (const ClassT* p : find_by_cached_field<Field>(value)) out.push_back(View<ClassT>(*this, *p));
     return out;
 }
 

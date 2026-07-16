@@ -3,9 +3,18 @@
 // Example domain types. These are user code, not part of the model -- they show
 // exactly what a type has to provide to live in the store.
 //
-// The contract:
-//   define_references()  optional: list every reference field ONCE, tagged by its own address
-//   define_keys()        optional: zero or more fields (or computed methods) for fast lookup
+// The contract (each define_X drives find_by_X and view_by_X; a field you
+// don't declare is invisible to that family's lookup):
+//   define_references()     optional: list every reference field ONCE, tagged by its own address
+//   define_keys()           optional: zero or more fields (or computed methods) for fast
+//                           UNIQUE lookup (find_by_key; a duplicate value overwrites)
+//   define_scan_fields()    optional: zero or more fields for UNINDEXED multi-match lookup
+//                           (find_by_scan_field; O(#objects) scan per query, zero write-side
+//                           cost -- for fields queried rarely)
+//   define_cached_fields()  optional: zero or more fields for INDEXED multi-match lookup
+//                           (find_by_cached_field; every match kept, O(log n + matches)).
+//                           Costs one index entry per object per field, maintained on every
+//                           commit -- declare only what's queried often.
 //
 // (type() also exists, for diagnostic messages, but Object<Derived> derives it
 // from typeid() automatically -- there's nothing to override.)
@@ -48,6 +57,14 @@ public:
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
         v.key<&Account::name>(s.name);
     }
+
+    /// name is ALSO a scan field: find_by_key gives the unique-index winner,
+    /// find_by_scan_field gives every account sharing the name. The same
+    /// field can live in more than one lookup family.
+    template <class Self>
+    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Account::name>(s.name);
+    }
 };
 
 class Order final : public model::Object<Order> {
@@ -68,6 +85,24 @@ public:
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
         v.key<&Order::computed_key>(s.computed_key());
+    }
+
+    /// The scan family: queryable via find_by_scan_field / view_by_scan_field
+    /// (O(#orders) per query, zero write-side cost). qty appears in BOTH
+    /// multi-match families -- scan here, cached below -- to show they're
+    /// independent; a real type would usually pick one per field.
+    template <class Self>
+    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Order::qty>(s.qty);
+        v.key<&Order::computed_key>(s.computed_key());
+    }
+
+    /// qty is deliberately non-unique (many orders share a quantity), so it
+    /// goes in a MULTI-match family, not define_keys():
+    /// s.find_by_cached_field<&Order::qty>(5) -> every order with qty == 5.
+    template <class Self>
+    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Order::qty>(s.qty);
     }
 };
 

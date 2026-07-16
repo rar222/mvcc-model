@@ -483,6 +483,62 @@ void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* aft
     });
 }
 
+// The cached-field (multimap) index. Buckets are persistent maps keyed by the
+// Id's own bytes -- never flat vectors, which would make each mutation
+// O(#duplicates of that value) -- and every mutation captures the prior OUTER
+// map for the undo log (a shared_ptr copy, same pattern as add_field_keys):
+// a rollback that skipped these would leave the index claiming membership
+// that never committed.
+
+void Model::add_cached_fields(const ObjectBase* o) {
+    const Id id = o->id;
+    o->each_cached_field([&](const void* field, std::string key) {
+        auto prev = by_cached_field_[field];
+        const pmap::PersistentMap<Id>* bucket = prev.get(key);
+        by_cached_field_[field] =
+            prev.set(key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(id_key(id), id));
+        log([this, field, prev = std::move(prev)]() mutable { by_cached_field_[field] = std::move(prev); });
+    });
+}
+
+void Model::drop_cached_fields(const ObjectBase* o) {
+    const Id id = o->id;
+    o->each_cached_field([&](const void* field, std::string key) {
+        auto prev = by_cached_field_[field];
+        const pmap::PersistentMap<Id>* bucket = prev.get(key);
+        if (!bucket) return;
+        auto nb = bucket->erase(id_key(id));
+        // An emptied bucket is dropped outright, so a value with no remaining
+        // holders doesn't leave a tombstone entry behind.
+        by_cached_field_[field] = nb.empty() ? prev.erase(key) : prev.set(key, nb);
+        log([this, field, prev = std::move(prev)]() mutable { by_cached_field_[field] = std::move(prev); });
+    });
+}
+
+void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* after) {
+    const Id id = after->id;
+    std::unordered_map<const void*, std::string> old_keys;
+    before->each_cached_field([&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
+
+    after->each_cached_field([&](const void* field, std::string new_key) {
+        const auto it = old_keys.find(field);
+        if (it != old_keys.end() && it->second == new_key) return;  // unchanged
+
+        auto prev = by_cached_field_[field];
+        auto cur = prev;
+        if (it != old_keys.end()) {
+            if (const pmap::PersistentMap<Id>* ob = cur.get(it->second)) {
+                auto nb = ob->erase(id_key(id));
+                cur = nb.empty() ? cur.erase(it->second) : cur.set(it->second, nb);
+            }
+        }
+        const pmap::PersistentMap<Id>* bucket = cur.get(new_key);
+        cur = cur.set(new_key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(id_key(id), id));
+        by_cached_field_[field] = std::move(cur);
+        log([this, field, prev = std::move(prev)]() mutable { by_cached_field_[field] = std::move(prev); });
+    });
+}
+
 void Model::retire(const ObjectBase* o) {
     // Invisible from version_+1 onward, but snapshots at or below version_ can
     // still see it. Free only once none of those remain.
@@ -563,6 +619,7 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
 
     add_out_refs(raw);
     add_field_keys(raw);
+    add_cached_fields(raw);
 
     changes_.push_back({id, ChangeKind::Created, tag});
     log([this] { changes_.pop_back(); });
@@ -619,6 +676,7 @@ std::optional<Model::IntegrityError> Model::apply_update(std::unique_ptr<ObjectB
     // be dragged into X's cascade.
     reconcile_referrer_edges(baseline, raw);
     reconcile_field_keys(baseline, raw);
+    reconcile_cached_fields(baseline, raw);
     return std::nullopt;
 }
 
@@ -677,6 +735,7 @@ std::vector<Id> Model::remove_raw(Id id) {
                     m->null_ref(e.field);
                     reconcile_referrer_edges(baseline, m);
                     reconcile_field_keys(baseline, m);
+                    reconcile_cached_fields(baseline, m);
                 }
             } else {
                 work.push_back(e.from);  // dies with its target
@@ -707,6 +766,7 @@ std::vector<Id> Model::remove_raw(Id id) {
         log([this, tag, prev_sub = std::move(prev_sub)]() mutable { by_type_[tag] = std::move(prev_sub); });
 
         drop_field_keys(victim);
+        drop_cached_fields(victim);
 
         set_slot(x.index, nullptr, x.gen);  // logs restore of victim + its gen
 
@@ -860,6 +920,7 @@ CommitResult Model::try_commit(Transaction& txn) {
     r->spine = spine_;        // ~n/kChunkSize shared_ptr copies. Cheap.
     r->by_type = by_type_;    // O(#types): each per-type submap is shared, not copied.
     r->by_field = by_field_;  // O(#indexed fields): same reasoning.
+    r->by_cached_field = by_cached_field_;  // O(#cached fields): ditto.
 
     Snapshot pub;
     {
