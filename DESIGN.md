@@ -118,10 +118,11 @@ serialized** behind one mutex, `commit_mu_`. Inside that critical section:
    against whatever is *actually* alive right now, not a possibly-stale view. This is what
    makes "every Ref<T> still resolves" a property of the *latest* committed state, for free,
    with no separate re-validation pass.
-5. On failure (an `IntegrityError`, or a `false` from the pre-commit hook), everything applied
-   in this attempt unwinds via an undo log — the same rollback mechanism the single-writer
-   project uses for a failed `commit()`, just scoped to one `try_commit()` attempt instead of
-   an open-ended session.
+5. On failure (an integrity violation — reported by value as `CommitStatus::Conflict` or
+   `Invalid` with `CommitResult::error`; this project has no exceptions — or a `false` from
+   the pre-commit hook), everything applied in this attempt unwinds via an undo log — the
+   same rollback mechanism the single-writer project uses for a failed `commit()`, just
+   scoped to one `try_commit()` attempt instead of an open-ended session.
 6. On success: version bump, COW `Root` build, atomic publish, subscriber notify, append to
    `changelog_`, prune whatever the changelog no longer needs.
 

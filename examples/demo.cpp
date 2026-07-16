@@ -267,27 +267,25 @@ int main() {
     // Demonstrate an integrity failure before the concurrent phase. Unlike
     // the single-writer sibling project, nothing is validated until
     // try_commit()'s apply phase -- building a transaction never touches
-    // shared state, so there is nothing to roll back afterward. Dropping the
-    // Transaction (or just letting it go out of scope, as here) is the whole
-    // story.
+    // shared state, so there is nothing to roll back afterward on the
+    // caller's side. try_commit() rejects the whole transaction as Invalid
+    // (no exceptions in this project -- see CLAUDE.md) and unwinds everything
+    // it had applied, DOOMED included.
     {
         const std::size_t before = m.snapshot().size();
         Transaction bad_txn = m.begin();
-        try {
-            auto doomed = std::make_unique<Order>();
-            doomed->code = "DOOMED";
-            doomed->account = accounts[0];
-            bad_txn.create(std::move(doomed));  // fine so far -- not checked yet
-            auto bad = std::make_unique<Order>();
-            bad->code = "BAD";
-            bad->account = Ref<Account>(Id{999999, 1});  // dangling Ref
-            bad_txn.create(std::move(bad));              // still fine locally
-            m.try_commit(bad_txn);                       // throws IntegrityError, mid-apply
-            std::printf("  (unreachable)\n");
-        } catch (const Model::IntegrityError& e) {
-            std::printf("rejected invalid txn: %s -> discarded, nothing was ever published\n",
-                        e.what());
-        }
+        auto doomed = std::make_unique<Order>();
+        doomed->code = "DOOMED";
+        doomed->account = accounts[0];
+        bad_txn.create(std::move(doomed));  // fine so far -- not checked yet
+        auto bad = std::make_unique<Order>();
+        bad->code = "BAD";
+        bad->account = Ref<Account>(Id{999999, 1});  // dangling Ref
+        bad_txn.create(std::move(bad));              // still fine locally
+        const CommitResult res = m.try_commit(bad_txn);  // rejected mid-apply, fully unwound
+        assert(res.status == CommitStatus::Invalid);
+        std::printf("rejected invalid txn: %s -> discarded, nothing was ever published\n",
+                    res.error->message.c_str());
         std::printf("after rejection: %zu objects (was %zu) -- DOOMED never happened\n\n",
                     m.snapshot().size(), before);
     }

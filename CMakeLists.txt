@@ -29,6 +29,11 @@ if(MSVC)
   endif()
 else()
   target_compile_options(model_flags INTERFACE -Wall -Wextra -Wpedantic)
+  # No C++ exceptions anywhere in this project (see CLAUDE.md): errors are
+  # reported through CommitResult / return values, and anything unrecoverable
+  # (e.g. bad_alloc out of the standard library) terminates loudly instead of
+  # unwinding. The flag makes an accidental `throw` or `try` a compile error.
+  target_compile_options(model_flags INTERFACE -fno-exceptions)
   if(MODEL_WERROR)
     target_compile_options(model_flags INTERFACE -Werror)
   endif()

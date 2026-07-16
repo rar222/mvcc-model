@@ -37,6 +37,12 @@ std::string id_key(Id id) {
     return std::string(reinterpret_cast<const char*>(&id), sizeof(id));
 }
 
+/// The one integrity failure with no real Id to classify against the
+/// transaction's base -- always CommitStatus::Invalid, never a Conflict.
+constexpr const char* kUnmappedLocalMsg =
+    "Ref<>/Opt<> points at a local id that was never created, or was removed "
+    "within the same transaction before it was ever committed";
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -333,25 +339,28 @@ void Model::set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t ge
     });
 }
 
-void Model::validate(const ObjectBase* o) const {
+std::optional<Model::IntegrityError> Model::validate(const ObjectBase* o) const {
     // Referential integrity is enforced *here*, at apply time, against the
     // CURRENT (latest) state -- not the transaction's base. That's what makes
     // "Ref<T> re-validated against latest, not just base" fall out for free,
-    // rather than needing a bespoke second check. Throwing (rather than
-    // aborting) lets try_commit() classify the failure -- did the target
-    // exist at the transaction's own base()? -- and turn a concurrent
-    // deletion into a Conflict rather than an escaped exception. See
-    // IntegrityError::bad_target and try_commit()'s catch block.
+    // rather than needing a bespoke second check. Returning the violation
+    // (rather than asserting) lets try_commit() classify the failure -- did
+    // the target exist at the transaction's own base()? -- and turn a
+    // concurrent deletion into a Conflict rather than an Invalid rejection.
+    // See IntegrityError::bad_target and try_commit()'s error handling.
+    std::optional<IntegrityError> err;
     o->each_ref([&](const void* /*field*/, const char* name, Id target, bool nullable) {
+        if (err) return;  // keep the FIRST violation; the attempt aborts either way
         if (!target) {
             if (!nullable)
-                throw IntegrityError(std::string("null Ref in field ") + name + " of " + o->type());
+                err = IntegrityError{std::string("null Ref in field ") + name + " of " + o->type(), Id{}};
             return;
         }
         if (!peek(target))
-            throw IntegrityError(
-                std::string(o->type()) + " field " + name + " references a dead object", target);
+            err = IntegrityError{
+                std::string(o->type()) + " field " + name + " references a dead object", target};
     });
+    return err;
 }
 
 void Model::add_out_refs(const ObjectBase* o) {
@@ -392,6 +401,12 @@ void Model::reconcile_referrer_edges(const ObjectBase* before, const ObjectBase*
     // each_ref() reports the identical set of fields for both -- only the
     // targets can differ. Fields whose target didn't change are left alone:
     // no redundant erase/insert for a field the caller never touched.
+    //
+    // Like every other apply-phase mutation, each edit here logs its inverse:
+    // a rollback (conflict, veto, or an invalid transaction) must restore the
+    // index exactly, or the next cascade resolves against a lie -- an edge
+    // erased here but never restored means a later remove() of the old target
+    // publishes a dangling Ref.
     const Id id = after->id;
     std::unordered_map<const void*, Id> old_targets;
     before->each_ref([&](const void* field, const char*, Id target, bool) { old_targets[field] = target; });
@@ -409,12 +424,25 @@ void Model::reconcile_referrer_edges(const ObjectBase* before, const ObjectBase*
                     return e.from == id && e.field == field;
                 });
                 if (pos != v.end()) {
+                    const RefEdge edge = *pos;
                     v.erase(pos);
                     if (v.empty()) referrers_.erase(rit);
+                    const std::uint32_t key = old_target.index;
+                    log([this, key, edge] { referrers_[key].push_back(edge); });
                 }
             }
         }
-        if (new_target) referrers_[new_target.index].push_back(RefEdge{id, field, nullable});
+        if (new_target) {
+            referrers_[new_target.index].push_back(RefEdge{id, field, nullable});
+            const std::uint32_t key = new_target.index;
+            log([this, key] {
+                auto rit = referrers_.find(key);
+                if (rit != referrers_.end()) {
+                    rit->second.pop_back();  // exact inverse of the push_back above
+                    if (rit->second.empty()) referrers_.erase(rit);
+                }
+            });
+        }
     });
 }
 
@@ -444,8 +472,14 @@ void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* aft
         const auto it = old_keys.find(field);
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
+        // Same undo pattern as add_field_keys/drop_field_keys: capture the
+        // whole prior map (cheap -- persistent, structure-shared) and restore
+        // it on rollback. Without this, a vetoed/conflicted attempt leaves
+        // by_field_ permanently indexing values that never committed.
+        auto prev = by_field_[field];
         if (it != old_keys.end()) by_field_[field] = by_field_[field].erase(it->second);
         by_field_[field] = by_field_[field].set(new_key, id);
+        log([this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); });
     });
 }
 
@@ -492,10 +526,15 @@ std::vector<std::pair<std::uint64_t, int>> Model::debug_live_versions() const {
 // try_commit() internals
 // ---------------------------------------------------------------------------
 
-void Model::apply_create(std::unique_ptr<ObjectBase> o, std::unordered_map<std::uint32_t, Id>& remap) {
+std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectBase> o,
+                                                         std::unordered_map<std::uint32_t, Id>& remap) {
     const std::uint32_t local_index = o->id.index;  // still local; the remap key
 
-    o->remap_refs(RefRemapper{remap});  // may reference an earlier local create in this txn
+    // May reference an earlier local create in this txn. Nothing is logged
+    // yet, so an unmapped local id can just return; `o` frees itself.
+    bool unmapped = false;
+    o->remap_refs(RefRemapper{remap, &unmapped});
+    if (unmapped) return IntegrityError{kUnmappedLocalMsg, Id{}};
 
     const std::uint32_t slot = alloc_slot();
     const std::uint32_t i = slot & kChunkMask;
@@ -505,10 +544,10 @@ void Model::apply_create(std::unique_ptr<ObjectBase> o, std::unordered_map<std::
     const std::uint32_t g = cur_gen + 1;  // recycled slot gets a fresh generation
 
     o->id = Id{slot, g};
-    // May throw IntegrityError. The slot allocation above is already logged,
-    // so rollback_apply() reclaims it; the object is still owned by `o` and
-    // is freed here by unique_ptr as the stack unwinds.
-    validate(o.get());
+    // On a violation, the slot allocation above is already logged, so
+    // rollback_apply() reclaims it; the object is still owned by `o` and is
+    // freed by unique_ptr on the early return.
+    if (auto err = validate(o.get())) return err;
 
     const Id id = o->id;
     ObjectBase* raw = o.release();
@@ -535,18 +574,25 @@ void Model::apply_create(std::unique_ptr<ObjectBase> o, std::unordered_map<std::
     txn_created_.push_back(raw);
 
     remap[local_index] = id;
+    return std::nullopt;
 }
 
-void Model::apply_update(std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap) {
+std::optional<Model::IntegrityError> Model::apply_update(std::unique_ptr<ObjectBase> clone,
+                                                         std::unordered_map<std::uint32_t, Id>& remap) {
     ObjectBase* raw = clone.release();
-    raw->remap_refs(RefRemapper{remap});  // may reference a local create in this same txn
 
-    // Log the clone's deletion FIRST, so in reverse replay it runs LAST -- after
-    // set_slot's undo has repointed the slot back at the baseline. Otherwise
-    // we'd free `raw` while the slot still referenced it.
+    // Log the clone's deletion FIRST (before anything can fail), so in
+    // reverse replay it runs LAST -- after set_slot's undo has repointed the
+    // slot back at the baseline. Otherwise we'd free `raw` while the slot
+    // still referenced it, and an early error return below would leak it.
     log([raw] { delete raw; });
 
-    validate(raw);  // against CURRENT peek(), not the transaction's base -- see validate()'s comment
+    bool unmapped = false;
+    raw->remap_refs(RefRemapper{remap, &unmapped});  // may reference a local create in this same txn
+    if (unmapped) return IntegrityError{kUnmappedLocalMsg, Id{}};
+
+    // Against CURRENT peek(), not the transaction's base -- see validate()'s comment.
+    if (auto err = validate(raw)) return err;
 
     const Id id = raw->id;
     const ObjectBase* baseline = peek(id);
@@ -573,6 +619,7 @@ void Model::apply_update(std::unique_ptr<ObjectBase> clone, std::unordered_map<s
     // be dragged into X's cascade.
     reconcile_referrer_edges(baseline, raw);
     reconcile_field_keys(baseline, raw);
+    return std::nullopt;
 }
 
 ObjectBase* Model::clone_for_cascade_null(Id id) {
@@ -743,56 +790,67 @@ CommitResult Model::try_commit(Transaction& txn) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
     if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
-        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}};
+        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
 
     std::lock_guard commit_lk(commit_mu_);
 
     if (std::vector<Id> overlap = check_id_overlap(txn); !overlap.empty()) {
         return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
-                            ConflictInfo{ConflictReason::IdSetOverlap, std::move(overlap)}, {}};
+                            ConflictInfo{ConflictReason::IdSetOverlap, std::move(overlap)}, {},
+                            std::nullopt};
     }
 
     std::unordered_map<std::uint32_t, Id> remap;  // local Id::index -> real Id, this attempt only
 
-    try {
-        // Creates first, then updates (reconciled immediately, see
-        // apply_update), then deletes resolved last -- in that order, so a
-        // same-transaction "repoint away from X, then delete X" sees the
-        // repoint already reflected in referrers_ before the cascade BFS runs.
-        for (auto& obj : txn.local_created_) {
-            if (obj) apply_create(std::move(obj), remap);  // null: create-then-remove, cancelled locally
-        }
+    // Creates first, then updates (reconciled immediately, see apply_update),
+    // then deletes resolved last -- in that order, so a same-transaction
+    // "repoint away from X, then delete X" sees the repoint already reflected
+    // in referrers_ before the cascade BFS runs. The first integrity
+    // violation aborts the attempt; everything applied so far is unwound.
+    std::optional<IntegrityError> err;
+    for (auto& obj : txn.local_created_) {
+        if (obj && (err = apply_create(std::move(obj), remap))) break;  // null: cancelled locally
+    }
+    if (!err) {
         for (auto& [slot, clone] : txn.local_updated_) {
             (void)slot;
-            if (clone) apply_update(std::move(clone), remap);
+            if (clone && (err = apply_update(std::move(clone), remap))) break;
         }
+    }
+    if (!err) {
         for (Id rid : txn.remove_intents_) remove_raw(rid);
-    } catch (const IntegrityError& e) {
+    }
+
+    if (err) {
         rollback_apply();
         // Did the dangling target exist at this transaction's own base()? If
         // so, someone else deleted it concurrently -- a Conflict, not a bug.
-        // (e.bad_target is null for a null non-nullable Ref, which has no
-        // target to check and is always a genuine transaction-building bug.)
-        if (e.bad_target && txn.base().find_raw(e.bad_target)) {
+        // (bad_target is null for a null non-nullable Ref or an unmapped
+        // local id, which have no target to check and are always genuine
+        // transaction-building bugs -- those reject as Invalid.)
+        if (err->bad_target && txn.base().find_raw(err->bad_target)) {
             return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
-                                ConflictInfo{ConflictReason::RefIntegrity, {e.bad_target}}, {}};
+                                ConflictInfo{ConflictReason::RefIntegrity, {err->bad_target}}, {},
+                                std::nullopt};
         }
-        throw;
+        return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, std::move(err)};
     }
 
     if (changes_.empty()) {
         // Everything in txn had already been applied by an earlier
         // try_commit() on this same Transaction (or every local create was
         // locally cancelled) -- a no-op success, not a fresh publish.
-        return CommitResult{CommitStatus::Committed, snapshot(), {}, std::nullopt, {}};
+        return CommitResult{CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
     }
 
     // Runs after apply, not before: it sees the FULLY resolved changeset,
     // including cascade deletes (resolved just above). A false return unwinds
-    // everything applied so far, exactly like an IntegrityError does.
+    // everything applied so far, exactly like an integrity violation does.
+    // (The hook cannot report failure by throwing -- the project builds with
+    // -fno-exceptions, so a throw is std::terminate, not an error path.)
     if (pre_commit_ && !pre_commit_(*this, changes_)) {
         rollback_apply();
-        return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}};
+        return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
     }
 
     ++version_;
@@ -840,7 +898,8 @@ CommitResult Model::try_commit(Transaction& txn) {
     undo_.clear();         // committed: nothing to roll back to
     txn_created_.clear();  // published objects are now owned by the spine
 
-    return CommitResult{CommitStatus::Committed, pub, std::move(resolved), std::nullopt, std::move(remap)};
+    return CommitResult{CommitStatus::Committed, pub, std::move(resolved), std::nullopt, std::move(remap),
+                        std::nullopt};
 }
 
 }  // namespace model

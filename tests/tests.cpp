@@ -920,7 +920,103 @@ TEST(pre_commit_hook_veto_unwinds_everything_as_if_try_commit_were_never_called)
     CHECK(m.snapshot().find(o2) != nullptr);
 }
 
-TEST(create_with_a_dead_ref_throws) {
+TEST(veto_rollback_restores_the_reverse_index_so_later_cascades_stay_correct) {
+    Model m;
+    const Ref<Account> x = make_account(m, "X");
+    const Ref<Account> y = make_account(m, "Y");
+    const Ref<Order> o = make_order(m, "O1", x);
+
+    // Repoint O's Ref<Account> from X to Y, then get vetoed. The rollback
+    // must also undo the reconcile step's referrers_ edits (X->O edge erased,
+    // Y->O edge added), or the committed state (O still points at X) and the
+    // reverse index disagree forever.
+    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    Transaction txn = m.begin();
+    txn.update(o)->account = y;
+    CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
+    m.set_pre_commit({});
+    CHECK(m.snapshot().find(o)->account == x);
+
+    // No phantom edge: removing Y must not drag O along.
+    CHECK_EQ(remove_and_commit(m, y), std::size_t{1});
+    CHECK(m.snapshot().find(o) != nullptr);
+
+    // No lost edge: removing X must cascade O, not strand it dangling.
+    CHECK_EQ(remove_and_commit(m, x), std::size_t{2});
+    CHECK(m.snapshot().find(o) == nullptr);
+}
+
+TEST(veto_rollback_restores_the_field_key_index) {
+    Model m;
+    const Ref<Account> a = make_account(m, "OLD");
+
+    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    Transaction txn = m.begin();
+    txn.update(a)->name = "NEW";
+    CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
+    m.set_pre_commit({});
+
+    make_account(m, "UNRELATED");  // publish a fresh root carrying by_field_
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.find(a)->name, std::string("OLD"));
+    CHECK(s.find_by_key<&Account::name>("OLD") == s.find(a));
+    CHECK(s.find_by_key<&Account::name>("NEW") == nullptr);
+}
+
+TEST(an_invalid_transaction_unwinds_like_a_veto_and_reports_why) {
+    Model m;
+    const std::string before = state_of(m);
+
+    Transaction txn = m.begin();
+    auto g = std::make_unique<Account>();
+    g->name = "GHOST";
+    txn.create(std::move(g));
+    auto bad = std::make_unique<Order>();
+    bad->code = "BAD";  // account left default -> null non-nullable Ref
+    txn.create(std::move(bad));
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Invalid);
+    CHECK(res.error.has_value());
+    CHECK(!res.error->bad_target);  // null Ref: nothing to classify against base
+    CHECK_EQ(state_of(m), before);
+
+    // The next commit must publish ONLY its own changes -- nothing left over
+    // from the rejected attempt (its slot writes, index entries, changes_,
+    // and undo log must all have been unwound before try_commit returned).
+    const Ref<Account> real = make_account(m, "REAL");
+    Snapshot s = m.snapshot();
+    CHECK(s.find(real) != nullptr);
+    CHECK(s.find_by_key<&Account::name>("GHOST") == nullptr);
+    CHECK_EQ(s.size(), std::size_t{1});
+}
+
+TEST(set_pre_commit_can_race_try_commit_without_a_data_race) {
+    // The real assertion here is TSan's (ctest --preset tsan): installing a
+    // hook must be serialized against the commits that invoke it.
+    Model m;
+    std::atomic<bool> stop{false};
+    std::thread committer([&] {
+        int n = 0;
+        // do-while: at least one commit lands even if the main thread finishes
+        // all its set_pre_commit() calls before this thread is scheduled.
+        do {
+            Transaction txn = m.begin();
+            auto a = std::make_unique<Account>();
+            a->name = "A" + std::to_string(n++);
+            txn.create(std::move(a));
+            (void)m.try_commit(txn);
+        } while (!stop.load(std::memory_order_relaxed));
+    });
+    for (int i = 0; i < 500; ++i)
+        m.set_pre_commit([](Model&, const std::vector<Change>&) { return true; });
+    m.set_pre_commit({});
+    stop = true;
+    committer.join();
+    CHECK(m.snapshot().size() > 0);
+}
+
+TEST(create_with_a_dead_ref_is_rejected_as_invalid) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> good = make_order(m, "GOOD", a);
@@ -932,30 +1028,26 @@ TEST(create_with_a_dead_ref_throws) {
     o->account = a;  // Ref<Account> to an already-dead account (as of txn's own base)
     txn.create(std::move(o));
 
-    bool threw = false;
-    try {
-        m.try_commit(txn);
-    } catch (const Model::IntegrityError&) {
-        threw = true;
-    }
-    CHECK(threw);
+    // Dead even at the txn's own base: a transaction-building bug (Invalid,
+    // with the offending target reported), not a concurrency Conflict.
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Invalid);
+    CHECK(res.error.has_value());
+    CHECK(res.error->bad_target == a.raw());
     CHECK(m.snapshot().find(good) == nullptr);  // txn's base already reflects a/good gone
 }
 
-TEST(create_with_a_null_nonnullable_ref_throws) {
+TEST(create_with_a_null_nonnullable_ref_is_rejected_as_invalid) {
     Model m;
     Transaction txn = m.begin();
     auto o = std::make_unique<Order>();
     o->code = "X";  // account left default -> null Ref<Account>
     txn.create(std::move(o));
 
-    bool threw = false;
-    try {
-        m.try_commit(txn);
-    } catch (const Model::IntegrityError&) {
-        threw = true;
-    }
-    CHECK(threw);
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Invalid);
+    CHECK(res.error.has_value());
+    CHECK(!res.error->bad_target);  // a null Ref has no target to report
     CHECK_EQ(m.snapshot().size(), std::size_t{0});
 }
 
@@ -1148,13 +1240,10 @@ TEST(a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction
     o->account = a_local;
     txn2.create(std::move(o));
 
-    bool threw = false;
-    try {
-        m.try_commit(txn2);
-    } catch (const Model::IntegrityError&) {
-        threw = true;
-    }
-    CHECK(threw);
+    const CommitResult res = m.try_commit(txn2);
+    CHECK(res.status == CommitStatus::Invalid);
+    CHECK(res.error.has_value());
+    CHECK(!res.error->bad_target);  // a stray local id has no real target to report
     CHECK_EQ(m.snapshot().size(), std::size_t{0});  // neither txn1 nor txn2 ever published anything
 }
 
@@ -1393,14 +1482,9 @@ TEST(ref_integrity_is_revalidated_against_latest_not_just_base) {
     o->account = a;  // new Order -> now-dead Account
     a_txn.create(std::move(o));
 
-    bool threw = false;
-    CommitResult ra;
-    try {
-        ra = m.try_commit(a_txn);
-    } catch (const Model::IntegrityError&) {
-        threw = true;
-    }
-    CHECK(!threw);  // classified as Conflict, not an escaped exception
+    // The target was alive at a_txn's base and died to a CONCURRENT commit:
+    // classified as a Conflict (retryable contention), not Invalid.
+    const CommitResult ra = m.try_commit(a_txn);
     CHECK(ra.status == CommitStatus::Conflict);
     CHECK(ra.conflict->reason == ConflictReason::RefIntegrity);
 }

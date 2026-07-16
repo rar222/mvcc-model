@@ -24,8 +24,6 @@
 // never needing to be merged -- even though many threads can now build
 // transactions concurrently. See CLAUDE.md invariant 8.
 
-#include "model/persistent_map.h"
-
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -37,7 +35,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -45,6 +42,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "model/persistent_map.h"
 
 namespace model {
 
@@ -88,7 +87,9 @@ struct IdHash {
 /// isn't a real slot).
 inline constexpr std::uint32_t kLocalIdBit = 0x8000'0000u;
 
-inline bool is_local(Id id) noexcept { return (id.index & kLocalIdBit) != 0; }
+inline bool is_local(Id id) noexcept {
+    return (id.index & kLocalIdBit) != 0;
+}
 
 // ---------------------------------------------------------------------------
 // Type tags -- a cheap, RTTI-free checked downcast
@@ -254,18 +255,28 @@ struct RefNuller {
 /// which point applying the Order remaps it to the real one. A field that
 /// isn't local (already a real id, or null) is left untouched.
 ///
-/// Throws Model::IntegrityError if a local id has no entry in the table --
-/// which means it pointed at a local object that was never created, or one
-/// created-then-removed within the same transaction (see
-/// Transaction::remove(), the create-then-uncreate case): a genuine
-/// transaction-building bug, not a concurrency conflict, so it is NOT
-/// classified as a Conflict by try_commit() (bad_target is left null, since
-/// there is no real Id to check against the transaction's base -- see
-/// Model::validate's use of IntegrityError::bad_target for the contrast).
+/// Sets *unmapped (there are no exceptions in this project -- see CLAUDE.md)
+/// if a local id has no entry in the table -- which means it pointed at a
+/// local object that was never created, or one created-then-removed within
+/// the same transaction (see Transaction::remove(), the create-then-uncreate
+/// case). try_commit() then rejects the transaction as CommitStatus::Invalid:
+/// a genuine transaction-building bug, not a concurrency conflict (there is
+/// no real Id to check against the transaction's base, so it cannot be
+/// classified as a Conflict -- see Model::validate's use of
+/// IntegrityError::bad_target for the contrast). The field is left null; the
+/// half-remapped object is never installed, so the value doesn't matter.
 struct RefRemapper {
     const std::unordered_map<std::uint32_t, Id>& table;  // local Id::index -> real Id
+    bool* unmapped;  // set on a local id with no mapping; the apply aborts
 
-    Id resolve(Id id) const;  // defined after Model::IntegrityError below
+    Id resolve(Id id) const {
+        auto it = table.find(id.index);
+        if (it == table.end()) {
+            *unmapped = true;
+            return Id{};
+        }
+        return it->second;
+    }
 
     template <class T>
     void operator()(const void*, const char*, Ref<T>& r) const {
@@ -319,15 +330,15 @@ namespace detail {
 template <class D, class = void>
 struct has_define_references : std::false_type {};
 template <class D>
-struct has_define_references<
-    D, std::void_t<decltype(D::define_references(std::declval<const D&>(), std::declval<const RefReader&>()))>>
+struct has_define_references<D, std::void_t<decltype(D::define_references(
+                                    std::declval<const D&>(), std::declval<const RefReader&>()))>>
     : std::true_type {};
 
 template <class D, class = void>
 struct has_define_keys : std::false_type {};
 template <class D>
-struct has_define_keys<
-    D, std::void_t<decltype(D::define_keys(std::declval<const D&>(), std::declval<const FieldKeyReader&>()))>>
+struct has_define_keys<D, std::void_t<decltype(D::define_keys(
+                              std::declval<const D&>(), std::declval<const FieldKeyReader&>()))>>
     : std::true_type {};
 
 /// Demangles a typeid name for use as a diagnostic label (Object<Derived>::type()).
@@ -403,7 +414,8 @@ public:
 ///
 ///     template <class Self>
 ///     static void define_keys(Self& s, const model::FieldKeyReader& v) {
-///         v.key<&Order::computed_key>(s.computed_key());  // find_by_key<&Order::computed_key>("ord:O1")
+///         v.key<&Order::computed_key>(s.computed_key());  //
+///         find_by_key<&Order::computed_key>("ord:O1")
 ///     }
 ///
 /// Each indexed field is assumed unique within its type; a duplicate value
@@ -412,9 +424,7 @@ public:
 template <class Derived>
 class Object : public ObjectBase {
 public:
-    ObjectBase* clone() const override {
-        return new Derived(static_cast<const Derived&>(*this));
-    }
+    ObjectBase* clone() const override { return new Derived(static_cast<const Derived&>(*this)); }
 
     TypeTag tag() const noexcept override { return type_tag<Derived>(); }
 
@@ -621,7 +631,8 @@ public:
     /// Ref<U>/Opt<U>::target_type) is enforced by the parameter type itself,
     /// not a runtime static_assert.
     template <auto Field, class F>
-    void for_each_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
+    void for_each_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                           F&& f) const {
         using ClassT = member_class_t<decltype(Field)>;
         for_each<ClassT>([&](const ClassT& o) {
             if ((o.*Field).raw() == target.raw()) f(o);
@@ -640,7 +651,8 @@ public:
 
     /// View-returning form of for_each_referrer.
     template <auto Field, class F>
-    void for_each_referrer_view(Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const;
+    void for_each_referrer_view(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                F&& f) const;
 
     /// View-returning form of find_referrers.
     template <auto Field>
@@ -728,14 +740,21 @@ struct Change {
 /// are resolved earlier in the same apply phase (see CLAUDE.md invariant 9).
 ///
 /// Returning false vetoes the commit: try_commit() unwinds everything applied
-/// so far and returns CommitStatus::Vetoed. Throwing instead propagates to
-/// the caller of try_commit(), leaving the Transaction's local state
-/// untouched (nothing shared was published) -- catch it, fix up, and retry.
+/// so far and returns CommitStatus::Vetoed; nothing was published, and the
+/// Transaction is spent (its local overlay was moved from during apply) --
+/// begin() a fresh one to retry. The hook must NOT throw: this project builds
+/// with -fno-exceptions (see CLAUDE.md), so a throw is std::terminate, not an
+/// error path. Report "no" by returning false.
 ///
 /// Read-only by convention: the hook sees the resolved changeset and can
 /// peek_as<T> any of it via the Model reference, but must not call
 /// try_commit() itself or otherwise begin a new transaction -- this runs
 /// inside an existing try_commit(), which already holds the commit lock.
+/// The same lock also rules out calling current_version(),
+/// retired_pending(), exhausted_slots(), or set_pre_commit() from the hook
+/// (self-deadlock on the non-recursive commit_mu_); snapshot() is fine, and
+/// yields the still-current PRE-commit version, since the transaction being
+/// inspected has not published yet.
 using PreCommitFn = std::function<bool(Model&, const std::vector<Change>&)>;
 
 struct Update {
@@ -789,7 +808,7 @@ public:
 
     Snapshot snapshot();  ///< O(1)
     std::shared_ptr<Subscription> subscribe(std::size_t queue_depth = 8);
-    void shutdown();      ///< wakes blocked subscribers so their threads can exit
+    void shutdown();  ///< wakes blocked subscribers so their threads can exit
 
     // ---- write side (any thread -- try_commit() serializes internally) -----
 
@@ -813,23 +832,30 @@ public:
     /// (3), if nothing conflicted, publishes atomically. See CommitResult and
     /// CLAUDE.md's "try_commit() phase order" for the exact algorithm.
     ///
-    /// A conflicting or vetoed attempt leaves `txn` fully consumed either way
-    /// (its local overlay has already been moved from during apply) --
-    /// discard it and begin() a fresh Transaction to retry.
+    /// A conflicting, vetoed, or invalid attempt leaves `txn` fully consumed
+    /// either way (its local overlay has already been moved from during
+    /// apply) -- discard it and begin() a fresh Transaction to retry.
     CommitResult try_commit(Transaction& txn);
 
     /// Install (or clear, with {}) the pre-commit hook. See PreCommitFn.
-    void set_pre_commit(PreCommitFn fn) { pre_commit_ = std::move(fn); }
+    /// Takes the commit lock, so it is safe to call while other threads
+    /// commit -- the hook swaps in between commits, never mid-commit. Never
+    /// call it from inside the hook itself: commit_mu_ is not recursive.
+    void set_pre_commit(PreCommitFn fn) {
+        std::lock_guard lk(commit_mu_);
+        pre_commit_ = std::move(fn);
+    }
 
-    /// Thrown by try_commit()'s apply phase when a Transaction's own creates
-    /// or updates would violate referential integrity. Most such failures are
-    /// classified as a Conflict by try_commit() (see bad_target) rather than
-    /// escaping as this exception -- it only ever reaches a caller for a
-    /// target that never existed even at the transaction's own base, which is
-    /// a genuine transaction-building bug, not contention.
-    struct IntegrityError : std::runtime_error {
-        IntegrityError(const std::string& msg, Id bad_target = Id{})
-            : std::runtime_error(msg), bad_target(bad_target) {}
+    /// Reported via CommitResult::error (status == Invalid) when a
+    /// Transaction's own creates or updates would violate referential
+    /// integrity. Not an exception -- this project builds with
+    /// -fno-exceptions; see CLAUDE.md. Most such failures are classified as a
+    /// Conflict by try_commit() (see bad_target) rather than as Invalid --
+    /// Invalid only ever means a target that never existed even at the
+    /// transaction's own base (or a null non-nullable Ref, or a stray local
+    /// id), which is a genuine transaction-building bug, not contention.
+    struct IntegrityError {
+        std::string message;
         Id bad_target;  ///< Id{} if not applicable (e.g. a null non-nullable Ref)
     };
 
@@ -900,7 +926,7 @@ private:
     const ObjectBase* peek(Id id) const;
     Chunk* cow(std::uint32_t chunk_index);
     std::uint32_t alloc_slot();
-    void validate(const ObjectBase* o) const;  // throws IntegrityError
+    std::optional<IntegrityError> validate(const ObjectBase* o) const;  // nullopt == valid
     void add_out_refs(const ObjectBase* o);
     void drop_out_refs(const ObjectBase* o);
     void reconcile_referrer_edges(const ObjectBase* before, const ObjectBase* after);
@@ -909,7 +935,7 @@ private:
     void reconcile_field_keys(const ObjectBase* before, const ObjectBase* after);
     void retire(const ObjectBase* o);
     void release_version(std::uint64_t v);
-    void reaper_loop();          ///< body of the background reaper thread
+    void reaper_loop();  ///< body of the background reaper thread
     void enqueue_retired(std::vector<std::pair<std::uint64_t, const ObjectBase*>> batch);
 
     // Undo log. Every mutation of writer-private state during a try_commit()
@@ -922,8 +948,12 @@ private:
     void set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen);
 
     // ---- try_commit() internals (ALL require commit_mu_ already held) ------
-    void apply_create(std::unique_ptr<ObjectBase> o, std::unordered_map<std::uint32_t, Id>& remap);
-    void apply_update(std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap);
+    // apply_* return nullopt on success, or the integrity violation that
+    // aborted this attempt -- the caller must then rollback_apply().
+    std::optional<IntegrityError> apply_create(std::unique_ptr<ObjectBase> o,
+                                               std::unordered_map<std::uint32_t, Id>& remap);
+    std::optional<IntegrityError> apply_update(std::unique_ptr<ObjectBase> clone,
+                                               std::unordered_map<std::uint32_t, Id>& remap);
     std::vector<Id> remove_raw(Id id);  // cascade BFS, called from try_commit()'s apply phase
     // remove_raw's helper for a NULLABLE referrer: clone + install, so the
     // caller can null_ref() the field that pointed at the victim, then
@@ -943,7 +973,8 @@ private:
     std::atomic<std::shared_ptr<const Root>> root_;
 
     mutable std::mutex ver_mu_;
-    std::map<std::uint64_t, int> live_;  ///< live snapshot (incl. txn base) versions; min = watermark
+    std::map<std::uint64_t, int>
+        live_;  ///< live snapshot (incl. txn base) versions; min = watermark
 
     std::mutex subs_mu_;
     std::vector<std::shared_ptr<Subscription>> subs_;
@@ -982,7 +1013,8 @@ private:
     std::vector<Change> changes_;  ///< scratch: this attempt's resolved changeset
     std::vector<std::pair<std::uint64_t, const ObjectBase*>> retired_;
     PreCommitFn pre_commit_;
-    std::deque<ChangelogEntry> changelog_;  ///< for try_commit()'s conflict check; see prune_changelog
+    std::deque<ChangelogEntry>
+        changelog_;  ///< for try_commit()'s conflict check; see prune_changelog
 
     // Undo log and the objects created this attempt (which rollback_apply()
     // must delete, since they were never published and nothing else owns them).
@@ -995,7 +1027,12 @@ private:
 // Multi-writer commit results
 // ---------------------------------------------------------------------------
 
-enum class CommitStatus { Committed, Conflict, Vetoed };
+/// Invalid means the Transaction itself was malformed (a null non-nullable
+/// Ref, a target dead even at the transaction's own base, or a Ref holding a
+/// stray local id) -- a transaction-building bug at the call site, not
+/// contention. See CommitResult::error for the specifics. This status exists
+/// because the project has no exceptions to throw (see CLAUDE.md).
+enum class CommitStatus { Committed, Conflict, Vetoed, Invalid };
 enum class ConflictReason { IdSetOverlap, RefIntegrity };
 
 struct ConflictInfo {
@@ -1005,9 +1042,12 @@ struct ConflictInfo {
 
 struct CommitResult {
     CommitStatus status;
-    Snapshot snapshot;                     ///< valid only if status == Committed
+    Snapshot snapshot;  ///< valid only if status == Committed. If every conflicted attempt handed
+                        ///< back a pinned snapshot,
+                        //// a caller who holds CommitResults (perfectly natural for
+                        ///logging/diagnostics) would silently stall the reaper.
     std::vector<Change> changes;           ///< FULL resolved changeset, incl. cascade deletes;
-                                            ///< empty unless status == Committed
+                                           ///< empty unless status == Committed
     std::optional<ConflictInfo> conflict;  ///< set only if status == Conflict
 
     /// local Id::index (kLocalIdBit set) -> real Id, populated only when
@@ -1021,11 +1061,15 @@ struct CommitResult {
     /// read this map directly.
     std::unordered_map<std::uint32_t, Id> local_remap;
 
+    /// Set only if status == Invalid: what was wrong with the transaction.
+    /// The whole attempt was unwound; nothing was published.
+    std::optional<Model::IntegrityError> error;
+
     /// Translates a Ref<T> obtained from Transaction::create() BEFORE this
     /// try_commit() call into its real, post-commit handle. A ref that was
     /// never local (read from base(), or returned by Transaction::update())
     /// passes through unchanged. Only meaningful when status == Committed --
-    /// a local id from a Conflict/Vetoed attempt was never installed
+    /// a local id from a Conflict/Vetoed/Invalid attempt was never installed
     /// anywhere; begin() a fresh Transaction and create() again instead.
     template <class T>
     Ref<T> resolve(Ref<T> local) const {
@@ -1041,15 +1085,6 @@ struct CommitResult {
         return Opt<T>(it == local_remap.end() ? Id{} : it->second);
     }
 };
-
-inline Id RefRemapper::resolve(Id id) const {
-    auto it = table.find(id.index);
-    if (it == table.end())
-        throw Model::IntegrityError(
-            "Ref<>/Opt<> points at a local id that was never created, or was removed "
-            "within the same transaction before it was ever committed");
-    return it->second;
-}
 
 // ---------------------------------------------------------------------------
 // Transaction -- the write side's private, per-caller working set
@@ -1174,7 +1209,8 @@ public:
     template <class T>
     const T* peek_before(Id id) const {
         auto it = update_baseline_.find(id.index);
-        if (it == update_baseline_.end() || it->second->id != id || it->second->tag() != type_tag<T>())
+        if (it == update_baseline_.end() || it->second->id != id ||
+            it->second->tag() != type_tag<T>())
             return nullptr;
         return static_cast<const T*>(it->second);
     }
@@ -1227,8 +1263,9 @@ private:
             const std::uint32_t idx = id.index & ~kLocalIdBit;
             if (idx < local_created_.size()) local_created_[idx].reset();  // cancel locally
             auto rm = [&](const Change& c) { return c.id == id; };
-            pending_changes_.erase(std::remove_if(pending_changes_.begin(), pending_changes_.end(), rm),
-                                   pending_changes_.end());
+            pending_changes_.erase(
+                std::remove_if(pending_changes_.begin(), pending_changes_.end(), rm),
+                pending_changes_.end());
             return;
         }
         remove_intents_.insert(id);
@@ -1256,11 +1293,14 @@ private:
     Model* model_ = nullptr;
     Snapshot base_;  ///< pins base_version_ in Model::live_, same as any reader's snapshot
 
-    std::vector<std::unique_ptr<ObjectBase>> local_created_;  ///< index == local id's low bits;
-                                                               ///< null entry == cancelled (see remove_impl)
-    std::unordered_map<std::uint32_t, std::unique_ptr<ObjectBase>> local_updated_;  ///< keyed by real slot index
-    std::unordered_map<std::uint32_t, const ObjectBase*> update_baseline_;  ///< points into base_'s Root,
-                                                                              ///< kept alive by base_ itself
+    std::vector<std::unique_ptr<ObjectBase>>
+        local_created_;  ///< index == local id's low bits;
+                         ///< null entry == cancelled (see remove_impl)
+    std::unordered_map<std::uint32_t, std::unique_ptr<ObjectBase>>
+        local_updated_;  ///< keyed by real slot index
+    std::unordered_map<std::uint32_t, const ObjectBase*>
+        update_baseline_;                            ///< points into base_'s Root,
+                                                     ///< kept alive by base_ itself
     std::unordered_set<Id, IdHash> remove_intents_;  ///< real ids only -- see remove_impl
     std::uint32_t next_local_id_ = 0;
     std::vector<Change> pending_changes_;
@@ -1314,13 +1354,13 @@ public:
 
     /// Follow a non-nullable field. Always yields a view.
     template <class U>
-    View<U> operator[](Ref<U> T::*field) const noexcept {
+    View<U> operator[](Ref<U> T::* field) const noexcept {
         return View<U>(*s_, s_->resolve(o_->*field));
     }
 
     /// Follow a nullable field. Empty if the target was cascaded away.
     template <class U>
-    std::optional<View<U>> operator[](Opt<U> T::*field) const noexcept {
+    std::optional<View<U>> operator[](Opt<U> T::* field) const noexcept {
         if (const U* p = s_->resolve(o_->*field)) return View<U>(*s_, *p);
         return std::nullopt;
     }
@@ -1380,8 +1420,8 @@ std::vector<View<T>> Snapshot::find_all_view(Pred&& pred) const {
 }
 
 template <auto Field, class F>
-void Snapshot::for_each_referrer_view(Ref<typename member_value_t<decltype(Field)>::target_type> target,
-                                      F&& f) const {
+void Snapshot::for_each_referrer_view(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
     for_each_view<ClassT>([&](View<ClassT> v) {
         if (((*v).*Field).raw() == target.raw()) f(v);

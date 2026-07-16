@@ -153,6 +153,14 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
 
 ## Working style in this repo
 
+- **No C++ exceptions. None.** The whole project builds with `-fno-exceptions` (enforced in
+  CMakeLists.txt), so `throw` and `try`/`catch` are compile errors — don't reintroduce them
+  "just locally", in tests, or in example code. Failure is reported by value:
+  `try_commit()` returns `CommitStatus::Conflict` / `Vetoed` / `Invalid` (with
+  `CommitResult::error` carrying the `Model::IntegrityError` details), and internal apply
+  helpers return `std::optional<Model::IntegrityError>`. A pre-commit hook signals "no" by
+  returning `false`; under `-fno-exceptions` a throw from anywhere (including the standard
+  library, e.g. `bad_alloc`) is `std::terminate` — loud, by design.
 - **When adding a ref field to a type, update `define_references` (both directions: read and
   null) together**, keep field tags stable, and add a cascade test. A ref that
   `define_references` doesn't report is invisible to the reverse index AND to `RefRemapper`
@@ -163,8 +171,8 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
 - **A `CommitResult` with `status != Committed` means the `Transaction` you passed in is
   spent** — its local overlay was already moved from during apply. Don't try to reuse it;
   `begin()` a fresh one.
-- **Prefer failing loudly.** This code would rather throw from `try_commit()` (or fail an
-  assert) than publish a broken graph to readers.
+- **Prefer failing loudly.** This code would rather reject a commit as
+  `CommitStatus::Invalid` (or fail an assert) than publish a broken graph to readers.
 - Comments explain **why**, not what. If a comment would just restate the code, don't
   write it.
 
