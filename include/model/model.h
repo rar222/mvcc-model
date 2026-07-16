@@ -58,14 +58,32 @@ namespace model {
 /// Dense slot index plus a generation, bumped on every reuse of a slot. Slots
 /// recycle constantly, so without the generation a stale handle would silently
 /// alias whatever object landed in that slot next.
+///
+/// 32-bit on purpose, and asymmetric with the model's 64-bit version
+/// counters. The rule: 64 bits for values bounded by TIME (Model::version_
+/// increments forever -- at 100 commits/sec a uint32 would wrap in ~16
+/// months of uptime, guaranteed), 32 bits for values bounded by POPULATION.
+/// index gives 2^31 usable slots (top bit is kLocalIdBit), ~2000x the
+/// target scale; gen wraps only after 2^32 reuses of ONE slot -- worst-case
+/// LIFO hammering of a single slot for ~16 months -- and alloc_slot()
+/// handles that by retiring the slot, at the cost of one slot, counted in
+/// exhausted_slots(). Widening to 64+64 would double every stored
+/// Ref<>/Opt<> (the whole point of thin refs), grow RefEdge 24->32 bytes,
+/// double Chunk's gen array (+33% memcpy per COWed chunk per commit), and
+/// demote IdHash from a perfect 64-bit pack to a lossy hash -- real costs
+/// on the hottest structures, buying headroom the design never uses. Do not
+/// "future-proof" this.
 struct Id {
-    std::uint32_t index = 0;
-    std::uint32_t gen = 0;  ///< 0 means null
+    std::uint32_t index = 0;  ///< slot number in the spine (chunk = index >> kChunkBits);
+                              ///< top bit set = LOCAL placeholder, see kLocalIdBit
+    std::uint32_t gen = 0;    ///< which lifetime of that slot; 0 means null
 
-    explicit operator bool() const noexcept { return gen != 0; }
+    explicit operator bool() const noexcept { return gen != 0; }  ///< non-null?
     friend bool operator==(Id, Id) noexcept = default;
 };
 
+/// Hasher for the model's own unordered containers keyed by Id (a
+/// Transaction's remove_intents_, Subscription's coalescing merge, ...).
 struct IdHash {
     std::size_t operator()(Id id) const noexcept {
         // Compute in uint64_t, NOT size_t: on a 32-bit size_t platform the
@@ -97,6 +115,9 @@ struct IdHash {
 /// isn't a real slot).
 inline constexpr std::uint32_t kLocalIdBit = 0x8000'0000u;
 
+/// True for a Transaction-scoped placeholder id (see kLocalIdBit), false for
+/// a real slot. Everything that can meet both kinds -- Transaction's peek/
+/// update/remove, RefRemapper, CommitResult::resolve -- branches on this.
 inline bool is_local(Id id) noexcept {
     return (id.index & kLocalIdBit) != 0;
 }
@@ -105,8 +126,16 @@ inline bool is_local(Id id) noexcept {
 // Type tags -- a cheap, RTTI-free checked downcast
 // ---------------------------------------------------------------------------
 
+/// A type's identity, as an opaque address. Compared (never dereferenced) to
+/// check "is this object a T?" -- one virtual call plus a pointer compare,
+/// on the read path that runs millions of times a second. dynamic_cast is
+/// not in that budget, which is why this exists (see CLAUDE.md).
 using TypeTag = const void*;
 
+/// The tag for T: the address of a per-T function-local static, so every use
+/// of type_tag<T>() in the program agrees on one value with zero
+/// registration. (Address-based identity assumes one program image -- the
+/// usual caveat about comparing across shared-library boundaries applies.)
 template <class T>
 inline TypeTag type_tag() noexcept {
     static const char anchor = 0;
@@ -175,13 +204,20 @@ using member_value_t = typename member_value<M>::type;
 template <class T>
 class Ref {
 public:
-    using target_type = T;
+    using target_type = T;  ///< deduction hook: lets for_each_referrer<&Order::account>
+                            ///< require exactly Ref<Account> for its target parameter
 
     Ref() = default;  ///< null until assigned; validate() rejects it at create time
+
+    /// Wrap an untyped Id (e.g. a Change::id) -- explicit and UNCHECKED: the
+    /// type claim is only verified when the ref is resolved/found against a
+    /// Snapshot, whose tag check catches a wrong T then.
     explicit Ref(Id id) noexcept : id_(id) {}
 
+    /// The untyped Id, for correlating with Change events or storing in
+    /// heterogeneous containers. Type information is deliberately dropped.
     Id raw() const noexcept { return id_; }
-    explicit operator bool() const noexcept { return static_cast<bool>(id_); }
+    explicit operator bool() const noexcept { return static_cast<bool>(id_); }  ///< non-null?
 
     friend bool operator==(Ref, Ref) noexcept = default;
 
@@ -194,18 +230,20 @@ private:
 template <class T>
 class Opt {
 public:
-    using target_type = T;
+    using target_type = T;  ///< same deduction hook as Ref<T>::target_type
 
-    Opt() = default;
-    explicit Opt(Id id) noexcept : id_(id) {}
+    Opt() = default;                          ///< null -- a legal, permanent state for an Opt
+    explicit Opt(Id id) noexcept : id_(id) {}  ///< unchecked wrap, same caveat as Ref(Id)
 
     /// A non-null Ref is always a valid Opt. Not the reverse.
     Opt(Ref<T> r) noexcept : id_(r.raw()) {}
 
+    /// Clear to null by hand -- the same state a cascade null produces.
+    /// (Ref<T> has no equivalent; that asymmetry IS the integrity guarantee.)
     void reset() noexcept { id_ = Id{}; }
 
-    Id raw() const noexcept { return id_; }
-    explicit operator bool() const noexcept { return static_cast<bool>(id_); }
+    Id raw() const noexcept { return id_; }  ///< the untyped Id; see Ref::raw()
+    explicit operator bool() const noexcept { return static_cast<bool>(id_); }  ///< non-null?
 
     friend bool operator==(Opt, Opt) noexcept = default;
 
@@ -217,6 +255,12 @@ private:
 // Object model
 // ---------------------------------------------------------------------------
 
+/// Callback shape for enumerating an object's outgoing references (see
+/// ObjectBase::each_ref): the field's identity tag, its diagnostic-only
+/// name, the id it currently points at (possibly null), and whether the
+/// field is an Opt<> (nullable) rather than a Ref<>. Drives the reverse
+/// index, cascade resolution, and validation -- everything that needs to
+/// walk edges without knowing concrete types.
 using RefFn = std::function<void(const void* field, const char* name, Id target, bool nullable)>;
 
 /// Reports every outgoing reference. Nullability is read off the *field type*, so
@@ -298,6 +342,10 @@ struct RefRemapper {
     }
 };
 
+/// Callback shape for enumerating a type's declared lookup fields (see
+/// ObjectBase::each_field_key / each_cached_field / each_scan_field): the
+/// field's identity tag plus its value in canonical string form
+/// (to_field_key). One shape serves all three lookup families.
 using FieldKeyFn = std::function<void(const void* field, std::string key)>;
 
 /// Canonical string form of a define_keys()-indexed field's value: a
@@ -337,6 +385,12 @@ struct FieldKeyReader {
 };
 
 namespace detail {
+// Detection traits for the four opt-in declarations (define_references,
+// define_keys, define_cached_fields, define_scan_fields). Object<Derived>
+// branches on these with `if constexpr`, so a user type declares only what
+// it needs -- omitting one costs nothing and overrides nothing -- and a
+// declaration with the wrong signature simply doesn't match (it is silently
+// unused, which is why every declared field deserves a test; see CLAUDE.md).
 template <class D, class = void>
 struct has_define_references : std::false_type {};
 template <class D>
@@ -372,13 +426,32 @@ struct has_define_scan_fields<D, std::void_t<decltype(D::define_scan_fields(
 std::string demangle_type_name(const std::type_info& ti);
 }  // namespace detail
 
+/// The type-erased base of every stored object -- what the model actually
+/// holds in its chunks and passes through its internals, which must handle
+/// heterogeneous objects (change events, cascade BFS, index maintenance)
+/// without knowing concrete types. Never derive from it directly: derive
+/// from Object<Derived>, which implements every virtual from the type's own
+/// declarations. Instances are owned by the Model once committed (or by a
+/// Transaction while pending); user code only ever sees `const` access
+/// through a Snapshot, or a mutable pointer scoped to its own Transaction.
 class ObjectBase {
 public:
+    /// Assigned by the machinery -- Transaction::create() (a local
+    /// placeholder) and try_commit()'s apply phase (the real slot). Never
+    /// set it yourself; an object's identity is not user data.
     Id id;
 
-    virtual ~ObjectBase() = default;
+    virtual ~ObjectBase() = default;  ///< objects are deleted through base pointers
 
+    /// A faithful copy of the derived object (Object<Derived> implements it
+    /// via the copy constructor -- keep derived types copyable). This is the
+    /// copy-on-write primitive: Transaction::update() clones the committed
+    /// object for local editing, and the cascade BFS clones a referrer
+    /// before nulling one field, so published state is never mutated.
     virtual ObjectBase* clone() const = 0;
+
+    /// The type's identity, for the checked downcast (see TypeTag). Always
+    /// type_tag<Derived>() -- Object<Derived> implements it.
     virtual TypeTag tag() const noexcept = 0;
 
     /// Diagnostic label only (IntegrityError messages) -- never compared or
@@ -387,7 +460,17 @@ public:
     /// automatically; there is nothing to override.
     virtual const char* type() const = 0;
 
+    /// Visit every outgoing Ref<>/Opt<> field, as declared in
+    /// define_references(). The default (no references) is what a type
+    /// without define_references() gets. Feeds validation, the reverse
+    /// index, and cascade resolution -- a field missing here is invisible
+    /// to all three (see Object<>'s warning).
     virtual void each_ref(const RefFn&) const {}
+
+    /// Null the one Opt<> field identified by `field` -- the cascade BFS's
+    /// write primitive when a target dies but the referrer survives. A
+    /// Ref<> field cannot be nulled through this (RefNuller has no clearing
+    /// overload), which is the compile-time half of the integrity guarantee.
     virtual void null_ref(const void* /*field*/) {}
 
     /// Rewrites this object's own ref fields via a RefRemapper. Only ever
@@ -533,9 +616,14 @@ public:
 // Storage
 // ---------------------------------------------------------------------------
 
+/// Slots per chunk = 2^kChunkBits. An Id::index splits into (chunk = index
+/// >> kChunkBits, slot = index & kChunkMask). 256 balances the two costs
+/// that pull in opposite directions: a bigger chunk means a bigger memcpy
+/// every time a commit COWs it (a chunk is ~3KB at 256), a smaller chunk
+/// means a longer spine to copy into every published Root.
 inline constexpr std::uint32_t kChunkBits = 8;
 inline constexpr std::uint32_t kChunkSize = 1u << kChunkBits;  // 256 slots
-inline constexpr std::uint32_t kChunkMask = kChunkSize - 1;
+inline constexpr std::uint32_t kChunkMask = kChunkSize - 1;    // low bits: slot within chunk
 
 /// The last usable generation. A slot that reaches this is retired rather than
 /// reused, because the next bump would wrap to 0 -- the null id -- and a stale
@@ -544,14 +632,28 @@ inline constexpr std::uint32_t kGenMax = 0xFFFFFFFFu;
 
 /// Copy-on-write leaf. Raw pointers on purpose: copying a chunk must be a memcpy
 /// with zero atomics. shared_ptr here would mean kChunkSize atomic RMWs per
-/// dirtied chunk, which is what kills this design at scale.
+/// dirtied chunk, which is what kills this design at scale. Object lifetime
+/// is NOT managed here -- the version watermark (Model's reaper) frees an
+/// object only once no snapshot that could see it remains.
 struct Chunk {
-    const ObjectBase* obj[kChunkSize] = {};
-    std::uint32_t gen[kChunkSize] = {};
+    const ObjectBase* obj[kChunkSize] = {};  ///< null == empty slot; parallel to gen[]
+    std::uint32_t gen[kChunkSize] = {};      ///< current generation of each slot; a lookup
+                                             ///< whose Id::gen mismatches is stale, not found
 };
 
+/// One published, immutable version of the whole model -- everything a
+/// Snapshot can see, in one struct. try_commit() builds a fresh Root per
+/// commit and swaps it in atomically (Model::root_); nothing in a published
+/// Root is ever mutated afterward (CLAUDE.md invariant 3). Cheap to derive:
+/// the spine is a vector of shared_ptrs (chunks not touched by the commit
+/// are shared with the previous Root), and the index maps share structure
+/// persistently, so building one is proportional to the CHANGES, never to
+/// model size.
 struct Root {
-    std::uint64_t version = 0;
+    std::uint64_t version = 0;  ///< strictly increasing; what Snapshot::version() reports
+
+    /// The object store: spine[index >> kChunkBits]->obj[index & kChunkMask].
+    /// Dense, so a lookup is two indexed loads -- no hashing, no probing.
     std::vector<std::shared_ptr<const Chunk>> spine;
 
     /// One persistent map per type: every Id of that type, keyed by an
@@ -603,10 +705,14 @@ class View;
 /// full of shared_ptr -- but the objects themselves are owned by the Model.
 class Snapshot {
 public:
+    /// Null snapshot: sees nothing, resolves nothing, pins nothing. What a
+    /// failed CommitResult carries; also the harmless moved-from state.
     Snapshot() = default;
 
+    /// The committed version this snapshot reads (0 for a null snapshot).
+    /// Comparable across snapshots of the same Model to order observations.
     std::uint64_t version() const noexcept { return root_ ? root_->version : 0; }
-    explicit operator bool() const noexcept { return root_ != nullptr; }
+    explicit operator bool() const noexcept { return root_ != nullptr; }  ///< non-null?
 
     /// Total object count, summed across every type. O(#types), not
     /// O(#objects) -- the per-type maps themselves are O(1) to size.
@@ -825,6 +931,10 @@ public:
     // resolve a v40 object's reference against a v44 root -- a mistake the raw
     // resolve() API happily compiles. See View below.
 
+    /// Bind an object you already read from THIS snapshot. Unchecked --
+    /// pairing an object from one snapshot with another compiles and is
+    /// exactly the version-mixing bug views exist to prevent, so only pass
+    /// objects this snapshot handed you.
     template <class T>
     View<T> view(const T& obj) const noexcept;
 
@@ -856,6 +966,12 @@ public:
 private:
     friend class Model;
     friend class Transaction;
+
+    /// RAII registration of this snapshot's version in Model::live_ (defined
+    /// in model.cpp). Its destructor is what tells the reaper a version may
+    /// have become reclaimable. Held by shared_ptr so COPIES of a Snapshot
+    /// share ONE registration -- the version is released exactly once, when
+    /// the last copy drops.
     struct Lease;
 
     /// One virtual call plus a pointer compare. No RTTI, no dynamic_cast.
@@ -865,14 +981,20 @@ private:
         return static_cast<const T*>(o);
     }
 
-    std::shared_ptr<const Root> root_;
-    std::shared_ptr<Lease> lease_;
+    std::shared_ptr<const Root> root_;  ///< the immutable version everything above reads;
+                                        ///< shared with the Model and other snapshots
+    std::shared_ptr<Lease> lease_;      ///< keeps root_'s version registered while any copy lives
 };
 
 // ---------------------------------------------------------------------------
 // Change events
 // ---------------------------------------------------------------------------
 
+/// What happened to one Id in one committed transaction. Updated covers any
+/// reinstall of the object -- a field write via Transaction::update() AND a
+/// cascade-nulled Opt<> field -- so subscribers cannot tell those apart
+/// (they see the final value either way). A given Id (generation included)
+/// appears at most once per changeset.
 enum class ChangeKind : std::uint8_t { Created, Updated, Deleted };
 
 /// Changesets span every type in the model, so they carry the untyped Id --
@@ -885,9 +1007,9 @@ enum class ChangeKind : std::uint8_t { Created, Updated, Deleted };
 /// snapshot.find<T>(Ref<T>(c.id)), or Transaction::peek_as<T>(c.id) -- but
 /// `tag` means you never need a Snapshot just to find out WHAT changed.
 struct Change {
-    Id id;
-    ChangeKind kind;
-    TypeTag tag;
+    Id id;           ///< which object; wrap in Ref<T>/use peek_as<T> to read it (typed)
+    ChangeKind kind;  ///< what happened to it -- see ChangeKind's caveats
+    TypeTag tag;      ///< the object's type, valid even for Deleted; compare to type_tag<T>()
 };
 
 /// Registered once via Model::set_pre_commit, called on every try_commit()
@@ -916,10 +1038,14 @@ struct Change {
 /// inspected has not published yet.
 using PreCommitFn = std::function<bool(Model&, const std::vector<Change>&)>;
 
+/// One delivery to a subscriber: a consistent state plus what changed since
+/// the previous delivery -- read the changed objects out of THIS update's
+/// own snapshot, never a fresh Model::snapshot() (which may already be
+/// newer, and would tear the "state matches changes" pairing).
 struct Update {
-    Snapshot snapshot;
-    std::vector<Change> changes;
-    bool coalesced = false;  ///< true if intermediate versions were folded away
+    Snapshot snapshot;            ///< state as of these changes; pins its version until dropped
+    std::vector<Change> changes;  ///< every id that changed since the last delivery
+    bool coalesced = false;       ///< true if intermediate versions were folded away
 };
 
 /// One bounded queue per subscriber, drained on the subscriber's own thread.
@@ -932,6 +1058,9 @@ struct Update {
 /// looked", not every intermediate version.
 class Subscription {
 public:
+    /// `depth` = max queued Updates before overflow coalesces. Deeper keeps
+    /// more distinct intermediate versions for a slow consumer -- and pins
+    /// that many snapshots. Obtain via Model::subscribe(), not directly.
     explicit Subscription(std::size_t depth) : cap_(depth) {}
 
     bool wait(Update& out);       ///< blocks; false once the model shuts down
@@ -940,32 +1069,49 @@ public:
 private:
     friend class Model;
 
-    void push(Update u);
-    void collapse(Update tail);
-    void close();
+    void push(Update u);         ///< called by try_commit() at publish; coalesces when full
+    void collapse(Update tail);  ///< the overflow path: merge queue + tail into ONE Update
+    void close();                ///< Model::shutdown(): wake blocked wait()ers to return false
 
-    std::mutex m_;
-    std::condition_variable cv_;
-    std::deque<Update> q_;
-    std::size_t cap_;
-    bool closed_ = false;
+    std::mutex m_;                ///< guards everything below; never held while user code runs
+    std::condition_variable cv_;  ///< signals wait(): queue non-empty, or closed
+    std::deque<Update> q_;        ///< pending deliveries, oldest first; length <= cap_
+    std::size_t cap_;             ///< the constructor's depth
+    bool closed_ = false;         ///< set once by close(); wait() drains what's left, then false
 };
 
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
+/// The store itself: owns every committed object, the writer-side indexes,
+/// and the background reaper thread. One instance per object graph; all the
+/// other types in this header (Snapshot, Transaction, Subscription, View)
+/// are windows onto one Model and must not outlive it.
 class Model {
 public:
-    Model();
-    ~Model();
+    Model();   ///< starts at version 1 (empty), spawns the reaper thread
+    ~Model();  ///< joins the reaper, frees everything. Every Snapshot,
+               ///< Transaction, Subscription, and View must already be gone
+               ///< -- a Lease releasing against a destroyed Model is UB.
 
+    // Not copyable (owns a thread, mutexes, and every object's identity) and
+    // not movable either: Snapshots/Transactions hold interior pointers back
+    // to this Model, so its address is part of the contract.
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
 
     // ---- read side (any thread) ---------------------------------------------
 
-    Snapshot snapshot();  ///< O(1)
+    /// The current committed state, O(1): a lock-free root load plus version
+    /// registration under the small ver_mu_ -- never commit_mu_, so readers
+    /// never wait on writers (see CLAUDE.md invariant 10). Take one per unit
+    /// of work and drop it; holding one pins retired objects (see Snapshot).
+    Snapshot snapshot();
+
+    /// Register for change events; see Subscription for the queue/coalescing
+    /// contract and the queue_depth tradeoff. Subscribe BEFORE shutdown();
+    /// the returned object stays valid until dropped.
     std::shared_ptr<Subscription> subscribe(std::size_t queue_depth = 8);
     void shutdown();  ///< wakes blocked subscribers so their threads can exit
 
@@ -1035,6 +1181,12 @@ public:
     /// sequences and deterministic tests. Returns the number still pinned by live
     /// snapshots (which cannot be freed until those snapshots drop).
     std::size_t wait_for_reclamation();
+
+    /// The latest committed version -- may be stale the instant it returns
+    /// (another thread can commit immediately after). For observability and
+    /// tests; decisions about state belong on a Snapshot, whose version()
+    /// stays consistent with what it actually shows. Takes commit_mu_, so
+    /// never call it from a pre-commit hook (self-deadlock; see PreCommitFn).
     std::uint64_t current_version() const {
         std::lock_guard lk(commit_mu_);
         return version_;
@@ -1066,6 +1218,10 @@ private:
     friend struct Snapshot::Lease;
     friend class Transaction;
 
+    /// One incoming edge in the reverse index (referrers_): "`from`'s
+    /// `field` points at me." `nullable` is the cascade decision, captured
+    /// at edge creation: a nullable referrer gets its field nulled when the
+    /// target dies; a non-nullable one dies too.
     struct RefEdge {
         Id from;
         const void* field;
@@ -1082,22 +1238,58 @@ private:
         std::vector<Change> changes;
     };
 
+    // All of the following run only under commit_mu_ (invariant 7), except
+    // release_version / reaper_loop / enqueue_retired, which have their own
+    // locking noted below.
+
+    /// The writer's view of the LATEST state (generation-checked, like
+    /// Snapshot::find_raw but against spine_, which may be mid-commit).
+    /// This is what validate() checks against -- "re-validated against
+    /// latest, not just base" falls out of using peek() here.
     const ObjectBase* peek(Id id) const;
+
+    /// First touch of a chunk per attempt clones it (tracked in dirty_);
+    /// later writes hit the clone in place. Published chunks stay immutable.
     Chunk* cow(std::uint32_t chunk_index);
+
+    /// Pop the LIFO free list (retiring generation-exhausted slots as they
+    /// surface -- see Id's width note), else mint a fresh slot. Undo-logged.
     std::uint32_t alloc_slot();
+
     std::optional<IntegrityError> validate(const ObjectBase* o) const;  // nullopt == valid
+
+    // Reverse-index (referrers_) maintenance: add/drop an object's whole
+    // outgoing edge set (create/delete), or diff before->after (update).
+    // Every edit is undo-logged -- a rollback that missed one would leave a
+    // phantom or missing edge for a LATER cascade to resolve against.
     void add_out_refs(const ObjectBase* o);
     void drop_out_refs(const ObjectBase* o);
     void reconcile_referrer_edges(const ObjectBase* before, const ObjectBase* after);
+
+    // Same trio for the unique key index (by_field_)...
     void add_field_keys(const ObjectBase* o);
     void drop_field_keys(const ObjectBase* o);
     void reconcile_field_keys(const ObjectBase* before, const ObjectBase* after);
+
+    // ...and for the multimap index (by_cached_field_).
     void add_cached_fields(const ObjectBase* o);
     void drop_cached_fields(const ObjectBase* o);
     void reconcile_cached_fields(const ObjectBase* before, const ObjectBase* after);
+
+    /// Mark an object invisible from the NEXT version on; the reaper frees
+    /// it once no live snapshot is older than that (invariant 4). Never
+    /// delete a published object directly.
     void retire(const ObjectBase* o);
+
+    /// Lease's destructor: deregister a version from live_ (ver_mu_) and
+    /// nudge the reaper (reap_mu_) -- taken SEQUENTIALLY, not nested, to
+    /// stay off the lock-order cycle (see invariant 10).
     void release_version(std::uint64_t v);
-    void reaper_loop();  ///< body of the background reaper thread
+
+    void reaper_loop();  ///< body of the background reaper thread (reap_mu_, briefly ver_mu_)
+
+    /// Hand a commit's retirees to the reaper (reap_mu_). Batched so a large
+    /// cascade is one lock acquisition, and freeing happens off-thread.
     void enqueue_retired(std::vector<std::pair<std::uint64_t, const ObjectBase*>> batch);
 
     // Undo log. Every mutation of writer-private state during a try_commit()
@@ -1107,6 +1299,9 @@ private:
     // far harder to get out of sync than a parallel variant type. The log is
     // proportional to the changes made, never to model size.
     void log(std::function<void()> undo) { undo_.push_back(std::move(undo)); }
+
+    /// Point a slot at an object (or null) with a new generation, through
+    /// cow(); logs the exact inverse (previous object + generation).
     void set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen);
 
     // ---- try_commit() internals (ALL require commit_mu_ already held) ------
@@ -1122,8 +1317,17 @@ private:
     // reconcile immediately. See the .cpp for why reconciliation must happen
     // in the caller, after null_ref() -- not in here.
     ObjectBase* clone_for_cascade_null(Id id);
+
+    /// The conflict check: every slot this transaction updated or intends to
+    /// remove, tested against every changelog entry newer than its base.
+    /// Read-only; runs before anything is applied, so a Conflict here costs
+    /// no rollback. Creates can't conflict (fresh slots) and aren't checked.
     std::vector<Id> check_id_overlap(const Transaction& txn) const;
+
+    /// Drop changelog entries at or below the live watermark -- no open
+    /// Transaction (its base pins a version in live_) can need them again.
     void prune_changelog();
+
     void rollback_apply();  // unwinds one failed try_commit() apply attempt
 
     // ---- read/publish path -------------------------------------------------
@@ -1138,22 +1342,26 @@ private:
     std::map<std::uint64_t, int>
         live_;  ///< live snapshot (incl. txn base) versions; min = watermark
 
-    std::mutex subs_mu_;
-    std::vector<std::shared_ptr<Subscription>> subs_;
+    std::mutex subs_mu_;                              ///< guards subs_ only; publish copies the
+                                                      ///< list out so pushes run without it held
+    std::vector<std::shared_ptr<Subscription>> subs_;  ///< every live subscriber; shared_ptr so a
+                                                       ///< subscriber outliving shutdown() is safe
 
     // ---- background reaper --------------------------------------------------
     // Retired objects are handed to a dedicated thread rather than freed inline
     // in try_commit(), so a large cascade never stalls a commit, and destructors
     // run off both the committing thread and any reader thread.
-    std::thread reaper_;
-    std::mutex reap_mu_;
-    std::condition_variable reap_cv_;
-    std::condition_variable reap_done_cv_;
+    std::thread reaper_;               ///< started by the ctor, joined by the dtor
+    std::mutex reap_mu_;               ///< guards everything below except retired_pending_
+    std::condition_variable reap_cv_;  ///< wakes the reaper: work arrived, or stopping
+    std::condition_variable reap_done_cv_;  ///< wakes wait_for_reclamation(): a pass finished
     std::vector<std::pair<std::uint64_t, const ObjectBase*>> reap_queue_;
+    ///< ^ (version at which each object became invisible, object); freed once
+    ///< the live watermark reaches that version
     std::atomic<std::size_t> retired_pending_{0};  ///< reaper backlog, for observability
     std::uint64_t reap_done_round_ = 0;            ///< bumped after each reap pass
     bool dirty_reap_ = false;                      ///< a reap pass is due
-    bool reaper_stop_ = false;
+    bool reaper_stop_ = false;                     ///< dtor -> reaper: drain and exit
 
     // ---- commit-lock-protected state ----------------------------------------
     // Touched ONLY by whichever thread currently holds commit_mu_, only from
@@ -1163,19 +1371,37 @@ private:
     // strictly safer, not a rewrite. See CLAUDE.md invariant 7 and the lock
     // order rule (commit_mu_ -> ver_mu_ -> reap_mu_, never reversed).
     mutable std::mutex commit_mu_;
-    std::uint64_t version_ = 0;
-    std::vector<std::shared_ptr<const Chunk>> spine_;
-    std::unordered_set<std::uint32_t> dirty_;
+    std::uint64_t version_ = 0;  ///< 64-bit because it's bounded by TIME, not population:
+                                 ///< it increments forever, and at 100 commits/sec a uint32
+                                 ///< would wrap in ~16 months of uptime. See Id's width note
+                                 ///< for the full 32-vs-64 rule.
+    std::vector<std::shared_ptr<const Chunk>> spine_;  ///< the writer's working spine; COWed
+                                                       ///< chunks land here, published via Root
+    std::unordered_set<std::uint32_t> dirty_;  ///< chunks already cloned THIS attempt (see cow());
+                                               ///< cleared per attempt so publish stays immutable
+    // The writer's working copies of Root's three indexes -- same persistent
+    // structures, so publishing them into a new Root is a cheap map copy.
     std::unordered_map<TypeTag, pmap::PersistentMap<Id>> by_type_;
     std::unordered_map<const void*, pmap::PersistentMap<Id>> by_field_;
     std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_field_;
+
+    /// The reverse index driving cascade delete: target SLOT (bare index --
+    /// only the live generation of a slot can ever be referenced, so the
+    /// full Id would be redundant) -> every edge pointing at it. Writer-only
+    /// and mutable in place; the one structure that could never be handed to
+    /// readers, and the reason cascade resolution must happen at commit time
+    /// (invariant 8). Linear scan per target; see CLAUDE.md scope notes.
     std::unordered_map<std::uint32_t, std::vector<RefEdge>> referrers_;
-    std::vector<std::uint32_t> free_slots_;
-    std::uint32_t next_slot_ = 0;
-    std::size_t exhausted_slots_ = 0;
+
+    std::vector<std::uint32_t> free_slots_;  ///< recycled slots, LIFO -- reuse concentrates on
+                                             ///< hot slots, keeping the spine dense
+    std::uint32_t next_slot_ = 0;            ///< high-water mark: next never-used slot
+    std::size_t exhausted_slots_ = 0;        ///< see exhausted_slots() accessor
     std::vector<Change> changes_;  ///< scratch: this attempt's resolved changeset
     std::vector<std::pair<std::uint64_t, const ObjectBase*>> retired_;
-    PreCommitFn pre_commit_;
+    ///< ^ this attempt's retirees, same shape as reap_queue_: handed to the
+    ///< reaper on publish, drained back out by the undo log on rollback
+    PreCommitFn pre_commit_;  ///< empty = no hook; swapped only under commit_mu_ (set_pre_commit)
     std::deque<ChangelogEntry>
         changelog_;  ///< for try_commit()'s conflict check; see prune_changelog
 
@@ -1190,25 +1416,63 @@ private:
 // Multi-writer commit results
 // ---------------------------------------------------------------------------
 
-/// Invalid means the Transaction itself was malformed (a null non-nullable
-/// Ref, a target dead even at the transaction's own base, or a Ref holding a
-/// stray local id) -- a transaction-building bug at the call site, not
-/// contention. See CommitResult::error for the specifics. This status exists
-/// because the project has no exceptions to throw (see CLAUDE.md).
+/// How a try_commit() attempt ended. Only Committed published anything; the
+/// other three unwound completely, and differ in what to do next:
+///
+///   Committed  the transaction is now the latest version.
+///   Conflict   lost a race with a concurrent commit -- not a bug. RETRY:
+///              begin() a fresh Transaction (its new base sees the winner)
+///              and rebuild. See ConflictInfo for what collided.
+///   Vetoed     the pre-commit hook said no. Retrying unchanged will just
+///              be vetoed again; whatever the hook checks must change first.
+///   Invalid    the Transaction itself was malformed (a null non-nullable
+///              Ref, a target dead even at the transaction's own base, or a
+///              Ref holding a stray local id) -- a transaction-building bug
+///              at the call site, not contention; retrying unchanged cannot
+///              succeed. See CommitResult::error for the specifics. This
+///              status exists because the project has no exceptions to
+///              throw (see CLAUDE.md).
 enum class CommitStatus { Committed, Conflict, Vetoed, Invalid };
+
+/// Which of the two conflict rules fired (see CLAUDE.md's OCC contract:
+/// "a commit succeeds if no one touched the same ids and every Ref<T> is
+/// still valid"):
+///   IdSetOverlap  a commit newer than this transaction's base touched an id
+///                 this transaction updated or removed.
+///   RefIntegrity  an object this transaction created/updated references a
+///                 target that a CONCURRENT commit deleted (it was alive at
+///                 the transaction's base -- that's what distinguishes this
+///                 from Invalid).
 enum class ConflictReason { IdSetOverlap, RefIntegrity };
 
+/// The specifics behind CommitStatus::Conflict -- enough to log, or to
+/// decide a retry is pointless (e.g. your target is simply gone).
 struct ConflictInfo {
     ConflictReason reason;
     std::vector<Id> ids;  ///< the specific id(s) that conflicted
 };
 
+/// Everything try_commit() has to say about one attempt. Check `status`
+/// first; every other field documents which statuses make it meaningful.
 struct CommitResult {
-    CommitStatus status;
-    Snapshot snapshot;  ///< valid only if status == Committed. If every conflicted attempt handed
-                        ///< back a pinned snapshot,
-                        //// a caller who holds CommitResults (perfectly natural for
-                        ///logging/diagnostics) would silently stall the reaper.
+    CommitStatus status;  ///< what happened -- gates the meaning of every field below
+
+    /// Valid only if status == Committed; deliberately NULL on every failure
+    /// status. A Snapshot pins its version against the reaper, and failures
+    /// are the HOT path under contention (retry loops) -- if every
+    /// conflicted attempt handed back a pinned snapshot, a caller who holds
+    /// CommitResults (perfectly natural for logging/diagnostics) would
+    /// silently stall reclamation, the exact fat-ref failure mode View<T>'s
+    /// docs warn about. It wouldn't help a retry either: the only correct
+    /// base for the next attempt is whatever is latest at retry time, and
+    /// begin() takes that itself. To inspect the state that beat you (e.g.
+    /// to look up conflict->ids), call Model::snapshot() -- one call, and
+    /// the pinning cost becomes opt-in instead of paid by every rejection.
+    /// One wrinkle: the empty-transaction fast path returns Committed with
+    /// the transaction's own base(), which may be stale relative to other
+    /// writers -- nothing changed, so any version is "after" that commit.
+    Snapshot snapshot;
+
     std::vector<Change> changes;           ///< FULL resolved changeset, incl. cascade deletes;
                                            ///< empty unless status == Committed
     std::optional<ConflictInfo> conflict;  ///< set only if status == Conflict
@@ -1262,13 +1526,22 @@ struct CommitResult {
 /// rollback: since nothing shared was ever touched, there is nothing to undo.
 class Transaction {
 public:
+    // Movable so it can be returned from begin() and handed between owners;
+    // the moved-from shell is inert (null base, empty overlay). NOT copyable:
+    // it owns unique_ptrs to not-yet-installed objects, and two copies
+    // racing try_commit() with the same local ids would be incoherent.
     Transaction(Transaction&&) = default;
     Transaction& operator=(Transaction&&) = default;
     Transaction(const Transaction&) = delete;
     Transaction& operator=(const Transaction&) = delete;
 
-    /// The committed version this transaction is building on top of.
+    /// The pinned Snapshot this transaction reads through (peek/update clone
+    /// from here). Also usable directly, e.g. to look at pre-transaction
+    /// state -- it's an ordinary Snapshot.
     const Snapshot& base() const noexcept { return base_; }
+
+    /// Shorthand for base().version(): what try_commit()'s conflict check
+    /// compares the changelog against.
     std::uint64_t base_version() const noexcept { return base_.version(); }
 
     /// Takes ownership. Returns a LOCAL id, usable immediately as a Ref<T>/
@@ -1332,6 +1605,10 @@ public:
         remove_impl(r.raw());
     }
 
+    /// "Is `r` alive as far as THIS transaction can tell?" -- peek() != null,
+    /// so it honors local creates, edits, and remove() intents, but NOT other
+    /// transactions' uncommitted work, and not cascade fan-out from this
+    /// transaction's own intents (invisible until commit; see remove()).
     template <class T>
     bool exists(Ref<T> r) const {
         return peek(r) != nullptr;
@@ -1393,6 +1670,9 @@ public:
 private:
     friend class Model;
 
+    /// Only Model::begin() (and Snapshot::begin(), through it) constructs
+    /// one -- a Transaction is meaningless without a Model to commit to and
+    /// a pinned base to read through.
     Transaction(Model* m, Snapshot base) : model_(m), base_(std::move(base)) {}
 
     ObjectBase* update_impl(Id id) {
@@ -1453,7 +1733,8 @@ private:
         return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
     }
 
-    Model* model_ = nullptr;
+    Model* model_ = nullptr;  ///< where try_commit() applies this; asserted against
+                              ///< cross-model misuse in try_commit()
     Snapshot base_;  ///< pins base_version_ in Model::live_, same as any reader's snapshot
 
     std::vector<std::unique_ptr<ObjectBase>>
@@ -1465,8 +1746,9 @@ private:
         update_baseline_;                            ///< points into base_'s Root,
                                                      ///< kept alive by base_ itself
     std::unordered_set<Id, IdHash> remove_intents_;  ///< real ids only -- see remove_impl
-    std::uint32_t next_local_id_ = 0;
-    std::vector<Change> pending_changes_;
+    std::uint32_t next_local_id_ = 0;      ///< mints local ids; per-TRANSACTION, so the same
+                                           ///< value recurs across transactions (see create())
+    std::vector<Change> pending_changes_;  ///< what pending_changes() returns, in call order
 };
 
 // ---------------------------------------------------------------------------
@@ -1512,8 +1794,11 @@ public:
     View(const Snapshot& s, const T& obj) noexcept : s_(&s), o_(&obj) {}
     View(Snapshot&&, const T&) = delete;  // never bind to a temporary snapshot
 
+    // Plain field access -- a view reads like a pointer to the object...
     const T& operator*() const noexcept { return *o_; }
     const T* operator->() const noexcept { return o_; }
+    // ...while operator[] below is the traversal step that stays on this
+    // view's own snapshot.
 
     /// Follow a non-nullable field. Always yields a view.
     template <class U>
@@ -1528,6 +1813,9 @@ public:
         return std::nullopt;
     }
 
+    /// The snapshot this view reads through -- to drop back to the raw API
+    /// (find_by_key, for_each, ...) mid-traversal without re-plumbing which
+    /// version you were on.
     const Snapshot& snapshot() const noexcept { return *s_; }
 
     /// "Who references this?" -- every object whose `Field` points at this
@@ -1545,8 +1833,8 @@ public:
     }
 
 private:
-    const Snapshot* s_;
-    const T* o_;
+    const Snapshot* s_;  ///< by POINTER, never by value -- see the class comment
+    const T* o_;         ///< owned by the Model, alive as long as *s_ is
 };
 
 template <class T>
