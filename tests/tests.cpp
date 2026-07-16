@@ -1138,6 +1138,39 @@ TEST(view_of_a_stale_handle_is_empty) {
     CHECK(!s.view_by_key<&Order::computed_key>("ord:O1").has_value());
 }
 
+TEST(view_by_field_returns_every_match_not_just_the_indexed_winner) {
+    Model m;
+    const Ref<Account> a = make_account(m, "DUP", 1);  // Account::name IS indexed
+    const Ref<Account> b = make_account(m, "DUP", 2);  // duplicate name: the index keeps only this one
+    make_account(m, "OTHER", 3);
+    make_order(m, "O1", a, {}, 5);
+    make_order(m, "O2", a, {}, 5);  // Order::qty is NOT in any define_keys()
+    make_order(m, "O3", a, {}, 7);
+
+    Snapshot s = m.snapshot();
+
+    // The unique-key index sees one winner for a duplicate value...
+    CHECK(s.find_by_key<&Account::name>("DUP") == s.find(b));
+    // ...view_by_field sees every object, on the same field.
+    auto dups = s.view_by_field<&Account::name>("DUP");
+    CHECK_EQ(dups.size(), std::size_t{2});
+    std::int64_t balances = 0;
+    for (const auto& v : dups) balances += v->balance;
+    CHECK_EQ(balances, std::int64_t{3});  // 1 + 2: both objects, not the winner twice
+    CHECK(s.view_by_field<&Account::name>("NOBODY").empty());
+
+    // Works on a field no define_keys() ever mentioned -- it's a scan, not an
+    // index lookup -- and the Views traverse like any other.
+    auto q5 = s.view_by_field<&Order::qty>(5);
+    CHECK_EQ(q5.size(), std::size_t{2});
+    for (const auto& v : q5) CHECK_EQ(v[&Order::account]->balance, std::int64_t{1});
+
+    // And on a computed (nullary const method) field, same as view_by_key.
+    auto o3 = s.view_by_field<&Order::computed_key>("ord:O3");
+    CHECK_EQ(o3.size(), std::size_t{1});
+    CHECK_EQ(o3[0]->qty, std::int64_t{7});
+}
+
 TEST(a_view_always_traverses_its_own_snapshot) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");

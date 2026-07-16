@@ -420,7 +420,8 @@ public:
 ///
 /// Each indexed field is assumed unique within its type; a duplicate value
 /// silently overwrites the earlier entry. For "give me every match, not just
-/// one," use the slow Snapshot::find_all() predicate scan instead.
+/// one," use the slow Snapshot::view_by_field<&T::field>(value) scan (or the
+/// predicate form, Snapshot::find_all()) instead.
 template <class Derived>
 class Object : public ObjectBase {
 public:
@@ -575,9 +576,9 @@ public:
     /// type is member_value_t<decltype(Field)>, not a bare std::string), so
     /// passing "222" for an int64_t field or 222 for a string field is a
     /// compile error, not a lookup that silently never matches. A duplicate
-    /// value across two objects means the later write wins -- use find_all()
-    /// for "every match." Null if the key is absent, or the field wasn't
-    /// declared as indexed.
+    /// value across two objects means the later write wins -- use
+    /// view_by_field() for "every match." Null if the key is absent, or the
+    /// field wasn't declared as indexed.
     template <auto Field>
     const member_class_t<decltype(Field)>* find_by_key(
         const member_value_t<decltype(Field)>& value) const {
@@ -588,6 +589,20 @@ public:
     /// View-returning form of find_by_key.
     template <auto Field>
     std::optional<View<member_class_t<decltype(Field)>>> view_by_key(
+        const member_value_t<decltype(Field)>& value) const;
+
+    /// EVERY object whose `Field` currently equals `value`, as Views bound to
+    /// this snapshot -- the multi-match counterpart of view_by_key. Named the
+    /// same way: `s.view_by_field<&Order::qty>(5)`, and `Field` may also be a
+    /// nullary const method (`s.view_by_field<&Order::computed_key>(...)`).
+    ///
+    /// This is a SLOW SCAN, O(#ClassT objects), NOT an indexed lookup: the
+    /// by_field index deliberately keeps exactly one Id per key value
+    /// (duplicates overwrite -- see Object<>), so "all matches" can only come
+    /// from the same scan find_all() does. The upside of not touching the
+    /// index: this works on ANY field, declared in define_keys() or not.
+    template <auto Field>
+    std::vector<View<member_class_t<decltype(Field)>>> view_by_field(
         const member_value_t<decltype(Field)>& value) const;
 
     /// Visit every object of type T. O(#T objects): backed by a per-type
@@ -1397,6 +1412,23 @@ std::optional<View<member_class_t<decltype(Field)>>> Snapshot::view_by_key(
     using ClassT = member_class_t<decltype(Field)>;
     if (const ClassT* p = find_by_key<Field>(value)) return View<ClassT>(*this, *p);
     return std::nullopt;
+}
+
+template <auto Field>
+std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_by_field(
+    const member_value_t<decltype(Field)>& value) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    std::vector<View<ClassT>> out;
+    for_each_view<ClassT>([&](View<ClassT> v) {
+        // Field is either a data member or a nullary const method -- the same
+        // two shapes member_class/member_value accept everywhere else.
+        if constexpr (std::is_member_object_pointer_v<decltype(Field)>) {
+            if ((*v).*Field == value) out.push_back(v);
+        } else {
+            if (((*v).*Field)() == value) out.push_back(v);
+        }
+    });
+    return out;
 }
 
 template <class T>
