@@ -725,6 +725,11 @@ Transaction Model::begin() { return begin(snapshot()); }
 
 Transaction Model::begin(Snapshot base) { return Transaction(this, std::move(base)); }
 
+Transaction Snapshot::begin() const {
+    assert(lease_ && "begin() on a default-constructed Snapshot -- no Model to build against");
+    return lease_->m->begin(*this);
+}
+
 CommitResult Model::try_commit(Transaction& txn) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 

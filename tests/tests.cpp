@@ -1126,6 +1126,71 @@ TEST(transaction_local_creates_can_reference_each_other_via_placeholder_ids) {
     CHECK_EQ(s.resolve(s.find(o_real)->account).name, std::string("A1"));
 }
 
+TEST(a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction) {
+    Model m;
+    Transaction txn1 = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "A1";
+    const Ref<Account> a_local = txn1.create(std::move(a));  // placeholder, only meaningful inside txn1
+
+    // A second, independent transaction never saw txn1's create -- to txn2,
+    // a_local is just some id it never issued and never cloned from base().
+    Transaction txn2 = m.begin();
+    CHECK(txn2.peek(a_local) == nullptr);
+    CHECK(!txn2.exists(a_local));
+    CHECK(txn2.update(a_local) == nullptr);
+
+    // Embedding the stray local id in something txn2 commits fails loudly:
+    // try_commit()'s remap table (built fresh per attempt) only knows about
+    // local ids THIS transaction's own local_created_ produced.
+    auto o = std::make_unique<Order>();
+    o->code = "O1";
+    o->account = a_local;
+    txn2.create(std::move(o));
+
+    bool threw = false;
+    try {
+        m.try_commit(txn2);
+    } catch (const Model::IntegrityError&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});  // neither txn1 nor txn2 ever published anything
+}
+
+TEST(a_local_id_that_collides_with_another_transactions_own_local_index_silently_aliases) {
+    Model m;
+
+    Transaction txn1 = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "FROM-TXN1";
+    const Ref<Account> a_local = txn1.create(std::move(a));  // txn1's local counter: index 0
+
+    Transaction txn2 = m.begin();
+    auto own = std::make_unique<Account>();
+    own->name = "TXN2-OWN";
+    const Ref<Account> own_local = txn2.create(std::move(own));  // txn2's local counter ALSO starts at 0
+
+    // Local ids are only unique WITHIN a transaction (kLocalIdBit | a per-txn
+    // counter) -- across transactions the same raw Id can name two completely
+    // different objects. Nothing here can tell them apart: no exception, no
+    // null, just the wrong object.
+    CHECK(a_local.raw() == own_local.raw());
+    CHECK(txn2.peek(a_local) == txn2.peek(own_local));
+    CHECK_EQ(txn2.peek(a_local)->name, std::string("TXN2-OWN"));  // NOT txn1's "FROM-TXN1"
+
+    // update() is just as fooled -- this mutates txn2's own object, not txn1's.
+    txn2.update(a_local)->balance = 42;
+    CHECK_EQ(txn2.peek(own_local)->balance, std::int64_t{42});
+
+    // And a commit built on this stray ref succeeds outright, because as far
+    // as txn2's remap table is concerned, index 0 was always its own create.
+    CommitResult res = m.try_commit(txn2);
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK_EQ(m.snapshot().find(res.resolve(own_local))->name, std::string("TXN2-OWN"));
+    CHECK_EQ(m.snapshot().size(), std::size_t{1});  // only txn2's object was ever real
+}
+
 TEST(transaction_update_is_visible_locally_without_touching_shared_state) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 10);

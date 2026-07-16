@@ -665,6 +665,16 @@ public:
     template <class T, class F>
     void for_each_view(F&& f) const;
 
+    // ---- write side ---------------------------------------------------------
+
+    /// Start a Transaction based on this Snapshot -- equivalent to
+    /// `model.begin(snapshot)`, but doesn't require holding the Model
+    /// separately. Handy when a Snapshot is what you already have (e.g. one
+    /// you're also using for analysis, so you want the transaction's view to
+    /// match it exactly). The Snapshot itself is untouched -- copied into the
+    /// new Transaction's base(), same as Model::begin(Snapshot) does.
+    Transaction begin() const;
+
     /// Untyped escape hatch -- for change events, which are heterogeneous. The
     /// key is only unique within `field`'s own keyspace (see field_tag), so
     /// the field must be supplied; there is no single global keyspace to
