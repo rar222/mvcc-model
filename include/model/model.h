@@ -1188,7 +1188,53 @@ struct Change {
 /// (self-deadlock on the non-recursive commit_mu_); snapshot() is fine, and
 /// yields the still-current PRE-commit version, since the transaction being
 /// inspected has not published yet.
+///
+/// Unchanged by, and unaware of, PreTransactionsFn below: if a
+/// pre-transactions phase ran first, this hook still runs at exactly the
+/// same point (after the MAIN transaction's own apply) seeing exactly the
+/// same thing (the main transaction's own resolved changeset) -- it has no
+/// way to tell whether pre-transactions ran, and doesn't need to.
 using PreCommitFn = std::function<bool(Model&, const std::vector<Change>&)>;
+
+/// Registered once via Model::set_pre_transactions, called on every
+/// try_commit() attempt (if installed) IMMEDIATELY after commit_mu_ is
+/// acquired -- before the main Transaction is touched in ANY way: not
+/// conflict-checked, not applied. This is the ONLY point at which
+/// Model::run_pre_commit_transaction() may be called; use it to run zero or
+/// more OTHER Transactions first, atomically with respect to every other
+/// writer (commit_mu_ never releases in between) and atomically with
+/// respect to the main transaction (which hasn't started yet).
+///
+/// Each call to run_pre_commit_transaction() is a REAL, independent commit
+/// -- conflict-checked against the changelog (which now includes every
+/// EARLIER pre-transaction this same phase already published) and, if it
+/// passes, published for real: its own version, its own changelog entry,
+/// its own subscriber Update. There is no undo once one of them succeeds
+/// (CLAUDE.md invariant 3: published state is immutable) -- if a LATER
+/// pre-transaction in the same phase then fails, try_commit() returns
+/// CommitStatus::PrecommitConflict and skips the main transaction, but
+/// every pre-transaction that already published stays published. Design
+/// for that: make each pre-transaction a complete, independently-correct
+/// unit of work, not a step that depends on a later one succeeding.
+///
+/// Once any call fails (returns anything other than CommitStatus::
+/// Committed), calling it again is a hook bug (assert): the attempt is
+/// already doomed to CommitStatus::PrecommitConflict regardless of what
+/// runs after, so a well-behaved hook checks each return value and stops.
+///
+/// Because the main transaction is applied AFTER every pre-transaction has
+/// already published, it gets its conflict-checking for free: its own
+/// check_id_overlap (against the now-extended changelog) and its own
+/// apply-time Ref<> validation (against the now-current state) will report
+/// CommitStatus::Conflict if it touches -- or references -- anything a
+/// pre-transaction just changed, exactly as if that pre-transaction were an
+/// ordinary commit from another writer. No new conflict-detection code is
+/// needed for this; it is the existing multi-writer OCC mechanism, applied
+/// to writes this SAME try_commit() call happened to make first.
+///
+/// This hook is entirely separate from PreCommitFn/set_pre_commit -- see
+/// PreCommitFn's own comment for why the two are not merged into one call.
+using PreTransactionsFn = std::function<void(Model&)>;
 
 /// One delivery to a subscriber: a consistent state plus what changed since
 /// the previous delivery -- read the changed objects out of THIS update's
@@ -1302,6 +1348,33 @@ public:
         std::lock_guard lk(commit_mu_);
         pre_commit_ = std::move(fn);
     }
+
+    /// Install (or clear, with {}) the pre-transactions hook. See
+    /// PreTransactionsFn. Same locking contract as set_pre_commit: takes
+    /// commit_mu_ itself, so call it between commits, never from inside
+    /// either hook.
+    void set_pre_transactions(PreTransactionsFn fn) {
+        std::lock_guard lk(commit_mu_);
+        pre_transactions_ = std::move(fn);
+    }
+
+    /// Callable ONLY from inside a running PreTransactionsFn callback
+    /// (asserted via in_pre_transactions_phase_ -- commit_mu_ is not
+    /// recursive, so this must NOT itself try to lock it; it runs already
+    /// holding the lock the enclosing try_commit() took). Applies and
+    /// publishes `txn` as a complete, independent commit: conflict-checked
+    /// against everything committed so far (including earlier
+    /// pre-transactions this same phase already published), then, if that
+    /// passes, applied and published for real -- its own version bump, its
+    /// own changelog entry, its own subscriber Update. PreCommitFn is NOT
+    /// invoked for it; only the main transaction's veto hook runs (see
+    /// PreCommitFn).
+    ///
+    /// Once a call returns anything other than CommitStatus::Committed, the
+    /// enclosing try_commit() is already doomed to
+    /// CommitStatus::PrecommitConflict -- calling this again afterward is a
+    /// hook bug (asserted). Check the return value and stop.
+    CommitResult run_pre_commit_transaction(Transaction& txn);
 
     /// Reported via CommitResult::error (status == Invalid) when a
     /// Transaction's own creates or updates would violate referential
@@ -1489,6 +1562,48 @@ private:
 
     void rollback_apply();  // unwinds one failed try_commit() apply attempt
 
+    // ---- shared by try_commit() and run_pre_commit_transaction() -----------
+    // Both publish a Transaction as a real, independent commit while already
+    // holding commit_mu_; apply_transaction_contents/classify_apply_failure/
+    // check_and_apply/publish_now are that shared machinery, factored out so
+    // a pre-transaction gets EXACTLY the same conflict/apply/publish behavior
+    // as the main transaction, with nothing bespoke to keep in sync.
+
+    /// The creates-then-updates-then-removes apply loop (see try_commit()'s
+    /// phase-order comment for why that order matters). Returns nullopt on
+    /// success; the caller must then check changes_ and eventually publish
+    /// or, on failure, pass the returned error to classify_apply_failure().
+    std::optional<IntegrityError> apply_transaction_contents(
+        Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap);
+
+    /// Unwinds the failed apply attempt (rollback_apply()) and turns the
+    /// IntegrityError into the right CommitResult: Conflict(RefIntegrity) if
+    /// the dangling target existed at txn's own base (someone else deleted it
+    /// concurrently), Invalid otherwise (a genuine transaction-building bug).
+    CommitResult classify_apply_failure(IntegrityError err, const Transaction& txn);
+
+    /// check_id_overlap() + apply_transaction_contents(), collapsed into one
+    /// call: nullopt means "proceed, remap is populated, changes_ may or may
+    /// not be empty"; otherwise the CommitResult IS the final result (a
+    /// Conflict from either the overlap check or classify_apply_failure()).
+    std::optional<CommitResult> check_and_apply(Transaction& txn,
+                                                 std::unordered_map<std::uint32_t, Id>& remap);
+
+    /// The publish tail: version bump, new Root, atomic store under ver_mu_,
+    /// subscriber notify, retirees handed to the reaper, changelog append,
+    /// scratch cleared. Always succeeds -- by the time it's called, nothing
+    /// left to reject. Consumes changes_ (member scratch) into the result.
+    CommitResult publish_now(std::unordered_map<std::uint32_t, Id> remap);
+
+    /// check_and_apply() + publish_now(), with NO veto-hook seam -- used only
+    /// by run_pre_commit_transaction(), which must never invoke pre_commit_
+    /// for a pre-transaction (that hook is reserved for the main
+    /// transaction). try_commit() does NOT call this: the main transaction
+    /// still needs the veto seam between apply and publish, so it inlines
+    /// check_and_apply() + publish_now() itself. Requires commit_mu_ already
+    /// held.
+    CommitResult commit_locked(Transaction& txn);
+
     // ---- read/publish path -------------------------------------------------
     // root_ is atomic so snapshot() acquires the current version with a lock-free
     // load -- no shared mutex on the hot read path. Version bookkeeping (for the
@@ -1565,6 +1680,21 @@ private:
     std::deque<ChangelogEntry>
         changelog_;  ///< for try_commit()'s conflict check; see prune_changelog
 
+    PreTransactionsFn pre_transactions_;  ///< empty = no hook; swapped only under commit_mu_
+                                          ///< (set_pre_transactions)
+    bool in_pre_transactions_phase_ = false;  ///< guards run_pre_commit_transaction(): true only
+                                              ///< while pre_transactions_(*this) is on the stack
+    bool precommit_failed_ = false;   ///< a pre-transaction this attempt already failed --
+                                      ///< try_commit() will report PrecommitConflict and skip
+                                      ///< the main transaction; a further run_pre_commit_
+                                      ///< transaction() call this attempt is a hook bug (assert)
+    std::unique_ptr<CommitResult> precommit_failure_;  ///< the failing CommitResult, reported back
+                                                       ///< as PrecommitConflict. unique_ptr, not
+                                                       ///< optional: CommitResult is only forward-
+                                                       ///< declared this far up (see line ~805) --
+                                                       ///< optional<T> needs T complete as a member,
+                                                       ///< unique_ptr<T> doesn't.
+
     // Undo log and the objects created this attempt (which rollback_apply()
     // must delete, since they were never published and nothing else owns them).
     // Scratch: cleared at the start of every try_commit() attempt.
@@ -1577,22 +1707,45 @@ private:
 // ---------------------------------------------------------------------------
 
 /// How a try_commit() attempt ended. Only Committed published anything; the
-/// other three unwound completely, and differ in what to do next:
+/// other four unwound completely (Conflict/Vetoed/Invalid) or never touched
+/// the main transaction at all (PrecommitConflict), and differ in what to do
+/// next:
 ///
-///   Committed  the transaction is now the latest version.
-///   Conflict   lost a race with a concurrent commit -- not a bug. RETRY:
-///              begin() a fresh Transaction (its new base sees the winner)
-///              and rebuild. See ConflictInfo for what collided.
-///   Vetoed     the pre-commit hook said no. Retrying unchanged will just
-///              be vetoed again; whatever the hook checks must change first.
-///   Invalid    the Transaction itself was malformed (a null non-nullable
-///              Ref, a target dead even at the transaction's own base, or a
-///              Ref holding a stray local id) -- a transaction-building bug
-///              at the call site, not contention; retrying unchanged cannot
-///              succeed. See CommitResult::error for the specifics. This
-///              status exists because the project has no exceptions to
-///              throw (see CLAUDE.md).
-enum class CommitStatus { Committed, Conflict, Vetoed, Invalid };
+///   Committed         the transaction is now the latest version.
+///   Conflict          lost a race with a concurrent commit -- not a bug.
+///                     RETRY: begin() a fresh Transaction (its new base sees
+///                     the winner) and rebuild. See ConflictInfo for what
+///                     collided. Also reported when the main transaction
+///                     collides with a pre-transaction THIS SAME attempt
+///                     already published (see PreTransactionsFn) -- from the
+///                     main transaction's perspective that pre-transaction
+///                     is just another concurrent commit, indistinguishable
+///                     from one made by a different thread.
+///   Vetoed            the pre-commit hook said no. Retrying unchanged will
+///                     just be vetoed again; whatever the hook checks must
+///                     change first.
+///   Invalid           the Transaction itself was malformed (a null
+///                     non-nullable Ref, a target dead even at the
+///                     transaction's own base, or a Ref holding a stray
+///                     local id) -- a transaction-building bug at the call
+///                     site, not contention; retrying unchanged cannot
+///                     succeed. See CommitResult::error for the specifics.
+///                     This status exists because the project has no
+///                     exceptions to throw (see CLAUDE.md).
+///   PrecommitConflict a Model::run_pre_commit_transaction() call inside the
+///                     installed PreTransactionsFn did not return Committed.
+///                     The main transaction was never even conflict-checked,
+///                     let alone applied -- `txn` is unconsumed and may be
+///                     retried as-is (unlike every other non-Committed
+///                     status, which spends the local overlay during apply).
+///                     CommitResult::conflict/error carry through from
+///                     whichever pre-transaction failed, so the caller can
+///                     tell why. IMPORTANT: any EARLIER pre-transaction in
+///                     the same phase that already succeeded stays published
+///                     regardless (invariant 3: published state is
+///                     immutable) -- PrecommitConflict means only "the main
+///                     transaction didn't run," not "nothing happened."
+enum class CommitStatus { Committed, Conflict, Vetoed, Invalid, PrecommitConflict };
 
 /// Which of the two conflict rules fired (see CLAUDE.md's OCC contract:
 /// "a commit succeeds if no one touched the same ids and every Ref<T> is
@@ -1635,7 +1788,10 @@ struct CommitResult {
 
     std::vector<Change> changes;           ///< FULL resolved changeset, incl. cascade deletes;
                                            ///< empty unless status == Committed
-    std::optional<ConflictInfo> conflict;  ///< set only if status == Conflict
+    std::optional<ConflictInfo> conflict;  ///< set if status == Conflict; also set if status ==
+                                           ///< PrecommitConflict and the failing pre-transaction's
+                                           ///< own outcome was itself a Conflict (forwarded through
+                                           ///< as-is -- see CommitStatus::PrecommitConflict)
 
     /// local Id::index (kLocalIdBit set) -> real Id, populated only when
     /// status == Committed. A Ref<T>/Opt<T> returned by Transaction::create()
@@ -1648,8 +1804,11 @@ struct CommitResult {
     /// read this map directly.
     std::unordered_map<std::uint32_t, Id> local_remap;
 
-    /// Set only if status == Invalid: what was wrong with the transaction.
-    /// The whole attempt was unwound; nothing was published.
+    /// Set if status == Invalid: what was wrong with the transaction. The
+    /// whole attempt was unwound; nothing was published. Also set if status
+    /// == PrecommitConflict and the failing pre-transaction's own outcome
+    /// was itself Invalid (forwarded through as-is -- see
+    /// CommitStatus::PrecommitConflict).
     std::optional<Model::IntegrityError> error;
 
     /// Translates a Ref<T> obtained from Transaction::create() BEFORE this

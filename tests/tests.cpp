@@ -1251,6 +1251,233 @@ TEST(create_with_a_null_nonnullable_ref_is_rejected_as_invalid) {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-transactions (Model::set_pre_transactions / run_pre_commit_transaction)
+// ---------------------------------------------------------------------------
+
+// A pre-transaction run from inside the hook publishes for real, BEFORE the
+// main transaction is even conflict-checked -- so the main transaction, once
+// it runs, already sees the pre-transaction's object.
+TEST(pre_transactions_hook_runs_and_publishes_before_the_main_transaction) {
+    Model m;
+    m.set_pre_transactions([](Model& model) {
+        Transaction pre = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "PRE";
+        pre.create(std::move(a));
+        CommitResult r = model.run_pre_commit_transaction(pre);
+        CHECK(r.status == CommitStatus::Committed);
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "MAIN";
+    const Ref<Account> local = txn.create(std::move(a));
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.size(), std::size_t{2});
+    CHECK(s.find_by_key<&Account::name>("PRE") != nullptr);
+    CHECK(s.find(res.resolve(local)) != nullptr);
+    m.set_pre_transactions({});
+}
+
+// try_commit()'s existing fast path for an empty Transaction never touches
+// commit_mu_ at all, so the pre-transactions hook -- like the pre-commit
+// hook -- is never invoked for it either.
+TEST(pre_transactions_hook_is_not_invoked_for_an_empty_main_transaction) {
+    Model m;
+    bool called = false;
+    m.set_pre_transactions([&](Model&) { called = true; });
+
+    Transaction txn = m.begin();  // nothing pending
+    CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(!called);
+    m.set_pre_transactions({});
+}
+
+// If a pre-transaction fails (here: Invalid, a null non-nullable Ref), the
+// main transaction is never conflict-checked or applied at all -- try_commit
+// reports PrecommitConflict, forwarding the failing pre-transaction's own
+// `error`. Because the main transaction was never touched, `txn` is still
+// fresh and can be retried as-is once the hook stops failing.
+TEST(a_failing_pre_transaction_reports_precommit_conflict_and_skips_the_main_transaction) {
+    Model m;
+    m.set_pre_transactions([](Model& model) {
+        Transaction pre = model.begin();
+        auto o = std::make_unique<Order>();
+        o->code = "BAD";  // account left default -> null non-nullable Ref
+        pre.create(std::move(o));
+        CommitResult r = model.run_pre_commit_transaction(pre);
+        CHECK(r.status == CommitStatus::Invalid);
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "NEVER_APPLIED";
+    const Ref<Account> local = txn.create(std::move(a));
+
+    CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::PrecommitConflict);
+    CHECK(res.error.has_value());  // forwarded from the failing pre-transaction
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});  // main txn never applied
+
+    // txn was never consumed -- retry it as-is once the hook is well-behaved.
+    m.set_pre_transactions({});
+    res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find(res.resolve(local)) != nullptr);
+}
+
+// A pre-transaction that succeeds stays published even if the main
+// transaction is then skipped because a LATER pre-transaction in the same
+// phase fails -- published state is immutable (CLAUDE.md invariant 3).
+// PrecommitConflict means only "the main transaction didn't run."
+TEST(an_earlier_successful_pre_transaction_stays_committed_even_if_a_later_one_fails) {
+    Model m;
+    m.set_pre_transactions([](Model& model) {
+        Transaction pre1 = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "PRE_OK";
+        pre1.create(std::move(a));
+        CHECK(model.run_pre_commit_transaction(pre1).status == CommitStatus::Committed);
+
+        Transaction pre2 = model.begin();
+        auto o = std::make_unique<Order>();
+        o->code = "PRE_BAD";  // null non-nullable Ref -> Invalid
+        pre2.create(std::move(o));
+        CHECK(model.run_pre_commit_transaction(pre2).status == CommitStatus::Invalid);
+        // A well-behaved hook stops calling run_pre_commit_transaction() here.
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "MAIN_NEVER_APPLIED";
+    txn.create(std::move(a));
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::PrecommitConflict);
+
+    m.set_pre_transactions({});
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.size(), std::size_t{1});  // PRE_OK published; PRE_BAD and MAIN did not
+    CHECK(s.find_by_key<&Account::name>("PRE_OK") != nullptr);
+    CHECK(s.find_by_key<&Account::name>("MAIN_NEVER_APPLIED") == nullptr);
+}
+
+// The main transaction gets its conflict-checking against a pre-transaction
+// for free: both target the same Account's slot, so the main transaction
+// (built from a base that predates the pre-transaction) reports an ordinary
+// Conflict(IdSetOverlap) -- exactly as if the pre-transaction had been made
+// by a different writer thread racing it.
+TEST(main_transaction_conflicts_with_a_pre_transaction_touching_the_same_object) {
+    Model m;
+    const Ref<Account> a = make_account(m, "SHARED");
+
+    Transaction txn = m.begin();  // base predates the pre-transaction below
+    txn.update(a)->name = "FROM_MAIN";
+
+    m.set_pre_transactions([a](Model& model) {
+        Transaction pre = model.begin();
+        pre.update(a)->name = "FROM_PRE";
+        CHECK(model.run_pre_commit_transaction(pre).status == CommitStatus::Committed);
+    });
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Conflict);
+    CHECK(res.conflict.has_value());
+    CHECK(res.conflict->reason == ConflictReason::IdSetOverlap);
+
+    m.set_pre_transactions({});
+    CHECK_EQ(m.snapshot().find(a)->name, std::string("FROM_PRE"));
+}
+
+// PreCommitFn (the existing veto hook) is unaffected by, and unaware of, a
+// pre-transactions phase: it still runs exactly once, after the MAIN
+// transaction's own apply, seeing only the main transaction's own resolved
+// changeset -- not the pre-transaction's.
+TEST(pre_commit_veto_hook_still_only_sees_the_main_transactions_own_changeset) {
+    Model m;
+    m.set_pre_transactions([](Model& model) {
+        Transaction pre = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "PRE";
+        pre.create(std::move(a));
+        CHECK(model.run_pre_commit_transaction(pre).status == CommitStatus::Committed);
+    });
+
+    std::size_t seen = 0;
+    m.set_pre_commit([&](Model&, const std::vector<Change>& changes) {
+        seen = changes.size();
+        return true;
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "MAIN";
+    txn.create(std::move(a));
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+    CHECK_EQ(seen, std::size_t{1});  // only MAIN's own create, not PRE's
+
+    m.set_pre_transactions({});
+    m.set_pre_commit({});
+}
+
+// Empirical proof, not just a locking argument: under heavy CONCURRENT
+// contention from many other threads racing try_commit(), a pre-transaction
+// and its main transaction always publish ADJACENT versions. version_ is a
+// monotonic counter, incremented exactly once per publish_now() call, only
+// ever while commit_mu_ is held (CLAUDE.md invariant 7). If any other
+// thread's commit could land between "this thread's pre-transaction
+// published" and "this thread's main transaction published", the two
+// versions this SAME try_commit() call produced would not be consecutive --
+// some other version would be wedged in between. Extend this test (not just
+// the locking) if you ever touch the pre-transactions phase.
+TEST(pre_transactions_and_the_main_transaction_publish_with_no_other_commit_landing_between_them) {
+    Model m;
+    // Thread-local, not shared: each racing thread runs its own
+    // pre-transaction-then-main-transaction pair, and only ever needs to
+    // compare its OWN pair's versions against each other.
+    thread_local std::uint64_t t_pre_version = 0;
+
+    m.set_pre_transactions([](Model& model) {
+        Transaction pre = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "PRE";
+        pre.create(std::move(a));
+        CommitResult r = model.run_pre_commit_transaction(pre);
+        if (r.status == CommitStatus::Committed) t_pre_version = r.snapshot.version();
+    });
+
+    constexpr int kThreads = 8;
+    constexpr int kItersPerThread = 300;
+    std::atomic<int> gap_violations{0};
+    std::atomic<int> committed{0};
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < kItersPerThread; ++i) {
+                Transaction txn = m.begin();
+                auto a = std::make_unique<Account>();
+                a->name = "T" + std::to_string(t) + "_" + std::to_string(i);
+                txn.create(std::move(a));
+                CommitResult main = m.try_commit(txn);
+                if (main.status != CommitStatus::Committed) continue;
+                if (main.snapshot.version() != t_pre_version + 1) gap_violations.fetch_add(1);
+                ++committed;
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    m.set_pre_transactions({});
+
+    CHECK(committed.load() > 0);
+    CHECK_EQ(gap_violations.load(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Persistent secondary index
 // ---------------------------------------------------------------------------
 

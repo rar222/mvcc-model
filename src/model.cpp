@@ -906,27 +906,14 @@ Transaction Snapshot::begin() const {
     return lease_->m->begin(*this);
 }
 
-CommitResult Model::try_commit(Transaction& txn) {
-    assert(txn.model_ == this && "Transaction belongs to a different Model");
-
-    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
-        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
-
-    std::lock_guard commit_lk(commit_mu_);
-
-    if (std::vector<Id> overlap = check_id_overlap(txn); !overlap.empty()) {
-        return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
-                            ConflictInfo{ConflictReason::IdSetOverlap, std::move(overlap)}, {},
-                            std::nullopt};
-    }
-
-    std::unordered_map<std::uint32_t, Id> remap;  // local Id::index -> real Id, this attempt only
-
+std::optional<Model::IntegrityError> Model::apply_transaction_contents(
+    Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap) {
     // Creates first, then updates (reconciled immediately, see apply_update),
     // then deletes resolved last -- in that order, so a same-transaction
     // "repoint away from X, then delete X" sees the repoint already reflected
     // in referrers_ before the cascade BFS runs. The first integrity
-    // violation aborts the attempt; everything applied so far is unwound.
+    // violation aborts the attempt; the caller must then rollback (via
+    // classify_apply_failure()).
     std::optional<IntegrityError> err;
     for (auto& obj : txn.local_created_) {
         if (obj && (err = apply_create(std::move(obj), remap))) break;  // null: cancelled locally
@@ -940,39 +927,38 @@ CommitResult Model::try_commit(Transaction& txn) {
     if (!err) {
         for (Id rid : txn.remove_intents_) remove_raw(rid);
     }
+    return err;
+}
 
-    if (err) {
-        rollback_apply();
-        // Did the dangling target exist at this transaction's own base()? If
-        // so, someone else deleted it concurrently -- a Conflict, not a bug.
-        // (bad_target is null for a null non-nullable Ref or an unmapped
-        // local id, which have no target to check and are always genuine
-        // transaction-building bugs -- those reject as Invalid.)
-        if (err->bad_target && txn.base().find_raw(err->bad_target)) {
-            return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
-                                ConflictInfo{ConflictReason::RefIntegrity, {err->bad_target}}, {},
-                                std::nullopt};
-        }
-        return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, std::move(err)};
+CommitResult Model::classify_apply_failure(IntegrityError err, const Transaction& txn) {
+    rollback_apply();
+    // Did the dangling target exist at this transaction's own base()? If
+    // so, someone else deleted it concurrently -- a Conflict, not a bug.
+    // (bad_target is null for a null non-nullable Ref or an unmapped
+    // local id, which have no target to check and are always genuine
+    // transaction-building bugs -- those reject as Invalid.)
+    if (err.bad_target && txn.base().find_raw(err.bad_target)) {
+        return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
+                            ConflictInfo{ConflictReason::RefIntegrity, {err.bad_target}}, {},
+                            std::nullopt};
     }
+    return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, std::move(err)};
+}
 
-    if (changes_.empty()) {
-        // Everything in txn had already been applied by an earlier
-        // try_commit() on this same Transaction (or every local create was
-        // locally cancelled) -- a no-op success, not a fresh publish.
-        return CommitResult{CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
+std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
+                                                    std::unordered_map<std::uint32_t, Id>& remap) {
+    if (std::vector<Id> overlap = check_id_overlap(txn); !overlap.empty()) {
+        return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
+                            ConflictInfo{ConflictReason::IdSetOverlap, std::move(overlap)}, {},
+                            std::nullopt};
     }
-
-    // Runs after apply, not before: it sees the FULLY resolved changeset,
-    // including cascade deletes (resolved just above). A false return unwinds
-    // everything applied so far, exactly like an integrity violation does.
-    // (The hook cannot report failure by throwing -- the project builds with
-    // -fno-exceptions, so a throw is std::terminate, not an error path.)
-    if (pre_commit_ && !pre_commit_(*this, changes_)) {
-        rollback_apply();
-        return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
+    if (auto err = apply_transaction_contents(txn, remap)) {
+        return classify_apply_failure(std::move(*err), txn);
     }
+    return std::nullopt;  // applied; remap is populated, changes_ may or may not be empty
+}
 
+CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
     ++version_;
 
     auto r = std::make_shared<Root>();
@@ -1022,6 +1008,101 @@ CommitResult Model::try_commit(Transaction& txn) {
 
     return CommitResult{CommitStatus::Committed, pub, std::move(resolved), std::nullopt, std::move(remap),
                         std::nullopt};
+}
+
+CommitResult Model::commit_locked(Transaction& txn) {
+    assert(txn.model_ == this && "Transaction belongs to a different Model");
+
+    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
+        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
+
+    std::unordered_map<std::uint32_t, Id> remap;  // local Id::index -> real Id, this attempt only
+    if (auto failure = check_and_apply(txn, remap)) return std::move(*failure);
+
+    if (changes_.empty()) {
+        // Everything in txn had already been applied by an earlier
+        // try_commit() on this same Transaction (or every local create was
+        // locally cancelled) -- a no-op success, not a fresh publish.
+        return CommitResult{CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
+    }
+
+    return publish_now(std::move(remap));
+}
+
+CommitResult Model::run_pre_commit_transaction(Transaction& txn) {
+    assert(in_pre_transactions_phase_ &&
+           "run_pre_commit_transaction() called outside a running PreTransactionsFn callback");
+    assert(!precommit_failed_ &&
+           "run_pre_commit_transaction() called again after an earlier pre-transaction this same "
+           "attempt already failed -- check the return value and stop");
+    assert(txn.model_ == this && "Transaction belongs to a different Model");
+
+    CommitResult result = commit_locked(txn);
+    if (result.status != CommitStatus::Committed) {
+        precommit_failed_ = true;
+        precommit_failure_ = std::make_unique<CommitResult>(result);
+    }
+    return result;
+}
+
+CommitResult Model::try_commit(Transaction& txn) {
+    assert(txn.model_ == this && "Transaction belongs to a different Model");
+
+    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
+        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
+
+    std::lock_guard commit_lk(commit_mu_);
+
+    if (pre_transactions_) {
+        assert(!in_pre_transactions_phase_ && "pre_transactions_ invoked reentrantly");
+        precommit_failed_ = false;
+        precommit_failure_.reset();
+        in_pre_transactions_phase_ = true;
+        pre_transactions_(*this);
+        in_pre_transactions_phase_ = false;
+
+        if (precommit_failed_) {
+            // txn itself was never touched -- not conflict-checked, not
+            // applied -- so it's still fresh and may be retried as-is. See
+            // CommitStatus::PrecommitConflict.
+            CommitResult failure = std::move(*precommit_failure_);
+            precommit_failure_.reset();
+            failure.status = CommitStatus::PrecommitConflict;
+            return failure;
+        }
+    }
+
+    // The main transaction gets its conflict-checking against any
+    // pre-transaction(s) just published above for free: check_and_apply()'s
+    // check_id_overlap() scans the changelog (which now includes them), and
+    // apply_transaction_contents()'s Ref<> validation runs against the
+    // now-current state -- exactly as if those pre-transactions were made by
+    // another writer racing this one. See PreTransactionsFn.
+    //
+    // Inlined rather than routed through commit_locked(): the main
+    // transaction, unlike a pre-transaction (run_pre_commit_transaction()),
+    // must still go through the pre_commit_ veto hook below.
+    std::unordered_map<std::uint32_t, Id> remap;
+    if (auto failure = check_and_apply(txn, remap)) return std::move(*failure);
+
+    if (changes_.empty()) {
+        // Everything in txn had already been applied by an earlier
+        // try_commit() on this same Transaction (or every local create was
+        // locally cancelled) -- a no-op success, not a fresh publish.
+        return CommitResult{CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
+    }
+
+    // Runs after apply, not before: it sees the FULLY resolved changeset,
+    // including cascade deletes (resolved just above). A false return unwinds
+    // everything applied so far, exactly like an integrity violation does.
+    // (The hook cannot report failure by throwing -- the project builds with
+    // -fno-exceptions, so a throw is std::terminate, not an error path.)
+    if (pre_commit_ && !pre_commit_(*this, changes_)) {
+        rollback_apply();
+        return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
+    }
+
+    return publish_now(std::move(remap));
 }
 
 }  // namespace model
