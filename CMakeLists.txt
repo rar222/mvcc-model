@@ -77,6 +77,12 @@ target_link_libraries(bench PRIVATE model)
 add_executable(commit_bench examples/commit_bench.cpp)
 target_link_libraries(commit_bench PRIVATE model)
 
+# find_referrers (O(#items) scan) vs find_cached_referrers (O(log n +
+# matches), Root::by_cached_reference) -- read speedup vs. the per-write
+# cost that pays for it. See DESIGN.md's "Lookup families" section.
+add_executable(cached_reference_bench examples/cached_reference_bench.cpp)
+target_link_libraries(cached_reference_bench PRIVATE model)
+
 # --- tests ------------------------------------------------------------------
 
 enable_testing()
