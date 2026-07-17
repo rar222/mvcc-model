@@ -298,6 +298,9 @@ Ref<T> pick_live(const Transaction& txn, const std::vector<Ref<T>>& v, std::mt19
 // Basics
 // ---------------------------------------------------------------------------
 
+// Basic roundtrip: create+commit, then find both by Ref/Id and by a
+// define_keys()-declared field, and confirm a typed lookup distinguishes
+// two types even when one's key string looks like the other's.
 TEST(create_and_find_by_id_and_key) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 100);
@@ -316,6 +319,9 @@ TEST(create_and_find_by_id_and_key) {
     CHECK_EQ(s.find_by_key<&Account::name>("A1")->id, a.raw());
 }
 
+// Ref<>/Opt<> resolve correctly through a Snapshot: a non-null Opt
+// resolves to the right object, a null Opt (the root order's parent)
+// resolves to nullptr -- no special-casing needed by the caller.
 TEST(refs_resolve_through_snapshot) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -332,6 +338,9 @@ TEST(refs_resolve_through_snapshot) {
     CHECK(s.resolve(s.find(p)->parent) == nullptr);
 }
 
+// A Transaction's local edits -- including a same-transaction local-id
+// create -- are invisible to any Snapshot taken before commit, and only
+// become visible via a FRESH Snapshot taken after commit.
 TEST(uncommitted_writes_are_invisible_to_readers) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -357,6 +366,9 @@ TEST(uncommitted_writes_are_invisible_to_readers) {
 // Snapshot isolation
 // ---------------------------------------------------------------------------
 
+// Snapshot isolation's headline property: a snapshot taken before an
+// update keeps reporting the pre-update value even after a later commit
+// changes it and publishes a newer version.
 TEST(old_snapshot_sees_old_values) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -371,6 +383,9 @@ TEST(old_snapshot_sees_old_values) {
     CHECK(v1.version() < v2.version());
 }
 
+// An older Snapshot can still find and read a since-deleted object --
+// the reclamation invariant (nothing freed while a reader can reach it)
+// made directly observable; see the in-body comment for the ASan angle.
 TEST(deleted_object_survives_in_older_snapshot) {
     // The reclamation invariant: nothing may be freed while a reader can still
     // reach it. Under ASan, getting this wrong is a use-after-free here.
@@ -387,6 +402,9 @@ TEST(deleted_object_survives_in_older_snapshot) {
     CHECK(m.retired_pending() > 0);  // held back from the free list
 }
 
+// wait_for_reclamation() reports objects as pinned while a Snapshot holds
+// their version, and reports zero once that snapshot is dropped and the
+// next commit moves the watermark past it.
 TEST(reclamation_advances_when_snapshots_are_dropped) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -403,6 +421,9 @@ TEST(reclamation_advances_when_snapshots_are_dropped) {
     CHECK_EQ(m.wait_for_reclamation(), std::size_t{0});
 }
 
+// Invariant 5: a stale handle from before a slot was recycled must NOT
+// resolve to the new occupant, even though it shares the same slot index
+// -- the generation mismatch is what stops the aliasing.
 TEST(stale_id_does_not_alias_a_recycled_slot) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -418,6 +439,9 @@ TEST(stale_id_does_not_alias_a_recycled_slot) {
     CHECK(s.find(o2) != nullptr);
 }
 
+// Regression test: see the in-body comment for the exact bug shape --
+// Transaction::local_updated_ is keyed by bare slot index, so peek_impl/
+// update_impl must also check the FULL Id before trusting a hit.
 TEST(transaction_local_update_does_not_alias_a_stale_generation_of_the_same_slot) {
     // Regression: Transaction::local_updated_ is keyed by bare slot index (a
     // transaction only ever clones ONE generation of a given slot -- the one
@@ -456,6 +480,9 @@ TEST(transaction_local_update_does_not_alias_a_stale_generation_of_the_same_slot
 // Cascade delete (resolved at try_commit() time, not eagerly)
 // ---------------------------------------------------------------------------
 
+// Deleting a target cascades to kill every non-nullable (Ref<>) referrer
+// too, and removes them from every index (by_type, define_keys) as well
+// -- not just the object store.
 TEST(cascade_kills_non_nullable_referrers) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -473,6 +500,9 @@ TEST(cascade_kills_non_nullable_referrers) {
     CHECK_EQ(s.size(), std::size_t{0});
 }
 
+// A referrer reachable only via a nullable Opt<> field survives its
+// target's deletion with that field nulled, while its OTHER (Ref<>)
+// edges stay completely intact.
 TEST(cascade_nulls_nullable_referrers_instead_of_killing_them) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -490,6 +520,9 @@ TEST(cascade_nulls_nullable_referrers_instead_of_killing_them) {
     CHECK_EQ(s.resolve(s.find(c)->account).id, a.raw());  // its Ref<> is intact
 }
 
+// A chain of non-nullable Ref<> edges (o3 -> o2 -> o1 -> a) all die
+// together when the chain's root is removed -- cascade isn't limited to
+// one hop.
 TEST(cascade_is_transitive_and_mixed) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -505,6 +538,9 @@ TEST(cascade_is_transitive_and_mixed) {
     (void)o3;
 }
 
+// The cascade BFS's visited-set guards against a Ref<>/Opt<> cycle
+// looping forever: a cycle resolves by nulling the Opt<> edge in it,
+// not by hanging try_commit().
 TEST(cascade_terminates_on_cycles) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -522,6 +558,9 @@ TEST(cascade_terminates_on_cycles) {
     CHECK(!s.find(o2)->parent);  // cycle edge nulled
 }
 
+// After Transaction::update() repoints a non-nullable Ref<> to a new
+// target, the reverse index tracks the NEW target (not the original) --
+// deleting the new target correctly cascades, proving reconciliation ran.
 TEST(reassigning_a_ref_field_after_update_is_tracked_for_cascade) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
@@ -537,6 +576,9 @@ TEST(reassigning_a_ref_field_after_update_is_tracked_for_cascade) {
     CHECK(m.snapshot().find(o) == nullptr);
 }
 
+// Same idea for a nullable Opt<>: reassigning it moves the reverse-index
+// edge to the new target, and the OLD target is no longer treated as a
+// referrer -- no phantom edge left behind to corrupt a later cascade.
 TEST(reassigning_an_opt_field_after_update_is_tracked_for_cascade) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -557,6 +599,9 @@ TEST(reassigning_an_opt_field_after_update_is_tracked_for_cascade) {
     CHECK(m.snapshot().find(c) != nullptr);
 }
 
+// Regression guard: see the in-body comment. Two update() calls to the
+// same id in ONE transaction must reconcile against the last COMMITTED
+// state, never an intermediate, never-published in-transaction value.
 TEST(repeated_updates_in_one_transaction_diff_against_the_pre_transaction_state) {
     // Two update() calls on the same id before a single commit must still
     // reconcile against the state as of the LAST commit, not an intermediate,
@@ -585,6 +630,8 @@ TEST(repeated_updates_in_one_transaction_diff_against_the_pre_transaction_state)
     CHECK(m.snapshot().find(o) == nullptr);
 }
 
+// Transaction::update() on an id already deleted in the committed state
+// returns null rather than resurrecting or aliasing it.
 TEST(update_returns_null_for_a_dead_id) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -600,6 +647,8 @@ TEST(update_returns_null_for_a_dead_id) {
 // Events
 // ---------------------------------------------------------------------------
 
+// A subscription receives exactly one Update per commit, carrying that
+// commit's own changeset paired with a matching post-commit Snapshot.
 TEST(subscriber_gets_a_changeset_per_commit) {
     Model m;
     auto sub = m.subscribe(8);
@@ -616,6 +665,9 @@ TEST(subscriber_gets_a_changeset_per_commit) {
     CHECK(!sub->try_drain(u));
 }
 
+// Exceeding a subscriber's queue depth coalesces intermediate updates
+// into one entry instead of growing the queue unboundedly -- and the
+// coalesced delivery still carries the LATEST value, not a stale one.
 TEST(overflow_coalesces_instead_of_growing) {
     Model m;
     auto sub = m.subscribe(/*depth=*/2);
@@ -641,6 +693,9 @@ TEST(overflow_coalesces_instead_of_growing) {
     CHECK_EQ(final_qty, 19);  // the latest state still arrives
 }
 
+// Subscription::collapse's create+delete cancellation: an object created
+// and deleted before the subscriber ever drains never appears in the
+// delivered changeset at all, not even as a no-op pair.
 TEST(create_then_delete_between_drains_cancels_out) {
     Model m;
     auto sub = m.subscribe(/*depth=*/1);
@@ -671,6 +726,8 @@ TEST(create_then_delete_between_drains_cancels_out) {
 // Typing
 // ---------------------------------------------------------------------------
 
+// Snapshot::for_each<T>() visits only objects of exactly that type, even
+// when other types coexist in the same model.
 TEST(for_each_is_type_filtered) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
@@ -694,6 +751,9 @@ TEST(for_each_is_type_filtered) {
     CHECK_EQ(s.size(), std::size_t{5});
 }
 
+// find_by_key<Field> is type-safe: a value that matches under a
+// DIFFERENT type's key (or the wrong field on the same value) returns
+// null rather than a miscast object.
 TEST(a_typed_lookup_of_the_wrong_type_is_null_not_a_bad_cast) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -707,6 +767,9 @@ TEST(a_typed_lookup_of_the_wrong_type_is_null_not_a_bad_cast) {
     (void)o;
 }
 
+// Two different types can share the identical raw key string without
+// colliding -- define_keys() indexes per (type, field), not one global
+// namespace -- and deleting one type's entry leaves the other untouched.
 TEST(external_keys_are_scoped_per_type_not_global) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -725,6 +788,8 @@ TEST(external_keys_are_scoped_per_type_not_global) {
     CHECK(s.find_by_key<&Widget::computed_key>("ord:X") != nullptr);
 }
 
+// find_all()/find_all_view() run a predicate scan restricted to one
+// type, in both the raw-pointer and the View-returning forms.
 TEST(find_all_runs_an_arbitrary_predicate_over_one_type) {
     Model m;
     make_account(m, "A1", 50);
@@ -745,6 +810,9 @@ TEST(find_all_runs_an_arbitrary_predicate_over_one_type) {
     CHECK(none.empty());
 }
 
+// The unindexed reverse-lookup family (for_each_referrer/find_referrers
+// and their View forms) correctly reports every referrer of a target
+// across both Ref<> and Opt<> fields, and empty for an unreferenced one.
 TEST(find_referrers_answers_who_points_at_me) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
@@ -783,6 +851,8 @@ TEST(find_referrers_answers_who_points_at_me) {
     CHECK_EQ(view_children.size(), std::size_t{2});
 }
 
+// find_by_key works for both a string field and an arithmetic field, and
+// returns null for an undeclared field or a value that was never set.
 TEST(find_by_key_looks_up_define_keys_declared_fields) {
     Model m;
     const Ref<Gadget> g1 = make_gadget(m, "Widget", 111);
@@ -796,6 +866,9 @@ TEST(find_by_key_looks_up_define_keys_declared_fields) {
     CHECK(s.find_by_key<&Order::code>("anything") == nullptr);
 }
 
+// Reassigning a define_keys()-declared field via update() moves its
+// index entry: the old value stops resolving, the new value resolves to
+// the same object.
 TEST(field_index_tracks_a_reassigned_indexed_field) {
     Model m;
     const Ref<Gadget> g = make_gadget(m, "Widget", 111);
@@ -809,6 +882,8 @@ TEST(field_index_tracks_a_reassigned_indexed_field) {
     CHECK_EQ(s.find_by_key<&Gadget::serial>(111)->id, g.raw());
 }
 
+// Removing an object drops every one of its define_keys() index
+// entries -- they don't linger as stale, dangling lookups.
 TEST(field_index_is_cleaned_up_on_removal) {
     Model m;
     const Ref<Gadget> g = make_gadget(m, "Widget", 111);
@@ -819,6 +894,8 @@ TEST(field_index_is_cleaned_up_on_removal) {
     CHECK(s.find_by_key<&Gadget::serial>(111) == nullptr);
 }
 
+// Two objects sharing the same indexed value: find_by_key resolves to
+// whichever was written last, matching the documented contract.
 TEST(field_index_duplicate_value_is_last_write_wins) {
     Model m;
     const Ref<Gadget> g1 = make_gadget(m, "Same", 1);
@@ -829,6 +906,9 @@ TEST(field_index_duplicate_value_is_last_write_wins) {
     (void)g1;
 }
 
+// A two-hop cascade: deleting an Account kills an Order (Ref<>), which
+// in turn nulls -- not kills -- a second Order's Opt<> pointing at it,
+// while that second Order's own Ref<> edge stays intact.
 TEST(opt_survives_a_cascade_that_ref_does_not) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
@@ -850,6 +930,9 @@ TEST(opt_survives_a_cascade_that_ref_does_not) {
 // Generation exhaustion
 // ---------------------------------------------------------------------------
 
+// A slot whose generation is forced to kGenMax is permanently withdrawn
+// from free_slots_ rather than handed out again, and exhausted_slots()
+// reports it.
 TEST(an_exhausted_slot_is_retired_not_reused) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -867,6 +950,9 @@ TEST(an_exhausted_slot_is_retired_not_reused) {
     CHECK(m.snapshot().find(o2) != nullptr);
 }
 
+// A handle captured before its slot was exhaustion-retired never
+// resolves to whatever object a later, freshly allocated DIFFERENT slot
+// ends up holding.
 TEST(a_stale_handle_never_aliases_across_exhaustion) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -886,6 +972,9 @@ TEST(a_stale_handle_never_aliases_across_exhaustion) {
 // Background reaper + lock-free reads
 // ---------------------------------------------------------------------------
 
+// wait_for_reclamation() as a barrier: it reports work still pinned
+// while a Snapshot is held, and reports fully drained once that Snapshot
+// is dropped.
 TEST(reaper_frees_eventually_after_snapshots_drop) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -899,6 +988,9 @@ TEST(reaper_frees_eventually_after_snapshots_drop) {
     CHECK_EQ(m.wait_for_reclamation(), std::size_t{0});
 }
 
+// A single remove() cascading through 500 objects completes and is
+// fully reclaimable -- cascade fan-out isn't hard-capped by size, and
+// the reaper can clear the whole backlog afterward.
 TEST(a_large_cascade_does_not_block_forever_and_reclaims) {
     Model m;
     const Ref<Account> a = make_account(m, "hub");
@@ -929,6 +1021,8 @@ TEST(a_large_cascade_does_not_block_forever_and_reclaims) {
 // Pre-commit hook
 // ---------------------------------------------------------------------------
 
+// A pre-commit hook returning true sees the resolved changeset and lets
+// the commit through unmodified.
 TEST(pre_commit_hook_approving_commits_normally) {
     Model m;
     int seen = 0;
@@ -942,6 +1036,8 @@ TEST(pre_commit_hook_approving_commits_normally) {
     CHECK_EQ(m.snapshot().size(), std::size_t{1});
 }
 
+// try_commit() on a Transaction with nothing pending is a no-op fast
+// path that never calls the pre-commit hook at all.
 TEST(pre_commit_hook_is_not_invoked_for_an_empty_commit) {
     Model m;
     bool called = false;
@@ -956,6 +1052,9 @@ TEST(pre_commit_hook_is_not_invoked_for_an_empty_commit) {
     CHECK(!called);
 }
 
+// The hook runs AFTER cascade resolution, so it observes every
+// cascade-deleted object too -- not just the ones the Transaction's own
+// remove() intent explicitly named.
 TEST(pre_commit_hook_sees_the_fully_resolved_changeset_including_cascade_deletes) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -974,6 +1073,9 @@ TEST(pre_commit_hook_sees_the_fully_resolved_changeset_including_cascade_deletes
     (void)o;
 }
 
+// A hook returning false (Vetoed) leaves the model in EXACTLY its
+// pre-attempt state (checked via state_of()), and a later attempt still
+// commits normally once the hook is cleared.
 TEST(pre_commit_hook_veto_unwinds_everything_as_if_try_commit_were_never_called) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -996,6 +1098,9 @@ TEST(pre_commit_hook_veto_unwinds_everything_as_if_try_commit_were_never_called)
     CHECK(m.snapshot().find(o2) != nullptr);
 }
 
+// Regression test for the reconcile_referrer_edges undo-log bug -- see
+// the in-body comment. A vetoed reassignment must restore the old edge
+// AND remove the phantom new one, or a later cascade sees a lie.
 TEST(veto_rollback_restores_the_reverse_index_so_later_cascades_stay_correct) {
     Model m;
     const Ref<Account> x = make_account(m, "X");
@@ -1022,6 +1127,9 @@ TEST(veto_rollback_restores_the_reverse_index_so_later_cascades_stay_correct) {
     CHECK(m.snapshot().find(o) == nullptr);
 }
 
+// Same undo-log discipline for by_field_: a vetoed rename must leave the
+// OLD value still findable and the NEW value NOT findable, once a later
+// commit actually publishes.
 TEST(veto_rollback_restores_the_field_key_index) {
     Model m;
     const Ref<Account> a = make_account(m, "OLD");
@@ -1039,6 +1147,9 @@ TEST(veto_rollback_restores_the_field_key_index) {
     CHECK(s.find_by_key<&Account::name>("NEW") == nullptr);
 }
 
+// A structurally invalid Transaction (a null non-nullable Ref alongside
+// otherwise-valid creates) is rejected as CommitStatus::Invalid, fully
+// unwound, with the specific violation reported via CommitResult::error.
 TEST(an_invalid_transaction_unwinds_like_a_veto_and_reports_why) {
     Model m;
     const std::string before = state_of(m);
@@ -1067,6 +1178,9 @@ TEST(an_invalid_transaction_unwinds_like_a_veto_and_reports_why) {
     CHECK_EQ(s.size(), std::size_t{1});
 }
 
+// TSan-targeted: see the in-body comment. Installing/clearing the hook
+// concurrently with a hammering committer thread must never race --
+// set_pre_commit() takes commit_mu_ the same way try_commit() does.
 TEST(set_pre_commit_can_race_try_commit_without_a_data_race) {
     // The real assertion here is TSan's (ctest --preset tsan): installing a
     // hook must be serialized against the commits that invoke it.
@@ -1092,6 +1206,9 @@ TEST(set_pre_commit_can_race_try_commit_without_a_data_race) {
     CHECK(m.snapshot().size() > 0);
 }
 
+// A create() whose Ref<> target was already dead even at the
+// Transaction's OWN base is classified Invalid (a build-time bug), not
+// Conflict, with bad_target naming the dead id.
 TEST(create_with_a_dead_ref_is_rejected_as_invalid) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1113,6 +1230,8 @@ TEST(create_with_a_dead_ref_is_rejected_as_invalid) {
     CHECK(m.snapshot().find(good) == nullptr);  // txn's base already reflects a/good gone
 }
 
+// Leaving a non-nullable Ref<> field at its default (null) value is
+// rejected as Invalid at apply time, with no target to report.
 TEST(create_with_a_null_nonnullable_ref_is_rejected_as_invalid) {
     Model m;
     Transaction txn = m.begin();
@@ -1131,6 +1250,9 @@ TEST(create_with_a_null_nonnullable_ref_is_rejected_as_invalid) {
 // Persistent secondary index
 // ---------------------------------------------------------------------------
 
+// Root::by_field (the define_keys index) is versioned like the object
+// store itself: an older Snapshot keeps answering find_by_key as of its
+// own version, even as later commits add and remove entries.
 TEST(the_index_is_versioned_like_everything_else) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1152,6 +1274,9 @@ TEST(the_index_is_versioned_like_everything_else) {
     CHECK(v3.find_by_key<&Order::computed_key>("ord:O2") != nullptr);
 }
 
+// A long randomized sequence of interleaved creates/removes leaves the
+// surviving objects' index entries exactly consistent with what
+// for_each<T>()/find() report -- no drift after heavy churn.
 TEST(index_survives_heavy_churn_and_stays_consistent) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1182,6 +1307,8 @@ TEST(index_survives_heavy_churn_and_stays_consistent) {
 // Views
 // ---------------------------------------------------------------------------
 
+// View<T>::operator[] follows Ref<>/Opt<> fields -- including chained
+// hops -- without the caller ever passing a Snapshot explicitly.
 TEST(view_traverses_refs_without_plumbing_the_snapshot) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 77);
@@ -1203,6 +1330,8 @@ TEST(view_traverses_refs_without_plumbing_the_snapshot) {
     CHECK(!(*parent)[&Order::parent].has_value());
 }
 
+// Snapshot::view()/view_by_key() on a since-deleted handle return an
+// empty optional rather than a dangling View.
 TEST(view_of_a_stale_handle_is_empty) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1214,6 +1343,9 @@ TEST(view_of_a_stale_handle_is_empty) {
     CHECK(!s.view_by_key<&Order::computed_key>("ord:O1").has_value());
 }
 
+// The scan family returns EVERY match (unlike find_by_key's single
+// winner), works on any declared scan field including one that's ALSO a
+// define_keys field, and is empty for a field never declared scan.
 TEST(find_by_scan_field_returns_every_match_and_only_for_declared_fields) {
     Model m;
     const Ref<Account> a = make_account(m, "DUP", 1);  // Account::name: define_keys AND define_scan_fields
@@ -1255,6 +1387,9 @@ TEST(find_by_scan_field_returns_every_match_and_only_for_declared_fields) {
     CHECK(s.view_by_scan_field<&Account::balance>(1).empty());
 }
 
+// The full lifecycle of a cached (multi-match, indexed) field: create,
+// an update that moves an object between buckets, cascade delete
+// emptying a bucket cleanly, and versioning like every other index.
 TEST(find_by_cached_field_tracks_creates_updates_and_cascades_and_is_versioned) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1293,6 +1428,9 @@ TEST(find_by_cached_field_tracks_creates_updates_and_cascades_and_is_versioned) 
     CHECK(after.find_by_cached_field<&Order::qty>(7).empty());
 }
 
+// The full lifecycle of a cached REFERENCE field, mirroring the cached-
+// field test above: agreement with the unindexed scan, reconciliation
+// on reassignment, versioning, the View form, and direct removal.
 TEST(find_cached_referrers_matches_the_slow_scan_and_tracks_updates_and_is_versioned) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
@@ -1333,6 +1471,8 @@ TEST(find_cached_referrers_matches_the_slow_scan_and_tracks_updates_and_is_versi
     CHECK_EQ(m.snapshot().find_cached_referrers<&Order::account>(a2).size(), std::size_t{1});
 }
 
+// A cascade-deleted referrer is dropped from its own outgoing bucket in
+// Root::by_cached_reference, leaving no tombstone once the bucket empties.
 TEST(find_cached_referrers_tracks_cascade_delete) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1351,6 +1491,9 @@ TEST(find_cached_referrers_tracks_cascade_delete) {
     CHECK(m.snapshot().find_cached_referrers<&Order::account>(a).empty());
 }
 
+// The cascade-NULL path of Model::reconcile_cached_references -- see
+// the in-body comment for why a dedicated (Node) type is needed here,
+// since the shared demo types don't cache a nullable reference field.
 TEST(find_cached_referrers_tracks_cascade_null) {
     // Order::parent is deliberately NOT cached (see demo/types.h), so the
     // cascade-null path of Model::reconcile_cached_references needs a
@@ -1370,6 +1513,9 @@ TEST(find_cached_referrers_tracks_cascade_null) {
     CHECK(s.find_cached_referrers<&Node::parent>(root).empty());
 }
 
+// The cached-reference family's own version of the shared
+// "undeclared is invisible" rule: the slow scan still finds an
+// uncached field's referrers; the index does not, with no silent fallback.
 TEST(find_cached_referrers_is_empty_for_a_field_never_declared_cached) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1385,6 +1531,9 @@ TEST(find_cached_referrers_is_empty_for_a_field_never_declared_cached) {
     CHECK(m.snapshot().find_cached_referrers<&Order::parent>(hub).empty());
 }
 
+// Undo-log discipline for Root::by_cached_reference: a vetoed
+// reassignment must leave the index exactly as it was before the
+// attempt, once a later commit actually publishes.
 TEST(veto_rollback_restores_the_cached_reference_index) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
@@ -1404,6 +1553,8 @@ TEST(veto_rollback_restores_the_cached_reference_index) {
     CHECK(s.find(o)->account == a1);
 }
 
+// Same undo-log discipline for Root::by_cached_field: a vetoed value
+// change must leave the index exactly as it was before the attempt.
 TEST(veto_rollback_restores_the_cached_field_index) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1422,6 +1573,9 @@ TEST(veto_rollback_restores_the_cached_field_index) {
     CHECK_EQ(s.find(o)->qty, std::int64_t{5});
 }
 
+// Two Views built from different Snapshots of the same object never mix
+// versions: each traverses strictly through the Snapshot it was bound
+// to, even when both ultimately describe the same underlying object.
 TEST(a_view_always_traverses_its_own_snapshot) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1447,6 +1601,8 @@ TEST(a_view_always_traverses_its_own_snapshot) {
     (void)c;
 }
 
+// Snapshot::for_each_view<T>() is type-filtered exactly like for_each<T>(),
+// and each yielded View can chain into a Ref<> field's own View.
 TEST(for_each_view_is_type_filtered) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 5);
@@ -1469,6 +1625,8 @@ TEST(for_each_view_is_type_filtered) {
 // Transaction-local semantics
 // ---------------------------------------------------------------------------
 
+// Model::begin() pins a Transaction's base() to the current committed
+// version, matching a Snapshot taken at the same moment.
 TEST(begin_returns_a_transaction_bound_to_the_current_snapshot) {
     Model m;
     make_account(m, "A1");
@@ -1479,6 +1637,9 @@ TEST(begin_returns_a_transaction_bound_to_the_current_snapshot) {
     CHECK_EQ(txn.base().version(), m.current_version());
 }
 
+// A same-transaction create can reference another same-transaction
+// create via its local placeholder id, and that reference resolves
+// correctly to the REAL id once try_commit() remaps and publishes.
 TEST(transaction_local_creates_can_reference_each_other_via_placeholder_ids) {
     Model m;
     Transaction txn = m.begin();
@@ -1502,6 +1663,9 @@ TEST(transaction_local_creates_can_reference_each_other_via_placeholder_ids) {
     CHECK_EQ(s.resolve(s.find(o_real)->account).name, std::string("A1"));
 }
 
+// A local id is meaningless outside the Transaction that minted it: a
+// second Transaction can't peek/exists/update it, and embedding it in a
+// commit is rejected as Invalid rather than silently misresolving.
 TEST(a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction) {
     Model m;
     Transaction txn1 = m.begin();
@@ -1531,6 +1695,9 @@ TEST(a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction
     CHECK_EQ(m.snapshot().size(), std::size_t{0});  // neither txn1 nor txn2 ever published anything
 }
 
+// The sharper, documented hazard behind the previous test: when two
+// transactions' local counters land on the SAME raw index, the stray id
+// silently aliases the wrong object instead of failing at all.
 TEST(a_local_id_that_collides_with_another_transactions_own_local_index_silently_aliases) {
     Model m;
 
@@ -1564,6 +1731,9 @@ TEST(a_local_id_that_collides_with_another_transactions_own_local_index_silently
     CHECK_EQ(m.snapshot().size(), std::size_t{1});  // only txn2's object was ever real
 }
 
+// A pending update() is visible via txn.peek() immediately, but the
+// committed Snapshot (and state_of()) stays untouched until try_commit()
+// actually publishes.
 TEST(transaction_update_is_visible_locally_without_touching_shared_state) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 10);
@@ -1579,6 +1749,9 @@ TEST(transaction_update_is_visible_locally_without_touching_shared_state) {
     CHECK_EQ(m.snapshot().find(a)->balance, 999);
 }
 
+// Letting a Transaction go out of scope without committing is a
+// complete, silent rollback: every pending create/update it held simply
+// vanishes, and the model is byte-for-byte as if it never existed.
 TEST(dropping_a_transaction_without_committing_touches_no_shared_state) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 5);
@@ -1603,6 +1776,9 @@ TEST(dropping_a_transaction_without_committing_touches_no_shared_state) {
     CHECK_EQ(m.snapshot().find(a)->balance, 5);
 }
 
+// remove() masks its OWN target from the transaction's local view
+// immediately, but the intent doesn't appear in pending_changes() (that
+// list only carries creates/updates) until try_commit() resolves it.
 TEST(remove_intent_is_not_yet_visible_as_deleted_in_pending_changes) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1624,6 +1800,9 @@ TEST(remove_intent_is_not_yet_visible_as_deleted_in_pending_changes) {
     CHECK(m.snapshot().find(o) == nullptr);
 }
 
+// A same-transaction "create X referencing Y, then remove Y" correctly
+// cascades the brand-new X too -- the cascade BFS sees the local create
+// as a real referrer once apply installs it, not just pre-existing ones.
 TEST(same_transaction_create_referencing_an_existing_object_then_remove_of_that_object_cascades_the_new_object_too) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1645,6 +1824,9 @@ TEST(same_transaction_create_referencing_an_existing_object_then_remove_of_that_
     CHECK(m.snapshot().find(res.resolve(o_local)) == nullptr);
 }
 
+// remove()'ing an id that was create()'d earlier in the SAME transaction
+// cancels the create outright -- there is nothing to publish, and the
+// commit is a real no-op, not a create-then-immediate-delete pair.
 TEST(removing_a_locally_created_object_cancels_the_create_outright) {
     Model m;
     Transaction txn = m.begin();
@@ -1664,6 +1846,8 @@ TEST(removing_a_locally_created_object_cancels_the_create_outright) {
 // try_commit correctness: conflicts
 // ---------------------------------------------------------------------------
 
+// The baseline success path: a straightforward create commits, and the
+// returned CommitResult's snapshot/changes reflect that publish.
 TEST(try_commit_of_a_non_conflicting_transaction_succeeds_and_publishes) {
     Model m;
     Transaction txn = m.begin();
@@ -1676,6 +1860,9 @@ TEST(try_commit_of_a_non_conflicting_transaction_succeeds_and_publishes) {
     CHECK_EQ(res.changes.size(), std::size_t{1});
 }
 
+// Two threads committing updates to DIFFERENT ids never conflict with
+// each other -- object-write-set OCC only serializes overlapping writes,
+// not all concurrent writers.
 TEST(two_concurrent_transactions_touching_disjoint_ids_both_succeed) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1", 1);
@@ -1700,6 +1887,9 @@ TEST(two_concurrent_transactions_touching_disjoint_ids_both_succeed) {
     CHECK_EQ(s.find(a2)->balance, 200);
 }
 
+// Two transactions racing an update to the SAME id: the first commit
+// wins, the second is rejected as Conflict/IdSetOverlap, and a fresh
+// retry against the new base succeeds cleanly.
 TEST(two_concurrent_transactions_updating_the_same_id_one_conflicts_with_id_set_overlap) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 0);
@@ -1727,6 +1917,9 @@ TEST(two_concurrent_transactions_updating_the_same_id_one_conflicts_with_id_set_
     CHECK_EQ(m.snapshot().find(a)->balance, 222);
 }
 
+// A concurrent remove() and update() targeting the same id conflict via
+// IdSetOverlap exactly like two updates would -- removal isn't a special
+// case of the id-overlap check.
 TEST(update_conflicts_with_a_concurrent_remove_of_the_same_id) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1744,6 +1937,9 @@ TEST(update_conflicts_with_a_concurrent_remove_of_the_same_id) {
     CHECK(r2.conflict->reason == ConflictReason::IdSetOverlap);
 }
 
+// The headline multi-writer guarantee: see the in-body comment. A
+// transaction that never touched a since-deleted id, but references it
+// via a brand-new object, still fails -- against the LATEST state, not base.
 TEST(ref_integrity_is_revalidated_against_latest_not_just_base) {
     // txn A's base has an Account alive. txn B deletes it and commits first.
     // A never touches that id directly, but references it via a brand-new
@@ -1773,6 +1969,9 @@ TEST(ref_integrity_is_revalidated_against_latest_not_just_base) {
     CHECK(ra.conflict->reason == ConflictReason::RefIntegrity);
 }
 
+// A hub-and-spoke cascade (1 account, 20 dependent orders) kills exactly
+// the expected count in one commit, confirming try_commit()'s deferred
+// cascade resolution matches what an eager, synchronous BFS would do.
 TEST(cascade_delete_resolved_at_commit_time_matches_a_synchronous_bfs) {
     Model m;
     const Ref<Account> hub = make_account(m, "hub");
@@ -1796,6 +1995,9 @@ TEST(cascade_delete_resolved_at_commit_time_matches_a_synchronous_bfs) {
 // Changelog / GC
 // ---------------------------------------------------------------------------
 
+// prune_changelog()'s retention policy: entries accumulate while a
+// Snapshot pins an old watermark, then collapse back down once that
+// Snapshot drops and later commits move the watermark past them.
 TEST(changelog_entries_are_pruned_once_no_open_transaction_or_snapshot_needs_them) {
     Model m;
     make_account(m, "A1");
@@ -1821,6 +2023,11 @@ TEST(changelog_entries_are_pruned_once_no_open_transaction_or_snapshot_needs_the
 // Concurrency stress
 // ---------------------------------------------------------------------------
 
+// The project's primary concurrency invariant test (see CLAUDE.md):
+// many writer threads racing try_commit() on overlapping state, plus
+// readers resolving Refs throughout, must never corrupt referrers_ or
+// publish a dangling Ref -- extend this one rather than adding a new
+// writer-only stress test where the scenario is genuinely the same.
 TEST(concurrent_stress_many_writer_threads_hammering_try_commit_never_corrupts_referrers_or_leaks_a_dangling_ref) {
     Model m;
     std::vector<Ref<Account>> accounts;
@@ -1894,6 +2101,13 @@ TEST(concurrent_stress_many_writer_threads_hammering_try_commit_never_corrupts_r
         [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.raw()); });
 }
 
+// A larger-scale companion to the test above: up to 8 threads (mixed
+// readers and writers) against a 25000+ object corpus, writes touching
+// 5 fields across 2 reference edges (one cascade-delete, one cascade-
+// null) per object, PLUS the first concurrent exercise of the cached-
+// reference index -- readers cross-check find_referrers against
+// find_cached_referrers on every snapshot, and the model must never
+// let the two disagree.
 TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two_of_them_refs) {
     Model m;
 
