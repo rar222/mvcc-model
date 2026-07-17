@@ -15,6 +15,12 @@
 //                           (find_by_cached_field; every match kept, O(log n + matches)).
 //                           Costs one index entry per object per field, maintained on every
 //                           commit -- declare only what's queried often.
+//   define_cached_references()  optional: zero or more Ref<>/Opt<> fields -- ALREADY listed
+//                           in define_references() -- for INDEXED "who points at this?"
+//                           lookup (find_cached_referrers; O(log n + matches) instead of
+//                           for_each_referrer's always-available O(#objects) scan). Same
+//                           cost model as define_cached_fields; declare only what's queried
+//                           often.
 //
 // (type() also exists, for diagnostic messages, but Object<Derived> derives it
 // from typeid() automatically -- there's nothing to override.)
@@ -80,6 +86,21 @@ public:
     static void define_references(Self& s, V&& v) {
         v(model::field_tag<&Order::account>(), "account", s.account);
         v(model::field_tag<&Order::parent>(), "parent", s.parent);
+    }
+
+    /// account is the classic hot reverse lookup ("every Order for this
+    /// Account") -- worth the index. parent is deliberately left OUT: it's
+    /// queried rarely enough that for_each_referrer<&Order::parent>(...)'s
+    /// O(#orders) scan is the better trade (zero write-side cost) -- the same
+    /// "index only what's worth it" tradeoff define_cached_fields() and
+    /// define_scan_fields() apply to plain fields, above. Both account and
+    /// parent are still declared in define_references() regardless -- that's
+    /// what makes them cascade/null correctly; this declaration only adds
+    /// the fast lookup on top of account.
+    template <class Self>
+    static void define_cached_references(Self& s, const model::RefIndexReader& v) {
+        (void)s;
+        v.index<&Order::account>();
     }
 
     template <class Self>

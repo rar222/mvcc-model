@@ -28,15 +28,6 @@ std::string demangle_type_name(const std::type_info& ti) {
 }  // namespace detail
 
 namespace {
-/// Opaque, internal-only string key for Root::by_type / Model::by_type_: an
-/// Id is already unique within its type (and globally), so its raw bytes are
-/// a perfectly good PersistentMap<Id> key -- this index exists purely so
-/// Snapshot::for_each<T>() can enumerate a type's objects in O(#T objects)
-/// without a mandatory user-visible identity key.
-std::string id_key(Id id) {
-    return std::string(reinterpret_cast<const char*>(&id), sizeof(id));
-}
-
 /// The one integrity failure with no real Id to classify against the
 /// transaction's base -- always CommitStatus::Invalid, never a Conflict.
 constexpr const char* kUnmappedLocalMsg =
@@ -496,7 +487,7 @@ void Model::add_cached_fields(const ObjectBase* o) {
         auto prev = by_cached_field_[field];
         const pmap::PersistentMap<Id>* bucket = prev.get(key);
         by_cached_field_[field] =
-            prev.set(key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(id_key(id), id));
+            prev.set(key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
         log([this, field, prev = std::move(prev)]() mutable { by_cached_field_[field] = std::move(prev); });
     });
 }
@@ -507,7 +498,7 @@ void Model::drop_cached_fields(const ObjectBase* o) {
         auto prev = by_cached_field_[field];
         const pmap::PersistentMap<Id>* bucket = prev.get(key);
         if (!bucket) return;
-        auto nb = bucket->erase(id_key(id));
+        auto nb = bucket->erase(detail::id_key(id));
         // An emptied bucket is dropped outright, so a value with no remaining
         // holders doesn't leave a tombstone entry behind.
         by_cached_field_[field] = nb.empty() ? prev.erase(key) : prev.set(key, nb);
@@ -528,14 +519,79 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
         auto cur = prev;
         if (it != old_keys.end()) {
             if (const pmap::PersistentMap<Id>* ob = cur.get(it->second)) {
-                auto nb = ob->erase(id_key(id));
+                auto nb = ob->erase(detail::id_key(id));
                 cur = nb.empty() ? cur.erase(it->second) : cur.set(it->second, nb);
             }
         }
         const pmap::PersistentMap<Id>* bucket = cur.get(new_key);
-        cur = cur.set(new_key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(id_key(id), id));
+        cur = cur.set(new_key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
         by_cached_field_[field] = std::move(cur);
         log([this, field, prev = std::move(prev)]() mutable { by_cached_field_[field] = std::move(prev); });
+    });
+}
+
+// The cached-reference (reverse multimap) index -- the read-side counterpart
+// of referrers_, opt-in per Ref<>/Opt<> field via define_cached_references().
+// Same persistent-bucket discipline as the cached-field trio above (never a
+// flat vector; every mutation undo-logged), keyed by the TARGET's Id bytes
+// instead of a field's value, storing the REFERRER's Id in each bucket.
+// each_cached_reference() already filters to just the declared fields, so
+// these never do anything for a field not opted in.
+
+void Model::add_cached_references(const ObjectBase* o) {
+    const Id id = o->id;
+    o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
+        if (!target) return;  // Opt<> currently null: nothing to index
+        auto prev = by_cached_reference_[field];
+        const pmap::PersistentMap<Id>* bucket = prev.get(detail::id_key(target));
+        by_cached_reference_[field] = prev.set(
+            detail::id_key(target), (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        log([this, field, prev = std::move(prev)]() mutable { by_cached_reference_[field] = std::move(prev); });
+    });
+}
+
+void Model::drop_cached_references(const ObjectBase* o) {
+    const Id id = o->id;
+    o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
+        if (!target) return;
+        auto prev = by_cached_reference_[field];
+        const pmap::PersistentMap<Id>* bucket = prev.get(detail::id_key(target));
+        if (!bucket) return;
+        auto nb = bucket->erase(detail::id_key(id));
+        // An emptied bucket is dropped outright, so a target with no
+        // remaining referrers doesn't leave a tombstone entry behind.
+        by_cached_reference_[field] =
+            nb.empty() ? prev.erase(detail::id_key(target)) : prev.set(detail::id_key(target), nb);
+        log([this, field, prev = std::move(prev)]() mutable { by_cached_reference_[field] = std::move(prev); });
+    });
+}
+
+void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBase* after) {
+    const Id id = after->id;
+    std::unordered_map<const void*, Id> old_targets;
+    before->each_cached_reference(
+        [&](const void* field, const char*, Id target, bool) { old_targets[field] = target; });
+
+    after->each_cached_reference([&](const void* field, const char*, Id new_target, bool) {
+        const auto it = old_targets.find(field);
+        const Id old_target = (it != old_targets.end()) ? it->second : Id{};
+        if (new_target == old_target) return;  // unchanged (incl. both still null)
+
+        auto prev = by_cached_reference_[field];
+        auto cur = prev;
+        if (old_target) {
+            if (const pmap::PersistentMap<Id>* ob = cur.get(detail::id_key(old_target))) {
+                auto nb = ob->erase(detail::id_key(id));
+                cur = nb.empty() ? cur.erase(detail::id_key(old_target)) : cur.set(detail::id_key(old_target), nb);
+            }
+        }
+        if (new_target) {
+            const pmap::PersistentMap<Id>* bucket = cur.get(detail::id_key(new_target));
+            cur = cur.set(detail::id_key(new_target),
+                          (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        }
+        by_cached_reference_[field] = std::move(cur);
+        log([this, field, prev = std::move(prev)]() mutable { by_cached_reference_[field] = std::move(prev); });
     });
 }
 
@@ -614,12 +670,13 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
     // enumeration index, unconditionally -- this is what for_each<T>() scans.
     const TypeTag tag = raw->tag();
     auto prev_sub = by_type_[tag];
-    by_type_[tag] = prev_sub.set(id_key(id), id);
+    by_type_[tag] = prev_sub.set(detail::id_key(id), id);
     log([this, tag, prev_sub = std::move(prev_sub)]() mutable { by_type_[tag] = std::move(prev_sub); });
 
     add_out_refs(raw);
     add_field_keys(raw);
     add_cached_fields(raw);
+    add_cached_references(raw);
 
     changes_.push_back({id, ChangeKind::Created, tag});
     log([this] { changes_.pop_back(); });
@@ -677,6 +734,7 @@ std::optional<Model::IntegrityError> Model::apply_update(std::unique_ptr<ObjectB
     reconcile_referrer_edges(baseline, raw);
     reconcile_field_keys(baseline, raw);
     reconcile_cached_fields(baseline, raw);
+    reconcile_cached_references(baseline, raw);
     return std::nullopt;
 }
 
@@ -736,6 +794,7 @@ std::vector<Id> Model::remove_raw(Id id) {
                     reconcile_referrer_edges(baseline, m);
                     reconcile_field_keys(baseline, m);
                     reconcile_cached_fields(baseline, m);
+                    reconcile_cached_references(baseline, m);
                 }
             } else {
                 work.push_back(e.from);  // dies with its target
@@ -762,11 +821,12 @@ std::vector<Id> Model::remove_raw(Id id) {
 
         const TypeTag tag = victim->tag();
         auto prev_sub = by_type_[tag];
-        by_type_[tag] = prev_sub.erase(id_key(x));
+        by_type_[tag] = prev_sub.erase(detail::id_key(x));
         log([this, tag, prev_sub = std::move(prev_sub)]() mutable { by_type_[tag] = std::move(prev_sub); });
 
         drop_field_keys(victim);
         drop_cached_fields(victim);
+        drop_cached_references(victim);
 
         set_slot(x.index, nullptr, x.gen);  // logs restore of victim + its gen
 
@@ -921,6 +981,7 @@ CommitResult Model::try_commit(Transaction& txn) {
     r->by_type = by_type_;    // O(#types): each per-type submap is shared, not copied.
     r->by_field = by_field_;  // O(#indexed fields): same reasoning.
     r->by_cached_field = by_cached_field_;  // O(#cached fields): ditto.
+    r->by_cached_reference = by_cached_reference_;  // O(#cached ref fields): ditto.
 
     Snapshot pub;
     {

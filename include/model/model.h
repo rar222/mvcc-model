@@ -122,6 +122,18 @@ inline bool is_local(Id id) noexcept {
     return (id.index & kLocalIdBit) != 0;
 }
 
+namespace detail {
+/// Opaque, internal-only string encoding of an Id's raw bytes -- never a
+/// user-visible string. An Id is already unique (index + generation), so
+/// its bytes are a perfectly good PersistentMap key with no extra hashing
+/// collisions to worry about. Used for every index keyed by IDENTITY rather
+/// than by a declared field's value: Root::by_type, and the inner buckets
+/// of Root::by_cached_field / Root::by_cached_reference.
+inline std::string id_key(Id id) {
+    return std::string(reinterpret_cast<const char*>(&id), sizeof(id));
+}
+}  // namespace detail
+
 // ---------------------------------------------------------------------------
 // Type tags -- a cheap, RTTI-free checked downcast
 // ---------------------------------------------------------------------------
@@ -342,6 +354,27 @@ struct RefRemapper {
     }
 };
 
+/// Callback shape for declaring WHICH Ref<>/Opt<> fields -- already listed in
+/// define_references() -- should also get a reverse-lookup index. See
+/// define_cached_references() and Snapshot::find_cached_referrers.
+using RefIndexFn = std::function<void(const void* field)>;
+
+/// Visitor for define_cached_references(): `v.index<&Order::account>()`
+/// marks that field for the index. No value to supply -- unlike
+/// FieldKeyReader::key(), this is pure metadata (WHICH field, not what
+/// value it holds right now), so define_cached_references() must not read
+/// instance state: Object<Derived> calls it once per TYPE (a function-local
+/// static caches the result), not once per object, and if it happened to
+/// return something different for a different instance, only the FIRST
+/// caller's answer would ever be used.
+struct RefIndexReader {
+    const RefIndexFn& fn;
+    template <auto Field>
+    void index() const {
+        fn(field_tag<Field>());
+    }
+};
+
 /// Callback shape for enumerating a type's declared lookup fields (see
 /// ObjectBase::each_field_key / each_cached_field / each_scan_field): the
 /// field's identity tag plus its value in canonical string form
@@ -417,6 +450,13 @@ struct has_define_scan_fields : std::false_type {};
 template <class D>
 struct has_define_scan_fields<D, std::void_t<decltype(D::define_scan_fields(
                                      std::declval<const D&>(), std::declval<const FieldKeyReader&>()))>>
+    : std::true_type {};
+
+template <class D, class = void>
+struct has_define_cached_references : std::false_type {};
+template <class D>
+struct has_define_cached_references<D, std::void_t<decltype(D::define_cached_references(
+                                          std::declval<const D&>(), std::declval<const RefIndexReader&>()))>>
     : std::true_type {};
 
 /// Demangles a typeid name for use as a diagnostic label (Object<Derived>::type()).
@@ -498,6 +538,16 @@ public:
     /// that keeps the three lookup families uniform (undeclared == invisible
     /// to the lookup). See Object<>.
     virtual void each_scan_field(const FieldKeyFn&) const {}
+
+    /// The reverse-index SUBSET of each_ref(): only the Ref<>/Opt<> fields
+    /// declared in define_cached_references(), for indexed "who points at
+    /// this?" lookup (Snapshot::find_cached_referrers) -- the read-side
+    /// counterpart of the writer-private referrers_ index (that one can
+    /// never be handed to a reader; see CLAUDE.md invariant 8). Same
+    /// diff-at-apply-time maintenance discipline as each_cached_field, just
+    /// keyed by the field's TARGET instead of an arbitrary value. See
+    /// Object<> for the contract and the cost model.
+    virtual void each_cached_reference(const RefFn&) const {}
 };
 
 /// CRTP base. Derive from it and declare your reference fields ONCE, in
@@ -567,6 +617,24 @@ public:
 /// (define_cached_fields is declared identically; a field may appear in more
 /// than one family.) The fully undeclared escape hatch remains the
 /// Snapshot::find_all() predicate scan.
+///
+/// A FOURTH family, structurally different (it indexes by TARGET, not by
+/// value, and only applies to Ref<>/Opt<> fields already listed in
+/// define_references()): define_cached_references() -> find_cached_referrers
+/// / view_cached_referrers, the indexed O(log n + #matches) alternative to
+/// the always-available for_each_referrer / find_referrers O(#T) scan.
+/// Declare only the field's IDENTITY (define_references() already supplies
+/// the target and nullability):
+///
+///     template <class Self>
+///     static void define_cached_references(Self& s, const model::RefIndexReader& v) {
+///         v.index<&Order::account>();  // find_cached_referrers<&Order::account>(acct)
+///     }
+///
+/// Same cost model as define_cached_fields (one index entry per object per
+/// declared reference field, maintained every commit) -- so cache the
+/// references that get queried often (e.g. "every Order for this Account"),
+/// and leave rarely-queried ones (a nullable `parent`, say) on the scan.
 template <class Derived>
 class Object : public ObjectBase {
 public:
@@ -609,6 +677,29 @@ public:
     void each_scan_field(const FieldKeyFn& fn) const override {
         if constexpr (detail::has_define_scan_fields<Derived>::value)
             Derived::define_scan_fields(static_cast<const Derived&>(*this), FieldKeyReader{fn});
+    }
+
+    void each_cached_reference(const RefFn& fn) const override {
+        if constexpr (detail::has_define_cached_references<Derived>::value) {
+            // Computed once per Derived, not once per object: define_cached_
+            // references() is required to be pure metadata (see
+            // RefIndexReader), so any instance's answer is every instance's
+            // answer -- a function-local static (thread-safe init) is exactly
+            // the "compute once per type" tool already used for type()'s
+            // demangled name above.
+            static const std::unordered_set<const void*> wanted = [this] {
+                std::unordered_set<const void*> w;
+                RefIndexFn collect = [&](const void* f) { w.insert(f); };
+                Derived::define_cached_references(static_cast<const Derived&>(*this), RefIndexReader{collect});
+                return w;
+            }();
+            if constexpr (detail::has_define_references<Derived>::value) {
+                RefFn filtered = [&](const void* field, const char* name, Id target, bool nullable) {
+                    if (wanted.count(field)) fn(field, name, target, nullable);
+                };
+                Derived::define_references(static_cast<const Derived&>(*this), RefReader{filtered});
+            }
+        }
     }
 };
 
@@ -684,6 +775,18 @@ struct Root {
     /// for a low-cardinality field (a status, a category) is O(n) per op --
     /// the exact size-proportional cost this design exists to avoid.
     std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_field;
+
+    /// One persistent MULTIMAP per define_cached_references()-declared
+    /// Ref<>/Opt<> field: TARGET's Id bytes -> a persistent set of every
+    /// REFERRER's Id whose field currently points there. Same bucket
+    /// discipline as by_cached_field (persistent map buckets, never flat
+    /// vectors -- a hub object referenced by thousands would otherwise make
+    /// every one of those referrers' commits O(#referrers)). This is the
+    /// published, read-side counterpart of the writer-private referrers_
+    /// (Model::referrers_): that index drives cascade delete and can never
+    /// be handed to a reader (CLAUDE.md invariant 8), so a field worth fast
+    /// reverse lookup needs this SEPARATE, opt-in structure.
+    std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_reference;
 };
 
 class Model;
@@ -894,7 +997,10 @@ public:
     /// `s.for_each_referrer<&Order::account>(acct, f)`. The class is deduced
     /// from the field, and `target`'s required type (exactly the field's own
     /// Ref<U>/Opt<U>::target_type) is enforced by the parameter type itself,
-    /// not a runtime static_assert.
+    /// not a runtime static_assert. Works on ANY Ref<>/Opt<> field, declared
+    /// cached or not -- for one queried often enough to be worth an index,
+    /// declare it in define_cached_references() and use
+    /// find_cached_referrers instead.
     template <auto Field, class F>
     void for_each_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
                            F&& f) const {
@@ -922,6 +1028,33 @@ public:
     /// View-returning form of find_referrers.
     template <auto Field>
     std::vector<View<member_class_t<decltype(Field)>>> find_referrers_view(
+        Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
+
+    /// INDEXED counterpart of find_referrers: O(log n + #matches) instead of
+    /// O(#ClassT objects), backed by Root::by_cached_reference. Only works
+    /// for a field declared in define_cached_references() -- empty
+    /// otherwise, same "undeclared is invisible" rule as find_by_cached_field
+    /// (there is no silent fallback to the scan; call find_referrers by name
+    /// for that). Named the same way: `s.find_cached_referrers<&Order::account>(acct)`.
+    template <auto Field>
+    std::vector<const member_class_t<decltype(Field)>*> find_cached_referrers(
+        Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
+        using ClassT = member_class_t<decltype(Field)>;
+        std::vector<const ClassT*> out;
+        if (!root_) return out;
+        auto it = root_->by_cached_reference.find(field_tag<Field>());
+        if (it == root_->by_cached_reference.end()) return out;
+        const pmap::PersistentMap<Id>* bucket = it->second.get(detail::id_key(target.raw()));
+        if (!bucket) return out;
+        bucket->for_each([&](const std::string&, Id id) {
+            if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
+        });
+        return out;
+    }
+
+    /// View-returning form of find_cached_referrers.
+    template <auto Field>
+    std::vector<View<member_class_t<decltype(Field)>>> view_cached_referrers(
         Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
 
     // ---- views ------------------------------------------------------------
@@ -1276,6 +1409,13 @@ private:
     void drop_cached_fields(const ObjectBase* o);
     void reconcile_cached_fields(const ObjectBase* before, const ObjectBase* after);
 
+    // Same trio again, for the reverse-lookup multimap (by_cached_reference_)
+    // -- keyed by each declared field's TARGET, walked via
+    // each_cached_reference() instead of each_cached_field().
+    void add_cached_references(const ObjectBase* o);
+    void drop_cached_references(const ObjectBase* o);
+    void reconcile_cached_references(const ObjectBase* before, const ObjectBase* after);
+
     /// Mark an object invisible from the NEXT version on; the reaper frees
     /// it once no live snapshot is older than that (invariant 4). Never
     /// delete a published object directly.
@@ -1384,6 +1524,7 @@ private:
     std::unordered_map<TypeTag, pmap::PersistentMap<Id>> by_type_;
     std::unordered_map<const void*, pmap::PersistentMap<Id>> by_field_;
     std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_field_;
+    std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_reference_;
 
     /// The reverse index driving cascade delete: target SLOT (bare index --
     /// only the live generation of a slot can ever be referenced, so the
@@ -1903,6 +2044,15 @@ std::vector<View<member_class_t<decltype(Field)>>> Snapshot::find_referrers_view
     using ClassT = member_class_t<decltype(Field)>;
     std::vector<View<ClassT>> out;
     for_each_referrer_view<Field>(target, [&](View<ClassT> v) { out.push_back(v); });
+    return out;
+}
+
+template <auto Field>
+std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_cached_referrers(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    std::vector<View<ClassT>> out;
+    for (const ClassT* p : find_cached_referrers<Field>(target)) out.push_back(View<ClassT>(*this, *p));
     return out;
 }
 

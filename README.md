@@ -77,6 +77,16 @@ public:
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
         v.key<&Order::computed_key>(s.computed_key());
     }
+
+    // Multi-match lookups are separate, opt-in declarations -- see below.
+    template <class Self>
+    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Order::qty>(s.qty);      // find_by_scan_field: every match, O(#objects) scan
+    }
+    template <class Self>
+    static void define_cached_references(Self& s, const model::RefIndexReader& v) {
+        v.index<&Order::account>();     // find_cached_referrers: every match, O(log n + matches)
+    }
 };
 
 // 2. Any thread: begin a transaction, mutate it locally, try to commit.
@@ -107,6 +117,11 @@ const Account& owner = s.resolve(x->account);         // Ref<Account> -> const A
 const Order*   dad   = s.resolve(x->parent);          // Opt<Order>   -> const Order*
 
 s.for_each<Order>([&](const Order& o) { /* type-filtered iteration */ });
+
+// Multi-match: every order with qty == 5 (unindexed scan)...
+std::vector<const Order*> q5 = s.find_by_scan_field<&Order::qty>(5);
+// ...vs. every order FOR this account (indexed -- see define_cached_references above).
+std::vector<const Order*> mine = s.find_cached_referrers<&Order::account>(acct);
 
 // 3b. Views work exactly as before -- scoped to a Snapshot, not a Transaction.
 auto v = *s.view_by_key<&Order::computed_key>("ord:O1");
@@ -141,6 +156,19 @@ state and takes no lock, so any number of threads can build concurrently with ze
 contention. *Applying* is not parallel: `examples/commit_bench.cpp`'s thread-count sweep
 shows this plainly (throughput does not scale linearly with writer threads). That's the
 tradeoff this design makes, not an oversight.
+
+**Multi-match lookups are opt-in, and cost is why.** Beyond `define_keys()` (unique,
+indexed, `find_by_key`), a type can declare `define_scan_fields()` for "every match" via an
+O(#objects) scan — costs nothing until you call it — or `define_cached_fields()` /
+`define_cached_references()` for "every match" via a persistent index (`find_by_cached_field`
+/ `find_cached_referrers`), O(log n + matches) per query. The indexed forms aren't free: each
+declared field costs roughly one extra index entry per object, upkept inside the serialized
+`try_commit()` apply phase on every create, delete, and value change — the same write-side
+tax `by_type` already pays, just per declared field instead of per object. That's why it's
+opt-in rather than automatic: index only the fields actually queried often, and leave the
+rest on the scan (or on nothing at all — `find_all()`'s predicate scan and
+`for_each_referrer()` always work, undeclared or not, just at O(#objects) per call instead of
+paid for once per commit).
 
 ## Layout
 

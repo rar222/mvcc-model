@@ -154,6 +154,38 @@ Ref<Gadget> make_gadget(Model& m, const std::string& label, std::int64_t serial)
     return commit_ok(m, txn).resolve(local);
 }
 
+/// Self-referential, with a CACHED nullable reference. Order::parent (the
+/// shared demo type's analogous field) is deliberately left OUT of
+/// define_cached_references() to demonstrate the "index only what's worth
+/// it" tradeoff -- so testing the cascade-NULL maintenance path of
+/// Model::reconcile_cached_references needs a field that actually IS cached
+/// and nullable. Node exists purely for that.
+class Node final : public model::Object<Node> {
+public:
+    std::string label;
+    model::Opt<Node> parent;
+
+    template <class Self, class V>
+    static void define_references(Self& s, V&& v) {
+        v(model::field_tag<&Node::parent>(), "parent", s.parent);
+    }
+
+    template <class Self>
+    static void define_cached_references(Self& s, const model::RefIndexReader& v) {
+        (void)s;
+        v.index<&Node::parent>();
+    }
+};
+
+Ref<Node> make_node(Model& m, const std::string& label, Opt<Node> parent = Opt<Node>{}) {
+    Transaction txn = m.begin();
+    auto n = std::make_unique<Node>();
+    n->label = label;
+    n->parent = parent;
+    const Ref<Node> local = txn.create(std::move(n));
+    return commit_ok(m, txn).resolve(local);
+}
+
 Ref<Order> make_order(Model& m, const std::string& code, Ref<Account> account,
                       Opt<Order> parent = Opt<Order>{}, std::int64_t qty = 1) {
     Transaction txn = m.begin();
@@ -1215,6 +1247,117 @@ TEST(find_by_cached_field_tracks_creates_updates_and_cascades_and_is_versioned) 
     Snapshot after = m.snapshot();
     CHECK(after.find_by_cached_field<&Order::qty>(5).empty());
     CHECK(after.find_by_cached_field<&Order::qty>(7).empty());
+}
+
+TEST(find_cached_referrers_matches_the_slow_scan_and_tracks_updates_and_is_versioned) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Order> o1 = make_order(m, "O1", a1);
+    make_order(m, "O2", a1);
+    make_order(m, "O3", a2);
+
+    Snapshot before = m.snapshot();
+    // The indexed and scan forms agree on every account, empty included.
+    for (Ref<Account> a : {a1, a2, Ref<Account>(make_account(m, "A3"))}) {
+        auto fast = before.find_cached_referrers<&Order::account>(a);
+        auto slow = before.find_referrers<&Order::account>(a);
+        CHECK_EQ(fast.size(), slow.size());
+        for (const Order* o : fast) CHECK(std::find(slow.begin(), slow.end(), o) != slow.end());
+    }
+    CHECK_EQ(before.find_cached_referrers<&Order::account>(a1).size(), std::size_t{2});
+
+    // Reassigning account moves the entry between buckets (reconcile).
+    {
+        Transaction txn = m.begin();
+        txn.update(o1)->account = a2;
+        commit_ok(m, txn);
+    }
+    Snapshot mid = m.snapshot();
+    CHECK_EQ(mid.find_cached_referrers<&Order::account>(a1).size(), std::size_t{1});
+    CHECK_EQ(mid.find_cached_referrers<&Order::account>(a2).size(), std::size_t{2});
+    // Versioned like everything else: the old snapshot still sees the old split.
+    CHECK_EQ(before.find_cached_referrers<&Order::account>(a1).size(), std::size_t{2});
+
+    // The view form traverses like any other view.
+    auto views = mid.view_cached_referrers<&Order::account>(a2);
+    CHECK_EQ(views.size(), std::size_t{2});
+    for (const auto& v : views) CHECK_EQ(v[&Order::account]->name, std::string("A2"));
+
+    // Removing o1 directly (no cascade) drops it from its bucket cleanly.
+    remove_and_commit(m, o1);
+    CHECK_EQ(m.snapshot().find_cached_referrers<&Order::account>(a2).size(), std::size_t{1});
+}
+
+TEST(find_cached_referrers_tracks_cascade_delete) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o1 = make_order(m, "O1", a);
+    make_order(m, "O2", a);
+    CHECK_EQ(m.snapshot().find_cached_referrers<&Order::account>(a).size(), std::size_t{2});
+
+    // Removing an order directly drops it from its own outgoing bucket.
+    remove_and_commit(m, o1);
+    CHECK_EQ(m.snapshot().find_cached_referrers<&Order::account>(a).size(), std::size_t{1});
+
+    // Deleting the account (Ref<Account> is non-nullable) cascades: the
+    // remaining order dies too, and the account's own bucket empties out --
+    // no tombstone left behind.
+    remove_and_commit(m, a);
+    CHECK(m.snapshot().find_cached_referrers<&Order::account>(a).empty());
+}
+
+TEST(find_cached_referrers_tracks_cascade_null) {
+    // Order::parent is deliberately NOT cached (see demo/types.h), so the
+    // cascade-null path of Model::reconcile_cached_references needs a
+    // CACHED nullable field to exercise -- Node, declared just above, exists
+    // purely for this.
+    Model m;
+    const Ref<Node> root = make_node(m, "root");
+    const Ref<Node> child = make_node(m, "child", root);
+    CHECK_EQ(m.snapshot().find_cached_referrers<&Node::parent>(root).size(), std::size_t{1});
+
+    // Deleting `root` (Opt<Node> is nullable) nulls -- does not kill --
+    // `child`, moving child's index entry out of root's bucket.
+    remove_and_commit(m, root);
+    Snapshot s = m.snapshot();
+    CHECK(s.find(child) != nullptr);
+    CHECK(!s.find(child)->parent);
+    CHECK(s.find_cached_referrers<&Node::parent>(root).empty());
+}
+
+TEST(find_cached_referrers_is_empty_for_a_field_never_declared_cached) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> hub = make_order(m, "HUB", a);
+    make_order(m, "C1", a, hub);
+
+    // parent IS declared in define_references() (so it cascades/nulls
+    // correctly) but deliberately NOT in define_cached_references() -- see
+    // demo/types.h. The slow scan still finds it; the indexed form is
+    // invisible to it, same "undeclared is invisible" rule the other three
+    // lookup families share -- there is no silent fallback to the scan.
+    CHECK(!m.snapshot().find_referrers<&Order::parent>(hub).empty());
+    CHECK(m.snapshot().find_cached_referrers<&Order::parent>(hub).empty());
+}
+
+TEST(veto_rollback_restores_the_cached_reference_index) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Order> o = make_order(m, "O1", a1);
+
+    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    Transaction txn = m.begin();
+    txn.update(o)->account = a2;
+    CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
+    m.set_pre_commit({});
+
+    make_account(m, "UNRELATED");  // publish a fresh root carrying the index
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.find_cached_referrers<&Order::account>(a1).size(), std::size_t{1});
+    CHECK(s.find_cached_referrers<&Order::account>(a2).empty());
+    CHECK(s.find(o)->account == a1);
 }
 
 TEST(veto_rollback_restores_the_cached_field_index) {

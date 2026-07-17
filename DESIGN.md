@@ -49,16 +49,22 @@ publishes through the exact same immutable, COW `Root`.
 ## Structure
 
 ```
-Root  { version, spine, by_type, by_field }    immutable, published atomically
-  spine    : vector<shared_ptr<const Chunk>>      ~n/256 entries; copied whole per commit
-  Chunk    : 256 x const ObjectBase*              COW; copied only when dirtied
-             256 x uint32 generation
-  by_type  : unordered_map<TypeTag, PersistentMap<Id>>   internal, Id-keyed: what for_each<T>() scans
-  by_field : unordered_map<field_tag, PersistentMap<Id>> lookup index, see define_keys()
+Root { version, spine, by_type, by_field, by_cached_field, by_cached_reference }
+  spine             : vector<shared_ptr<const Chunk>>   ~n/256 entries; copied whole per commit
+  Chunk             : 256 x const ObjectBase*            COW; copied only when dirtied
+                       256 x uint32 generation
+  by_type           : unordered_map<TypeTag, PersistentMap<Id>>
+                       internal, Id-keyed: what for_each<T>() scans
+  by_field          : unordered_map<field_tag, PersistentMap<Id>>
+                       unique lookup index, see define_keys()
+  by_cached_field   : unordered_map<field_tag, PersistentMap<PersistentMap<Id>>>
+                       multi-match index, see define_cached_fields()
+  by_cached_reference : unordered_map<field_tag, PersistentMap<PersistentMap<Id>>>
+                       reverse-lookup index, see define_cached_references()
 ```
 
-A read is `spine[k >> 8]->obj[k & 0xff]` — an array index. No hashing, no trie walk, one
-cache miss.
+All published atomically as one immutable `Root`. A read is `spine[k >> 8]->obj[k & 0xff]`
+— an array index. No hashing, no trie walk, one cache miss.
 
 ### Identity
 
@@ -78,6 +84,42 @@ cascade (`RefNuller`) has *no overload* that can clear a `Ref<T>`. A type's
 A reference is still just an `Id` underneath; it resolves through a `Snapshot`, never itself.
 The alternative — a "fat" ref carrying a pointer to its snapshot root — means every stored
 ref pins a snapshot alive, stalling reclamation.
+
+### Lookup families: unique, scan, and cached
+
+`define_keys()` is the baseline index: one `PersistentMap<Id>` per declared field, UNIQUE (a
+duplicate value silently overwrites the earlier one), O(log n) via `find_by_key`. Everything
+past that is "give me every match," and comes in two different costs, not one:
+
+- **`define_scan_fields()` → `find_by_scan_field`.** No index at all — the declaration is
+  purely a *visibility gate* (an undeclared field returns empty, same rule every family
+  shares), and the lookup itself is an O(#objects) linear scan comparing the field's real
+  typed value. Zero write-side cost: nothing is touched at commit time. Right choice for a
+  field queried rarely enough that paying per-query beats paying per-commit.
+- **`define_cached_fields()` / `define_cached_references()` → `find_by_cached_field` /
+  `find_cached_referrers`.** A real index: `PersistentMap<PersistentMap<Id>>`, outer key the
+  field's own value (or, for a reference field, the *target's* `Id`), inner map a persistent
+  *set* of every matching object's `Id`. The inner map is deliberately a `PersistentMap`
+  bucket, never a flat `vector<Id>` — a flat bucket would make every mutation of a
+  low-cardinality value (a status, a category, a popular hub object) O(#objects sharing that
+  value), which is exactly the size-proportional cost this whole design exists to avoid. A
+  `PersistentMap` bucket keeps every mutation O(log n) regardless of how many objects share
+  the key. Maintained by the same three-function shape as every other index in this design
+  (`add_*`/`drop_*`/`reconcile_*`, undo-logged like everything else `try_commit()` touches),
+  wired into all four apply-phase sites that can change membership: create, update
+  (reconcile), cascade-null (reconcile), and cascade-delete (drop).
+
+`define_cached_references()` is the read-side counterpart of `referrers_` (below): same
+"who points at this?" question, but published and O(log n + matches) instead of
+writer-private and O(1)-but-never-exposed. It only ever indexes fields already listed in
+`define_references()` — it supplies no value of its own (the target and nullability are
+already known from that list), just which fields are worth the index.
+
+The cost of a cached field or cached reference is real: roughly one index entry per object
+per declared field, upkept inside `commit_mu_` on every commit that touches it — the same
+tax `by_type` already pays per object, just per declared field on top. That is why these are
+opt-in rather than automatic, and why the scan family exists at all: index only what gets
+queried often at scale; leave the rest on the always-correct, zero-upkeep scan.
 
 ## Multi-writer optimistic concurrency
 
@@ -166,7 +208,10 @@ Unchanged in mechanism from the single-writer sibling, just re-homed: `Model::va
 rejects any object whose non-nullable refs are null or point at something dead, and it is
 called from inside `try_commit()`'s apply phase against current state. The reverse index
 (`Id -> [(referrer, field, nullable)]`) is still plain mutable state — it just now requires
-`commit_mu_` instead of "only one thread exists" to be safe to touch.
+`commit_mu_` instead of "only one thread exists" to be safe to touch, and it is still
+writer-private: it can never be handed to a reader (that's the whole reason
+`define_cached_references()` — see "Lookup families" above — exists as a *separate*,
+published structure for the fields worth exposing that way).
 
 **Cascade fan-out is still unbounded and invisible to the caller** — same open TODO as the
 single-writer sibling (a two-phase plan/apply for `remove()` would help both projects
