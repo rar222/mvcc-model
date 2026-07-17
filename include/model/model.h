@@ -79,6 +79,11 @@ struct Id {
     std::uint32_t gen = 0;    ///< which lifetime of that slot; 0 means null
 
     explicit operator bool() const noexcept { return gen != 0; }  ///< non-null?
+
+    /// Memberwise (index AND gen). Deliberately not just index: two Ids with
+    /// the same slot but different generations name DIFFERENT objects (one
+    /// dead, recycled since) and must never compare equal -- that's the
+    /// whole reason gen exists (see the struct comment).
     friend bool operator==(Id, Id) noexcept = default;
 };
 
@@ -231,6 +236,10 @@ public:
     Id raw() const noexcept { return id_; }
     explicit operator bool() const noexcept { return static_cast<bool>(id_); }  ///< non-null?
 
+    /// Same-target comparison, by Id value (index AND generation) -- not by
+    /// which object each side happens to currently resolve to (there may be
+    /// none, if either side is stale). Two Refs from different snapshots can
+    /// legitimately compare equal or unequal without either being resolved.
     friend bool operator==(Ref, Ref) noexcept = default;
 
 private:
@@ -257,6 +266,8 @@ public:
     Id raw() const noexcept { return id_; }  ///< the untyped Id; see Ref::raw()
     explicit operator bool() const noexcept { return static_cast<bool>(id_); }  ///< non-null?
 
+    /// Same-target comparison, by Id value -- see Ref::operator==. Two nulls
+    /// (both default-constructed, or one reset()) always compare equal.
     friend bool operator==(Opt, Opt) noexcept = default;
 
 private:
@@ -1089,11 +1100,19 @@ public:
     /// new Transaction's base(), same as Model::begin(Snapshot) does.
     Transaction begin() const;
 
-    /// Untyped escape hatch -- for change events, which are heterogeneous. The
-    /// key is only unique within `field`'s own keyspace (see field_tag), so
-    /// the field must be supplied; there is no single global keyspace to
-    /// search without it.
+    /// Untyped escape hatch -- for change events, which are heterogeneous
+    /// (a Change::id could be any type). Generation-checked exactly like the
+    /// typed find()/resolve() built on it: null for an absent slot OR a
+    /// stale id whose generation no longer matches (see Chunk::gen). Prefer
+    /// find<T>()/resolve<T>() when you know the type -- this is what they
+    /// call underneath, before the tag check.
     const ObjectBase* find_raw(Id id) const noexcept;
+
+    /// Untyped counterpart of find_by_key -- the `key` string is only unique
+    /// within `field`'s own keyspace (see field_tag), never global, so the
+    /// field must be supplied to disambiguate. Used where the field isn't
+    /// known at compile time; find_by_key<Field>(value) is the typed,
+    /// preferred entry point that calls this.
     const ObjectBase* find_by_key_raw(const void* field, const std::string& key) const;
 
 private:
@@ -1816,6 +1835,14 @@ private:
     /// a pinned base to read through.
     Transaction(Model* m, Snapshot base) : model_(m), base_(std::move(base)) {}
 
+    /// Untyped body of update()/update(): local id -> the already-owned
+    /// local_created_ entry (create()-then-update() in the same txn, no new
+    /// clone needed); real id already touched this txn -> the existing
+    /// clone; otherwise clone base()'s value into local_updated_, remember
+    /// the pre-edit baseline (peek_before()) and record the pending change.
+    /// Null for a masked (remove()-intended) or nonexistent id. The clone
+    /// happens AT MOST ONCE per id per transaction -- repeated update()
+    /// calls on the same id return the SAME clone, so writes accumulate.
     ObjectBase* update_impl(Id id) {
         if (is_local(id)) {
             const std::uint32_t idx = id.index & ~kLocalIdBit;
@@ -1842,6 +1869,11 @@ private:
         return raw;
     }
 
+    /// Untyped body of remove()/remove(): for a LOCAL id, cancels the
+    /// create() outright -- drops the owned object and scrubs it from
+    /// pending_changes() -- since nothing has ever been published for it to
+    /// reference. For a real id, just records the intent (remove_intents_);
+    /// no cascade work happens here, see the class-level remove() doc for why.
     void remove_impl(Id id) {
         if (is_local(id)) {
             const std::uint32_t idx = id.index & ~kLocalIdBit;
@@ -1855,6 +1887,12 @@ private:
         remove_intents_.insert(id);
     }
 
+    /// Untyped body of peek()/peek()/peek_as(): resolves `id` against this
+    /// transaction's local overlay first (a local create, or an already-
+    /// cloned update), falls through to base() only if neither applies, and
+    /// is masked to null by a pending remove() intent regardless of what
+    /// base() would say. The final tag check is what makes peek_as<T> safe
+    /// to call on an untyped Change::id without a separate cast.
     template <class T>
     const T* peek_impl(Id id) const {
         const ObjectBase* o = nullptr;
@@ -1932,6 +1970,12 @@ inline const ObjectBase* Snapshot::find_raw(Id id) const noexcept {
 template <class T>
 class View {
 public:
+    /// Pairs an object with the snapshot it came from -- unchecked (`obj`
+    /// must actually live in `s`; nothing here verifies that, see
+    /// Snapshot::view(const T&)) and by REFERENCE, not copy: this is the one
+    /// place a View's two pointers get set, and it takes an lvalue Snapshot
+    /// specifically so a caller can't accidentally bind to a temporary (see
+    /// the deleted overload below) and leave s_ dangling immediately.
     View(const Snapshot& s, const T& obj) noexcept : s_(&s), o_(&obj) {}
     View(Snapshot&&, const T&) = delete;  // never bind to a temporary snapshot
 

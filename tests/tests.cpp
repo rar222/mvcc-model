@@ -458,7 +458,8 @@ TEST(transaction_local_update_does_not_alias_a_stale_generation_of_the_same_slot
     const std::uint32_t slot = o1.raw().index;
 
     remove_and_commit(m, o1);
-    const Ref<Order> o2 = make_order(m, "O2", a);  // reuses `a` -- nothing else steals the freed slot
+    const Ref<Order> o2 =
+        make_order(m, "O2", a);  // reuses `a` -- nothing else steals the freed slot
     CHECK_EQ(o2.raw().index, slot);
     CHECK(o2.raw().gen != o1.raw().gen);
 
@@ -570,7 +571,8 @@ TEST(reassigning_a_ref_field_after_update_is_tracked_for_cascade) {
     update_field(m, o, [&](Order* p) { p->account = a2; });  // reassign the non-nullable Ref
     CHECK(m.snapshot().find(o)->account == a2);
 
-    const std::size_t killed = remove_and_commit(m, a2);  // must cascade-kill o: Ref<> is non-nullable
+    const std::size_t killed =
+        remove_and_commit(m, a2);  // must cascade-kill o: Ref<> is non-nullable
 
     CHECK_EQ(killed, std::size_t{2});  // a2 and o
     CHECK(m.snapshot().find(o) == nullptr);
@@ -590,8 +592,8 @@ TEST(reassigning_an_opt_field_after_update_is_tracked_for_cascade) {
     CHECK(m.snapshot().find(c)->parent == Opt<Order>(p2));
 
     remove_and_commit(m, p2);  // must null c's parent: the index must track p2, not p1
-    CHECK(m.snapshot().find(c) != nullptr);         // Opt<>: survives
-    CHECK(!m.snapshot().find(c)->parent);  // ...nulled
+    CHECK(m.snapshot().find(c) != nullptr);  // Opt<>: survives
+    CHECK(!m.snapshot().find(c)->parent);    // ...nulled
 
     // p1 must be untouched by any of this -- proves the OLD edge (c -> p1)
     // was correctly dropped rather than left as a phantom referrer.
@@ -984,7 +986,9 @@ TEST(reaper_frees_eventually_after_snapshots_drop) {
     remove_and_commit(m, o);
     CHECK(m.wait_for_reclamation() > 0);  // pinned by `pin`, cannot free yet
 
-    { Snapshot drop = std::move(pin); }
+    {
+        Snapshot drop = std::move(pin);
+    }
     CHECK_EQ(m.wait_for_reclamation(), std::size_t{0});
 }
 
@@ -1348,8 +1352,10 @@ TEST(view_of_a_stale_handle_is_empty) {
 // define_keys field, and is empty for a field never declared scan.
 TEST(find_by_scan_field_returns_every_match_and_only_for_declared_fields) {
     Model m;
-    const Ref<Account> a = make_account(m, "DUP", 1);  // Account::name: define_keys AND define_scan_fields
-    const Ref<Account> b = make_account(m, "DUP", 2);  // duplicate name: the unique index keeps only this one
+    const Ref<Account> a =
+        make_account(m, "DUP", 1);  // Account::name: define_keys AND define_scan_fields
+    const Ref<Account> b =
+        make_account(m, "DUP", 2);  // duplicate name: the unique index keeps only this one
     make_account(m, "OTHER", 3);
     make_order(m, "O1", a, {}, 5);
     make_order(m, "O2", a, {}, 5);
@@ -1671,7 +1677,8 @@ TEST(a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction
     Transaction txn1 = m.begin();
     auto a = std::make_unique<Account>();
     a->name = "A1";
-    const Ref<Account> a_local = txn1.create(std::move(a));  // placeholder, only meaningful inside txn1
+    const Ref<Account> a_local =
+        txn1.create(std::move(a));  // placeholder, only meaningful inside txn1
 
     // A second, independent transaction never saw txn1's create -- to txn2,
     // a_local is just some id it never issued and never cloned from base().
@@ -1691,7 +1698,7 @@ TEST(a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction
     const CommitResult res = m.try_commit(txn2);
     CHECK(res.status == CommitStatus::Invalid);
     CHECK(res.error.has_value());
-    CHECK(!res.error->bad_target);  // a stray local id has no real target to report
+    CHECK(!res.error->bad_target);                  // a stray local id has no real target to report
     CHECK_EQ(m.snapshot().size(), std::size_t{0});  // neither txn1 nor txn2 ever published anything
 }
 
@@ -1709,7 +1716,8 @@ TEST(a_local_id_that_collides_with_another_transactions_own_local_index_silently
     Transaction txn2 = m.begin();
     auto own = std::make_unique<Account>();
     own->name = "TXN2-OWN";
-    const Ref<Account> own_local = txn2.create(std::move(own));  // txn2's local counter ALSO starts at 0
+    const Ref<Account> own_local =
+        txn2.create(std::move(own));  // txn2's local counter ALSO starts at 0
 
     // Local ids are only unique WITHIN a transaction (kLocalIdBit | a per-txn
     // counter) -- across transactions the same raw Id can name two completely
@@ -1803,7 +1811,8 @@ TEST(remove_intent_is_not_yet_visible_as_deleted_in_pending_changes) {
 // A same-transaction "create X referencing Y, then remove Y" correctly
 // cascades the brand-new X too -- the cascade BFS sees the local create
 // as a real referrer once apply installs it, not just pre-existing ones.
-TEST(same_transaction_create_referencing_an_existing_object_then_remove_of_that_object_cascades_the_new_object_too) {
+TEST(
+    same_transaction_create_referencing_an_existing_object_then_remove_of_that_object_cascades_the_new_object_too) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
 
@@ -2028,7 +2037,8 @@ TEST(changelog_entries_are_pruned_once_no_open_transaction_or_snapshot_needs_the
 // readers resolving Refs throughout, must never corrupt referrers_ or
 // publish a dangling Ref -- extend this one rather than adding a new
 // writer-only stress test where the scenario is genuinely the same.
-TEST(concurrent_stress_many_writer_threads_hammering_try_commit_never_corrupts_referrers_or_leaks_a_dangling_ref) {
+TEST(
+    concurrent_stress_many_writer_threads_hammering_try_commit_never_corrupts_referrers_or_leaks_a_dangling_ref) {
     Model m;
     std::vector<Ref<Account>> accounts;
     for (int i = 0; i < 4; ++i) accounts.push_back(make_account(m, "A" + std::to_string(i)));
@@ -2101,13 +2111,15 @@ TEST(concurrent_stress_many_writer_threads_hammering_try_commit_never_corrupts_r
         [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.raw()); });
 }
 
-// A larger-scale companion to the test above: up to 8 threads (mixed
-// readers and writers) against a 25000+ object corpus, writes touching
-// 5 fields across 2 reference edges (one cascade-delete, one cascade-
-// null) per object, PLUS the first concurrent exercise of the cached-
-// reference index -- readers cross-check find_referrers against
-// find_cached_referrers on every snapshot, and the model must never
-// let the two disagree.
+// Up to N threads mixed reader/writer — kThreads = 8, split 4 readers / 4 writers, all launched and
+// alive concurrently for the run window (same pattern as the existing stress test, just with a
+// configurable thread count and roughly even role split instead of a fixed 2+3). 10,000–100,000
+// total objects — seeded 100 Accounts + 25,000 Records (25,100 total), with an explicit CHECK
+// asserting the count falls in [10000, 100000] both right after seeding and again at the end (after
+// the concurrent churn of creates/removes). 5 fields, 2 references — new type Record: label
+// (string), value (int64), flag (bool), owner (Ref<Account>, non-nullable — cascade-delete edge),
+// related (Opt<Record>, nullable, self-referential — cascade-null edge). Writers touch all five on
+// every create, and reassign both references plus a plain field on every update.
 TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two_of_them_refs) {
     Model m;
 
@@ -2215,8 +2227,10 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
                     r->value = static_cast<std::int64_t>(rng() % 1000);
                     r->flag = !r->flag;
                     r->owner = accounts[rng() % accounts.size()];
-                    if (rng() % 4 == 0) r->related.reset();
-                    else if (const Ref<Record> rel = pick_live(txn, records, rng)) r->related = rel;
+                    if (rng() % 4 == 0)
+                        r->related.reset();
+                    else if (const Ref<Record> rel = pick_live(txn, records, rng))
+                        r->related = rel;
                 }
             } else {
                 if (const Ref<Record> r = pick_live(txn, records, rng)) txn.remove(r);
@@ -2228,7 +2242,8 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
     std::vector<std::thread> pool;
     for (int i = 0; i < kReaders; ++i) pool.emplace_back(reader);
     while (readers_ready.load(std::memory_order_relaxed) < kReaders) std::this_thread::yield();
-    for (int i = 0; i < kWriters; ++i) pool.emplace_back([&, i] { writer(static_cast<unsigned>(700 + i)); });
+    for (int i = 0; i < kWriters; ++i)
+        pool.emplace_back([&, i] { writer(static_cast<unsigned>(700 + i)); });
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     stop = true;
