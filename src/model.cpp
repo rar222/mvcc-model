@@ -1,9 +1,8 @@
 #include "model/model.h"
 
-#include <chrono>
-
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -86,8 +85,10 @@ bool Subscription::try_drain(Update& out) {
 
 void Subscription::push(Update u) {
     std::lock_guard lk(m_);
-    if (q_.size() >= cap_) collapse(std::move(u));
-    else q_.push_back(std::move(u));
+    if (q_.size() >= cap_)
+        collapse(std::move(u));
+    else
+        q_.push_back(std::move(u));
     cv_.notify_one();
 }
 
@@ -344,7 +345,8 @@ std::optional<Model::IntegrityError> Model::validate(const ObjectBase* o) const 
         if (err) return;  // keep the FIRST violation; the attempt aborts either way
         if (!target) {
             if (!nullable)
-                err = IntegrityError{std::string("null Ref in field ") + name + " of " + o->type(), Id{}};
+                err = IntegrityError{std::string("null Ref in field ") + name + " of " + o->type(),
+                                     Id{}};
             return;
         }
         if (!peek(target))
@@ -377,8 +379,9 @@ void Model::drop_out_refs(const ObjectBase* o) {
         auto it = referrers_.find(target.index);
         if (it == referrers_.end()) return;
         auto& v = it->second;
-        auto pos = std::find_if(v.begin(), v.end(),
-                                [&](const RefEdge& e) { return e.from == from && e.field == field; });
+        auto pos = std::find_if(v.begin(), v.end(), [&](const RefEdge& e) {
+            return e.from == from && e.field == field;
+        });
         if (pos == v.end()) return;
         const RefEdge edge = *pos;
         v.erase(pos);
@@ -400,7 +403,8 @@ void Model::reconcile_referrer_edges(const ObjectBase* before, const ObjectBase*
     // publishes a dangling Ref.
     const Id id = after->id;
     std::unordered_map<const void*, Id> old_targets;
-    before->each_ref([&](const void* field, const char*, Id target, bool) { old_targets[field] = target; });
+    before->each_ref(
+        [&](const void* field, const char*, Id target, bool) { old_targets[field] = target; });
 
     after->each_ref([&](const void* field, const char*, Id new_target, bool nullable) {
         const auto it = old_targets.find(field);
@@ -442,7 +446,9 @@ void Model::add_field_keys(const ObjectBase* o) {
     o->each_field_key([&](const void* field, std::string key) {
         auto prev = by_field_[field];
         by_field_[field] = prev.set(key, id);
-        log([this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); });
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_field_[field] = std::move(prev);
+        });
     });
 }
 
@@ -450,14 +456,17 @@ void Model::drop_field_keys(const ObjectBase* o) {
     o->each_field_key([&](const void* field, std::string key) {
         auto prev = by_field_[field];
         by_field_[field] = prev.erase(key);
-        log([this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); });
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_field_[field] = std::move(prev);
+        });
     });
 }
 
 void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* after) {
     const Id id = after->id;
     std::unordered_map<const void*, std::string> old_keys;
-    before->each_field_key([&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
+    before->each_field_key(
+        [&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
 
     after->each_field_key([&](const void* field, std::string new_key) {
         const auto it = old_keys.find(field);
@@ -470,7 +479,9 @@ void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* aft
         auto prev = by_field_[field];
         if (it != old_keys.end()) by_field_[field] = by_field_[field].erase(it->second);
         by_field_[field] = by_field_[field].set(new_key, id);
-        log([this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); });
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_field_[field] = std::move(prev);
+        });
     });
 }
 
@@ -486,9 +497,11 @@ void Model::add_cached_fields(const ObjectBase* o) {
     o->each_cached_field([&](const void* field, std::string key) {
         auto prev = by_cached_field_[field];
         const pmap::PersistentMap<Id>* bucket = prev.get(key);
-        by_cached_field_[field] =
-            prev.set(key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
-        log([this, field, prev = std::move(prev)]() mutable { by_cached_field_[field] = std::move(prev); });
+        by_cached_field_[field] = prev.set(
+            key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_cached_field_[field] = std::move(prev);
+        });
     });
 }
 
@@ -502,14 +515,17 @@ void Model::drop_cached_fields(const ObjectBase* o) {
         // An emptied bucket is dropped outright, so a value with no remaining
         // holders doesn't leave a tombstone entry behind.
         by_cached_field_[field] = nb.empty() ? prev.erase(key) : prev.set(key, nb);
-        log([this, field, prev = std::move(prev)]() mutable { by_cached_field_[field] = std::move(prev); });
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_cached_field_[field] = std::move(prev);
+        });
     });
 }
 
 void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* after) {
     const Id id = after->id;
     std::unordered_map<const void*, std::string> old_keys;
-    before->each_cached_field([&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
+    before->each_cached_field(
+        [&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
 
     after->each_cached_field([&](const void* field, std::string new_key) {
         const auto it = old_keys.find(field);
@@ -524,9 +540,12 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
             }
         }
         const pmap::PersistentMap<Id>* bucket = cur.get(new_key);
-        cur = cur.set(new_key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        cur = cur.set(new_key,
+                      (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
         by_cached_field_[field] = std::move(cur);
-        log([this, field, prev = std::move(prev)]() mutable { by_cached_field_[field] = std::move(prev); });
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_cached_field_[field] = std::move(prev);
+        });
     });
 }
 
@@ -544,9 +563,12 @@ void Model::add_cached_references(const ObjectBase* o) {
         if (!target) return;  // Opt<> currently null: nothing to index
         auto prev = by_cached_reference_[field];
         const pmap::PersistentMap<Id>* bucket = prev.get(detail::id_key(target));
-        by_cached_reference_[field] = prev.set(
-            detail::id_key(target), (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
-        log([this, field, prev = std::move(prev)]() mutable { by_cached_reference_[field] = std::move(prev); });
+        by_cached_reference_[field] =
+            prev.set(detail::id_key(target),
+                     (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_cached_reference_[field] = std::move(prev);
+        });
     });
 }
 
@@ -562,7 +584,9 @@ void Model::drop_cached_references(const ObjectBase* o) {
         // remaining referrers doesn't leave a tombstone entry behind.
         by_cached_reference_[field] =
             nb.empty() ? prev.erase(detail::id_key(target)) : prev.set(detail::id_key(target), nb);
-        log([this, field, prev = std::move(prev)]() mutable { by_cached_reference_[field] = std::move(prev); });
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_cached_reference_[field] = std::move(prev);
+        });
     });
 }
 
@@ -582,16 +606,20 @@ void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBa
         if (old_target) {
             if (const pmap::PersistentMap<Id>* ob = cur.get(detail::id_key(old_target))) {
                 auto nb = ob->erase(detail::id_key(id));
-                cur = nb.empty() ? cur.erase(detail::id_key(old_target)) : cur.set(detail::id_key(old_target), nb);
+                cur = nb.empty() ? cur.erase(detail::id_key(old_target))
+                                 : cur.set(detail::id_key(old_target), nb);
             }
         }
         if (new_target) {
             const pmap::PersistentMap<Id>* bucket = cur.get(detail::id_key(new_target));
-            cur = cur.set(detail::id_key(new_target),
-                          (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+            cur =
+                cur.set(detail::id_key(new_target),
+                        (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
         }
         by_cached_reference_[field] = std::move(cur);
-        log([this, field, prev = std::move(prev)]() mutable { by_cached_reference_[field] = std::move(prev); });
+        log([this, field, prev = std::move(prev)]() mutable {
+            by_cached_reference_[field] = std::move(prev);
+        });
     });
 }
 
@@ -638,8 +666,8 @@ std::vector<std::pair<std::uint64_t, int>> Model::debug_live_versions() const {
 // try_commit() internals
 // ---------------------------------------------------------------------------
 
-std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectBase> o,
-                                                         std::unordered_map<std::uint32_t, Id>& remap) {
+std::optional<Model::IntegrityError> Model::apply_create(
+    std::unique_ptr<ObjectBase> o, std::unordered_map<std::uint32_t, Id>& remap) {
     const std::uint32_t local_index = o->id.index;  // still local; the remap key
 
     // May reference an earlier local create in this txn. Nothing is logged
@@ -650,9 +678,8 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
 
     const std::uint32_t slot = alloc_slot();
     const std::uint32_t i = slot & kChunkMask;
-    const std::uint32_t cur_gen = (slot >> kChunkBits) < spine_.size()
-                                      ? spine_[slot >> kChunkBits]->gen[i]
-                                      : 0;
+    const std::uint32_t cur_gen =
+        (slot >> kChunkBits) < spine_.size() ? spine_[slot >> kChunkBits]->gen[i] : 0;
     const std::uint32_t g = cur_gen + 1;  // recycled slot gets a fresh generation
 
     o->id = Id{slot, g};
@@ -671,7 +698,9 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
     const TypeTag tag = raw->tag();
     auto prev_sub = by_type_[tag];
     by_type_[tag] = prev_sub.set(detail::id_key(id), id);
-    log([this, tag, prev_sub = std::move(prev_sub)]() mutable { by_type_[tag] = std::move(prev_sub); });
+    log([this, tag, prev_sub = std::move(prev_sub)]() mutable {
+        by_type_[tag] = std::move(prev_sub);
+    });
 
     add_out_refs(raw);
     add_field_keys(raw);
@@ -691,8 +720,8 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
     return std::nullopt;
 }
 
-std::optional<Model::IntegrityError> Model::apply_update(std::unique_ptr<ObjectBase> clone,
-                                                         std::unordered_map<std::uint32_t, Id>& remap) {
+std::optional<Model::IntegrityError> Model::apply_update(
+    std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap) {
     ObjectBase* raw = clone.release();
 
     // Log the clone's deletion FIRST (before anything can fail), so in
@@ -702,7 +731,8 @@ std::optional<Model::IntegrityError> Model::apply_update(std::unique_ptr<ObjectB
     log([raw] { delete raw; });
 
     bool unmapped = false;
-    raw->remap_refs(RefRemapper{remap, &unmapped});  // may reference a local create in this same txn
+    raw->remap_refs(
+        RefRemapper{remap, &unmapped});  // may reference a local create in this same txn
     if (unmapped) return IntegrityError{kUnmappedLocalMsg, Id{}};
 
     // Against CURRENT peek(), not the transaction's base -- see validate()'s comment.
@@ -822,7 +852,9 @@ std::vector<Id> Model::remove_raw(Id id) {
         const TypeTag tag = victim->tag();
         auto prev_sub = by_type_[tag];
         by_type_[tag] = prev_sub.erase(detail::id_key(x));
-        log([this, tag, prev_sub = std::move(prev_sub)]() mutable { by_type_[tag] = std::move(prev_sub); });
+        log([this, tag, prev_sub = std::move(prev_sub)]() mutable {
+            by_type_[tag] = std::move(prev_sub);
+        });
 
         drop_field_keys(victim);
         drop_cached_fields(victim);
@@ -897,9 +929,13 @@ void Model::rollback_apply() {
 // begin() / try_commit()
 // ---------------------------------------------------------------------------
 
-Transaction Model::begin() { return begin(snapshot()); }
+Transaction Model::begin() {
+    return begin(snapshot());
+}
 
-Transaction Model::begin(Snapshot base) { return Transaction(this, std::move(base)); }
+Transaction Model::begin(Snapshot base) {
+    return Transaction(this, std::move(base));
+}
 
 Transaction Snapshot::begin() const {
     assert(lease_ && "begin() on a default-constructed Snapshot -- no Model to build against");
@@ -938,18 +974,24 @@ CommitResult Model::classify_apply_failure(IntegrityError err, const Transaction
     // local id, which have no target to check and are always genuine
     // transaction-building bugs -- those reject as Invalid.)
     if (err.bad_target && txn.base().find_raw(err.bad_target)) {
-        return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
-                            ConflictInfo{ConflictReason::RefIntegrity, {err.bad_target}}, {},
+        return CommitResult{CommitStatus::Conflict,
+                            Snapshot{},
+                            {},
+                            ConflictInfo{ConflictReason::RefIntegrity, {err.bad_target}},
+                            {},
                             std::nullopt};
     }
     return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, std::move(err)};
 }
 
 std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
-                                                    std::unordered_map<std::uint32_t, Id>& remap) {
+                                                   std::unordered_map<std::uint32_t, Id>& remap) {
     if (std::vector<Id> overlap = check_id_overlap(txn); !overlap.empty()) {
-        return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
-                            ConflictInfo{ConflictReason::IdSetOverlap, std::move(overlap)}, {},
+        return CommitResult{CommitStatus::Conflict,
+                            Snapshot{},
+                            {},
+                            ConflictInfo{ConflictReason::IdSetOverlap, std::move(overlap)},
+                            {},
                             std::nullopt};
     }
     if (auto err = apply_transaction_contents(txn, remap)) {
@@ -966,7 +1008,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
     r->spine = spine_;        // ~n/kChunkSize shared_ptr copies. Cheap.
     r->by_type = by_type_;    // O(#types): each per-type submap is shared, not copied.
     r->by_field = by_field_;  // O(#indexed fields): same reasoning.
-    r->by_cached_field = by_cached_field_;  // O(#cached fields): ditto.
+    r->by_cached_field = by_cached_field_;          // O(#cached fields): ditto.
     r->by_cached_reference = by_cached_reference_;  // O(#cached ref fields): ditto.
 
     Snapshot pub;
@@ -1006,8 +1048,8 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
     undo_.clear();         // committed: nothing to roll back to
     txn_created_.clear();  // published objects are now owned by the spine
 
-    return CommitResult{CommitStatus::Committed, pub, std::move(resolved), std::nullopt, std::move(remap),
-                        std::nullopt};
+    return CommitResult{CommitStatus::Committed, pub,         std::move(resolved), std::nullopt,
+                        std::move(remap),        std::nullopt};
 }
 
 CommitResult Model::commit_locked(Transaction& txn) {
@@ -1023,13 +1065,20 @@ CommitResult Model::commit_locked(Transaction& txn) {
         // Everything in txn had already been applied by an earlier
         // try_commit() on this same Transaction (or every local create was
         // locally cancelled) -- a no-op success, not a fresh publish.
-        return CommitResult{CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
+        return CommitResult{
+            CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
     }
 
     return publish_now(std::move(remap));
 }
 
 CommitResult Model::run_pre_commit_transaction(Transaction& txn) {
+    // Crash, don't return a bad CommitResult: this function does no locking of its own -- it
+    // goes straight into commit_locked(), which requires commit_mu_ ALREADY
+    // held. Called from anywhere outside the one window try_commit()
+    // guarantees the lock is held, it would mutate commit_mu_-protected
+    // state (spine_, referrers_, ...) with no synchronization at all --
+    // corruption, not a recoverable error. See the doc comment in model.h.
     assert(in_pre_transactions_phase_ &&
            "run_pre_commit_transaction() called outside a running PreTransactionsFn callback");
     assert(!precommit_failed_ &&
@@ -1089,7 +1138,8 @@ CommitResult Model::try_commit(Transaction& txn) {
         // Everything in txn had already been applied by an earlier
         // try_commit() on this same Transaction (or every local create was
         // locally cancelled) -- a no-op success, not a fresh publish.
-        return CommitResult{CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
+        return CommitResult{
+            CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
     }
 
     // Runs after apply, not before: it sees the FULLY resolved changeset,

@@ -1374,6 +1374,27 @@ public:
     /// enclosing try_commit() is already doomed to
     /// CommitStatus::PrecommitConflict -- calling this again afterward is a
     /// hook bug (asserted). Check the return value and stop.
+    ///
+    /// Why the in_pre_transactions_phase_ check is an assert (crash) rather
+    /// than a checked failure (an error CommitResult, or a no-op): this
+    /// function does no locking of its own -- it goes straight into
+    /// commit_locked(), which requires commit_mu_ ALREADY held by the
+    /// caller (see its own doc comment). The assert is the only thing
+    /// standing between "called during the one window where try_commit()
+    /// guarantees the lock is held" and "called from anywhere else" --
+    /// e.g. a stray call from ordinary application code holding no lock at
+    /// all, racing every other thread currently inside try_commit(). That
+    /// is not a logic error with a graceful fallback; it is invariant 7's
+    /// commit_mu_-protected state (spine_, referrers_, by_type_, ...) being
+    /// mutated with no synchronization whatsoever -- corruption or a
+    /// use-after-free, the exact failure mode this whole design exists to
+    /// rule out, and one a returned error status could not prevent (the
+    /// corrupting writes already happened by the time there's a status to
+    /// check). Failing loudly and immediately, every single time (asserts
+    /// are never compiled out in this project -- no preset defines
+    /// NDEBUG), turns a would-be race into a guaranteed, obvious crash at
+    /// the call site instead of a silent, load-dependent one discovered
+    /// later. See CLAUDE.md's "prefer failing loudly."
     CommitResult run_pre_commit_transaction(Transaction& txn);
 
     /// Reported via CommitResult::error (status == Invalid) when a
