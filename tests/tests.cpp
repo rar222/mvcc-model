@@ -248,6 +248,50 @@ std::string state_of(Model& m) {
     return out;
 }
 
+/// A wider record type for the large-scale mixed-thread stress test below:
+/// 5 fields, 2 of them references -- owner (Ref<Account>, non-nullable: the
+/// cascade-delete path) and related (Opt<Record>, nullable, self-referential:
+/// the cascade-null path) -- so every write there exercises reconcile_
+/// referrer_edges across two DIFFERENT edges at once, not just one. owner is
+/// also cached (define_cached_references), so the same run stress-tests
+/// Root::by_cached_reference concurrently for the first time -- every prior
+/// cached-reference test was single-threaded.
+class Record final : public model::Object<Record> {
+public:
+    std::string label;
+    std::int64_t value = 0;
+    bool flag = false;
+    model::Ref<Account> owner;
+    model::Opt<Record> related;
+
+    template <class Self, class V>
+    static void define_references(Self& s, V&& v) {
+        v(model::field_tag<&Record::owner>(), "owner", s.owner);
+        v(model::field_tag<&Record::related>(), "related", s.related);
+    }
+
+    template <class Self>
+    static void define_cached_references(Self& s, const model::RefIndexReader& v) {
+        (void)s;
+        v.index<&Record::owner>();
+    }
+};
+
+/// Same pattern as examples/demo.cpp's pick_live: a handle this Transaction's
+/// OWN local view still believes is live, checked against `txn` (base plus
+/// this transaction's own pending edits) -- not some model-wide notion of
+/// existence, since there isn't one. Another thread's concurrent commit can
+/// still make this stale by the time try_commit() runs; that race is exactly
+/// what the conflict check exists to catch.
+template <class T>
+Ref<T> pick_live(const Transaction& txn, const std::vector<Ref<T>>& v, std::mt19937& rng) {
+    for (int tries = 0; tries < 8 && !v.empty(); ++tries) {
+        const Ref<T> r = v[rng() % v.size()];
+        if (txn.exists(r)) return r;
+    }
+    return Ref<T>{};
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1848,6 +1892,152 @@ TEST(concurrent_stress_many_writer_threads_hammering_try_commit_never_corrupts_r
     Snapshot final_s = m.snapshot();
     final_s.for_each<Order>(
         [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.raw()); });
+}
+
+TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two_of_them_refs) {
+    Model m;
+
+    // ---- seed: a corpus in [10000, 100000] objects, well before any thread
+    // starts -- large enough that the concurrent phase below is genuinely
+    // contending over substantial state, not a handful of hot ids. ---------
+    constexpr int kAccounts = 100;
+    constexpr int kRecords = 25000;
+    std::vector<Ref<Account>> accounts;
+    {
+        Transaction seed = m.begin();
+        std::vector<Ref<Account>> local;
+        for (int i = 0; i < kAccounts; ++i) {
+            auto a = std::make_unique<Account>();
+            a->name = "A" + std::to_string(i);
+            local.push_back(seed.create(std::move(a)));
+        }
+        const CommitResult res = commit_ok(m, seed);
+        for (auto& r : local) accounts.push_back(res.resolve(r));
+    }
+
+    std::vector<Ref<Record>> records;
+    for (int i = 0; i < kRecords; i += 1000) {
+        Transaction txn = m.begin();
+        std::vector<Ref<Record>> local;
+        for (int j = 0; j < 1000 && i + j < kRecords; ++j) {
+            auto r = std::make_unique<Record>();
+            r->label = "R" + std::to_string(i + j);
+            r->value = i + j;
+            r->flag = (i + j) % 2 == 0;
+            r->owner = accounts[static_cast<std::size_t>((i + j) % accounts.size())];
+            local.push_back(txn.create(std::move(r)));
+        }
+        const CommitResult res = commit_ok(m, txn);
+        for (auto& r : local) records.push_back(res.resolve(r));
+    }
+    const std::size_t seeded = accounts.size() + records.size();
+    CHECK(seeded >= std::size_t{10000} && seeded <= std::size_t{100000});
+
+    // ---- concurrent phase: up to kThreads alive at once, mixed roles -----
+    constexpr int kThreads = 8;
+    constexpr int kReaders = kThreads / 2;
+    constexpr int kWriters = kThreads - kReaders;
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> snaps{0};
+    std::atomic<std::uint64_t> resolved{0};
+    std::atomic<int> readers_ready{0};
+    std::atomic<int> next_id{1'000'000};
+
+    // Readers scan every Record (both ref fields must always resolve/never
+    // crash) AND cross-check the two "who points at this Account?" answers
+    // against a fixed target -- the O(#Records) scan (find_referrers) and
+    // the O(log n + matches) index (find_cached_referrers) -- against the
+    // SAME frozen Snapshot, so they must agree exactly even while other
+    // threads race concurrent commits underneath.
+    auto reader = [&] {
+        bool signaled = false;
+        while (!stop.load(std::memory_order_relaxed)) {
+            Snapshot s = m.snapshot();
+            ++snaps;
+            if (!signaled) {
+                readers_ready.fetch_add(1, std::memory_order_relaxed);
+                signaled = true;
+            }
+            s.for_each<Record>([&](const Record& r) {
+                const Account& owner = s.resolve(r.owner);  // non-nullable: must never dangle
+                if (owner.name.empty()) ++g_failures;
+                ++resolved;
+                (void)s.resolve(r.related);  // nullable: null or a live Record, never UB
+            });
+
+            auto scan = s.find_referrers<&Record::owner>(accounts[0]);
+            auto idx = s.find_cached_referrers<&Record::owner>(accounts[0]);
+            std::sort(scan.begin(), scan.end());
+            std::sort(idx.begin(), idx.end());
+            CHECK(scan == idx);
+        }
+    };
+
+    // Writers touch all 5 fields: create sets every field at once (including
+    // both refs); update reassigns owner (cascade-edge move) and related
+    // (nullable edge move or clear) independently of the plain fields;
+    // remove exercises both the cascade-delete (an owner Account dying takes
+    // its Records with it -- not attempted here directly, but a removed
+    // Record can itself have been a cascade victim) and cascade-null paths
+    // (a removed Record that other Records' `related` pointed at).
+    auto writer = [&](unsigned seed) {
+        std::mt19937 rng(seed);
+        while (!stop.load(std::memory_order_relaxed)) {
+            Transaction txn = m.begin();
+            const int roll = static_cast<int>(rng() % 100);
+            if (roll < 35) {
+                auto r = std::make_unique<Record>();
+                r->label = "W" + std::to_string(next_id.fetch_add(1));
+                r->value = static_cast<std::int64_t>(rng() % 1000);
+                r->flag = (rng() % 2) == 0;
+                r->owner = accounts[rng() % accounts.size()];
+                if (rng() % 3 == 0) {
+                    if (const Ref<Record> rel = pick_live(txn, records, rng)) r->related = rel;
+                }
+                txn.create(std::move(r));
+            } else if (roll < 80) {
+                if (Record* r = txn.update(pick_live(txn, records, rng))) {
+                    r->value = static_cast<std::int64_t>(rng() % 1000);
+                    r->flag = !r->flag;
+                    r->owner = accounts[rng() % accounts.size()];
+                    if (rng() % 4 == 0) r->related.reset();
+                    else if (const Ref<Record> rel = pick_live(txn, records, rng)) r->related = rel;
+                }
+            } else {
+                if (const Ref<Record> r = pick_live(txn, records, rng)) txn.remove(r);
+            }
+            m.try_commit(txn);  // conflicts are expected and fine; just don't corrupt anything
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (int i = 0; i < kReaders; ++i) pool.emplace_back(reader);
+    while (readers_ready.load(std::memory_order_relaxed) < kReaders) std::this_thread::yield();
+    for (int i = 0; i < kWriters; ++i) pool.emplace_back([&, i] { writer(static_cast<unsigned>(700 + i)); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stop = true;
+    for (auto& t : pool) t.join();
+
+    CHECK(snaps.load() > 0);
+    CHECK(resolved.load() > 0);
+
+    // ---- final consistency: every live Record's non-nullable ref resolves,
+    // and the two "who points at this Account?" answers still agree for
+    // EVERY account, not just the one readers happened to poll. ------------
+    Snapshot final_s = m.snapshot();
+    const std::size_t final_size = final_s.size();
+    CHECK(final_size >= std::size_t{10000} && final_size <= std::size_t{100000});
+    final_s.for_each<Record>(
+        [&](const Record& r) { CHECK(final_s.resolve(r.owner).id == r.owner.raw()); });
+    for (const Ref<Account>& a : accounts) {
+        auto scan = final_s.find_referrers<&Record::owner>(a);
+        auto idx = final_s.find_cached_referrers<&Record::owner>(a);
+        std::sort(scan.begin(), scan.end());
+        std::sort(idx.begin(), idx.end());
+        CHECK(scan == idx);
+    }
 }
 
 // ---------------------------------------------------------------------------
