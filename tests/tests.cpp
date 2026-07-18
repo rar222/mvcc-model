@@ -2718,6 +2718,43 @@ TEST(bulk_load_into_a_fresh_model_installs_everything_with_cross_object_local_re
     CHECK(s.find_by_key<&Account::name>("A1") != nullptr);
 }
 
+// update() lets a forward reference (to an object this batch hasn't created
+// yet) get fixed up after the fact, instead of predicting a future local id
+// by hand the way bulk_load_rejects_an_out_of_range_local_ref_with_nothing_
+// mutated below constructs one manually.
+TEST(bulk_transaction_update_fixes_up_a_forward_reference_after_the_fact) {
+    Model m;
+    BulkTransaction t = m.begin_bulk();
+    auto ord = std::make_unique<Order>();
+    ord->code = "O1";  // account left null -- the Account doesn't exist yet
+    const Ref<Order> o = t.create(std::move(ord));
+
+    auto acc = std::make_unique<Account>();
+    acc->name = "A1";
+    const Ref<Account> a = t.create(std::move(acc));
+
+    t.update(o)->account = a;  // now that `a` exists, fix up the forward ref
+
+    CommitResult r = m.commit_bulk(t);
+    CHECK(r.status == CommitStatus::Committed);
+    const Ref<Account> real_a = r.to_real(a);
+    const Ref<Order> real_o = r.to_real(o);
+
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.find(real_o)->account.raw(), real_a.raw());
+}
+
+TEST(bulk_transaction_update_returns_null_for_an_id_this_batch_never_created) {
+    Model m;
+    BulkTransaction t = m.begin_bulk();
+    auto acc = std::make_unique<Account>();
+    acc->name = "A1";
+    const Ref<Account> a = t.create(std::move(acc));
+
+    CHECK(t.update(Ref<Account>(Id{kLocalIdBit | 999u, 1})) == nullptr);  // out of range
+    CHECK(t.update(a) != nullptr);  // sanity: a valid local id still resolves
+}
+
 TEST(bulk_load_wipes_all_pre_existing_data) {
     Model m;
     make_account(m, "old1");
