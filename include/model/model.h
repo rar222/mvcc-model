@@ -2086,19 +2086,22 @@ struct CommitResult {
 // BulkTransaction -- the builder half of Model::begin_bulk()/commit_bulk()
 // ---------------------------------------------------------------------------
 
-/// The bulk-load builder: create() only, no base to read against (there is
-/// nothing meaningful to read -- commit_bulk() wipes the model before
-/// installing this), no update()/remove()/peek(). See Model::begin_bulk()'s
-/// section comment for the full contract, including the exclusive-access
-/// precondition commit_bulk() requires.
+/// The bulk-load builder: create() plus a narrow, local-only update() --
+/// still no remove()/peek(), and no base to read against (there is nothing
+/// meaningful to read -- commit_bulk() wipes the model before installing
+/// this). See Model::begin_bulk()'s section comment for the full contract,
+/// including the exclusive-access precondition commit_bulk() requires.
 ///
 /// Building one touches no shared state, exactly like Transaction -- create()
 /// just mints a local id (see is_local()) and stores the object locally.
 /// Objects created here can reference each other freely, in any order,
 /// through the Ref<T>/Opt<T> returned by create(), the same way same-
 /// transaction local creates work on an ordinary Transaction; commit_bulk()
-/// remaps every one of those local ids to its real id in one pass. Not
-/// copyable (owns unique_ptrs to not-yet-installed objects); movable.
+/// remaps every one of those local ids to its real id in one pass. A forward
+/// reference -- pointing at an object this batch hasn't created yet -- can be
+/// fixed up after the fact with update() instead of predicting a future
+/// local id by hand. Not copyable (owns unique_ptrs to not-yet-installed
+/// objects); movable.
 ///
 /// Deliberately NOT a subclass of Transaction (in either direction), despite
 /// the create()-side resemblance. Transaction's local-id scheme tolerates
@@ -2136,6 +2139,22 @@ public:
         return Ref<T>(local_id);
     }
 
+    /// Mutable pointer to an object already create()'d on this SAME
+    /// BulkTransaction -- lets a forward reference get fixed up once the
+    /// object it points to exists, instead of predicting a future local id
+    /// by hand. Returns the exact object create() already owns: no clone,
+    /// no baseline to track, since there is no base() here to diff against
+    /// (unlike Transaction::update()). Null if `r` isn't a local id minted
+    /// by this same batch, or is out of range.
+    template <class T>
+    T* update(Ref<T> r) {
+        return static_cast<T*>(update_impl(r.raw()));
+    }
+    template <class T>
+    T* update(Opt<T> r) {
+        return static_cast<T*>(update_impl(r.raw()));
+    }
+
     /// How many objects are pending. Diagnostic; commit_bulk() doesn't need
     /// it, but a caller sanity-checking a large generated batch might.
     std::size_t size() const noexcept { return objects_.size(); }
@@ -2145,6 +2164,17 @@ private:
 
     /// Only Model::begin_bulk() constructs one.
     explicit BulkTransaction(Model* m) : model_(m) {}
+
+    /// Untyped body of update(): objects_'s index IS the local id's low
+    /// bits (see create()), so this is a direct bounds-checked lookup --
+    /// no clone-on-first-touch bookkeeping like Transaction::update_impl(),
+    /// because every entry here is already a local, not-yet-installed
+    /// object owned outright by this batch.
+    ObjectBase* update_impl(Id id) {
+        if (!is_local(id)) return nullptr;
+        const std::uint32_t idx = id.index & ~kLocalIdBit;
+        return idx < objects_.size() ? objects_[idx].get() : nullptr;
+    }
 
     Model* model_ = nullptr;  ///< asserted against cross-model misuse in commit_bulk()
     std::vector<std::unique_ptr<ObjectBase>> objects_;  ///< index == local id's low bits
