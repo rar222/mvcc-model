@@ -2345,6 +2345,93 @@ TEST(estimate_changes_never_races_a_concurrently_hammering_try_commit) {
     committer.join();
 }
 
+// When nothing else touches the model between building the estimate and
+// actually committing, estimate_changes() and the changeset PreCommitFn
+// sees are the SAME set of (id, kind, tag) triples. A pure remove() (no
+// creates) keeps every id real on both sides, so this is an exact
+// comparison, not just a size check.
+TEST(estimate_changes_matches_the_pre_commit_hooks_changeset_when_nothing_else_happened) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a);
+    (void)o;  // exists only so removing `a` has something to cascade into
+
+    Transaction txn = m.begin();
+    txn.remove(a);  // cascades to o
+    const std::vector<Change> estimate = txn.estimate_changes();
+
+    std::vector<Change> seen;
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>& changes) {
+        seen = changes;
+        return true;
+    });
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+    m.set_pre_commit({});
+
+    auto by_id = [](const Change& x, const Change& y) { return x.id.index < y.id.index; };
+    std::vector<Change> est_sorted = estimate;
+    std::vector<Change> seen_sorted = seen;
+    std::sort(est_sorted.begin(), est_sorted.end(), by_id);
+    std::sort(seen_sorted.begin(), seen_sorted.end(), by_id);
+
+    CHECK_EQ(est_sorted.size(), seen_sorted.size());
+    for (std::size_t i = 0; i < est_sorted.size(); ++i) {
+        CHECK(est_sorted[i].id == seen_sorted[i].id);
+        CHECK(est_sorted[i].kind == seen_sorted[i].kind);
+        CHECK(est_sorted[i].tag == seen_sorted[i].tag);
+    }
+}
+
+// If a DIFFERENT transaction repoints a reference the estimate depended on
+// before the original transaction actually commits, the estimate (computed
+// against a now-stale base()) and the real changeset PreCommitFn sees
+// diverge -- the estimate is a strict superset of what actually happened.
+TEST(estimate_changes_and_the_pre_commit_hooks_changeset_diverge_after_a_reference_changes) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Account> b = make_account(m, "B1");
+    const Ref<Order> o = make_order(m, "O1", a);  // o.account == a, for now
+
+    Transaction txn = m.begin();  // base() still sees o.account == a
+    txn.remove(a);
+    const std::vector<Change> estimate = txn.estimate_changes();
+
+    // Estimated cascade: a itself, plus o (its non-nullable account field
+    // still points at a, as far as txn's base() can see).
+    std::size_t estimated_deletes = 0;
+    for (const Change& c : estimate)
+        if (c.kind == ChangeKind::Deleted) ++estimated_deletes;
+    CHECK_EQ(estimated_deletes, std::size_t{2});
+
+    // A different transaction repoints o away from a, in between -- txn's
+    // own base() is pinned and never sees this happen.
+    {
+        Transaction other = m.begin();
+        other.update(o)->account = b;
+        CHECK(m.try_commit(other).status == CommitStatus::Committed);
+    }
+
+    // txn itself never conflicts (it only ever touches a's slot, never
+    // o's), so it applies normally -- but the REAL cascade BFS runs against
+    // the LATEST referrers_, where o no longer points at a. Only a dies.
+    std::vector<Change> seen;
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>& changes) {
+        seen = changes;
+        return true;
+    });
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+    m.set_pre_commit({});
+
+    CHECK_EQ(seen.size(), std::size_t{1});
+    CHECK(seen[0].id == a.raw());
+    CHECK(seen[0].kind == ChangeKind::Deleted);
+
+    // The estimate (2 deletes, computed before the repoint) and reality (1
+    // delete, after it) disagree -- exactly the staleness estimate_changes()'s
+    // own doc comment warns about.
+    CHECK(estimate.size() != seen.size());
+}
+
 // A same-transaction "create X referencing Y, then remove Y" correctly
 // cascades the brand-new X too -- the cascade BFS sees the local create
 // as a real referrer once apply installs it, not just pre-existing ones.
