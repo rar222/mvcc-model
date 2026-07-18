@@ -122,7 +122,7 @@ inline constexpr std::uint32_t kLocalIdBit = 0x8000'0000u;
 
 /// True for a Transaction-scoped placeholder id (see kLocalIdBit), false for
 /// a real slot. Everything that can meet both kinds -- Transaction's peek/
-/// update/remove, RefRemapper, CommitResult::resolve -- branches on this.
+/// update/remove, RefRemapper, CommitResult::to_real -- branches on this.
 inline bool is_local(Id id) noexcept {
     return (id.index & kLocalIdBit) != 0;
 }
@@ -1909,7 +1909,7 @@ struct CommitResult {
     /// until try_commit() is called. Once try_commit() returns, that local id
     /// is spent: it must never be stored, compared, or handed to a Snapshot,
     /// and it must never be reused across a DIFFERENT Transaction (a local id
-    /// is only unique within the transaction that minted it). Use resolve()
+    /// is only unique within the transaction that minted it). Use to_real()
     /// below to translate it into the real id this object now has -- do not
     /// read this map directly.
     std::unordered_map<std::uint32_t, Id> local_remap;
@@ -1927,15 +1927,24 @@ struct CommitResult {
     /// passes through unchanged. Only meaningful when status == Committed --
     /// a local id from a Conflict/Vetoed/Invalid attempt was never installed
     /// anywhere; begin() a fresh Transaction and create() again instead.
+    ///
+    /// Named to_real(), not resolve(): "resolve" already means two OTHER
+    /// things in this header -- Snapshot::resolve() (an unchecked, never-
+    /// null dereference to `const T&`/`const T*`, trusting the published
+    /// invariant) and Transaction::peek()'s doc contrasts itself against
+    /// that same meaning. This is neither: no dereference happens here at
+    /// all, just a local-id -> real-id translation (Ref<T> in, Ref<T> out) --
+    /// the same translation RefRemapper performs on the writer side, during
+    /// apply, via local_remap's table. See RefRemapper's own comment.
     template <class T>
-    Ref<T> resolve(Ref<T> local) const {
+    Ref<T> to_real(Ref<T> local) const {
         if (!is_local(local.raw())) return local;
         auto it = local_remap.find(local.raw().index);
         return Ref<T>(it == local_remap.end() ? Id{} : it->second);
     }
     /// Opt<T> form. Null passes through as null.
     template <class T>
-    Opt<T> resolve(Opt<T> local) const {
+    Opt<T> to_real(Opt<T> local) const {
         if (!local || !is_local(local.raw())) return local;
         auto it = local_remap.find(local.raw().index);
         return Opt<T>(it == local_remap.end() ? Id{} : it->second);

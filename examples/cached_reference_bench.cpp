@@ -126,7 +126,7 @@ void seed(Fixture& fx, int n_per_type) {
     }
     const CommitResult bres = fx.m.try_commit(seed_txn);
     assert(bres.status == CommitStatus::Committed);
-    for (auto& r : fx.buckets) r = bres.resolve(r);
+    for (auto& r : fx.buckets) r = bres.to_real(r);
 
     for (int i = 0; i < n_per_type; i += 1000) {
         Transaction txn = fx.m.begin();
@@ -161,7 +161,7 @@ void seed_one_type(Fixture& fx, int n_per_type) {
     }
     const CommitResult bres = fx.m.try_commit(seed_txn);
     assert(bres.status == CommitStatus::Committed);
-    for (auto& r : fx.buckets) r = bres.resolve(r);
+    for (auto& r : fx.buckets) r = bres.to_real(r);
 
     for (int i = 0; i < n_per_type; i += 1000) {
         Transaction txn = fx.m.begin();

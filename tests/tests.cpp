@@ -76,7 +76,7 @@ struct Registrar {
 // Helpers
 //
 // A local id returned by Transaction::create() is only meaningful until
-// try_commit() returns (see CommitResult::resolve's doc comment). These
+// try_commit() returns (see CommitResult::to_real's doc comment). These
 // helpers each own a single commit and hand back the REAL, post-commit ref,
 // so most tests never have to think about the local/real distinction at all
 // -- only the tests in the "Transaction-local semantics" section below,
@@ -98,7 +98,7 @@ Ref<Account> make_account(Model& m, const std::string& name, std::int64_t bal = 
     a->name = name;
     a->balance = bal;
     const Ref<Account> local = txn.create(std::move(a));
-    return commit_ok(m, txn).resolve(local);
+    return commit_ok(m, txn).to_real(local);
 }
 
 /// A second, unrelated type whose computed_key() has no fixed prefix -- unlike
@@ -121,7 +121,7 @@ Ref<Widget> make_widget(Model& m, const std::string& key) {
     auto w = std::make_unique<Widget>();
     w->key = key;
     const Ref<Widget> local = txn.create(std::move(w));
-    return commit_ok(m, txn).resolve(local);
+    return commit_ok(m, txn).to_real(local);
 }
 
 /// A type that opts three fields into fast lookup via define_keys(): a plain
@@ -151,7 +151,7 @@ Ref<Gadget> make_gadget(Model& m, const std::string& label, std::int64_t serial)
     g->label = label;
     g->serial = serial;
     const Ref<Gadget> local = txn.create(std::move(g));
-    return commit_ok(m, txn).resolve(local);
+    return commit_ok(m, txn).to_real(local);
 }
 
 /// Self-referential, with a CACHED nullable reference. Order::parent (the
@@ -183,7 +183,7 @@ Ref<Node> make_node(Model& m, const std::string& label, Opt<Node> parent = Opt<N
     n->label = label;
     n->parent = parent;
     const Ref<Node> local = txn.create(std::move(n));
-    return commit_ok(m, txn).resolve(local);
+    return commit_ok(m, txn).to_real(local);
 }
 
 Ref<Order> make_order(Model& m, const std::string& code, Ref<Account> account,
@@ -195,7 +195,7 @@ Ref<Order> make_order(Model& m, const std::string& code, Ref<Account> account,
     o->parent = parent;
     o->qty = qty;
     const Ref<Order> local = txn.create(std::move(o));
-    return commit_ok(m, txn).resolve(local);
+    return commit_ok(m, txn).to_real(local);
 }
 
 /// Runs `f(T*)` inside a fresh Transaction against `r` and commits. `f`
@@ -1278,7 +1278,7 @@ TEST(pre_transactions_hook_runs_and_publishes_before_the_main_transaction) {
     Snapshot s = m.snapshot();
     CHECK_EQ(s.size(), std::size_t{2});
     CHECK(s.find_by_key<&Account::name>("PRE") != nullptr);
-    CHECK(s.find(res.resolve(local)) != nullptr);
+    CHECK(s.find(res.to_real(local)) != nullptr);
     m.set_pre_transactions({});
 }
 
@@ -1327,7 +1327,7 @@ TEST(a_failing_pre_transaction_reports_precommit_conflict_and_skips_the_main_tra
     m.set_pre_transactions({});
     res = m.try_commit(txn);
     CHECK(res.status == CommitStatus::Committed);
-    CHECK(m.snapshot().find(res.resolve(local)) != nullptr);
+    CHECK(m.snapshot().find(res.to_real(local)) != nullptr);
 }
 
 // A pre-transaction that succeeds stays published even if the main
@@ -2089,7 +2089,7 @@ TEST(transaction_local_creates_can_reference_each_other_via_placeholder_ids) {
 
     CommitResult res = m.try_commit(txn);
     CHECK(res.status == CommitStatus::Committed);
-    const Ref<Order> o_real = res.resolve(o_local);
+    const Ref<Order> o_real = res.to_real(o_local);
     Snapshot s = m.snapshot();
     CHECK(s.find(o_real) != nullptr);
     CHECK_EQ(s.resolve(s.find(o_real)->account).name, std::string("A1"));
@@ -2161,7 +2161,7 @@ TEST(a_local_id_that_collides_with_another_transactions_own_local_index_silently
     // as txn2's remap table is concerned, index 0 was always its own create.
     CommitResult res = m.try_commit(txn2);
     CHECK(res.status == CommitStatus::Committed);
-    CHECK_EQ(m.snapshot().find(res.resolve(own_local))->name, std::string("TXN2-OWN"));
+    CHECK_EQ(m.snapshot().find(res.to_real(own_local))->name, std::string("TXN2-OWN"));
     CHECK_EQ(m.snapshot().size(), std::size_t{1});  // only txn2's object was ever real
 }
 
@@ -2256,7 +2256,7 @@ TEST(
         if (c.kind == ChangeKind::Deleted) ++killed;
     CHECK_EQ(killed, std::size_t{2});  // a AND the brand-new order
     CHECK(m.snapshot().find(a) == nullptr);
-    CHECK(m.snapshot().find(res.resolve(o_local)) == nullptr);
+    CHECK(m.snapshot().find(res.to_real(o_local)) == nullptr);
 }
 
 // remove()'ing an id that was create()'d earlier in the SAME transaction
@@ -2564,7 +2564,7 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
             local.push_back(seed.create(std::move(a)));
         }
         const CommitResult res = commit_ok(m, seed);
-        for (auto& r : local) accounts.push_back(res.resolve(r));
+        for (auto& r : local) accounts.push_back(res.to_real(r));
     }
 
     std::vector<Ref<Record>> records;
@@ -2580,7 +2580,7 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
             local.push_back(txn.create(std::move(r)));
         }
         const CommitResult res = commit_ok(m, txn);
-        for (auto& r : local) records.push_back(res.resolve(r));
+        for (auto& r : local) records.push_back(res.to_real(r));
     }
     const std::size_t seeded = accounts.size() + records.size();
     CHECK(seeded >= std::size_t{10000} && seeded <= std::size_t{100000});

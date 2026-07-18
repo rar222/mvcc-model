@@ -162,8 +162,8 @@ void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts, std::v
         if (res.status == CommitStatus::Committed) {
             ++commits_done;
             g_committed.fetch_add(1, std::memory_order_relaxed);
-            for (const Ref<Account>& r : new_accounts) accounts.push_back(res.resolve(r));
-            for (const Ref<Order>& r : new_orders) orders.push_back(res.resolve(r));
+            for (const Ref<Account>& r : new_accounts) accounts.push_back(res.to_real(r));
+            for (const Ref<Order>& r : new_orders) orders.push_back(res.to_real(r));
             std::printf("[writer %d] attempt %2d: COMMITTED v%llu (%zu changes)\n", tid, attempt,
                         static_cast<unsigned long long>(res.snapshot.version()), res.changes.size());
         } else {
@@ -210,8 +210,8 @@ int main() {
         }
         const CommitResult seed_res = m.try_commit(seed);
         assert(seed_res.status == CommitStatus::Committed);
-        for (auto& r : accounts) r = seed_res.resolve(r);
-        for (auto& r : orders) r = seed_res.resolve(r);
+        for (auto& r : accounts) r = seed_res.to_real(r);
+        for (auto& r : orders) r = seed_res.to_real(r);
     }
     std::printf("seeded %zu accounts, %zu orders\n\n", accounts.size(), orders.size());
 

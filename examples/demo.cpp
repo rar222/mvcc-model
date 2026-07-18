@@ -147,7 +147,7 @@ void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts,
         Transaction txn = m.begin();  // fresh base every attempt -- picks up the latest state
 
         // Refs returned by txn.create() this attempt hold LOCAL ids -- only
-        // meaningful until try_commit() returns (see CommitResult::resolve's
+        // meaningful until try_commit() returns (see CommitResult::to_real's
         // doc comment). Buffer them separately and only fold them into the
         // persistent accounts/orders lists, resolved to their real ids, once
         // this attempt actually commits; a local id must never survive into
@@ -195,8 +195,8 @@ void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts,
         if (res.status == CommitStatus::Committed) {
             ++commits_done;
             g_committed.fetch_add(1);
-            for (const Ref<Account>& r : new_accounts) accounts.push_back(res.resolve(r));
-            for (const Ref<Order>& r : new_orders) orders.push_back(res.resolve(r));
+            for (const Ref<Account>& r : new_accounts) accounts.push_back(res.to_real(r));
+            for (const Ref<Order>& r : new_orders) orders.push_back(res.to_real(r));
             std::size_t killed = 0, made = 0, changed = 0;
             for (const Change& c : res.changes) {
                 if (c.kind == ChangeKind::Created) ++made;
@@ -256,11 +256,11 @@ int main() {
         }
         const CommitResult seed_res = m.try_commit(seed);
         assert(seed_res.status == CommitStatus::Committed);
-        // accounts/orders currently hold LOCAL ids (see CommitResult::resolve's
+        // accounts/orders currently hold LOCAL ids (see CommitResult::to_real's
         // doc comment) -- translate to real, post-commit ids before anything
         // outside this transaction uses them.
-        for (auto& r : accounts) r = seed_res.resolve(r);
-        for (auto& r : orders) r = seed_res.resolve(r);
+        for (auto& r : accounts) r = seed_res.to_real(r);
+        for (auto& r : orders) r = seed_res.to_real(r);
     }
     std::printf("seeded %zu accounts, %zu orders\n", accounts.size(), orders.size());
 

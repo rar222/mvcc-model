@@ -21,7 +21,7 @@ double bench_latency(int n_objects) {
         accts.push_back(seed.create(std::move(a)));
     }
     const CommitResult seed_res = m.try_commit(seed);
-    for (auto& r : accts) r = seed_res.resolve(r);  // local ids -> real, post-commit
+    for (auto& r : accts) r = seed_res.to_real(r);  // local ids -> real, post-commit
 
     int id = 0;
     for (int i = 0; i < n_objects; i += 1000) {
@@ -78,7 +78,7 @@ ThroughputResult bench_throughput(int n_threads, int commits_per_thread) {
         accts.push_back(seed.create(std::move(a)));
     }
     const CommitResult seed_res = m.try_commit(seed);
-    for (auto& r : accts) r = seed_res.resolve(r);  // local ids -> real, post-commit
+    for (auto& r : accts) r = seed_res.to_real(r);  // local ids -> real, post-commit
 
     auto t0 = std::chrono::steady_clock::now();
     std::vector<std::thread> workers;
