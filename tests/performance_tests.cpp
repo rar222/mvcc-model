@@ -8,30 +8,47 @@
 // and notices.
 //
 // Three kinds of coverage, per the request that motivated this file:
-//   1. The claims themselves, swept across several sizes (1k/10k/100k),
-//      each printed as a number AND checked against a generous bound.
-//   2. Worst-case / degenerate data: the two specific costs CLAUDE.md's
-//      own "Known scope boundaries" section already documents as
-//      unbounded (a hub object with many referrers; an unbounded cascade)
-//      -- demonstrated and bounded, not silently accepted as "fine."
+//   1. The claims themselves, swept across several data sizes.
+//   2. Worst-case / degenerate data: the costs CLAUDE.md's own "Known
+//      scope boundaries" section documents as unbounded (a hub object
+//      with many referrers; unbounded cascade fan-out) -- demonstrated
+//      and bounded, not silently accepted as "fine."
 //   3. Object PAYLOAD size as its own axis, independent of object COUNT:
 //      write cost (clone/copy) should scale with an object's own byte
 //      size; read cost (find_by_key) should not.
 //
+// HOW PASS/FAIL WORKS. No test here asserts a fixed number of seconds.
+// Each sweep checks the SHAPE of the curve: every step's timing is
+// compared against the PREVIOUS step's measured timing, scaled by what
+// the claimed complexity predicts for that step's size ratio (see
+// check_scaling), with a +/-20% band by default. That makes every check
+// independent of how fast the machine running it happens to be, and
+// encodes the actual claim ("this grows like log n") rather than a
+// wall-clock budget that a slower machine would fail and a silent
+// O(log n)-to-O(n) regression would still pass.
+//
+// Three claims cannot hold a two-sided 20% band for reasons that are
+// physical rather than algorithmic (cache behaviour, fixed per-commit
+// overhead, O(log n) index maintenance). Each of those gets an explicitly
+// widened tolerance with the measured numbers that justify it recorded at
+// the definition -- see Tolerance below. None of them is a bare "it ran
+// fast enough" check.
+//
+// Measurements use best-of-N (see best_of): noise can only push a
+// wall-clock reading up, so the minimum across trials is the sample least
+// corrupted by scheduling jitter and cold caches. A 20% band is only
+// meaningful if its inputs are not themselves 50% noise.
+//
 // Dependency-free, same as tests/tests.cpp (see CLAUDE.md: "Don't add
 // gtest/Catch2") -- a small self-contained harness, adapted here to print
 // a timing line per measurement instead of just OK/FAIL.
-//
-// Thresholds are DELIBERATELY loose (generous multiples, not tight
-// bounds): this runs on unknown hardware, under default/asan/tsan alike,
-// so the goal is catching a catastrophic (10x-1000x) regression, not
-// flagging ordinary machine-to-machine variance.
 //
 // Run: ctest --preset default -R performance_tests --output-on-failure
 //   or: ./build/default/performance_tests
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -125,6 +142,139 @@ double time_ms(F&& f) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// Runs `f` (which returns its own elapsed time, in whatever unit) `trials`
+// times and keeps the MINIMUM -- the standard way to pull a stable estimate
+// out of a wall-clock microbenchmark: OS scheduling jitter, a cache miss, a
+// GC-unrelated page fault, etc. can only ever push one particular trial's
+// reading UP, never down, so the minimum across several trials is the
+// measurement least corrupted by that kind of noise. Every scaling check
+// below (check_scaling) depends on this: a +/-20% band around a
+// theoretical prediction is only meaningful if the inputs feeding it
+// aren't already +/-50% noise.
+template <class F>
+double best_of(int trials, F&& f) {
+    double best = f();
+    for (int t = 1; t < trials; ++t) {
+        const double v = f();
+        if (v < best) best = v;
+    }
+    return best;
+}
+
+// The claimed asymptotic order of an operation, for check_scaling() below.
+enum class GrowthOrder { kConstant, kLogN, kLinear, kLinearithmic };
+
+double scaling_factor(GrowthOrder order, int n_prev, int n_cur) {
+    switch (order) {
+        case GrowthOrder::kConstant:
+            return 1.0;
+        case GrowthOrder::kLogN:
+            return std::log(static_cast<double>(n_cur)) / std::log(static_cast<double>(n_prev));
+        case GrowthOrder::kLinear:
+            return static_cast<double>(n_cur) / static_cast<double>(n_prev);
+        case GrowthOrder::kLinearithmic:
+            return (static_cast<double>(n_cur) * std::log(static_cast<double>(n_cur))) /
+                   (static_cast<double>(n_prev) * std::log(static_cast<double>(n_prev)));
+    }
+    return 1.0;  // unreachable
+}
+
+// How much slack to allow around the predicted growth. kDefaultBand -- the
+// +/-20% two-sided band -- is the intended check and the one to reach for.
+// Every widening below is backed by a measurement recorded here, not by a
+// preference for green tests.
+//
+//   kSmallIndexedRead -- the O(log n) lookups. Their per-call cost is a
+//     fraction of a microsecond, and a 2x size step only predicts a x1.07
+//     change, so ordinary run-to-run jitter is a larger effect than the
+//     signal: measured step factors ran x0.82-x1.18 across repeat runs
+//     against that x1.07 prediction. (Match counts are held near-constant
+//     across the sweep so this measures index DEPTH; letting matches grow
+//     with n instead put these readings anywhere from 1.5 to 9.9 us and
+//     made them unassertable at any tolerance.)
+//
+//   kAtMostLinear -- upper bound only, for operations whose measured cost
+//     is dominated by FIXED per-commit overhead (lock acquisition, index
+//     bookkeeping, changelog append) rather than by the size-dependent
+//     term. A single-field commit's step factor was measured at x3.33 and
+//     x1.71 in one run and x1.56 and x3.69 in the next, against a x4.00
+//     linear prediction -- it is frequently BELOW linear, so a lower bound
+//     would be asserting noise. The ceiling still carries the weight that
+//     matters: turning the shared_ptr spine copy into a deep per-object
+//     copy would blow straight through it.
+//
+//   kLinearWithIndexOverhead -- cascade delete, checked against an n log n
+//     prediction rather than a linear one. Each cascaded victim performs
+//     several path-copying persistent-map erases (by_type_, plus
+//     drop_field_keys / drop_cached_fields / drop_cached_references --
+//     Order declares several indexed fields), so the real cost is
+//     superlinear: measured x5.01-x7.74 against a x4.00 pure-linear
+//     prediction, i.e. an empirical exponent around n^1.2-n^1.5. Against
+//     the n log n prediction (x4.65-x4.78) the measured factors sit at
+//     1.10-1.57x. The 2.0x ceiling covers that; a genuine O(n^2)
+//     regression would land at ~3.4x and still fail.
+//
+// Note the step ratios: the write-side sweeps use 4x steps, not 2x. At 2x
+// steps a quadratic regression produces x4.00 while observed noise alone
+// reached x3.45 -- the two overlap, so the check could not tell them
+// apart. At 4x steps linear predicts x4 and quadratic x16, which noise
+// cannot bridge.
+struct Tolerance {
+    double lo_mult;
+    double hi_mult;
+};
+
+constexpr Tolerance kDefaultBand{0.8, 1.2};              // the +/-20% band
+constexpr Tolerance kSmallIndexedRead{0.7, 1.3};         // sub-microsecond: jitter > 20%
+constexpr Tolerance kAtMostLinear{0.0, 1.75};            // upper bound only; see above
+constexpr Tolerance kLinearWithIndexOverhead{0.7, 2.0};  // n log n + allocator churn
+
+// For a claim whose absolute timings are too noisy for a step band, but
+// whose RELATIVE behaviour across the sweep is unmistakable: assert that
+// the indexed-vs-unindexed gap WIDENS by at least `min_growth` from the
+// smallest size to the largest. That is exactly the "one of these is O(n)
+// and the other is not" claim, and it is immune to the cache and
+// allocator noise that makes the scan's own per-step timings unstable --
+// the measured gap runs from ~5x at the smallest size to ~1000x at the
+// largest, so a 3x minimum has enormous headroom while still failing
+// outright if the index ever stops being asymptotically better.
+void check_gap_widens(const char* label, double small_scan, double small_indexed,
+                       double large_scan, double large_indexed, double min_growth) {
+    const double small_ratio = small_scan / small_indexed;
+    const double large_ratio = large_scan / large_indexed;
+    std::printf("    %-24s gap: %.1fx at smallest size -> %.1fx at largest (need >= %.1fx growth)\n",
+                label, small_ratio, large_ratio, min_growth);
+    CHECK(large_ratio >= small_ratio * min_growth);
+}
+
+// The actual pass/fail mechanism this file uses for every size/fanout
+// sweep: for each step, the EXPECTED timing is the PREVIOUS step's own
+// observed timing, scaled by what `order` predicts from the ratio between
+// consecutive sizes -- never a fixed number of milliseconds. A fixed
+// wall-clock bound is either too loose to catch a real regression (an
+// O(log n) lookup silently becoming O(n) still finishes in a few ms at
+// these sizes) or too tight to survive a slower machine; checking the
+// SHAPE of the curve against the previous step does neither -- it is
+// independent of the absolute speed of whatever hardware runs it, and it
+// directly encodes the actual claim ("this grows like log n", not "this
+// takes under 50 ms").
+void check_scaling(const char* label, GrowthOrder order, const std::vector<int>& sizes,
+                    const std::vector<double>& times, Tolerance tol = kDefaultBand) {
+    for (std::size_t i = 1; i < sizes.size(); ++i) {
+        const double factor = scaling_factor(order, sizes[i - 1], sizes[i]);
+        const double expected = times[i - 1] * factor;
+        const double lo = expected * tol.lo_mult;
+        const double hi = expected * tol.hi_mult;
+        const double actual_factor = times[i - 1] > 0 ? times[i] / times[i - 1] : 0.0;
+        std::printf(
+            "    %-24s %7d -> %7d : predicted x%.2f, measured x%.2f  (actual=%.6f, allowed "
+            "[%.6f, %.6f])\n",
+            label, sizes[i - 1], sizes[i], factor, actual_factor, times[i], lo, hi);
+        CHECK(times[i] >= lo);
+        CHECK(times[i] <= hi);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Setup helpers -- batched creates so seeding a large model is far faster
 // than one commit per object, while still going through the real
@@ -195,7 +345,7 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 // scan) -- see demo/types.h. Same field, same data, same query: any timing
 // difference is attributable entirely to the index, not to anything else.
 PERF_TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
-    const std::vector<int> sizes = {scaled(1000), scaled(10000), scaled(100000)};
+    const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> key_us, scan_us;
     for (int n : sizes) {
         Model m;
@@ -205,67 +355,78 @@ PERF_TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
         Snapshot s = m.snapshot();
 
         constexpr int kKeyReps = 5000;
-        const double t_key = time_ms([&] {
-            for (int i = 0; i < kKeyReps; ++i) (void)s.find_by_key<&Account::name>(probe);
-        });
-        key_us.push_back(t_key * 1000.0 / kKeyReps);
+        key_us.push_back(best_of(15, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < kKeyReps; ++i) (void)s.find_by_key<&Account::name>(probe);
+                   }) *
+                   1000.0 / kKeyReps;
+        }));
 
         // Fewer repetitions as n grows -- each individual scan call is
         // O(n), so this keeps total wall time roughly bounded while still
         // reporting a stable per-call average.
         const int scan_reps = std::max(5, 200000 / n);
-        const double t_scan = time_ms([&] {
-            for (int i = 0; i < scan_reps; ++i) (void)s.find_by_scan_field<&Account::name>(probe);
-        });
-        scan_us.push_back(t_scan * 1000.0 / scan_reps);
+        scan_us.push_back(best_of(5, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < scan_reps; ++i)
+                           (void)s.find_by_scan_field<&Account::name>(probe);
+                   }) *
+                   1000.0 / scan_reps;
+        }));
 
         std::printf("  n=%7d  find_by_key=%9.4f us/call   find_by_scan_field=%9.2f us/call\n", n,
                     key_us.back(), scan_us.back());
     }
-    // O(1): a 100x population increase must not blow up the per-call cost.
-    CHECK(key_us.back() < key_us.front() * 10.0 + 5.0);
-    // The tradeoff the two families exist to document (see demo/types.h):
-    // at the largest size, the unindexed scan must be markedly slower than
-    // the indexed lookup on the SAME field.
-    CHECK(scan_us.back() > key_us.back() * 5.0);
+    check_scaling("find_by_key", GrowthOrder::kConstant, sizes, key_us);
+    check_gap_widens("find_by_key vs scan", scan_us.front(), key_us.front(), scan_us.back(),
+                     key_us.back(), 3.0);
 }
 
 // Same comparison, one level up: Order::qty is in BOTH define_cached_fields
 // (indexed, O(log n + matches)) and define_scan_fields (O(#orders) scan).
 PERF_TEST(find_by_cached_field_stays_near_flat_while_scan_grows_on_the_same_field) {
-    const std::vector<int> sizes = {scaled(1000), scaled(10000), scaled(100000)};
+    const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> cached_us, scan_us;
     for (int n : sizes) {
         Model m;
         std::vector<Ref<Account>> accounts;
         seed_accounts(m, 4, accounts);
         std::vector<Ref<Order>> orders;
-        // qty_mod scales with n so match count for `probe_qty` stays ~50
+        // qty_mod scales with n so match count for `probe_qty` stays ~10
         // regardless of n -- isolates the index's O(log n) term from its
         // O(matches) term (see seed_orders' own comment).
-        const int qty_mod = std::max(8, n / 50);
+        const int qty_mod = std::max(8, n / 10);
         seed_orders(m, accounts, n, orders, qty_mod);
-        const std::int64_t probe_qty = 7;  // always < qty_mod (>= 8), always ~50 matches
+        const std::int64_t probe_qty = 7;  // always < qty_mod (>= 8), always ~10 matches
         Snapshot s = m.snapshot();
 
         constexpr int kCachedReps = 2000;
-        const double t_cached = time_ms([&] {
-            for (int i = 0; i < kCachedReps; ++i) (void)s.find_by_cached_field<&Order::qty>(probe_qty);
-        });
-        cached_us.push_back(t_cached * 1000.0 / kCachedReps);
+        cached_us.push_back(best_of(15, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < kCachedReps; ++i)
+                           (void)s.find_by_cached_field<&Order::qty>(probe_qty);
+                   }) *
+                   1000.0 / kCachedReps;
+        }));
 
         const int scan_reps = std::max(5, 200000 / n);
-        const double t_scan = time_ms([&] {
-            for (int i = 0; i < scan_reps; ++i) (void)s.find_by_scan_field<&Order::qty>(probe_qty);
-        });
-        scan_us.push_back(t_scan * 1000.0 / scan_reps);
+        scan_us.push_back(best_of(5, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < scan_reps; ++i)
+                           (void)s.find_by_scan_field<&Order::qty>(probe_qty);
+                   }) *
+                   1000.0 / scan_reps;
+        }));
 
         std::printf(
             "  n=%7d  find_by_cached_field=%9.4f us/call   find_by_scan_field=%9.2f us/call\n", n,
             cached_us.back(), scan_us.back());
     }
-    CHECK(cached_us.back() < cached_us.front() * 20.0 + 20.0);
-    CHECK(scan_us.back() > cached_us.back() * 5.0);
+    // Matches held ~constant across the sweep (see qty_mod above), so this
+    // isolates the index's O(log n) term from its O(matches) term.
+    check_scaling("find_by_cached_field", GrowthOrder::kLogN, sizes, cached_us, kSmallIndexedRead);
+    check_gap_widens("cached_field vs scan", scan_us.front(), cached_us.front(), scan_us.back(),
+                     cached_us.back(), 3.0);
 }
 
 // The reverse-lookup counterpart: Order::account is in define_references()
@@ -275,15 +436,15 @@ PERF_TEST(find_by_cached_field_stays_near_flat_while_scan_grows_on_the_same_fiel
 // same comparison examples/cached_reference_bench.cpp benchmarks in more
 // depth, here as an asserted claim at smaller, CI-friendly sizes.
 PERF_TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_population) {
-    const std::vector<int> sizes = {scaled(1000), scaled(10000), scaled(100000)};
+    const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> scan_us, indexed_us;
     for (int n : sizes) {
         Model m;
         // Account count scales with n (same reason as bucket_count_for in
         // examples/cached_reference_bench.cpp): match count for `target`
-        // stays ~250 regardless of n, isolating the index's O(log n) term
+        // stays ~10 regardless of n, isolating the index's O(log n) term
         // from its O(matches) term.
-        const int n_accounts = std::max(4, n / 250);
+        const int n_accounts = std::max(4, n / 10);
         std::vector<Ref<Account>> accounts;
         seed_accounts(m, n_accounts, accounts);
         std::vector<Ref<Order>> orders;
@@ -292,22 +453,30 @@ PERF_TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_populatio
         const Ref<Account> target = accounts[0];
 
         const int reps = std::max(5, 200000 / n);
-        const double t_scan = time_ms([&] {
-            for (int i = 0; i < reps; ++i) (void)s.find_referrers<&Order::account>(target);
-        });
-        scan_us.push_back(t_scan * 1000.0 / reps);
+        scan_us.push_back(best_of(5, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < reps; ++i) (void)s.find_referrers<&Order::account>(target);
+                   }) *
+                   1000.0 / reps;
+        }));
 
         constexpr int kIndexedReps = 2000;
-        const double t_idx = time_ms([&] {
-            for (int i = 0; i < kIndexedReps; ++i) (void)s.find_cached_referrers<&Order::account>(target);
-        });
-        indexed_us.push_back(t_idx * 1000.0 / kIndexedReps);
+        indexed_us.push_back(best_of(15, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < kIndexedReps; ++i)
+                           (void)s.find_cached_referrers<&Order::account>(target);
+                   }) *
+                   1000.0 / kIndexedReps;
+        }));
 
         std::printf("  n=%7d  scan=%10.2f us/call   indexed=%10.4f us/call   speedup=%8.0fx\n", n,
                     scan_us.back(), indexed_us.back(), scan_us.back() / indexed_us.back());
     }
-    CHECK(indexed_us.back() < indexed_us.front() * 20.0 + 20.0);
-    CHECK(scan_us.back() > indexed_us.back() * 5.0);
+    // Matches held ~constant across the sweep (account count scales with
+    // n above), so this isolates the index's O(log n) term.
+    check_scaling("find_cached_referrers", GrowthOrder::kLogN, sizes, indexed_us, kSmallIndexedRead);
+    check_gap_widens("cached_referrers vs scan", scan_us.front(), indexed_us.front(), scan_us.back(),
+                     indexed_us.back(), 3.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -317,33 +486,37 @@ PERF_TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_populatio
 // try_commit()'s publish step copies spine_ (O(#chunks) shared_ptr copies,
 // not a deep copy -- see DESIGN.md's Structure diagram) and every
 // per-type/per-field index (O(#types)/O(#indexed fields), independent of
-// model size). Net effect: a single-field update's commit latency is NOT
-// expected to stay flat as the model grows -- it grows with #chunks -- but
-// it must stay BOUNDED (a small multiple, not proportional to a deep copy
-// of the whole model). That's the claim under test here.
-PERF_TEST(single_field_commit_latency_stays_bounded_as_total_model_size_grows) {
-    const std::vector<int> sizes = {scaled(1000), scaled(10000), scaled(100000)};
-    std::vector<double> avg_ms;
+// model size). #chunks is proportional to model size, so the claim is that
+// a single-field update's commit latency grows LINEARLY with model size --
+// not flat, but also not proportional to a deep copy of the whole model
+// (which would grow far faster than linear).
+PERF_TEST(single_field_commit_latency_scales_linearly_with_total_model_size) {
+    const std::vector<int> sizes = {scaled(6250), scaled(25000), scaled(100000)};
+    std::vector<double> ms_per_commit;
     for (int n : sizes) {
         Model m;
         std::vector<Ref<Account>> accounts;
         seed_accounts(m, n, accounts);
 
-        constexpr int kReps = 20;
-        double total = 0;
-        for (int i = 0; i < kReps; ++i) {
-            Transaction txn = m.begin();
-            txn.update(accounts[static_cast<std::size_t>(i) % accounts.size()])->balance = i;
-            total += time_ms([&] { (void)m.try_commit(txn); });
-        }
-        avg_ms.push_back(total / kReps);
-        std::printf("  n=%7d  single-field commit = %8.4f ms/commit (avg of %d)\n", n, avg_ms.back(),
-                    kReps);
+        // Many commits, min-of-several-trials aggregation: the chunk-copy
+        // term this test is isolating is small relative to fixed
+        // per-commit overhead (lock acquisition, index bookkeeping) at
+        // these sizes, so a single (or lightly-averaged) sample is mostly
+        // noise -- see best_of()'s own comment.
+        constexpr int kReps = 50;
+        ms_per_commit.push_back(best_of(5, [&] {
+            double total = 0;
+            for (int i = 0; i < kReps; ++i) {
+                Transaction txn = m.begin();
+                txn.update(accounts[static_cast<std::size_t>(i) % accounts.size()])->balance = i;
+                total += time_ms([&] { (void)m.try_commit(txn); });
+            }
+            return total / kReps;
+        }));
+        std::printf("  n=%7d  single-field commit = %8.5f ms/commit (best-of-5 avg of %d)\n", n,
+                    ms_per_commit.back(), kReps);
     }
-    // Generous: catches "someone turned the chunk copy into a deep
-    // per-object copy" (which would blow well past this even at 100k), not
-    // ordinary linear growth in chunk count.
-    CHECK(avg_ms.back() < 200.0);
+    check_scaling("single-field commit", GrowthOrder::kLinear, sizes, ms_per_commit, kAtMostLinear);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,100 +555,122 @@ void seed_hub_with_fanout(Model& m, int fanout, int background, Ref<Account>& hu
 
 }  // namespace
 
-// Removing ONE of a hub's many referrers forces drop_out_refs to scan the
-// hub's ENTIRE referrer list (find_if) to find and erase that one edge --
-// this is the O(#referrers) cost CLAUDE.md's scope-boundaries section
-// documents. Demonstrated by holding the REST of the model's size fixed
-// and varying only the hub's fanout.
+// Removing ONE of a hub's many referrers forces drop_out_refs to locate
+// that one edge in the hub's referrer vector (a linear find_if) and erase
+// it (a vector erase) -- the O(#referrers) cost CLAUDE.md's
+// scope-boundaries section documents. Held here as an UPPER bound only
+// (kAtMostLinear), which is a deliberate, measured decision rather than a
+// loose default:
+//
+//   - The cost depends strongly on WHERE the edge sits. Removing the
+//     first-created referrer (edge at the FRONT: find_if returns
+//     immediately, but erase must memmove the whole tail) and the
+//     last-created one (edge at the BACK: full find_if scan, O(1) erase)
+//     differ by ~10x on a single cold measurement -- 16 ms vs 1.2 ms at
+//     fanout=50,000.
+//   - Almost all of that gap is COLD-CACHE first touch, not asymptotics.
+//     Taking the best of five successive removals collapses it: the same
+//     front-edge case then measures 0.23 ms at fanout=25,000, 0.17 ms at
+//     50,000 and 0.33 ms at 100,000 -- no clean growth at all, because in
+//     steady state fixed per-commit overhead dominates both the scan and
+//     the memmove.
+//
+// So a two-sided band here would be asserting noise. The upper bound is
+// still worth having: it rejects the regression that actually matters
+// (this operation going quadratic), while not pretending the linear term
+// is separable from commit overhead at any size this suite can afford.
 PERF_TEST(worst_case_removing_one_referrer_of_a_hub_scales_with_hub_fanout) {
-    const std::vector<int> fanouts = {scaled(100), scaled(1000), scaled(10000)};
+    const std::vector<int> fanouts = {scaled(6250), scaled(25000), scaled(100000)};
+    constexpr int kTrials = 5;
     std::vector<double> times_ms;
     for (int fanout : fanouts) {
         Model m;
         Ref<Account> hub;
         std::vector<Ref<Order>> hub_orders;
-        seed_hub_with_fanout(m, fanout, /*background=*/1000, hub, hub_orders);
+        // Seed `fanout + kTrials` referrers, then remove kTrials of them
+        // ONE AT A TIME below: kTrials << fanout, so the hub's fanout is
+        // still ~`fanout` for every one of those removals, letting us take
+        // several trials without rebuilding the whole hub each time.
+        seed_hub_with_fanout(m, fanout + kTrials, /*background=*/1000, hub, hub_orders);
 
-        const double t = time_ms([&] {
-            Transaction txn = m.begin();
-            txn.remove(hub_orders.back());
-            (void)m.try_commit(txn);
-        });
-        times_ms.push_back(t);
-        std::printf("  hub fanout=%6d   remove one referrer = %8.4f ms\n", fanout, t);
+        std::vector<double> trial_ms;
+        for (int t = 0; t < kTrials; ++t) {
+            const Ref<Order> victim = hub_orders.back();
+            hub_orders.pop_back();
+            trial_ms.push_back(time_ms([&] {
+                Transaction txn = m.begin();
+                txn.remove(victim);
+                (void)m.try_commit(txn);
+            }));
+        }
+        times_ms.push_back(*std::min_element(trial_ms.begin(), trial_ms.end()));
+        std::printf("  hub fanout=%6d   remove one referrer = %8.4f ms (best of %d)\n", fanout,
+                    times_ms.back(), kTrials);
     }
-    // Bounded, not flat -- this IS documented, expected growth (a known
-    // tradeoff, not a bug). Catch only a further, unexpected blowup (e.g.
-    // an accidental O(fanout^2)) on top of the already-linear cost.
-    CHECK(times_ms.back() < 1000.0);
+    // No step band: the measured values here are ~0.1 ms, small enough that
+    // run-to-run jitter exceeds the size-dependent term entirely (see the
+    // comment above). What IS robust is that a 16x increase in fanout must
+    // not produce a blowup: quadratic would be ~256x. A 10x ceiling clears
+    // the observed noise by a wide margin and still fails loudly on a real
+    // complexity regression.
+    std::printf("    %-24s %7d -> %7d fanout (16x): %.4f ms -> %.4f ms (ceiling %.4f)\n",
+                "remove one hub referrer", fanouts.front(), fanouts.back(), times_ms.front(),
+                times_ms.back(), times_ms.front() * 10.0);
+    CHECK(times_ms.back() <= times_ms.front() * 10.0);
 }
 
-namespace {
-
-// Account/Order have no non-nullable SELF-reference (Order.account always
-// points at an Account, never another Order; Order.parent is nullable, so
-// cascade NULLS it instead of propagating -- see demo/types.h). This type
-// exists purely to build a genuinely deep, non-nullable reference chain.
-class ChainNode final : public model::Object<ChainNode> {
-public:
-    std::string label;
-    model::Ref<ChainNode> prev;  // non-nullable: this node dies when `prev` does
-
-    template <class Self, class V>
-    static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&ChainNode::prev>(), "prev", s.prev);
-    }
-};
-
-// Builds head->...->tail (`depth` nodes), each node's `prev` pointing at
-// the one before it. The head points at ITSELF -- a self-loop is how a
-// non-nullable field survives having no real predecessor; remove_raw()'s
-// cycle handling (see cascade_terminates_on_cycles in tests/tests.cpp)
-// makes this a safe, already-tested shape, not a hack. Removing the head
-// cascades through the WHOLE chain, one hop at a time.
-Ref<ChainNode> build_chain(Model& m, int depth) {
-    Transaction txn = m.begin();
-    auto h = std::make_unique<ChainNode>();
-    h->label = "N0";
-    const Ref<ChainNode> head = txn.create(std::move(h));
-    txn.update(head)->prev = head;  // self-loop; update() on a local id mutates in place
-
-    Ref<ChainNode> prev = head;
-    for (int i = 1; i < depth; ++i) {
-        auto n = std::make_unique<ChainNode>();
-        n->label = "N" + std::to_string(i);
-        n->prev = prev;
-        prev = txn.create(std::move(n));
-    }
-    CommitResult res = m.try_commit(txn);
-    return res.to_real(head);
-}
-
-}  // namespace
-
-// Removing the head of a long non-nullable reference chain cascades
-// through every node, one hop at a time -- unbounded cascade fan-out from
-// a single remove() intent, the OTHER cost CLAUDE.md's scope-boundaries
-// section documents (distinct from the hub-fanout test above: this is
-// cascade DEPTH, not breadth).
-PERF_TEST(worst_case_removing_the_head_of_a_long_cascade_chain_scales_with_depth) {
-    const std::vector<int> depths = {scaled(100), scaled(1000), scaled(10000)};
+// Removing the hub ITSELF (rather than one of its referrers, as the test
+// above does) cascades to every Order pointing at it -- so the work is
+// proportional to the SIZE OF THE CASCADE, which is the cost CLAUDE.md's
+// scope-boundaries section means by "cascade fan-out from a single
+// remove() intent is still unbounded."
+//
+// A note on what is NOT tested here, because it is not expressible: an
+// arbitrarily DEEP non-nullable chain (a -> b -> c -> ... , removing `a`
+// cascading hop by hop). Every non-nullable Ref must point at something
+// that already exists -- RefRemapper resolves a create's refs BEFORE
+// recording that create's own id, so a self-loop, a same-transaction
+// forward reference, and a null head are all rejected as
+// CommitStatus::Invalid (verified directly against this model). A
+// non-nullable reference graph is therefore always a DAG rooted at
+// objects with no non-nullable refs, and its depth is bounded by the
+// number of distinct types, not by object count. Cascade cost scales with
+// the cascade's SIZE, which is what this test measures.
+PERF_TEST(worst_case_removing_a_hub_scales_with_the_size_of_its_cascade) {
+    const std::vector<int> fanouts = {scaled(1250), scaled(5000), scaled(20000)};
+    constexpr int kTrials = 5;
     std::vector<double> times_ms;
-    for (int depth : depths) {
+    for (int fanout : fanouts) {
         Model m;
-        const Ref<ChainNode> head = build_chain(m, depth);
+        // Removing a hub destroys that whole sub-graph, so the same hub
+        // can't be measured twice -- build kTrials INDEPENDENT hubs of
+        // equal fanout in one Model, then remove each exactly once.
+        std::vector<Ref<Account>> hubs;
+        for (int t = 0; t < kTrials; ++t) {
+            const Ref<Account> hub = make_one_account(m, "HUB" + std::to_string(t));
+            std::vector<Ref<Order>> orders;
+            seed_orders(m, std::vector<Ref<Account>>{hub}, fanout, orders);
+            hubs.push_back(hub);
+        }
+        const std::size_t before = m.snapshot().size();
 
-        const double t = time_ms([&] {
-            Transaction txn = m.begin();
-            txn.remove(head);
-            (void)m.try_commit(txn);
-        });
-        times_ms.push_back(t);
-        std::printf("  chain depth=%6d   remove head (full cascade) = %8.4f ms\n", depth, t);
+        std::vector<double> trial_ms;
+        for (const Ref<Account>& hub : hubs) {
+            trial_ms.push_back(time_ms([&] {
+                Transaction txn = m.begin();
+                txn.remove(hub);
+                (void)m.try_commit(txn);
+            }));
+        }
+        times_ms.push_back(*std::min_element(trial_ms.begin(), trial_ms.end()));
+        std::printf("  cascade size=%6d   remove hub (full cascade) = %8.4f ms (best of %d)\n",
+                    fanout, times_ms.back(), kTrials);
 
-        CHECK(m.snapshot().size() == std::size_t{0});  // the whole chain died, not just the head
+        // Each removal killed its hub AND all `fanout` Orders under it.
+        CHECK(m.snapshot().size() == before - static_cast<std::size_t>(fanout + 1) * kTrials);
     }
-    CHECK(times_ms.back() < 1000.0);
+    check_scaling("remove hub (cascade)", GrowthOrder::kLinearithmic, fanouts, times_ms,
+                  kLinearWithIndexOverhead);
 }
 
 // ---------------------------------------------------------------------------
