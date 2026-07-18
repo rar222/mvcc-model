@@ -162,7 +162,24 @@ double best_of(int trials, F&& f) {
 }
 
 // The claimed asymptotic order of an operation, for check_scaling() below.
-enum class GrowthOrder { kConstant, kLogN, kLinear, kLinearithmic };
+//
+// kNLogN is the one to reach for whenever an operation touches n objects
+// and does per-object index maintenance, because every such write goes
+// through a path-copying persistent map: n objects x O(log n) per object.
+// Cascade delete is the case in this suite (see the cascade test) -- each
+// victim drives by_type_ plus drop_field_keys / drop_cached_fields /
+// drop_cached_references. Reach for kLinear only when the per-object work
+// really is index-free (e.g. try_commit's spine copy, which is a flat run
+// of shared_ptr copies).
+//
+// Bulk create is the other structurally-n-log-n operation here (n creates,
+// each doing O(log n) persistent-map inserts), and it is deliberately NOT
+// swept: measured across 4x steps it came out x11.3 then x5.7, i.e. 2.5x
+// and 1.3x against the n log n prediction, because per-object cost climbs
+// from 2.6 us to 10.5 us as the working set leaves cache. The asymptotic
+// term is real but is not the dominant one over any range this suite can
+// afford, so asserting a band on it would be asserting cache behaviour.
+enum class GrowthOrder { kConstant, kLogN, kLinear, kNLogN };
 
 double scaling_factor(GrowthOrder order, int n_prev, int n_cur) {
     switch (order) {
@@ -172,7 +189,7 @@ double scaling_factor(GrowthOrder order, int n_prev, int n_cur) {
             return std::log(static_cast<double>(n_cur)) / std::log(static_cast<double>(n_prev));
         case GrowthOrder::kLinear:
             return static_cast<double>(n_cur) / static_cast<double>(n_prev);
-        case GrowthOrder::kLinearithmic:
+        case GrowthOrder::kNLogN:
             return (static_cast<double>(n_cur) * std::log(static_cast<double>(n_cur))) /
                    (static_cast<double>(n_prev) * std::log(static_cast<double>(n_prev)));
     }
@@ -669,7 +686,7 @@ PERF_TEST(worst_case_removing_a_hub_scales_with_the_size_of_its_cascade) {
         // Each removal killed its hub AND all `fanout` Orders under it.
         CHECK(m.snapshot().size() == before - static_cast<std::size_t>(fanout + 1) * kTrials);
     }
-    check_scaling("remove hub (cascade)", GrowthOrder::kLinearithmic, fanouts, times_ms,
+    check_scaling("remove hub (cascade)", GrowthOrder::kNLogN, fanouts, times_ms,
                   kLinearWithIndexOverhead);
 }
 
