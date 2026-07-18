@@ -2234,6 +2234,117 @@ TEST(remove_intent_is_not_yet_visible_as_deleted_in_pending_changes) {
     CHECK(m.snapshot().find(o) == nullptr);
 }
 
+// With no pending remove() intents, estimate_changes() has nothing to
+// estimate -- it's exactly pending_changes(), verbatim.
+TEST(estimate_changes_with_no_pending_removes_matches_pending_changes_exactly) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    Transaction txn = m.begin();
+    auto o = std::make_unique<Order>();
+    o->code = "O1";
+    o->account = a;
+    txn.create(std::move(o));
+    txn.update(a)->balance = 99;
+
+    const std::vector<Change> estimate = txn.estimate_changes();
+    const std::vector<Change>& pending = txn.pending_changes();
+    CHECK_EQ(estimate.size(), pending.size());
+    for (std::size_t i = 0; i < estimate.size(); ++i) {
+        CHECK(estimate[i].id == pending[i].id);
+        CHECK(estimate[i].kind == pending[i].kind);
+        CHECK(estimate[i].tag == pending[i].tag);
+    }
+}
+
+// A pending remove() of an Account estimates the cascade into every Order
+// whose (non-nullable) account field points at it -- Deleted for both,
+// computed read-only against base(), matching what the real try_commit()
+// (checked afterward) actually produces.
+TEST(estimate_changes_estimates_a_non_nullable_cascade_delete) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a);
+
+    Transaction txn = m.begin();
+    txn.remove(a);
+    const std::vector<Change> estimate = txn.estimate_changes();
+
+    std::size_t deletes = 0;
+    bool saw_account = false, saw_order = false;
+    for (const Change& c : estimate) {
+        if (c.kind != ChangeKind::Deleted) continue;
+        ++deletes;
+        if (c.id == a.raw()) saw_account = true;
+        if (c.id == o.raw()) saw_order = true;
+    }
+    CHECK_EQ(deletes, std::size_t{2});
+    CHECK(saw_account);
+    CHECK(saw_order);
+
+    // The estimate took no lock and mutated nothing -- the transaction
+    // commits normally afterward, with a real changeset matching the
+    // estimate's shape.
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK_EQ(res.changes.size(), std::size_t{2});
+}
+
+// A pending remove() of an Order estimates an Updated (not a Deleted) for
+// any OTHER Order whose Opt<Order> parent field points at it -- the
+// nullable-cascade-null case, distinct from the non-nullable case above.
+TEST(estimate_changes_estimates_a_nullable_cascade_null_as_updated_not_deleted) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> parent = make_order(m, "P1", a);
+    const Ref<Order> child = make_order(m, "C1", a, parent);
+
+    Transaction txn = m.begin();
+    txn.remove(parent);
+    const std::vector<Change> estimate = txn.estimate_changes();
+
+    bool saw_parent_deleted = false, saw_child_updated = false, saw_child_deleted = false;
+    for (const Change& c : estimate) {
+        if (c.id == parent.raw() && c.kind == ChangeKind::Deleted) saw_parent_deleted = true;
+        if (c.id == child.raw() && c.kind == ChangeKind::Updated) saw_child_updated = true;
+        if (c.id == child.raw() && c.kind == ChangeKind::Deleted) saw_child_deleted = true;
+    }
+    CHECK(saw_parent_deleted);
+    CHECK(saw_child_updated);  // nullable ref -> estimated null-out, not a delete
+    CHECK(!saw_child_deleted);
+}
+
+// TSan-targeted, same pattern as set_pre_commit_can_race_try_commit_
+// without_a_data_race: estimate_changes() takes no lock at all (commit_mu_
+// is unreachable from Transaction-building code -- invariant 10), so
+// calling it repeatedly from one thread must never race with another
+// thread hammering try_commit() concurrently. The real assertion here is
+// TSan's (ctest --preset tsan).
+TEST(estimate_changes_never_races_a_concurrently_hammering_try_commit) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    for (int i = 0; i < 20; ++i) make_order(m, "O" + std::to_string(i), a);
+
+    std::atomic<bool> stop{false};
+    std::thread committer([&] {
+        int n = 0;
+        do {
+            Transaction t = m.begin();
+            auto o = std::make_unique<Order>();
+            o->code = "W" + std::to_string(n++);
+            o->account = a;
+            t.create(std::move(o));
+            (void)m.try_commit(t);
+        } while (!stop.load(std::memory_order_relaxed));
+    });
+
+    Transaction txn = m.begin();
+    txn.remove(a);
+    for (int i = 0; i < 200; ++i) CHECK(!txn.estimate_changes().empty());
+
+    stop = true;
+    committer.join();
+}
+
 // A same-transaction "create X referencing Y, then remove Y" correctly
 // cascades the brand-new X too -- the cascade BFS sees the local create
 // as a real referrer once apply installs it, not just pre-existing ones.

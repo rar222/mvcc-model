@@ -1164,6 +1164,42 @@ Transaction Snapshot::begin() const {
     return lease_->m->begin(*this);
 }
 
+std::vector<Change> Transaction::estimate_changes() const {
+    // Creates and updates are already known exactly -- no estimation needed.
+    std::vector<Change> out = pending_changes_;
+    if (remove_intents_.empty()) return out;
+
+    // Read-only cascade ESTIMATE, against base() -- mirrors remove_raw()'s
+    // real BFS, but referrers_ (the writer's fast reverse index) is
+    // commit_mu_-protected and unreachable from here (Transaction building
+    // is lock-free -- invariant 10), so this walks base()'s published state
+    // directly via for_each_referrer_any(), at O(total live objects) cost
+    // per pending remove. See estimate_changes()'s own doc comment for the
+    // "estimate, not guarantee" caveats.
+    std::unordered_set<std::uint32_t> visited;
+    std::vector<Id> work(remove_intents_.begin(), remove_intents_.end());
+
+    while (!work.empty()) {
+        const Id x = work.back();
+        work.pop_back();
+        if (!base_.find_raw(x)) continue;  // already dead even at base() -- nothing to estimate
+        if (!visited.insert(x.index).second) continue;  // cycles terminate here, same as remove_raw()
+
+        out.push_back({x, ChangeKind::Deleted, base_.find_raw(x)->tag()});
+
+        base_.for_each_referrer_any(
+            x, [&](Id from, const void*, bool nullable, TypeTag from_tag) {
+                if (!base_.find_raw(from)) return;  // already accounted for, or already dead
+                if (nullable) {
+                    out.push_back({from, ChangeKind::Updated, from_tag});  // estimated null-out
+                } else {
+                    work.push_back(from);  // estimated to die with its target
+                }
+            });
+    }
+    return out;
+}
+
 std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap) {
     // Creates first, then updates (reconciled immediately, see apply_update),

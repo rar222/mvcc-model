@@ -1133,6 +1133,35 @@ private:
         return static_cast<const T*>(o);
     }
 
+    /// Generic ("any type, any field") counterpart of for_each_referrer<Field>:
+    /// walks EVERY live object of EVERY type via by_type, and every one of
+    /// ITS ref fields via the virtual each_ref() (so no compile-time list of
+    /// candidate (Type, Field) pairs is needed), calling
+    /// f(referrer_id, field, nullable, referrer_tag) for every edge whose
+    /// target is `target`. There is no index for this the way for_each_referrer
+    /// has for one declared Field -- referrers_, the structure that WOULD make
+    /// this cheap, is the writer's commit_mu_-protected reverse index and is
+    /// unreachable from the read side (invariant 7) -- so this is O(total live
+    /// objects), strictly for occasional/diagnostic use (see
+    /// Transaction::estimate_changes(), its only caller), never a hot path.
+    /// Private and friended to Transaction rather than public: exposing an
+    /// O(#everything) scan as ordinary public API would invite exactly the
+    /// misuse the single-Field scan family already warns against, multiplied
+    /// by every type in the model.
+    template <class F>
+    void for_each_referrer_any(Id target, F&& f) const {
+        if (!root_ || !target) return;
+        for (const auto& [tag, ids] : root_->by_type) {
+            ids.for_each([&](const std::string&, const Id& id) {
+                const ObjectBase* o = find_raw(id);
+                if (!o) return;
+                o->each_ref([&](const void* field, const char*, Id ref_target, bool nullable) {
+                    if (ref_target == target) f(o->id, field, nullable, tag);
+                });
+            });
+        }
+    }
+
     std::shared_ptr<const Root> root_;  ///< the immutable version everything above reads;
                                         ///< shared with the Model and other snapshots
     std::shared_ptr<Lease> lease_;      ///< keeps root_'s version registered while any copy lives
@@ -2132,6 +2161,33 @@ public:
     /// it drags down) is decided by try_commit()'s cascade BFS, not by the
     /// order remove() was called.
     const std::unordered_set<Id, IdHash>& remove_intents() const { return remove_intents_; }
+
+    /// Estimate this transaction's full effect, with no lock taken and
+    /// nothing mutated: pending_changes() (creates/updates -- already known
+    /// exactly, included verbatim) PLUS an estimated cascade resolution of
+    /// remove_intents(). For each pending remove, a read-only walk of
+    /// base() (see Snapshot::for_each_referrer_any) finds every current
+    /// referrer and estimates a cascaded Deleted (non-nullable) or a
+    /// null'd Updated (nullable) -- the same resolution remove_raw() does
+    /// for real at apply time, just computed here against base() instead
+    /// of the writer's referrers_ (commit_mu_-protected, unreachable from
+    /// Transaction-building code -- invariant 10), and so at O(total live
+    /// objects) per pending remove rather than referrers_'s near-O(1)
+    /// lookup. Meant for occasional, interactive use (e.g. "this will
+    /// affect N other objects, are you sure?") -- not a loop, and entirely
+    /// independent of try_commit(): call it any number of times, or never,
+    /// on a Transaction you may or may not go on to commit.
+    ///
+    /// This is an ESTIMATE, not a guarantee of what a later try_commit()
+    /// call will actually do -- shaped the same as CommitResult::changes
+    /// for easy comparison, but:
+    ///   - it says nothing about ACCEPTANCE, only CONTENT: it doesn't (and
+    ///     from here, cannot) run check_id_overlap(), so it cannot tell you
+    ///     whether a real commit would be accepted as Conflict-free;
+    ///   - it's computed against base(), which can go stale the instant
+    ///     another writer commits something that would change the
+    ///     cascade's shape.
+    std::vector<Change> estimate_changes() const;
 
 private:
     friend class Model;
