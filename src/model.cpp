@@ -614,10 +614,11 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
 void Model::add_field_keys(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
-        auto prev = by_field_[field];          // this field's map before the insert
-        by_field_[field] = prev.set(key, id);  // key is unique per field by construction (see
-                                               // define_keys' contract); a collision here is a
-                                               // caller bug, not something this layer detects
+        auto& sub = by_field_[field];  // one lookup; `sub` is this field's map, in place
+        auto prev = sub;                // snapshot before the insert, for the undo log below
+        sub = sub.set(key, id);         // key is unique per field by construction (see
+                                        // define_keys' contract); a collision here is a
+                                        // caller bug, not something this layer detects
         log([this, field, prev = std::move(prev)]() mutable {
             by_field_[field] = std::move(prev);
         });
@@ -626,8 +627,9 @@ void Model::add_field_keys(const ObjectBase* o) {
 
 void Model::drop_field_keys(const ObjectBase* o) {
     o->each_field_key([&](const void* field, std::string key) {
-        auto prev = by_field_[field];
-        by_field_[field] = prev.erase(key);
+        auto& sub = by_field_[field];
+        auto prev = sub;
+        sub = sub.erase(key);
         log([this, field, prev = std::move(prev)]() mutable {
             by_field_[field] = std::move(prev);
         });
@@ -652,9 +654,10 @@ void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* aft
         // whole prior map (cheap -- persistent, structure-shared) and restore
         // it on rollback. Without this, a vetoed/conflicted attempt leaves
         // by_field_ permanently indexing values that never committed.
-        auto prev = by_field_[field];
-        if (it != old_keys.end()) by_field_[field] = by_field_[field].erase(it->second);
-        by_field_[field] = by_field_[field].set(new_key, id);
+        auto& sub = by_field_[field];
+        auto prev = sub;
+        if (it != old_keys.end()) sub = sub.erase(it->second);
+        sub = sub.set(new_key, id);
         log([this, field, prev = std::move(prev)]() mutable {
             by_field_[field] = std::move(prev);
         });
@@ -676,10 +679,10 @@ void Model::add_cached_fields(const ObjectBase* o) {
         // holders, is the INNER map (Id-bytes -> Id) collecting every object
         // currently holding that value. `prev` is the outer map's state
         // before this insert, captured whole for the undo log below.
-        auto prev = by_cached_field_[field];
-        const pmap::PersistentMap<Id>* bucket = prev.get(key);
-        by_cached_field_[field] = prev.set(
-            key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        auto& sub = by_cached_field_[field];
+        auto prev = sub;
+        const pmap::PersistentMap<Id>* bucket = sub.get(key);
+        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_field_[field] = std::move(prev);
         });
@@ -689,13 +692,14 @@ void Model::add_cached_fields(const ObjectBase* o) {
 void Model::drop_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_field([&](const void* field, std::string key) {
-        auto prev = by_cached_field_[field];
-        const pmap::PersistentMap<Id>* bucket = prev.get(key);
+        auto& sub = by_cached_field_[field];
+        auto prev = sub;
+        const pmap::PersistentMap<Id>* bucket = sub.get(key);
         if (!bucket) return;  // nothing indexed under this key -- nothing to remove
         auto nb = bucket->erase(detail::id_key(id));  // nb: the bucket with just this id removed
         // An emptied bucket is dropped outright, so a value with no remaining
         // holders doesn't leave a tombstone entry behind.
-        by_cached_field_[field] = nb.empty() ? prev.erase(key) : prev.set(key, nb);
+        sub = nb.empty() ? sub.erase(key) : sub.set(key, nb);
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_field_[field] = std::move(prev);
         });
@@ -716,26 +720,26 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
         // prev: the OUTER map's state before any edit -- what the undo log
-        // restores wholesale on rollback. cur: the outer map as it's built
-        // up across the two steps below (old value's bucket shrinks/drops,
-        // new value's bucket grows), then installed once at the end.
-        auto prev = by_cached_field_[field];
-        auto cur = prev;
+        // restores wholesale on rollback. sub is written through directly
+        // across the two steps below (old value's bucket shrinks/drops, new
+        // value's bucket grows) -- each reassignment updates the map in
+        // place, so there's no separate "cur" to install at the end.
+        auto& sub = by_cached_field_[field];
+        auto prev = sub;
         if (it != old_keys.end()) {
             // Remove this id from its OLD value's bucket (ob), unless that
             // value was never actually indexed (e.g. this field just started
             // returning a cacheable value).
-            if (const pmap::PersistentMap<Id>* ob = cur.get(it->second)) {
+            if (const pmap::PersistentMap<Id>* ob = sub.get(it->second)) {
                 auto nb = ob->erase(detail::id_key(id));  // ob with this id removed
-                cur = nb.empty() ? cur.erase(it->second) : cur.set(it->second, nb);
+                sub = nb.empty() ? sub.erase(it->second) : sub.set(it->second, nb);
             }
         }
         // Add this id to its NEW value's bucket, creating that bucket if this
         // is the first object ever to hold this particular value.
-        const pmap::PersistentMap<Id>* bucket = cur.get(new_key);
-        cur = cur.set(new_key,
+        const pmap::PersistentMap<Id>* bucket = sub.get(new_key);
+        sub = sub.set(new_key,
                       (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
-        by_cached_field_[field] = std::move(cur);
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_field_[field] = std::move(prev);
         });
@@ -754,11 +758,11 @@ void Model::add_cached_references(const ObjectBase* o) {
     const Id id = o->id;  // the REFERRER -- the value stored in the bucket, not the bucket's key
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;  // Opt<> currently null: nothing to index
-        auto prev = by_cached_reference_[field];
-        const pmap::PersistentMap<Id>* bucket = prev.get(detail::id_key(target));
-        by_cached_reference_[field] =
-            prev.set(detail::id_key(target),
-                     (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        auto& sub = by_cached_reference_[field];
+        auto prev = sub;
+        const pmap::PersistentMap<Id>* bucket = sub.get(detail::id_key(target));
+        sub = sub.set(detail::id_key(target),
+                      (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_reference_[field] = std::move(prev);
         });
@@ -769,14 +773,14 @@ void Model::drop_cached_references(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;
-        auto prev = by_cached_reference_[field];
-        const pmap::PersistentMap<Id>* bucket = prev.get(detail::id_key(target));
+        auto& sub = by_cached_reference_[field];
+        auto prev = sub;
+        const pmap::PersistentMap<Id>* bucket = sub.get(detail::id_key(target));
         if (!bucket) return;
         auto nb = bucket->erase(detail::id_key(id));
         // An emptied bucket is dropped outright, so a target with no
         // remaining referrers doesn't leave a tombstone entry behind.
-        by_cached_reference_[field] =
-            nb.empty() ? prev.erase(detail::id_key(target)) : prev.set(detail::id_key(target), nb);
+        sub = nb.empty() ? sub.erase(detail::id_key(target)) : sub.set(detail::id_key(target), nb);
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_reference_[field] = std::move(prev);
         });
@@ -794,22 +798,20 @@ void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBa
         const Id old_target = (it != old_targets.end()) ? it->second : Id{};
         if (new_target == old_target) return;  // unchanged (incl. both still null)
 
-        auto prev = by_cached_reference_[field];
-        auto cur = prev;
+        auto& sub = by_cached_reference_[field];
+        auto prev = sub;
         if (old_target) {
-            if (const pmap::PersistentMap<Id>* ob = cur.get(detail::id_key(old_target))) {
+            if (const pmap::PersistentMap<Id>* ob = sub.get(detail::id_key(old_target))) {
                 auto nb = ob->erase(detail::id_key(id));
-                cur = nb.empty() ? cur.erase(detail::id_key(old_target))
-                                 : cur.set(detail::id_key(old_target), nb);
+                sub = nb.empty() ? sub.erase(detail::id_key(old_target))
+                                 : sub.set(detail::id_key(old_target), nb);
             }
         }
         if (new_target) {
-            const pmap::PersistentMap<Id>* bucket = cur.get(detail::id_key(new_target));
-            cur =
-                cur.set(detail::id_key(new_target),
-                        (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+            const pmap::PersistentMap<Id>* bucket = sub.get(detail::id_key(new_target));
+            sub = sub.set(detail::id_key(new_target),
+                          (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
         }
-        by_cached_reference_[field] = std::move(cur);
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_reference_[field] = std::move(prev);
         });
@@ -892,10 +894,11 @@ std::optional<Model::IntegrityError> Model::apply_create(
     // Every object gets an (internal, Id-keyed) entry in its type's
     // enumeration index, unconditionally -- this is what for_each<T>() scans.
     const TypeTag tag = raw->tag();
-    auto prev_sub = by_type_[tag];
-    by_type_[tag] = prev_sub.set(detail::id_key(id), id);
-    log([this, tag, prev_sub = std::move(prev_sub)]() mutable {
-        by_type_[tag] = std::move(prev_sub);
+    auto& sub = by_type_[tag];
+    auto prev = sub;
+    sub = sub.set(detail::id_key(id), id);
+    log([this, tag, prev = std::move(prev)]() mutable {
+        by_type_[tag] = std::move(prev);
     });
 
     add_out_refs(raw);
@@ -1070,10 +1073,11 @@ std::vector<Id> Model::remove_raw(Id id) {
         }
 
         const TypeTag tag = victim->tag();
-        auto prev_sub = by_type_[tag];
-        by_type_[tag] = prev_sub.erase(detail::id_key(x));
-        log([this, tag, prev_sub = std::move(prev_sub)]() mutable {
-            by_type_[tag] = std::move(prev_sub);
+        auto& sub = by_type_[tag];
+        auto prev = sub;
+        sub = sub.erase(detail::id_key(x));
+        log([this, tag, prev = std::move(prev)]() mutable {
+            by_type_[tag] = std::move(prev);
         });
 
         drop_field_keys(victim);
@@ -1478,9 +1482,10 @@ BulkTransaction Model::begin_bulk() {
 // occupant to capture, and (since nothing here is ever undone -- see the
 // declaration's doc comment) nothing to restore it for even if there were.
 void Model::set_slot_no_log(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen) {
-    Chunk* ch = cow(slot >> kChunkBits);
-    ch->obj[slot & kChunkMask] = obj;
-    ch->gen[slot & kChunkMask] = gen;
+    const std::uint32_t c = slot >> kChunkBits, i = slot & kChunkMask;
+    Chunk* ch = cow(c);  // clones the chunk on first touch this attempt; see cow()'s own comment
+    ch->obj[i] = obj;
+    ch->gen[i] = gen;
 }
 
 // Same referrers_ push as add_out_refs(), minus the pop_back/erase-if-empty
