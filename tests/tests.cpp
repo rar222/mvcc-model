@@ -1030,7 +1030,7 @@ TEST(a_large_cascade_does_not_block_forever_and_reclaims) {
 TEST(pre_commit_hook_approving_commits_normally) {
     Model m;
     int seen = 0;
-    m.set_pre_commit([&](Model&, const std::vector<Change>& changes) {
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>& changes) {
         seen = static_cast<int>(changes.size());
         return true;
     });
@@ -1045,7 +1045,7 @@ TEST(pre_commit_hook_approving_commits_normally) {
 TEST(pre_commit_hook_is_not_invoked_for_an_empty_commit) {
     Model m;
     bool called = false;
-    m.set_pre_commit([&](Model&, const std::vector<Change>&) {
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>&) {
         called = true;
         return true;
     });
@@ -1065,7 +1065,7 @@ TEST(pre_commit_hook_sees_the_fully_resolved_changeset_including_cascade_deletes
     const Ref<Order> o = make_order(m, "O1", a);
 
     std::size_t seen_deletes = 0;
-    m.set_pre_commit([&](Model&, const std::vector<Change>& changes) {
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>& changes) {
         for (const Change& c : changes)
             if (c.kind == ChangeKind::Deleted) ++seen_deletes;
         return true;
@@ -1085,7 +1085,7 @@ TEST(pre_commit_hook_veto_unwinds_everything_as_if_try_commit_were_never_called)
     const Ref<Account> a = make_account(m, "A1");
     const std::string before = state_of(m);
 
-    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
 
     Transaction txn = m.begin();
     auto o = std::make_unique<Order>();
@@ -1115,7 +1115,7 @@ TEST(veto_rollback_restores_the_reverse_index_so_later_cascades_stay_correct) {
     // must also undo the reconcile step's referrers_ edits (X->O edge erased,
     // Y->O edge added), or the committed state (O still points at X) and the
     // reverse index disagree forever.
-    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
     Transaction txn = m.begin();
     txn.update(o)->account = y;
     CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
@@ -1138,7 +1138,7 @@ TEST(veto_rollback_restores_the_field_key_index) {
     Model m;
     const Ref<Account> a = make_account(m, "OLD");
 
-    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
     Transaction txn = m.begin();
     txn.update(a)->name = "NEW";
     CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
@@ -1203,7 +1203,7 @@ TEST(set_pre_commit_can_race_try_commit_without_a_data_race) {
         } while (!stop.load(std::memory_order_relaxed));
     });
     for (int i = 0; i < 500; ++i)
-        m.set_pre_commit([](Model&, const std::vector<Change>&) { return true; });
+        m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return true; });
     m.set_pre_commit({});
     stop = true;
     committer.join();
@@ -1259,7 +1259,7 @@ TEST(create_with_a_null_nonnullable_ref_is_rejected_as_invalid) {
 // it runs, already sees the pre-transaction's object.
 TEST(pre_transactions_hook_runs_and_publishes_before_the_main_transaction) {
     Model m;
-    m.set_pre_transactions([](Model& model) {
+    m.set_pre_transactions([](Model& model, const Transaction&) {
         Transaction pre = model.begin();
         auto a = std::make_unique<Account>();
         a->name = "PRE";
@@ -1288,7 +1288,7 @@ TEST(pre_transactions_hook_runs_and_publishes_before_the_main_transaction) {
 TEST(pre_transactions_hook_is_not_invoked_for_an_empty_main_transaction) {
     Model m;
     bool called = false;
-    m.set_pre_transactions([&](Model&) { called = true; });
+    m.set_pre_transactions([&](Model&, const Transaction&) { called = true; });
 
     Transaction txn = m.begin();  // nothing pending
     CommitResult res = m.try_commit(txn);
@@ -1304,7 +1304,7 @@ TEST(pre_transactions_hook_is_not_invoked_for_an_empty_main_transaction) {
 // fresh and can be retried as-is once the hook stops failing.
 TEST(a_failing_pre_transaction_reports_precommit_conflict_and_skips_the_main_transaction) {
     Model m;
-    m.set_pre_transactions([](Model& model) {
+    m.set_pre_transactions([](Model& model, const Transaction&) {
         Transaction pre = model.begin();
         auto o = std::make_unique<Order>();
         o->code = "BAD";  // account left default -> null non-nullable Ref
@@ -1336,7 +1336,7 @@ TEST(a_failing_pre_transaction_reports_precommit_conflict_and_skips_the_main_tra
 // PrecommitConflict means only "the main transaction didn't run."
 TEST(an_earlier_successful_pre_transaction_stays_committed_even_if_a_later_one_fails) {
     Model m;
-    m.set_pre_transactions([](Model& model) {
+    m.set_pre_transactions([](Model& model, const Transaction&) {
         Transaction pre1 = model.begin();
         auto a = std::make_unique<Account>();
         a->name = "PRE_OK";
@@ -1378,7 +1378,7 @@ TEST(main_transaction_conflicts_with_a_pre_transaction_touching_the_same_object)
     Transaction txn = m.begin();  // base predates the pre-transaction below
     txn.update(a)->name = "FROM_MAIN";
 
-    m.set_pre_transactions([a](Model& model) {
+    m.set_pre_transactions([a](Model& model, const Transaction&) {
         Transaction pre = model.begin();
         pre.update(a)->name = "FROM_PRE";
         CHECK(model.run_pre_commit_transaction(pre).status == CommitStatus::Committed);
@@ -1399,7 +1399,7 @@ TEST(main_transaction_conflicts_with_a_pre_transaction_touching_the_same_object)
 // changeset -- not the pre-transaction's.
 TEST(pre_commit_veto_hook_still_only_sees_the_main_transactions_own_changeset) {
     Model m;
-    m.set_pre_transactions([](Model& model) {
+    m.set_pre_transactions([](Model& model, const Transaction&) {
         Transaction pre = model.begin();
         auto a = std::make_unique<Account>();
         a->name = "PRE";
@@ -1408,7 +1408,7 @@ TEST(pre_commit_veto_hook_still_only_sees_the_main_transactions_own_changeset) {
     });
 
     std::size_t seen = 0;
-    m.set_pre_commit([&](Model&, const std::vector<Change>& changes) {
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>& changes) {
         seen = changes.size();
         return true;
     });
@@ -1441,7 +1441,7 @@ TEST(pre_transactions_and_the_main_transaction_publish_with_no_other_commit_land
     // compare its OWN pair's versions against each other.
     thread_local std::uint64_t t_pre_version = 0;
 
-    m.set_pre_transactions([](Model& model) {
+    m.set_pre_transactions([](Model& model, const Transaction&) {
         Transaction pre = model.begin();
         auto a = std::make_unique<Account>();
         a->name = "PRE";
@@ -1475,6 +1475,205 @@ TEST(pre_transactions_and_the_main_transaction_publish_with_no_other_commit_land
 
     CHECK(committed.load() > 0);
     CHECK_EQ(gap_violations.load(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Post-commit hook (Model::set_post_commit)
+// ---------------------------------------------------------------------------
+
+// A post-commit hook receives the SAME CommitResult the caller of
+// try_commit() got back -- same status, same snapshot, same changes.
+TEST(post_commit_hook_receives_the_same_commit_result_the_caller_got) {
+    Model m;
+    std::optional<CommitStatus> seen_status;
+    std::size_t seen_changes = 0;
+    Snapshot seen_snapshot;
+    m.set_post_commit([&](Model&, const Transaction&, const CommitResult& r) {
+        seen_status = r.status;
+        seen_changes = r.changes.size();
+        seen_snapshot = r.snapshot;
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "A1";
+    txn.create(std::move(a));
+    const CommitResult res = m.try_commit(txn);
+
+    CHECK(seen_status.has_value());
+    CHECK(*seen_status == CommitStatus::Committed);
+    CHECK_EQ(seen_changes, std::size_t{1});
+    CHECK_EQ(seen_snapshot.version(), res.snapshot.version());
+    m.set_post_commit({});
+}
+
+// try_commit()'s existing fast path for an empty Transaction never takes
+// commit_mu_ at all, so -- like PreCommitFn and PreTransactionsFn -- the
+// post-commit hook is never invoked for it either.
+TEST(post_commit_hook_is_not_invoked_for_an_empty_transaction) {
+    Model m;
+    bool called = false;
+    m.set_post_commit([&](Model&, const Transaction&, const CommitResult&) { called = true; });
+
+    Transaction txn = m.begin();  // nothing pending
+    CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(!called);
+    m.set_post_commit({});
+}
+
+// The post-commit hook sees a NON-Committed result too -- here, a veto --
+// with the exact same status/error info the caller of try_commit() got.
+// (Contrast with PreCommitFn, which only ever runs for an attempt that is
+// ABOUT to publish; PostCommitFn runs for every non-empty attempt regardless
+// of how it ended.)
+TEST(post_commit_hook_sees_a_vetoed_result_too) {
+    Model m;
+    std::optional<CommitStatus> seen_status;
+    m.set_post_commit([&](Model&, const Transaction&, const CommitResult& r) { seen_status = r.status; });
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "VETOED";
+    txn.create(std::move(a));
+    const CommitResult res = m.try_commit(txn);
+
+    CHECK(res.status == CommitStatus::Vetoed);
+    CHECK(seen_status.has_value());
+    CHECK(*seen_status == CommitStatus::Vetoed);
+    m.set_pre_commit({});
+    m.set_post_commit({});
+}
+
+// The defining difference from PreCommitFn/PreTransactionsFn: because
+// commit_mu_ has ALREADY been released by the time the post-commit hook
+// runs, it is safe to call try_commit() (or begin(), or snapshot()) again
+// from inside it -- there is nothing left to self-deadlock against. This
+// chains a second, independent transaction from inside the hook and
+// confirms it actually commits.
+TEST(post_commit_hook_can_safely_chain_another_try_commit_call) {
+    Model m;
+    // chained_once guards against exactly the risk PostCommitFn's own doc
+    // comment calls out: the hook is still installed, so the CHAINED commit
+    // below would itself re-trigger this same hook, chaining forever, if
+    // this test didn't stop it after the first hop.
+    bool chained_once = false;
+    m.set_post_commit([&](Model& model, const Transaction&, const CommitResult& r) {
+        if (r.status != CommitStatus::Committed || chained_once) return;
+        chained_once = true;
+        Transaction chained = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "CHAINED";
+        chained.create(std::move(a));
+        CommitResult chained_res = model.try_commit(chained);
+        CHECK(chained_res.status == CommitStatus::Committed);
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "ORIGINAL";
+    txn.create(std::move(a));
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+    m.set_post_commit({});
+
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.size(), std::size_t{2});
+    CHECK(s.find_by_key<&Account::name>("ORIGINAL") != nullptr);
+    CHECK(s.find_by_key<&Account::name>("CHAINED") != nullptr);
+}
+
+// TSan-targeted: installing/clearing the post-commit hook concurrently with
+// a hammering committer thread must never race -- set_post_commit() takes
+// commit_mu_ the same way try_commit() does to copy it out.
+TEST(set_post_commit_can_race_try_commit_without_a_data_race) {
+    Model m;
+    std::atomic<bool> stop{false};
+    std::thread committer([&] {
+        int n = 0;
+        do {
+            Transaction txn = m.begin();
+            auto a = std::make_unique<Account>();
+            a->name = "A" + std::to_string(n++);
+            txn.create(std::move(a));
+            (void)m.try_commit(txn);
+        } while (!stop.load(std::memory_order_relaxed));
+    });
+    for (int i = 0; i < 500; ++i)
+        m.set_post_commit([](Model&, const Transaction&, const CommitResult&) {});
+    m.set_post_commit({});
+    stop = true;
+    committer.join();
+    CHECK(m.snapshot().size() > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Transaction::id() -- the correlation key shared by all three hooks
+// ---------------------------------------------------------------------------
+
+// Two Transactions from the same Model never collide, and id() survives the
+// move that returns a Transaction out of begin() (Transaction is move-only;
+// see its own comment on why).
+TEST(transaction_id_is_unique_per_transaction_and_stable_across_a_move) {
+    Model m;
+    Transaction a = m.begin();
+    Transaction b = m.begin();
+    CHECK(a.id() != b.id());
+
+    const std::uint64_t id_before_move = a.id();
+    Transaction c = std::move(a);
+    CHECK_EQ(c.id(), id_before_move);
+}
+
+// The defining proof of the correlation mechanism: PreTransactionsFn,
+// PreCommitFn, and PostCommitFn all receive a `const Transaction&` for one
+// try_commit() attempt, and it is the SAME Transaction throughout -- all
+// three see the exact id() the caller's own `txn.id()` has, before
+// try_commit() is even called. A pre-transaction built INSIDE
+// PreTransactionsFn is a genuinely different Transaction and gets its own,
+// different id -- proving the mechanism distinguishes "the main attempt"
+// from "a pre-transaction that ran as part of it" without any extra API.
+TEST(pre_transactions_pre_commit_and_post_commit_all_see_the_same_transaction_id) {
+    Model m;
+    std::uint64_t seen_in_pre_transactions = 0;
+    std::uint64_t seen_in_pre_commit = 0;
+    std::uint64_t seen_in_post_commit = 0;
+    std::uint64_t pre_transaction_own_id = 0;
+
+    m.set_pre_transactions([&](Model& model, const Transaction& main_txn) {
+        seen_in_pre_transactions = main_txn.id();
+
+        Transaction pre = model.begin();
+        pre_transaction_own_id = pre.id();  // a DIFFERENT id from main_txn's
+        auto a = std::make_unique<Account>();
+        a->name = "PRE";
+        pre.create(std::move(a));
+        CHECK(model.run_pre_commit_transaction(pre).status == CommitStatus::Committed);
+    });
+    m.set_pre_commit([&](Model&, const Transaction& main_txn, const std::vector<Change>&) {
+        seen_in_pre_commit = main_txn.id();
+        return true;
+    });
+    m.set_post_commit([&](Model&, const Transaction& main_txn, const CommitResult&) {
+        seen_in_post_commit = main_txn.id();
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "MAIN";
+    txn.create(std::move(a));
+    const std::uint64_t txn_id = txn.id();  // read BEFORE try_commit() -- proves the caller can
+                                            // already know the correlation key in advance
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+
+    CHECK_EQ(seen_in_pre_transactions, txn_id);
+    CHECK_EQ(seen_in_pre_commit, txn_id);
+    CHECK_EQ(seen_in_post_commit, txn_id);
+    CHECK(pre_transaction_own_id != txn_id);  // the pre-transaction is a DIFFERENT attempt
+
+    m.set_pre_transactions({});
+    m.set_pre_commit({});
+    m.set_post_commit({});
 }
 
 // ---------------------------------------------------------------------------
@@ -1773,7 +1972,7 @@ TEST(veto_rollback_restores_the_cached_reference_index) {
     const Ref<Account> a2 = make_account(m, "A2");
     const Ref<Order> o = make_order(m, "O1", a1);
 
-    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
     Transaction txn = m.begin();
     txn.update(o)->account = a2;
     CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
@@ -1793,7 +1992,7 @@ TEST(veto_rollback_restores_the_cached_field_index) {
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o = make_order(m, "O1", a, {}, 5);
 
-    m.set_pre_commit([](Model&, const std::vector<Change>&) { return false; });
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
     Transaction txn = m.begin();
     txn.update(o)->qty = 9;
     CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);

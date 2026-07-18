@@ -1189,12 +1189,25 @@ struct Change {
 /// yields the still-current PRE-commit version, since the transaction being
 /// inspected has not published yet.
 ///
+/// The Transaction parameter is the SAME `txn` passed to try_commit() --
+/// its id() is the correlation key shared with PreTransactionsFn and
+/// PostCommitFn for this same attempt (see Transaction::id()). By this
+/// point, apply has already MOVED `txn`'s local_created_/local_updated_
+/// contents out (same "spent" state a non-Committed CommitResult leaves
+/// behind) -- don't call create()/update()/remove() on it, and don't expect
+/// to see the original objects through it. Read-only accessors remain
+/// valid and meaningful, though: id(), base_version(), remove_intents(),
+/// and pending_changes() (a separate log, untouched by apply -- still shows
+/// the transaction's own local-id view of what it asked for, distinct from
+/// this hook's `changes_` parameter, which is the fully-resolved,
+/// real-id, cascade-included view).
+///
 /// Unchanged by, and unaware of, PreTransactionsFn below: if a
 /// pre-transactions phase ran first, this hook still runs at exactly the
 /// same point (after the MAIN transaction's own apply) seeing exactly the
 /// same thing (the main transaction's own resolved changeset) -- it has no
 /// way to tell whether pre-transactions ran, and doesn't need to.
-using PreCommitFn = std::function<bool(Model&, const std::vector<Change>&)>;
+using PreCommitFn = std::function<bool(Model&, const Transaction&, const std::vector<Change>&)>;
 
 /// Registered once via Model::set_pre_transactions, called on every
 /// try_commit() attempt (if installed) IMMEDIATELY after commit_mu_ is
@@ -1234,7 +1247,53 @@ using PreCommitFn = std::function<bool(Model&, const std::vector<Change>&)>;
 ///
 /// This hook is entirely separate from PreCommitFn/set_pre_commit -- see
 /// PreCommitFn's own comment for why the two are not merged into one call.
-using PreTransactionsFn = std::function<void(Model&)>;
+///
+/// The Transaction parameter is the MAIN transaction this try_commit()
+/// attempt is about to process -- completely untouched at this point (not
+/// conflict-checked, not applied), so every accessor is fully populated:
+/// id() (the correlation key shared with PreCommitFn/PostCommitFn for this
+/// same attempt, see Transaction::id()), base_version(), pending_changes(),
+/// remove_intents(). A hook can use these to decide WHICH pre-transactions
+/// to run, not just to log an id. It must not call any of txn's mutating
+/// methods (create()/update()/remove()) -- inspect it, don't build on it;
+/// run_pre_commit_transaction() only ever applies a SEPARATE Transaction
+/// built via model.begin() inside the hook, never this one.
+using PreTransactionsFn = std::function<void(Model&, const Transaction&)>;
+
+/// Registered once via Model::set_post_commit, called once per non-empty
+/// try_commit() attempt (if installed) -- but, unlike PreCommitFn and
+/// PreTransactionsFn, strictly AFTER commit_mu_ has been released, with the
+/// attempt's own final CommitResult (whatever it was -- Committed, Conflict,
+/// Vetoed, Invalid, or PrecommitConflict; check `status` first, same as any
+/// other CommitResult).
+///
+/// Because the lock is already gone by the time this runs, this is the one
+/// hook it is SAFE to call try_commit()/begin()/snapshot()/current_version()
+/// from -- there is nothing left to self-deadlock against (contrast with
+/// PreCommitFn and PreTransactionsFn, which run WHILE commit_mu_ is held and
+/// must never do any of that). A hook that always chains another commit is
+/// still the caller's own infinite-recursion risk to manage, same as any
+/// unconditional retry loop -- the framework doesn't need to guard against
+/// it, since it's no different from calling try_commit() in a `while(true)`
+/// by hand.
+///
+/// The trade-off for running unlocked: other commits (from other threads, or
+/// a chained one this hook itself starts) may have ALREADY landed by the
+/// time this runs -- the CommitResult it receives describes the state of the
+/// world as of the moment this attempt finished, not as of "now." If you
+/// need to observe or act on state atomically with respect to this
+/// transaction, do it inside PreCommitFn (still locked) instead; use
+/// PostCommitFn for side effects that don't need that atomicity -- logging,
+/// metrics, waking up other work, or kicking off a follow-up transaction.
+///
+/// The Transaction parameter is the same `txn` try_commit() was called
+/// with -- its id() is the same correlation key PreTransactionsFn/
+/// PreCommitFn saw for this attempt (see Transaction::id()). Like
+/// PreCommitFn's, it is "spent" by now (local overlay moved from during
+/// apply, whether or not the attempt actually published) -- id(),
+/// base_version(), and pending_changes() remain valid; don't call its
+/// mutating methods.
+using PostCommitFn = std::function<void(Model&, const Transaction&, const CommitResult&)>;
 
 /// One delivery to a subscriber: a consistent state plus what changed since
 /// the previous delivery -- read the changed objects out of THIS update's
@@ -1356,6 +1415,15 @@ public:
     void set_pre_transactions(PreTransactionsFn fn) {
         std::lock_guard lk(commit_mu_);
         pre_transactions_ = std::move(fn);
+    }
+
+    /// Install (or clear, with {}) the post-commit hook. See PostCommitFn.
+    /// Same swap-under-commit_mu_ contract as set_pre_commit/
+    /// set_pre_transactions -- but the hook it installs runs UNLOCKED; see
+    /// PostCommitFn for what that changes.
+    void set_post_commit(PostCommitFn fn) {
+        std::lock_guard lk(commit_mu_);
+        post_commit_ = std::move(fn);
     }
 
     /// Callable ONLY from inside a running PreTransactionsFn callback
@@ -1625,6 +1693,14 @@ private:
     /// held.
     CommitResult commit_locked(Transaction& txn);
 
+    /// The body of try_commit() that actually needs commit_mu_: everything
+    /// from the pre-transactions phase through check_and_apply(), the
+    /// pre_commit_ veto, and publish_now(). Factored out of try_commit()
+    /// itself so that function can copy post_commit_ out (see PostCommitFn)
+    /// and invoke it AFTER the std::lock_guard wrapping this call has gone
+    /// out of scope, instead of while still holding commit_mu_.
+    CommitResult try_commit_locked(Transaction& txn);
+
     // ---- read/publish path -------------------------------------------------
     // root_ is atomic so snapshot() acquires the current version with a lock-free
     // load -- no shared mutex on the hot read path. Version bookkeeping (for the
@@ -1632,6 +1708,13 @@ private:
     // split onto its own small mutex (ver_mu_) so it never contends with a
     // commit's apply work or a reader's actual traversal.
     std::atomic<std::shared_ptr<const Root>> root_;
+
+    /// Mints Transaction::id(). Deliberately its own plain atomic, NOT
+    /// commit_mu_-protected: Transaction construction (begin()) must stay
+    /// fully lock-free with respect to try_commit() (invariant 10), so this
+    /// counter can't live behind the same lock version_/next_slot_/etc. do.
+    /// Starts at 1 so 0 is free to mean "no transaction" wherever useful.
+    std::atomic<std::uint64_t> next_txn_id_{1};
 
     mutable std::mutex ver_mu_;
     std::map<std::uint64_t, int>
@@ -1715,6 +1798,12 @@ private:
                                                        ///< declared this far up (see line ~805) --
                                                        ///< optional<T> needs T complete as a member,
                                                        ///< unique_ptr<T> doesn't.
+
+    PostCommitFn post_commit_;  ///< empty = no hook; swapped only under commit_mu_
+                                ///< (set_post_commit). The MEMBER is commit_mu_-protected like
+                                ///< every other hook here -- but try_commit() copies it out while
+                                ///< still holding the lock and invokes that copy only after
+                                ///< releasing it; see try_commit_locked() and PostCommitFn.
 
     // Undo log and the objects created this attempt (which rollback_apply()
     // must delete, since they were never published and nothing else owns them).
@@ -1875,6 +1964,22 @@ public:
     Transaction(const Transaction&) = delete;
     Transaction& operator=(const Transaction&) = delete;
 
+    /// Unique for the lifetime of the Model that built this Transaction
+    /// (minted from Model::next_txn_id_, a plain atomic counter -- NOT
+    /// commit_mu_-protected, so begin() stays fully lock-free; see invariant
+    /// 10). Rides along across the move that returns a Transaction from
+    /// begin(), so it stays stable for the object's whole life. This is the
+    /// correlation key for PreTransactionsFn/PreCommitFn/PostCommitFn: all
+    /// three receive the SAME Transaction (by const reference) for one
+    /// try_commit() attempt, so id() is how a hook (or a caller comparing
+    /// its own logging) recognizes "these three calls are about the same
+    /// attempt." A pre-transaction built with model.begin() inside
+    /// PreTransactionsFn gets its OWN, different id -- there is no need for
+    /// a separate "parent id": the hook already has both ids in scope
+    /// (the main txn's, from its own parameter; the pre-transaction's, from
+    /// the object it just built) without any extra API.
+    std::uint64_t id() const noexcept { return id_; }
+
     /// The pinned Snapshot this transaction reads through (peek/update clone
     /// from here). Also usable directly, e.g. to look at pre-transaction
     /// state -- it's an ordinary Snapshot.
@@ -2012,8 +2117,14 @@ private:
 
     /// Only Model::begin() (and Snapshot::begin(), through it) constructs
     /// one -- a Transaction is meaningless without a Model to commit to and
-    /// a pinned base to read through.
-    Transaction(Model* m, Snapshot base) : model_(m), base_(std::move(base)) {}
+    /// a pinned base to read through. Mints this Transaction's id() here,
+    /// via m->next_txn_id_ (a plain atomic -- no lock taken), so id() is
+    /// stable and unique from construction, before try_commit() is ever
+    /// called.
+    Transaction(Model* m, Snapshot base)
+        : model_(m),
+          base_(std::move(base)),
+          id_(m->next_txn_id_.fetch_add(1, std::memory_order_relaxed)) {}
 
     /// Untyped body of update()/update(): local id -> the already-owned
     /// local_created_ entry (create()-then-update() in the same txn, no new
@@ -2095,6 +2206,9 @@ private:
     Model* model_ = nullptr;  ///< where try_commit() applies this; asserted against
                               ///< cross-model misuse in try_commit()
     Snapshot base_;  ///< pins base_version_ in Model::live_, same as any reader's snapshot
+    std::uint64_t id_ = 0;  ///< see id(); minted once, in the constructor, from
+                            ///< model_'s next_txn_id_ -- moves along with the rest of this
+                            ///< object via the defaulted move ctor/assignment
 
     std::vector<std::unique_ptr<ObjectBase>>
         local_created_;  ///< index == local id's low bits;

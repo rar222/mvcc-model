@@ -1331,20 +1331,15 @@ CommitResult Model::run_pre_commit_transaction(Transaction& txn) {
     return result;
 }
 
-CommitResult Model::try_commit(Transaction& txn) {
+CommitResult Model::try_commit_locked(Transaction& txn) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
-
-    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
-        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
-
-    std::lock_guard commit_lk(commit_mu_);
 
     if (pre_transactions_) {
         assert(!in_pre_transactions_phase_ && "pre_transactions_ invoked reentrantly");
         precommit_failed_ = false;
         precommit_failure_.reset();
         in_pre_transactions_phase_ = true;
-        pre_transactions_(*this);
+        pre_transactions_(*this, txn);
         in_pre_transactions_phase_ = false;
 
         if (precommit_failed_) {
@@ -1384,12 +1379,34 @@ CommitResult Model::try_commit(Transaction& txn) {
     // everything applied so far, exactly like an integrity violation does.
     // (The hook cannot report failure by throwing -- the project builds with
     // -fno-exceptions, so a throw is std::terminate, not an error path.)
-    if (pre_commit_ && !pre_commit_(*this, changes_)) {
+    if (pre_commit_ && !pre_commit_(*this, txn, changes_)) {
         rollback_apply();
         return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
     }
 
     return publish_now(std::move(remap));
+}
+
+CommitResult Model::try_commit(Transaction& txn) {
+    assert(txn.model_ == this && "Transaction belongs to a different Model");
+
+    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
+        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
+
+    // post_commit_copy: post_commit_ read out (a std::function copy, cheap)
+    // while commit_mu_ is still held by the lambda below -- that's the only
+    // point at which reading the commit_mu_-protected member is safe. It is
+    // then invoked below, AFTER the lambda's lock_guard has gone out of
+    // scope and released the lock -- see PostCommitFn for why that matters.
+    PostCommitFn post_commit_copy;
+    CommitResult result = [&] {
+        std::lock_guard commit_lk(commit_mu_);
+        post_commit_copy = post_commit_;
+        return try_commit_locked(txn);
+    }();
+
+    if (post_commit_copy) post_commit_copy(*this, txn, result);
+    return result;
 }
 
 }  // namespace model
