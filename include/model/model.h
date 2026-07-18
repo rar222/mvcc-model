@@ -2067,6 +2067,18 @@ public:
     /// own pending edit if there is one, else base()'s committed value, else
     /// null. Masked (returns null) if `r`'s id has a pending remove() intent,
     /// even though the object technically still exists in base().
+    ///
+    /// Deliberately NOT named/shaped like Snapshot::resolve(), even for a
+    /// non-nullable Ref<T>: resolve() returns `const T&`, unchecked, and
+    /// trusts the writer's invariant that a Ref inside a PUBLISHED,
+    /// validated snapshot can never dangle. Nothing here has been through
+    /// validate() yet -- a transaction being built can be temporarily
+    /// inconsistent (a Ref pointing at something not yet created, or since
+    /// locally removed) right up until try_commit() -- so peek() returns
+    /// `const T*`, checked, and can legitimately be null even for a field
+    /// that will end up non-nullable once committed. Don't assume peek()'s
+    /// null-ness tells you anything about how the FIELD is declared; it
+    /// only tells you what this transaction can currently see.
     template <class T>
     const T* peek(Ref<T> r) const {
         return peek_impl<T>(r.raw());
