@@ -492,7 +492,7 @@ std::optional<Model::IntegrityError> Model::validate(const ObjectBase* o) const 
 // live Ref, so the generation would be redundant), each bucket is a
 // vector<RefEdge> naming every field, on every object, currently pointing at
 // that slot. add_out_refs/drop_out_refs add or remove an object's WHOLE
-// outgoing edge set at once (create/delete); reconcile_referrer_edges below
+// outgoing edge set at once (create/delete); reconcile_out_refs below
 // diffs an update's before/after instead, touching only the fields whose
 // target actually changed.
 
@@ -540,7 +540,7 @@ void Model::drop_out_refs(const ObjectBase* o) {
     });
 }
 
-void Model::reconcile_referrer_edges(const ObjectBase* before, const ObjectBase* after) {
+void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after) {
     // Per-field diff. `before` and `after` are the same derived type, so
     // each_ref() reports the identical set of fields for both -- only the
     // targets can differ. Fields whose target didn't change are left alone:
@@ -946,7 +946,7 @@ std::optional<Model::IntegrityError> Model::apply_update(
     // same-transaction "repoint away from X, then delete X" needs referrers_
     // already updated, or the repointed-away-from object would incorrectly
     // be dragged into X's cascade.
-    reconcile_referrer_edges(baseline, raw);
+    reconcile_out_refs(baseline, raw);
     reconcile_field_keys(baseline, raw);
     reconcile_cached_fields(baseline, raw);
     reconcile_cached_references(baseline, raw);
@@ -1005,7 +1005,7 @@ std::vector<Id> Model::remove_raw(Id id) {
         if (!visited.insert(x.index).second) continue;  // cycles terminate here
 
         // Copy the referrer list: we are about to mutate it (both directly,
-        // via the erase below, and indirectly, via reconcile_referrer_edges
+        // via the erase below, and indirectly, via reconcile_out_refs
         // inside the nullable branch) while iterating what it pointed to.
         auto it = referrers_.find(x.index);
         const std::vector<RefEdge> edges =
@@ -1020,14 +1020,14 @@ std::vector<Id> Model::remove_raw(Id id) {
             if (!peek(e.from)) continue;  // referrer itself already deleted this same pass
             if (e.nullable) {
                 // `baseline` is captured BEFORE clone_for_cascade_null() installs
-                // the clone, so reconcile_referrer_edges (etc.) below can diff
+                // the clone, so reconcile_out_refs (etc.) below can diff
                 // "before this field was nulled" against "after" -- see
                 // clone_for_cascade_null's own comment for why reconciliation
                 // must happen here, after null_ref(), not inside that helper.
                 const ObjectBase* baseline = peek(e.from);
                 if (ObjectBase* m = clone_for_cascade_null(e.from)) {
                     m->null_ref(e.field);
-                    reconcile_referrer_edges(baseline, m);
+                    reconcile_out_refs(baseline, m);
                     reconcile_field_keys(baseline, m);
                     reconcile_cached_fields(baseline, m);
                     reconcile_cached_references(baseline, m);
@@ -1325,7 +1325,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
                         std::move(remap),        std::nullopt};
 }
 
-CommitResult Model::commit_locked(Transaction& txn) {
+CommitResult Model::commit_pretransaction_locked(Transaction& txn) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
     if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
@@ -1345,21 +1345,21 @@ CommitResult Model::commit_locked(Transaction& txn) {
     return publish_now(std::move(remap));
 }
 
-CommitResult Model::run_pre_commit_transaction(Transaction& txn) {
+CommitResult Model::run_pre_transaction(Transaction& txn) {
     // Crash, don't return a bad CommitResult: this function does no locking of its own -- it
-    // goes straight into commit_locked(), which requires commit_mu_ ALREADY
+    // goes straight into commit_pretransaction_locked(), which requires commit_mu_ ALREADY
     // held. Called from anywhere outside the one window try_commit()
     // guarantees the lock is held, it would mutate commit_mu_-protected
     // state (spine_, referrers_, ...) with no synchronization at all --
     // corruption, not a recoverable error. See the doc comment in model.h.
     assert(in_pre_transactions_phase_ &&
-           "run_pre_commit_transaction() called outside a running PreTransactionsFn callback");
+           "run_pre_transaction() called outside a running PreTransactionsFn callback");
     assert(!precommit_failed_ &&
-           "run_pre_commit_transaction() called again after an earlier pre-transaction this same "
+           "run_pre_transaction() called again after an earlier pre-transaction this same "
            "attempt already failed -- check the return value and stop");
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
-    CommitResult result = commit_locked(txn);
+    CommitResult result = commit_pretransaction_locked(txn);
     if (result.status != CommitStatus::Committed) {
         precommit_failed_ = true;
         precommit_failure_ = std::make_unique<CommitResult>(result);
@@ -1367,7 +1367,7 @@ CommitResult Model::run_pre_commit_transaction(Transaction& txn) {
     return result;
 }
 
-CommitResult Model::try_commit_locked(Transaction& txn) {
+CommitResult Model::commit_main_locked(Transaction& txn) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
     if (pre_transactions_) {
@@ -1396,8 +1396,8 @@ CommitResult Model::try_commit_locked(Transaction& txn) {
     // now-current state -- exactly as if those pre-transactions were made by
     // another writer racing this one. See PreTransactionsFn.
     //
-    // Inlined rather than routed through commit_locked(): the main
-    // transaction, unlike a pre-transaction (run_pre_commit_transaction()),
+    // Inlined rather than routed through commit_pretransaction_locked(): the main
+    // transaction, unlike a pre-transaction (run_pre_transaction()),
     // must still go through the pre_commit_ veto hook below.
     std::unordered_map<std::uint32_t, Id> remap;
     if (auto failure = check_and_apply(txn, remap)) return std::move(*failure);
@@ -1438,7 +1438,7 @@ CommitResult Model::try_commit(Transaction& txn) {
     CommitResult result = [&] {
         std::lock_guard commit_lk(commit_mu_);
         post_commit_copy = post_commit_;
-        return try_commit_locked(txn);
+        return commit_main_locked(txn);
     }();
 
     if (post_commit_copy) post_commit_copy(*this, txn, result);

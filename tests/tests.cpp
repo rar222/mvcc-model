@@ -1102,7 +1102,7 @@ TEST(pre_commit_hook_veto_unwinds_everything_as_if_try_commit_were_never_called)
     CHECK(m.snapshot().find(o2) != nullptr);
 }
 
-// Regression test for the reconcile_referrer_edges undo-log bug -- see
+// Regression test for the reconcile_out_refs undo-log bug -- see
 // the in-body comment. A vetoed reassignment must restore the old edge
 // AND remove the phantom new one, or a later cascade sees a lie.
 TEST(veto_rollback_restores_the_reverse_index_so_later_cascades_stay_correct) {
@@ -1251,7 +1251,7 @@ TEST(create_with_a_null_nonnullable_ref_is_rejected_as_invalid) {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-transactions (Model::set_pre_transactions / run_pre_commit_transaction)
+// Pre-transactions (Model::set_pre_transactions / run_pre_transaction)
 // ---------------------------------------------------------------------------
 
 // A pre-transaction run from inside the hook publishes for real, BEFORE the
@@ -1264,7 +1264,7 @@ TEST(pre_transactions_hook_runs_and_publishes_before_the_main_transaction) {
         auto a = std::make_unique<Account>();
         a->name = "PRE";
         pre.create(std::move(a));
-        CommitResult r = model.run_pre_commit_transaction(pre);
+        CommitResult r = model.run_pre_transaction(pre);
         CHECK(r.status == CommitStatus::Committed);
     });
 
@@ -1309,7 +1309,7 @@ TEST(a_failing_pre_transaction_reports_precommit_conflict_and_skips_the_main_tra
         auto o = std::make_unique<Order>();
         o->code = "BAD";  // account left default -> null non-nullable Ref
         pre.create(std::move(o));
-        CommitResult r = model.run_pre_commit_transaction(pre);
+        CommitResult r = model.run_pre_transaction(pre);
         CHECK(r.status == CommitStatus::Invalid);
     });
 
@@ -1341,14 +1341,14 @@ TEST(an_earlier_successful_pre_transaction_stays_committed_even_if_a_later_one_f
         auto a = std::make_unique<Account>();
         a->name = "PRE_OK";
         pre1.create(std::move(a));
-        CHECK(model.run_pre_commit_transaction(pre1).status == CommitStatus::Committed);
+        CHECK(model.run_pre_transaction(pre1).status == CommitStatus::Committed);
 
         Transaction pre2 = model.begin();
         auto o = std::make_unique<Order>();
         o->code = "PRE_BAD";  // null non-nullable Ref -> Invalid
         pre2.create(std::move(o));
-        CHECK(model.run_pre_commit_transaction(pre2).status == CommitStatus::Invalid);
-        // A well-behaved hook stops calling run_pre_commit_transaction() here.
+        CHECK(model.run_pre_transaction(pre2).status == CommitStatus::Invalid);
+        // A well-behaved hook stops calling run_pre_transaction() here.
     });
 
     Transaction txn = m.begin();
@@ -1381,7 +1381,7 @@ TEST(main_transaction_conflicts_with_a_pre_transaction_touching_the_same_object)
     m.set_pre_transactions([a](Model& model, const Transaction&) {
         Transaction pre = model.begin();
         pre.update(a)->name = "FROM_PRE";
-        CHECK(model.run_pre_commit_transaction(pre).status == CommitStatus::Committed);
+        CHECK(model.run_pre_transaction(pre).status == CommitStatus::Committed);
     });
 
     const CommitResult res = m.try_commit(txn);
@@ -1404,7 +1404,7 @@ TEST(pre_commit_veto_hook_still_only_sees_the_main_transactions_own_changeset) {
         auto a = std::make_unique<Account>();
         a->name = "PRE";
         pre.create(std::move(a));
-        CHECK(model.run_pre_commit_transaction(pre).status == CommitStatus::Committed);
+        CHECK(model.run_pre_transaction(pre).status == CommitStatus::Committed);
     });
 
     std::size_t seen = 0;
@@ -1446,7 +1446,7 @@ TEST(pre_transactions_and_the_main_transaction_publish_with_no_other_commit_land
         auto a = std::make_unique<Account>();
         a->name = "PRE";
         pre.create(std::move(a));
-        CommitResult r = model.run_pre_commit_transaction(pre);
+        CommitResult r = model.run_pre_transaction(pre);
         if (r.status == CommitStatus::Committed) t_pre_version = r.snapshot.version();
     });
 
@@ -1648,7 +1648,7 @@ TEST(pre_transactions_pre_commit_and_post_commit_all_see_the_same_transaction_id
         auto a = std::make_unique<Account>();
         a->name = "PRE";
         pre.create(std::move(a));
-        CHECK(model.run_pre_commit_transaction(pre).status == CommitStatus::Committed);
+        CHECK(model.run_pre_transaction(pre).status == CommitStatus::Committed);
     });
     m.set_pre_commit([&](Model&, const Transaction& main_txn, const std::vector<Change>&) {
         seen_in_pre_commit = main_txn.id();

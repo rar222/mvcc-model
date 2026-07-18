@@ -87,7 +87,7 @@ public:
 
 // Items per bucket, held roughly CONSTANT across the sweep by scaling bucket
 // count with n_per_type (see bucket_count_for below). This matters for the
-// WRITE benchmark specifically: reconcile_referrer_edges (the writer-private
+// WRITE benchmark specifically: reconcile_out_refs (the writer-private
 // referrers_ index, maintained for EVERY reference field regardless of
 // caching -- see CLAUDE.md's documented scope boundary) scans its target's
 // referrer list linearly, so if bucket count stayed fixed while n_per_type
@@ -197,7 +197,7 @@ double bench_reassign(Model& m, const std::vector<Ref<T>>& items, const std::vec
     // A DIFFERENT target bucket every rep (k+rep, not just k), so every
     // reassignment is a real value change -- old != new -- and actually
     // exercises reconciliation instead of hitting the "unchanged, skip" path
-    // reconcile_referrer_edges/reconcile_cached_references both take.
+    // reconcile_out_refs/reconcile_cached_references both take.
     int rep = 0;
     const double total_us = time_us(reps, [&] {
         Transaction txn = m.begin();

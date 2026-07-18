@@ -1242,12 +1242,12 @@ using PreCommitFn = std::function<bool(Model&, const Transaction&, const std::ve
 /// try_commit() attempt (if installed) IMMEDIATELY after commit_mu_ is
 /// acquired -- before the main Transaction is touched in ANY way: not
 /// conflict-checked, not applied. This is the ONLY point at which
-/// Model::run_pre_commit_transaction() may be called; use it to run zero or
+/// Model::run_pre_transaction() may be called; use it to run zero or
 /// more OTHER Transactions first, atomically with respect to every other
 /// writer (commit_mu_ never releases in between) and atomically with
 /// respect to the main transaction (which hasn't started yet).
 ///
-/// Each call to run_pre_commit_transaction() is a REAL, independent commit
+/// Each call to run_pre_transaction() is a REAL, independent commit
 /// -- conflict-checked against the changelog (which now includes every
 /// EARLIER pre-transaction this same phase already published) and, if it
 /// passes, published for real: its own version, its own changelog entry,
@@ -1285,7 +1285,7 @@ using PreCommitFn = std::function<bool(Model&, const Transaction&, const std::ve
 /// remove_intents(). A hook can use these to decide WHICH pre-transactions
 /// to run, not just to log an id. It must not call any of txn's mutating
 /// methods (create()/update()/remove()) -- inspect it, don't build on it;
-/// run_pre_commit_transaction() only ever applies a SEPARATE Transaction
+/// run_pre_transaction() only ever applies a SEPARATE Transaction
 /// built via model.begin() inside the hook, never this one.
 using PreTransactionsFn = std::function<void(Model&, const Transaction&)>;
 
@@ -1475,7 +1475,7 @@ public:
     /// Why the in_pre_transactions_phase_ check is an assert (crash) rather
     /// than a checked failure (an error CommitResult, or a no-op): this
     /// function does no locking of its own -- it goes straight into
-    /// commit_locked(), which requires commit_mu_ ALREADY held by the
+    /// commit_pretransaction_locked(), which requires commit_mu_ ALREADY held by the
     /// caller (see its own doc comment). The assert is the only thing
     /// standing between "called during the one window where try_commit()
     /// guarantees the lock is held" and "called from anywhere else" --
@@ -1492,7 +1492,7 @@ public:
     /// NDEBUG), turns a would-be race into a guaranteed, obvious crash at
     /// the call site instead of a silent, load-dependent one discovered
     /// later. See CLAUDE.md's "prefer failing loudly."
-    CommitResult run_pre_commit_transaction(Transaction& txn);
+    CommitResult run_pre_transaction(Transaction& txn);
 
     /// Reported via CommitResult::error (status == Invalid) when a
     /// Transaction's own creates or updates would violate referential
@@ -1607,7 +1607,7 @@ private:
     // phantom or missing edge for a LATER cascade to resolve against.
     void add_out_refs(const ObjectBase* o);
     void drop_out_refs(const ObjectBase* o);
-    void reconcile_referrer_edges(const ObjectBase* before, const ObjectBase* after);
+    void reconcile_out_refs(const ObjectBase* before, const ObjectBase* after);
 
     // Same trio for the unique key index (by_field_)...
     void add_field_keys(const ObjectBase* o);
@@ -1680,7 +1680,7 @@ private:
 
     void rollback_apply();  // unwinds one failed try_commit() apply attempt
 
-    // ---- shared by try_commit() and run_pre_commit_transaction() -----------
+    // ---- shared by try_commit() and run_pre_transaction() -----------
     // Both publish a Transaction as a real, independent commit while already
     // holding commit_mu_; apply_transaction_contents/classify_apply_failure/
     // check_and_apply/publish_now are that shared machinery, factored out so
@@ -1714,13 +1714,13 @@ private:
     CommitResult publish_now(std::unordered_map<std::uint32_t, Id> remap);
 
     /// check_and_apply() + publish_now(), with NO veto-hook seam -- used only
-    /// by run_pre_commit_transaction(), which must never invoke pre_commit_
+    /// by run_pre_transaction(), which must never invoke pre_commit_
     /// for a pre-transaction (that hook is reserved for the main
     /// transaction). try_commit() does NOT call this: the main transaction
     /// still needs the veto seam between apply and publish, so it inlines
     /// check_and_apply() + publish_now() itself. Requires commit_mu_ already
     /// held.
-    CommitResult commit_locked(Transaction& txn);
+    CommitResult commit_pretransaction_locked(Transaction& txn);
 
     /// The body of try_commit() that actually needs commit_mu_: everything
     /// from the pre-transactions phase through check_and_apply(), the
@@ -1728,7 +1728,7 @@ private:
     /// itself so that function can copy post_commit_ out (see PostCommitFn)
     /// and invoke it AFTER the std::lock_guard wrapping this call has gone
     /// out of scope, instead of while still holding commit_mu_.
-    CommitResult try_commit_locked(Transaction& txn);
+    CommitResult commit_main_locked(Transaction& txn);
 
     // ---- read/publish path -------------------------------------------------
     // root_ is atomic so snapshot() acquires the current version with a lock-free
@@ -1815,7 +1815,7 @@ private:
 
     PreTransactionsFn pre_transactions_;  ///< empty = no hook; swapped only under commit_mu_
                                           ///< (set_pre_transactions)
-    bool in_pre_transactions_phase_ = false;  ///< guards run_pre_commit_transaction(): true only
+    bool in_pre_transactions_phase_ = false;  ///< guards run_pre_transaction(): true only
                                               ///< while pre_transactions_(*this) is on the stack
     bool precommit_failed_ = false;   ///< a pre-transaction this attempt already failed --
                                       ///< try_commit() will report PrecommitConflict and skip
@@ -1832,7 +1832,7 @@ private:
                                 ///< (set_post_commit). The MEMBER is commit_mu_-protected like
                                 ///< every other hook here -- but try_commit() copies it out while
                                 ///< still holding the lock and invokes that copy only after
-                                ///< releasing it; see try_commit_locked() and PostCommitFn.
+                                ///< releasing it; see commit_main_locked() and PostCommitFn.
 
     // Undo log and the objects created this attempt (which rollback_apply()
     // must delete, since they were never published and nothing else owns them).
@@ -1871,7 +1871,7 @@ private:
 ///                     succeed. See CommitResult::error for the specifics.
 ///                     This status exists because the project has no
 ///                     exceptions to throw (see CLAUDE.md).
-///   PrecommitConflict a Model::run_pre_commit_transaction() call inside the
+///   PrecommitConflict a Model::run_pre_transaction() call inside the
 ///                     installed PreTransactionsFn did not return Committed.
 ///                     The main transaction was never even conflict-checked,
 ///                     let alone applied -- `txn` is unconsumed and may be
