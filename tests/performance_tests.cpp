@@ -39,6 +39,13 @@
 // corrupted by scheduling jitter and cold caches. A 20% band is only
 // meaningful if its inputs are not themselves 50% noise.
 //
+// Timing bounds are asserted in the DEFAULT build only. Under asan/tsan
+// the suite still runs and prints everything -- that is how this file's
+// own fork/VmHWM harness gets checked for memory errors and races -- but
+// complexity is not asserted there, because the sizes are 25x smaller and
+// the instrumentation overhead is not proportional to algorithmic work.
+// See kAssertTimings. Correctness assertions run everywhere.
+//
 // Dependency-free, same as tests/tests.cpp (see CLAUDE.md: "Don't add
 // gtest/Catch2") -- a small self-contained harness, adapted here to print
 // a timing line per measurement instead of just OK/FAIL.
@@ -135,6 +142,22 @@ constexpr bool kSlowSanitizedBuild = false;
 
 int scaled(int n) { return kSlowSanitizedBuild ? std::max(20, n / 25) : n; }
 
+// Timing-derived bounds are asserted ONLY in the default build. Under a
+// sanitizer this suite still runs every path (which is the point of
+// running it there -- it is how the fork/VmHWM harness and the model code
+// it drives get checked for memory errors and races), and still prints
+// every measurement, but it does not assert complexity: the data sizes
+// are 25x smaller (see scaled()) AND each operation carries 20-50x
+// instrumentation overhead that is not proportional to its algorithmic
+// work. Observed under TSan at those sizes: find_cached_referrers
+// measured 8.59, 8.36 then 5.37 us -- i.e. it got FASTER as n grew,
+// purely from instrumentation noise. Asserting a scaling band on that
+// would be asserting the sanitizer's overhead profile, not the model's
+// complexity. Correctness assertions (cascade killed the right objects,
+// the index costs more memory than no index) are NOT gated and run
+// everywhere.
+constexpr bool kAssertTimings = !kSlowSanitizedBuild;
+
 template <class F>
 double time_ms(F&& f) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -210,16 +233,6 @@ double scaling_factor(GrowthOrder order, int n_prev, int n_cur) {
 //     with n instead put these readings anywhere from 1.5 to 9.9 us and
 //     made them unassertable at any tolerance.)
 //
-//   kAtMostLinear -- upper bound only, for operations whose measured cost
-//     is dominated by FIXED per-commit overhead (lock acquisition, index
-//     bookkeeping, changelog append) rather than by the size-dependent
-//     term. A single-field commit's step factor was measured at x3.33 and
-//     x1.71 in one run and x1.56 and x3.69 in the next, against a x4.00
-//     linear prediction -- it is frequently BELOW linear, so a lower bound
-//     would be asserting noise. The ceiling still carries the weight that
-//     matters: turning the shared_ptr spine copy into a deep per-object
-//     copy would blow straight through it.
-//
 //   kLinearWithIndexOverhead -- cascade delete, checked against an n log n
 //     prediction rather than a linear one. Each cascaded victim performs
 //     several path-copying persistent-map erases (by_type_, plus
@@ -243,7 +256,6 @@ struct Tolerance {
 
 constexpr Tolerance kDefaultBand{0.8, 1.2};              // the +/-20% band
 constexpr Tolerance kSmallIndexedRead{0.7, 1.3};         // sub-microsecond: jitter > 20%
-constexpr Tolerance kAtMostLinear{0.0, 1.75};            // upper bound only; see above
 constexpr Tolerance kLinearWithIndexOverhead{0.7, 2.0};  // n log n + allocator churn
 
 // For a claim whose absolute timings are too noisy for a step band, but
@@ -261,6 +273,7 @@ void check_gap_widens(const char* label, double small_scan, double small_indexed
     const double large_ratio = large_scan / large_indexed;
     std::printf("    %-24s gap: %.1fx at smallest size -> %.1fx at largest (need >= %.1fx growth)\n",
                 label, small_ratio, large_ratio, min_growth);
+    if (!kAssertTimings) return;  // see kAssertTimings
     CHECK(large_ratio >= small_ratio * min_growth);
 }
 
@@ -287,6 +300,7 @@ void check_scaling(const char* label, GrowthOrder order, const std::vector<int>&
             "    %-24s %7d -> %7d : predicted x%.2f, measured x%.2f  (actual=%.6f, allowed "
             "[%.6f, %.6f])\n",
             label, sizes[i - 1], sizes[i], factor, actual_factor, times[i], lo, hi);
+        if (!kAssertTimings) continue;  // see kAssertTimings
         CHECK(times[i] >= lo);
         CHECK(times[i] <= hi);
     }
@@ -507,7 +521,7 @@ PERF_TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_populatio
 // a single-field update's commit latency grows LINEARLY with model size --
 // not flat, but also not proportional to a deep copy of the whole model
 // (which would grow far faster than linear).
-PERF_TEST(single_field_commit_latency_scales_linearly_with_total_model_size) {
+PERF_TEST(single_field_commit_latency_stays_bounded_as_total_model_size_grows) {
     const std::vector<int> sizes = {scaled(6250), scaled(25000), scaled(100000)};
     std::vector<double> ms_per_commit;
     for (int n : sizes) {
@@ -533,7 +547,26 @@ PERF_TEST(single_field_commit_latency_scales_linearly_with_total_model_size) {
         std::printf("  n=%7d  single-field commit = %8.5f ms/commit (best-of-5 avg of %d)\n", n,
                     ms_per_commit.back(), kReps);
     }
-    check_scaling("single-field commit", GrowthOrder::kLinear, sizes, ms_per_commit, kAtMostLinear);
+    // No step band, for the same reason as the hub-referrer test below: the
+    // size-dependent term is a minority of what is being measured. A
+    // single-field commit at n=100,000 costs 6-15 us in total, of which the
+    // O(#chunks) spine copy -- the only part that grows with model size --
+    // is roughly 2 us; the rest is fixed (lock, Root allocation, index map
+    // copies, changelog append) and overlaps asynchronous reaper work.
+    // Measured step factors ranged x1.51-x7.60 against a x4.00 linear
+    // prediction across repeat runs, i.e. 0.38x-1.90x of it: no band over
+    // that spread would mean anything.
+    //
+    // The ceiling is what carries the value, and it is aimed at a specific
+    // regression: if try_commit ever deep-copied objects instead of copying
+    // shared_ptrs, per-commit cost would become proportional to model size
+    // with a huge constant -- at n=100,000 that is milliseconds, ~1000x the
+    // smallest-size reading. A 20x ceiling over a 16x size increase clears
+    // the observed noise and still fails that outright.
+    std::printf("    %-24s %7d -> %7d objects (16x): %.5f ms -> %.5f ms (ceiling %.5f)\n",
+                "single-field commit", sizes.front(), sizes.back(), ms_per_commit.front(),
+                ms_per_commit.back(), ms_per_commit.front() * 20.0);
+    if (kAssertTimings) CHECK(ms_per_commit.back() <= ms_per_commit.front() * 20.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,9 +608,8 @@ void seed_hub_with_fanout(Model& m, int fanout, int background, Ref<Account>& hu
 // Removing ONE of a hub's many referrers forces drop_out_refs to locate
 // that one edge in the hub's referrer vector (a linear find_if) and erase
 // it (a vector erase) -- the O(#referrers) cost CLAUDE.md's
-// scope-boundaries section documents. Held here as an UPPER bound only
-// (kAtMostLinear), which is a deliberate, measured decision rather than a
-// loose default:
+// scope-boundaries section documents. Held here as an UPPER bound only,
+// which is a deliberate, measured decision rather than a loose default:
 //
 //   - The cost depends strongly on WHERE the edge sits. Removing the
 //     first-created referrer (edge at the FRONT: find_if returns
@@ -633,7 +665,7 @@ PERF_TEST(worst_case_removing_one_referrer_of_a_hub_scales_with_hub_fanout) {
     std::printf("    %-24s %7d -> %7d fanout (16x): %.4f ms -> %.4f ms (ceiling %.4f)\n",
                 "remove one hub referrer", fanouts.front(), fanouts.back(), times_ms.front(),
                 times_ms.back(), times_ms.front() * 10.0);
-    CHECK(times_ms.back() <= times_ms.front() * 10.0);
+    if (kAssertTimings) CHECK(times_ms.back() <= times_ms.front() * 10.0);
 }
 
 // Removing the hub ITSELF (rather than one of its referrers, as the test
@@ -773,8 +805,10 @@ PERF_TEST(write_cost_scales_with_object_payload_size_at_a_fixed_object_count) {
     // The large payload (50x the string count, 16x the string length --
     // ~800x the raw byte count) must not be catastrophically (>80x) more
     // expensive to create or clone than the small one at the SAME count.
-    CHECK(create_ms[1] < create_ms[0] * 80.0 + 200.0);
-    CHECK(update_ms[1] < update_ms[0] * 80.0 + 5.0);
+    if (kAssertTimings) {
+        CHECK(create_ms[1] < create_ms[0] * 80.0 + 200.0);
+        CHECK(update_ms[1] < update_ms[0] * 80.0 + 5.0);
+    }
 }
 
 // Contrast with the write-side test above: find_by_key never copies the
@@ -797,7 +831,7 @@ PERF_TEST(read_lookup_time_is_insensitive_to_object_payload_size) {
         lookup_us.push_back(t * 1000.0 / kReps);
         std::printf("  payload=%-16s  find_by_key = %9.4f us/call\n", c.label, lookup_us.back());
     }
-    CHECK(lookup_us[1] < lookup_us[0] * 5.0 + 5.0);
+    if (kAssertTimings) CHECK(lookup_us[1] < lookup_us[0] * 5.0 + 5.0);
 }
 
 // ---------------------------------------------------------------------------
