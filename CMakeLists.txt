@@ -107,3 +107,11 @@ set_tests_properties(demo_integration PROPERTIES TIMEOUT 300)
 
 add_test(NAME two_writer_demo_integration COMMAND two_writer_demo)
 set_tests_properties(two_writer_demo_integration PROPERTIES TIMEOUT 300)
+
+# This project's own documented complexity/memory claims (CLAUDE.md,
+# DESIGN.md, README.md), asserted across several sizes instead of only
+# ever printed for a human to eyeball -- see the file's own header comment.
+add_executable(performance_tests tests/performance_tests.cpp)
+target_link_libraries(performance_tests PRIVATE model)
+add_test(NAME performance_tests COMMAND performance_tests)
+set_tests_properties(performance_tests PROPERTIES TIMEOUT 300)
