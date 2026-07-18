@@ -2686,6 +2686,168 @@ TEST(changelog_entries_are_pruned_once_no_open_transaction_or_snapshot_needs_the
 }
 
 // ---------------------------------------------------------------------------
+// Bulk load (begin_bulk() / commit_bulk())
+// ---------------------------------------------------------------------------
+//
+// None of these tests hold a Snapshot or Transaction across a commit_bulk()
+// call -- that's the exclusive-access precondition documented on
+// Model::commit_bulk() itself, and violating it is undefined behavior, not a
+// checked error (see the assert in the implementation, which is a tripwire
+// for misuse during development, not a guard these tests should lean on).
+
+TEST(bulk_load_into_a_fresh_model_installs_everything_with_cross_object_local_refs) {
+    Model m;
+    BulkTransaction t = m.begin_bulk();
+    auto acc = std::make_unique<Account>();
+    acc->name = "A1";
+    const Ref<Account> a = t.create(std::move(acc));
+    auto ord = std::make_unique<Order>();
+    ord->code = "O1";
+    ord->account = a;  // forward reference to another object in the SAME batch
+    const Ref<Order> o = t.create(std::move(ord));
+
+    CommitResult r = m.commit_bulk(t);
+    CHECK(r.status == CommitStatus::Committed);
+    const Ref<Account> real_a = r.to_real(a);
+    const Ref<Order> real_o = r.to_real(o);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find(real_a) != nullptr);
+    CHECK(s.find(real_o) != nullptr);
+    CHECK_EQ(s.find(real_o)->account.raw(), real_a.raw());
+    CHECK(s.find_by_key<&Account::name>("A1") != nullptr);
+}
+
+TEST(bulk_load_wipes_all_pre_existing_data) {
+    Model m;
+    make_account(m, "old1");
+    make_account(m, "old2");
+    CHECK_EQ(m.snapshot().find_by_key<&Account::name>("old1") != nullptr, true);
+
+    BulkTransaction t = m.begin_bulk();
+    auto acc = std::make_unique<Account>();
+    acc->name = "new1";
+    t.create(std::move(acc));
+    CommitResult r = m.commit_bulk(t);
+    CHECK(r.status == CommitStatus::Committed);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_by_key<&Account::name>("old1") == nullptr);
+    CHECK(s.find_by_key<&Account::name>("old2") == nullptr);
+    CHECK(s.find_by_key<&Account::name>("new1") != nullptr);
+    std::size_t count = 0;
+    s.for_each<Account>([&](const Account&) { ++count; });
+    CHECK_EQ(count, std::size_t{1});
+}
+
+TEST(bulk_load_rejects_an_out_of_range_local_ref_with_nothing_mutated) {
+    Model m;
+    make_account(m, "survivor");
+    const std::uint64_t before = m.current_version();
+
+    BulkTransaction t = m.begin_bulk();
+    auto ord = std::make_unique<Order>();
+    ord->code = "O1";
+    // Points past the end of this batch (only one object is being created)
+    // -- after the wipe, nothing else could ever satisfy it.
+    ord->account = Ref<Account>(Id{kLocalIdBit | 999u, 1});
+    t.create(std::move(ord));
+
+    CommitResult r = m.commit_bulk(t);
+    CHECK(r.status == CommitStatus::Invalid);
+    CHECK_EQ(m.current_version(), before);  // no wipe, no publish -- rejected before any mutation
+    CHECK(m.snapshot().find_by_key<&Account::name>("survivor") != nullptr);
+}
+
+TEST(bulk_load_rejects_a_null_non_nullable_ref) {
+    Model m;
+    const std::uint64_t before = m.current_version();
+
+    BulkTransaction t = m.begin_bulk();
+    auto ord = std::make_unique<Order>();
+    ord->code = "O1";  // ord->account (Ref<Account>, non-nullable) left null
+    t.create(std::move(ord));
+
+    CommitResult r = m.commit_bulk(t);
+    CHECK(r.status == CommitStatus::Invalid);
+    CHECK_EQ(m.current_version(), before);
+}
+
+TEST(bulk_load_rejects_a_reference_to_a_pre_wipe_real_id) {
+    Model m;
+    const Ref<Account> old_real = make_account(m, "pre_wipe");
+
+    BulkTransaction t = m.begin_bulk();
+    auto ord = std::make_unique<Order>();
+    ord->code = "O1";
+    ord->account = old_real;  // a REAL id, not local -- can't survive the wipe
+    t.create(std::move(ord));
+
+    CommitResult r = m.commit_bulk(t);
+    CHECK(r.status == CommitStatus::Invalid);
+}
+
+TEST(normal_transaction_and_find_by_key_work_correctly_after_a_bulk_load) {
+    Model m;
+    {
+        BulkTransaction t = m.begin_bulk();
+        auto acc = std::make_unique<Account>();
+        acc->name = "C1";
+        t.create(std::move(acc));
+        CHECK(m.commit_bulk(t).status == CommitStatus::Committed);
+    }
+
+    const Ref<Account> a2 = make_account(m, "C2");  // an ordinary Transaction, on top of the bulk load
+    update_field(m, a2, [](Account* a) { a->balance = 42; });
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_by_key<&Account::name>("C1") != nullptr);
+    CHECK(s.find_by_key<&Account::name>("C2") != nullptr);
+    CHECK_EQ(s.find(a2)->balance, 42);
+    std::size_t count = 0;
+    s.for_each<Account>([&](const Account&) { ++count; });
+    CHECK_EQ(count, std::size_t{2});
+}
+
+// The reverse index (referrers_) has to come out of commit_bulk()'s no-log
+// installation path in exactly the state cascade delete expects -- this
+// exercises that by cascading a non-nullable ref and nulling a nullable one,
+// entirely on bulk-loaded data.
+TEST(cascade_delete_works_correctly_on_bulk_loaded_data) {
+    Model m;
+    BulkTransaction t = m.begin_bulk();
+    auto acc = std::make_unique<Account>();
+    acc->name = "Hub";
+    const Ref<Account> a = t.create(std::move(acc));
+    auto other = std::make_unique<Account>();  // unrelated -- keeps grandchild's own
+    other->name = "Other";                    // non-nullable Ref<Account> satisfied after
+    const Ref<Account> b = t.create(std::move(other));  // `a` is removed, so only `parent` nulls
+    auto child = std::make_unique<Order>();
+    child->code = "child";
+    child->account = a;  // non-nullable: dies when `a` is removed
+    const Ref<Order> c = t.create(std::move(child));
+    auto grandchild = std::make_unique<Order>();
+    grandchild->code = "grandchild";
+    grandchild->account = b;
+    grandchild->parent = c;  // nullable: survives, but parent gets nulled
+    const Ref<Order> g = t.create(std::move(grandchild));
+
+    CommitResult r = m.commit_bulk(t);
+    CHECK(r.status == CommitStatus::Committed);
+    const Ref<Account> real_a = r.to_real(a);
+    const Ref<Order> real_c = r.to_real(c);
+    const Ref<Order> real_g = r.to_real(g);
+
+    const std::size_t killed = remove_and_commit(m, real_a);
+    CHECK_EQ(killed, std::size_t{2});  // Hub + child cascade; grandchild survives
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find(real_c) == nullptr);
+    CHECK(s.find(real_g) != nullptr);
+    CHECK(s.find(real_g)->parent.raw() == Id{});  // nulled, not cascaded
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency stress
 // ---------------------------------------------------------------------------
 

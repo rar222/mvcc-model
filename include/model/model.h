@@ -802,6 +802,7 @@ struct Root {
 
 class Model;
 class Transaction;
+class BulkTransaction;
 struct CommitResult;
 
 template <class T>
@@ -1428,6 +1429,80 @@ public:
     /// apply) -- discard it and begin() a fresh Transaction to retry.
     CommitResult try_commit(Transaction& txn);
 
+    // ---- bulk load (EXCLUSIVE ACCESS ONLY -- read this before using) -------
+    //
+    // try_commit()'s per-object undo log -- log() every mutation's exact
+    // inverse, so a conflicted/invalid/vetoed attempt can unwind cleanly --
+    // is what makes multi-writer OCC safe. It is also, unavoidably, an
+    // O(items in the transaction) memory cost: every create logs a closure
+    // capturing the prior state of by_type_ (and, for indexed fields,
+    // by_field_/by_cached_field_/by_cached_reference_ too), and none of it
+    // is released until the WHOLE transaction resolves. Put 200,000 creates
+    // in one Transaction and you retain 200,000 of those closures
+    // simultaneously -- measured at ~15-17x the steady-state per-object
+    // cost of committing the same data in small batches. That is not a bug
+    // in try_commit(); it is the price of a guarantee (clean rollback) that
+    // a genuine bulk load does not need, because a bulk load either
+    // replaces the ENTIRE model or doesn't run at all -- there is no
+    // partial-failure state worth rolling back TO.
+    //
+    // begin_bulk()/commit_bulk() trade that guarantee away, deliberately
+    // and only here, for exactly that case: wipe the whole Model and load a
+    // fresh graph in one shot, at close to the steady-state per-object
+    // cost, with no per-object undo logging at all.
+    //
+    // THE PRECONDITION, and why it is load-bearing rather than advisory:
+    // commit_bulk() requires that NO OTHER THREAD is doing ANYTHING with
+    // this Model for the ENTIRE begin_bulk()..commit_bulk() window --
+    // holding a Snapshot, holding a Transaction, calling snapshot() or
+    // subscribe(), or having an undrained Subscription queue (a queued
+    // Update pins a Snapshot too). This is checked -- commit_bulk() asserts
+    // live_ is empty, both before it starts wiping and again immediately
+    // before it publishes -- but the assert is a tripwire, not a lock:
+    // commit_mu_ is held throughout for internal consistency with every
+    // other commit_mu_-protected member, but snapshot()/begin() deliberately
+    // never take commit_mu_ (invariant 10, and what keeps them
+    // contention-free against try_commit() in the first place), so nothing
+    // here can BLOCK a concurrent snapshot() call the way a lock would.
+    // If one slips in between the precondition check and the actual wipe,
+    // that thread's Snapshot points at a Root whose Chunks this call is
+    // actively deleting objects out from under -- a real, silent
+    // use-after-free, not a logical inconsistency the model can detect
+    // after the fact. This is the deliberate cost of "no locks, no log, no
+    // other overhead": there is no cheaper way to get that memory profile
+    // that still lets other threads touch the Model at the same time. Use
+    // this only at startup, before any Snapshot/Subscription has ever been
+    // handed out, or during a maintenance window where every other thread
+    // has already been quiesced.
+    //
+    // Scope, deliberately narrow: create() only (no update/remove/peek --
+    // there is nothing meaningful to update/remove/peek before the wipe
+    // installs anything), and the wipe is unconditional (this always
+    // replaces the ENTIRE model; it is not a bulk-insert-into-existing-data
+    // tool). PreCommitFn/PreTransactionsFn/PostCommitFn do NOT fire for a
+    // bulk commit -- they exist to gate/observe ordinary deltas, and a
+    // wholesale replacement isn't one.
+
+    /// Start building a bulk load. Touches nothing yet -- exactly like
+    /// begin(), building is free of shared state -- so nothing has
+    /// happened to the Model just because this was called. See the section
+    /// comment above for the full contract; this is only the builder half.
+    BulkTransaction begin_bulk();
+
+    /// Wipes the Model and installs everything created on `txn` as the
+    /// model's entire new content, in one atomic publish -- or, if any
+    /// object's Ref<>/Opt<> fails to resolve WITHIN this batch (the model
+    /// is empty afterward, so there is nothing else for a ref to resolve
+    /// against), rejects as CommitStatus::Invalid with NOTHING touched:
+    /// the whole batch is validated before any mutation begins, since
+    /// there is no undo log to unwind a partial failure with. Never
+    /// returns Conflict (nothing else can be racing this, by the
+    /// exclusive-access precondition) or Vetoed (no hook runs). See the
+    /// section comment above for the precondition this REQUIRES -- calling
+    /// this while any other thread holds a Snapshot of this Model is
+    /// undefined behavior, not a checked error.
+    CommitResult commit_bulk(BulkTransaction& txn);
+
     /// Install (or clear, with {}) the pre-commit hook. See PreCommitFn.
     /// Takes the commit lock, so it is safe to call while other threads
     /// commit -- the hook swaps in between commits, never mid-commit. Never
@@ -1653,6 +1728,24 @@ private:
     /// Point a slot at an object (or null) with a new generation, through
     /// cow(); logs the exact inverse (previous object + generation).
     void set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen);
+
+    // ---- commit_bulk() internals only -- see the section comment above
+    // Model::begin_bulk() before reaching for these anywhere else --------
+    //
+    // Exact behavioral twins of set_slot()/add_out_refs()/add_field_keys()/
+    // add_cached_fields()/add_cached_references() above, minus the log()
+    // call each one makes. That single omission is the entire point: it is
+    // the act of LOGGING (capturing and retaining the prior state so it can
+    // be replayed) that makes a huge, single Transaction expensive, not the
+    // index mutation itself -- see commit_bulk()'s own comment for the
+    // measured cost this avoids. Calling these from anywhere a failure
+    // might need to be unwound is a correctness bug: nothing here is
+    // undo-able, on purpose.
+    void set_slot_no_log(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen);
+    void add_out_refs_no_log(const ObjectBase* o);
+    void add_field_keys_no_log(const ObjectBase* o);
+    void add_cached_fields_no_log(const ObjectBase* o);
+    void add_cached_references_no_log(const ObjectBase* o);
 
     // ---- try_commit() internals (ALL require commit_mu_ already held) ------
     // apply_* return nullopt on success, or the integrity violation that
@@ -1978,6 +2071,62 @@ struct CommitResult {
         auto it = local_remap.find(local.raw().index);
         return Opt<T>(it == local_remap.end() ? Id{} : it->second);
     }
+};
+
+// ---------------------------------------------------------------------------
+// BulkTransaction -- the builder half of Model::begin_bulk()/commit_bulk()
+// ---------------------------------------------------------------------------
+
+/// The bulk-load builder: create() only, no base to read against (there is
+/// nothing meaningful to read -- commit_bulk() wipes the model before
+/// installing this), no update()/remove()/peek(). See Model::begin_bulk()'s
+/// section comment for the full contract, including the exclusive-access
+/// precondition commit_bulk() requires.
+///
+/// Building one touches no shared state, exactly like Transaction -- create()
+/// just mints a local id (see is_local()) and stores the object locally.
+/// Objects created here can reference each other freely, in any order,
+/// through the Ref<T>/Opt<T> returned by create(), the same way same-
+/// transaction local creates work on an ordinary Transaction; commit_bulk()
+/// remaps every one of those local ids to its real id in one pass. Not
+/// copyable (owns unique_ptrs to not-yet-installed objects); movable.
+class BulkTransaction {
+public:
+    BulkTransaction(BulkTransaction&&) = default;
+    BulkTransaction& operator=(BulkTransaction&&) = default;
+    BulkTransaction(const BulkTransaction&) = delete;
+    BulkTransaction& operator=(const BulkTransaction&) = delete;
+
+    /// Takes ownership and returns a LOCAL id -- usable immediately as a
+    /// Ref<T>/Opt<T> target for any other object created on this SAME
+    /// BulkTransaction, before or after this call. Meaningless outside it;
+    /// see CommitResult::to_real() for translating one into its real,
+    /// post-commit form once commit_bulk() succeeds.
+    template <class T>
+    Ref<T> create(std::unique_ptr<T> o) {
+        static_assert(std::is_base_of_v<ObjectBase, T>, "T must derive from Object<T>");
+        // objects_.size() doubles as the next local index: unlike
+        // Transaction, there is no remove() to cancel an earlier entry and
+        // leave a hole, so "how many objects exist so far" and "the next
+        // free local index" are always the same number.
+        const Id local_id{kLocalIdBit | static_cast<std::uint32_t>(objects_.size()), 1};
+        o->id = local_id;
+        objects_.push_back(std::move(o));
+        return Ref<T>(local_id);
+    }
+
+    /// How many objects are pending. Diagnostic; commit_bulk() doesn't need
+    /// it, but a caller sanity-checking a large generated batch might.
+    std::size_t size() const noexcept { return objects_.size(); }
+
+private:
+    friend class Model;
+
+    /// Only Model::begin_bulk() constructs one.
+    explicit BulkTransaction(Model* m) : model_(m) {}
+
+    Model* model_ = nullptr;  ///< asserted against cross-model misuse in commit_bulk()
+    std::vector<std::unique_ptr<ObjectBase>> objects_;  ///< index == local id's low bits
 };
 
 // ---------------------------------------------------------------------------

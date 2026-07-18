@@ -68,6 +68,7 @@
 
 #if defined(__linux__)
 #include <cstdlib>
+#include <malloc.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #define PERF_HAS_MEMORY_SECTION 1
@@ -867,6 +868,18 @@ template <class F>
 long measure_child_peak_kb(F&& work) {
     int fds[2];
     if (pipe(fds) != 0) return -1;
+    // Return whatever this PARENT process's own earlier (in-process, not
+    // forked) tests left resident-but-freed in glibc's heap arenas back to
+    // the OS before forking. Without this, a child measuring a SMALL true
+    // demand (tens of MB) can inherit a much larger already-resident free
+    // pool from prior tests via COW and satisfy its entire allocation from
+    // it without RSS growing at all -- measured directly: with pollution
+    // and no trim, a genuine ~71 MB demand showed up as a ~0.6 MB delta;
+    // with this trim, the same demand measures correctly. A demand large
+    // enough to exceed any plausible leftover pool (hundreds of MB, as the
+    // other test in this section is) isn't affected either way, but nothing
+    // here should have to know in advance which regime it's in.
+    malloc_trim(0);
     // Flush every open C stream BEFORE forking, not just skip re-flushing
     // in the child via _exit() below: when stdout isn't a terminal (piped,
     // redirected -- exactly how `ctest` and this very command run it), the
@@ -977,6 +990,80 @@ PERF_TEST(cached_reference_index_memory_overhead_is_present_but_bounded) {
     // curve; it exists to catch a runaway/leak-like blowup, not to pin an
     // exact ratio.
     CHECK(cached_kb < uncached_kb * 15 + 10000);
+}
+
+namespace {
+
+// Same shape as seed_one_type_spread_across_buckets, but built on ONE
+// BulkTransaction instead of one huge Transaction: the buckets themselves
+// are part of the same batch (cross-object local refs, exactly like any
+// other BulkTransaction), and commit_bulk() installs everything with no
+// per-object undo logging at all. This is the direct memory-cost comparison
+// that motivated Model::begin_bulk()/commit_bulk() in the first place (see
+// their doc comments): a single Transaction with n creates retains n
+// undo-log closures, each capturing a whole PersistentMap root, simultaneously,
+// until the WHOLE transaction resolves -- measured at ~13-17x the
+// steady-state per-object cost. A bulk load has nothing to roll back to
+// (see commit_bulk()'s own doc comment), so it never pays that cost.
+template <class T>
+void seed_one_type_via_bulk_load(Model& m, int n) {
+    const int n_buckets = std::max(50, n / kItemsPerBucket);
+    BulkTransaction t = m.begin_bulk();
+    std::vector<Ref<Account>> buckets;
+    buckets.reserve(static_cast<std::size_t>(n_buckets));
+    for (int i = 0; i < n_buckets; ++i) {
+        auto a = std::make_unique<Account>();
+        a->name = "B" + std::to_string(i);
+        buckets.push_back(t.create(std::move(a)));
+    }
+    for (int i = 0; i < n; ++i) {
+        auto o = std::make_unique<T>();
+        o->bucket = buckets[static_cast<std::size_t>(i) % buckets.size()];
+        t.create(std::move(o));
+    }
+    (void)m.commit_bulk(t);
+}
+
+}  // namespace
+
+PERF_TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
+    const int kN = scaled(200000);
+    const long baseline_kb = measure_child_peak_kb([] { /* just process startup cost */ });
+
+    const long single_txn_kb = measure_child_peak_kb([kN] {
+        Model m;
+        seed_one_type_spread_across_buckets<MemUncached>(m, kN);
+    }) - baseline_kb;
+
+    const long bulk_kb = measure_child_peak_kb([kN] {
+        Model m;
+        seed_one_type_via_bulk_load<MemUncached>(m, kN);
+    }) - baseline_kb;
+
+    const double single_bpi = kN > 0 ? single_txn_kb * 1024.0 / kN : 0.0;
+    const double bulk_bpi = kN > 0 ? bulk_kb * 1024.0 / kN : 0.0;
+    const double ratio = bulk_kb > 0 ? static_cast<double>(single_txn_kb) / bulk_kb : 0.0;
+    std::printf(
+        "  n=%d   single-transaction=%ld KB (%.0f B/item)   bulk-load=%ld KB (%.0f B/item)   "
+        "ratio=%.2fx\n",
+        kN, single_txn_kb, single_bpi, bulk_kb, bulk_bpi, ratio);
+
+    CHECK(single_txn_kb > 0);
+    CHECK(bulk_kb > 0);
+    // The whole point of commit_bulk(): no per-object undo-log retention, so
+    // its per-item cost lands near the steady-state batched-commit figure,
+    // not the single-huge-transaction figure. Measured ratio, repeatedly:
+    // ~11.7x at n=200,000 in the default build, ~13.0x under TSan (whose own
+    // allocator overhead is roughly proportional per-object, so the ratio
+    // survives it). Under ASan specifically, at the ~25x-smaller n=8,000
+    // scaled() falls back to, the ratio compresses to a stable ~2.2-2.3x --
+    // ASan's redzone-per-allocation overhead is a large, roughly FIXED cost
+    // per object regardless of which path created it, and it dominates at
+    // this size for both paths, compressing the gap between them (the same
+    // fixed-overhead-at-small-n effect the cached-reference memory test
+    // above documents for a different structure). 1.8x is kept below every
+    // measured floor with margin, not tuned to the letter of one run.
+    CHECK(bulk_kb * 9 < single_txn_kb * 5);
 }
 
 #endif  // PERF_HAS_MEMORY_SECTION

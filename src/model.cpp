@@ -1445,4 +1445,156 @@ CommitResult Model::try_commit(Transaction& txn) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// begin_bulk() / commit_bulk() -- see the section comment on the
+// declarations in model.h for the exclusive-access precondition. Everything
+// below assumes it holds; there is no way to check it from in here beyond
+// the two live_-emptiness asserts.
+// ---------------------------------------------------------------------------
+
+BulkTransaction Model::begin_bulk() { return BulkTransaction(this); }
+
+void Model::set_slot_no_log(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen) {
+    Chunk* ch = cow(slot >> kChunkBits);
+    ch->obj[slot & kChunkMask] = obj;
+    ch->gen[slot & kChunkMask] = gen;
+}
+
+void Model::add_out_refs_no_log(const ObjectBase* o) {
+    const Id from = o->id;
+    o->each_ref([&](const void* field, const char*, Id target, bool nullable) {
+        if (!target) return;
+        referrers_[target.index].push_back(RefEdge{from, field, nullable});
+    });
+}
+
+void Model::add_field_keys_no_log(const ObjectBase* o) {
+    const Id id = o->id;
+    o->each_field_key([&](const void* field, std::string key) {
+        auto& sub = by_field_[field];
+        sub = sub.set(key, id);
+    });
+}
+
+void Model::add_cached_fields_no_log(const ObjectBase* o) {
+    const Id id = o->id;
+    o->each_cached_field([&](const void* field, std::string key) {
+        auto& sub = by_cached_field_[field];
+        const pmap::PersistentMap<Id>* bucket = sub.get(key);
+        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+    });
+}
+
+void Model::add_cached_references_no_log(const ObjectBase* o) {
+    const Id id = o->id;
+    o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
+        if (!target) return;
+        auto& sub = by_cached_reference_[field];
+        const pmap::PersistentMap<Id>* bucket = sub.get(detail::id_key(target));
+        sub = sub.set(detail::id_key(target),
+                      (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+    });
+}
+
+CommitResult Model::commit_bulk(BulkTransaction& txn) {
+    assert(txn.model_ == this && "BulkTransaction belongs to a different Model");
+
+    // Checkpoint 1/2: the exclusivity precondition, checked (not enforced --
+    // see the doc comment on the declaration) before anything is touched.
+    {
+        std::lock_guard lk(ver_mu_);
+        assert(live_.empty() &&
+               "commit_bulk() requires exclusive access -- see its declaration's doc comment");
+    }
+
+    std::lock_guard commit_lk(commit_mu_);
+
+    // Pass 1: validate the WHOLE batch before mutating anything. There is no
+    // undo log here, so every check the ordinary path defers to per-object
+    // validate() (interleaved with installation) has to happen upfront,
+    // against the batch as a whole: after the wipe below, a non-null ref can
+    // only ever resolve to another object in THIS SAME BATCH, by local index.
+    for (const auto& obj : txn.objects_) {
+        bool bad = false;
+        obj->each_ref([&](const void*, const char*, Id target, bool nullable) {
+            if (bad) return;
+            if (!target) {
+                if (!nullable) bad = true;
+                return;
+            }
+            if (!is_local(target) || (target.index & ~kLocalIdBit) >= txn.objects_.size())
+                bad = true;
+        });
+        if (bad) {
+            // Nothing mutated yet -- txn still owns every object untouched.
+            return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {},
+                                IntegrityError{kUnmappedLocalMsg, Id{}}};
+        }
+    }
+
+    // Checkpoint 2/2, immediately before the wipe: same assert, same caveat.
+    {
+        std::lock_guard lk(ver_mu_);
+        assert(live_.empty() &&
+               "commit_bulk() requires exclusive access -- see its declaration's doc comment");
+    }
+
+    // Pass 2: wipe. No live Snapshot exists (asserted above), so every
+    // currently-installed object can be freed directly -- the retire-and-
+    // wait-for-the-reaper protocol exists for readers, and by precondition
+    // there are none. Same idiom as ~Model(), which is in exactly the same
+    // position (nothing left to observe the spine).
+    for (auto& ch : spine_)
+        for (std::uint32_t i = 0; i < kChunkSize; ++i) delete ch->obj[i];  // delete(nullptr): no-op
+    spine_.clear();
+    dirty_.clear();
+    by_type_.clear();
+    by_field_.clear();
+    by_cached_field_.clear();
+    by_cached_reference_.clear();
+    referrers_.clear();
+    free_slots_.clear();
+    next_slot_ = 0;
+    exhausted_slots_ = 0;
+    changelog_.clear();
+
+    // Pass 3: install. next_slot_ is 0 and free_slots_ is empty (just
+    // cleared), so real ids are just 0..N-1 in order -- what alloc_slot()
+    // would compute anyway, minus its own (otherwise pointless here) undo
+    // logging. Minting the whole remap table before installing anything
+    // means remap_refs() below always sees every target's real id already,
+    // regardless of which local index refers to which -- order doesn't
+    // matter the way it does for apply_create()'s incremental remap.
+    // Keyed by the FULL local Id::index (kLocalIdBit set), matching what
+    // RefRemapper::resolve() looks up -- not the bare 0-based position.
+    std::unordered_map<std::uint32_t, Id> remap;
+    remap.reserve(txn.objects_.size());
+    for (std::size_t i = 0; i < txn.objects_.size(); ++i)
+        remap[kLocalIdBit | static_cast<std::uint32_t>(i)] =
+            Id{static_cast<std::uint32_t>(next_slot_++), 1};
+
+    for (std::size_t i = 0; i < txn.objects_.size(); ++i) {
+        ObjectBase* raw = txn.objects_[i].release();
+        bool unmapped = false;
+        raw->remap_refs(RefRemapper{remap, &unmapped});
+        assert(!unmapped && "pass 1 already validated every ref resolves within the batch");
+
+        const Id id = remap[kLocalIdBit | static_cast<std::uint32_t>(i)];
+        raw->id = id;
+
+        set_slot_no_log(id.index, raw, id.gen);
+        auto& sub = by_type_[raw->tag()];
+        sub = sub.set(detail::id_key(id), id);
+        add_out_refs_no_log(raw);
+        add_field_keys_no_log(raw);
+        add_cached_fields_no_log(raw);
+        add_cached_references_no_log(raw);
+
+        changes_.push_back({id, ChangeKind::Created, raw->tag()});
+    }
+    txn.objects_.clear();  // every unique_ptr already release()'d above
+
+    return publish_now(std::move(remap));
+}
+
 }  // namespace model
