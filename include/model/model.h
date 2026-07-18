@@ -1741,6 +1741,15 @@ private:
     // measured cost this avoids. Calling these from anywhere a failure
     // might need to be unwound is a correctness bug: nothing here is
     // undo-able, on purpose.
+    //
+    // Deliberately NOT merged into the logged versions behind a `bool
+    // should_log` parameter, even though each pair's body is otherwise
+    // identical: a stray `true` at the one call site that must never log
+    // would silently reintroduce the exact per-object undo-log retention
+    // this whole mechanism exists to avoid, with no signal at the call site
+    // and nothing for the type system to catch. Separate names mean
+    // "commit_bulk() calls the _no_log ones" is a static, grep-able fact
+    // instead of something you have to trace a boolean through.
     void set_slot_no_log(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen);
     void add_out_refs_no_log(const ObjectBase* o);
     void add_field_keys_no_log(const ObjectBase* o);
@@ -2090,6 +2099,18 @@ struct CommitResult {
 /// transaction local creates work on an ordinary Transaction; commit_bulk()
 /// remaps every one of those local ids to its real id in one pass. Not
 /// copyable (owns unique_ptrs to not-yet-installed objects); movable.
+///
+/// Deliberately NOT a subclass of Transaction (in either direction), despite
+/// the create()-side resemblance. Transaction's local-id scheme tolerates
+/// holes (a same-transaction create-then-remove cancels the create outright,
+/// see Transaction::remove()); this type's create() uses objects_.size() as
+/// the next local index precisely BECAUSE it never needs to leave a hole --
+/// unifying the two would force one scheme onto the other. More importantly,
+/// if this were a base of Transaction, Model::commit_bulk(BulkTransaction&)
+/// would silently accept a Transaction upcast and wipe/reload the whole
+/// model from just its local_created_, discarding its base_, local_updated_,
+/// and remove_intents_ without a warning. Keeping them unrelated types means
+/// that mistake doesn't compile.
 class BulkTransaction {
 public:
     BulkTransaction(BulkTransaction&&) = default;

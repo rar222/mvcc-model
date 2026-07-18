@@ -89,16 +89,19 @@ bool Subscription::wait(Update& out) {
     // wakeup that raced another consumer thread and lost) just loops back to
     // sleep instead of returning garbage.
     cv_.wait(lk, [&] { return !q_.empty() || closed_; });
-    if (q_.empty()) return false;  // woke because closed_, not because work arrived: no more events, ever
-    out = std::move(q_.front());   // move out, not copy: an Update carries a Snapshot (pins a version)
-                                   // and a full Change vector -- no reason to duplicate either
+    if (q_.empty())
+        return false;  // woke because closed_, not because work arrived: no more events, ever
+    out =
+        std::move(q_.front());  // move out, not copy: an Update carries a Snapshot (pins a version)
+                                // and a full Change vector -- no reason to duplicate either
     q_.pop_front();
     return true;
 }
 
 bool Subscription::try_drain(Update& out) {
     std::lock_guard lk(m_);
-    if (q_.empty()) return false;  // non-blocking: nothing queued right now, caller decides what to do
+    if (q_.empty())
+        return false;  // non-blocking: nothing queued right now, caller decides what to do
     out = std::move(q_.front());
     q_.pop_front();
     return true;
@@ -178,19 +181,19 @@ void Subscription::collapse(Update tail) {
     Update out;
     out.snapshot = std::move(tail.snapshot);  // the newest version -- every older Snapshot in the
                                               // queue is dropped along with q_ below
-    out.coalesced = true;                     // tells the consumer this Update skipped intermediate versions
+    out.coalesced = true;  // tells the consumer this Update skipped intermediate versions
     out.changes.reserve(merged.size());
     for (auto& [id, kind] : merged) out.changes.push_back({id, kind, tags.at(id)});
 
     q_.clear();  // drops the intermediate snapshots -- the whole point (each one was pinning a
-                // version, and everything retired since, alive)
+                 // version, and everything retired since, alive)
     q_.push_back(std::move(out));
 }
 
 void Subscription::close() {
     std::lock_guard lk(m_);
-    closed_ = true;      // wait()'s predicate re-checks this: any blocked or future wait() call
-                         // returns false instead of hanging forever
+    closed_ = true;    // wait()'s predicate re-checks this: any blocked or future wait() call
+                       // returns false instead of hanging forever
     cv_.notify_all();  // notify_all, not notify_one: every blocked consumer thread (there may be
                        // several) must wake up and observe closed_, not just one of them
 }
@@ -209,7 +212,7 @@ Model::Model() {
     r->version = 1;
     root_.store(r, std::memory_order_release);
     version_ = 1;  // the writer's own copy of "latest version" (commit_mu_-protected); try_commit()
-                  // increments this, then builds the next Root from it
+                   // increments this, then builds the next Root from it
     reaper_ = std::thread([this] { reaper_loop(); });
 }
 
@@ -227,13 +230,16 @@ Model::~Model() {
     // Free whatever the reaper couldn't (objects still pinned at shutdown, now
     // safe because all readers are gone), plus everything still live in the
     // spine, plus any uncommitted-then-abandoned retirees.
-    for (auto& [v, p] : reap_queue_) delete p;  // v (the retirement version) is irrelevant now --
-                                                // no live snapshot can exist past ~Model()
-    for (auto& [v, p] : retired_) delete p;     // an in-flight try_commit() attempt's retirees,
-                                                // never published (only reached via a leaked
-                                                // Transaction -- defensive, not the normal path)
-    for (auto& ch : spine_)                     // every object still live in the last-published Root
-        for (std::uint32_t i = 0; i < kChunkSize; ++i) delete ch->obj[i];  // null slots: delete(nullptr) is a no-op
+    for (auto& [v, p] : reap_queue_)
+        delete p;  // v (the retirement version) is irrelevant now --
+                   // no live snapshot can exist past ~Model()
+    for (auto& [v, p] : retired_)
+        delete p;            // an in-flight try_commit() attempt's retirees,
+                             // never published (only reached via a leaked
+                             // Transaction -- defensive, not the normal path)
+    for (auto& ch : spine_)  // every object still live in the last-published Root
+        for (std::uint32_t i = 0; i < kChunkSize; ++i)
+            delete ch->obj[i];  // null slots: delete(nullptr) is a no-op
 }
 
 void Model::reaper_loop() {
@@ -284,13 +290,15 @@ void Model::reaper_loop() {
         reap_done_round_++;
         reap_done_cv_.notify_all();
 
-        if (reaper_stop_ && reap_queue_.empty()) return;  // re-check: this pass may have been the
-                                                          // last one needed to drain everything
+        if (reaper_stop_ && reap_queue_.empty())
+            return;  // re-check: this pass may have been the
+                     // last one needed to drain everything
     }
 }
 
 void Model::enqueue_retired(std::vector<std::pair<std::uint64_t, const ObjectBase*>> batch) {
-    if (batch.empty()) return;  // nothing to hand off (e.g. a commit that touched no existing object)
+    if (batch.empty())
+        return;  // nothing to hand off (e.g. a commit that touched no existing object)
     // Counted BEFORE being made visible in reap_queue_ (under reap_mu_
     // below), so retired_pending() -- which adds this atomic to
     // reap_queue_.size() -- never transiently UNDERcounts a batch that's
@@ -375,12 +383,13 @@ const ObjectBase* Model::peek(Id id) const {
     // (bounding a single COW clone's cost).
     const std::uint32_t c = id.index >> kChunkBits;
     const std::uint32_t i = id.index & kChunkMask;
-    if (c >= spine_.size()) return nullptr;             // never allocated: chunk doesn't exist yet
-    if (spine_[c]->gen[i] != id.gen) return nullptr;    // slot was recycled since this Id was
-                                                        // minted -- id.gen names a specific
-                                                        // occupant, not just a slot (invariant 5)
+    if (c >= spine_.size()) return nullptr;  // never allocated: chunk doesn't exist yet
+    if (spine_[c]->gen[i] != id.gen)
+        return nullptr;        // slot was recycled since this Id was
+                               // minted -- id.gen names a specific
+                               // occupant, not just a slot (invariant 5)
     return spine_[c]->obj[i];  // may itself be nullptr if the slot is currently empty (removed,
-                              // generation bumped, no create yet) -- caller must still check
+                               // generation bumped, no create yet) -- caller must still check
 }
 
 Chunk* Model::cow(std::uint32_t c) {
@@ -523,9 +532,10 @@ void Model::drop_out_refs(const ObjectBase* o) {
     o->each_ref([&](const void* field, const char* /*name*/, Id target, bool /*nullable*/) {
         if (!target) return;
         auto it = referrers_.find(target.index);
-        if (it == referrers_.end()) return;  // nothing indexed for this target (shouldn't happen if
-                                             // add_out_refs was called for every create, but a
-                                             // missing bucket is harmless to tolerate here)
+        if (it == referrers_.end())
+            return;  // nothing indexed for this target (shouldn't happen if
+                     // add_out_refs was called for every create, but a
+                     // missing bucket is harmless to tolerate here)
         auto& v = it->second;
         // Find the specific edge this (from, field) pair added -- v may hold
         // edges from many OTHER objects/fields pointing at the same target.
@@ -533,7 +543,8 @@ void Model::drop_out_refs(const ObjectBase* o) {
             return e.from == from && e.field == field;
         });
         if (pos == v.end()) return;
-        const RefEdge edge = *pos;  // saved for the undo closure -- `pos` itself won't survive the erase
+        const RefEdge edge =
+            *pos;  // saved for the undo closure -- `pos` itself won't survive the erase
         v.erase(pos);
         const std::uint32_t key = target.index;
         log([this, key, edge] { referrers_[key].push_back(edge); });
@@ -603,7 +614,7 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
 void Model::add_field_keys(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
-        auto prev = by_field_[field];         // this field's map before the insert
+        auto prev = by_field_[field];          // this field's map before the insert
         by_field_[field] = prev.set(key, id);  // key is unique per field by construction (see
                                                // define_keys' contract); a collision here is a
                                                // caller bug, not something this layer detects
@@ -1038,9 +1049,10 @@ std::vector<Id> Model::remove_raw(Id id) {
         }
 
         const ObjectBase* victim = peek(x);
-        if (!victim) continue;  // defensive, matching the peek()-then-check style used for every
-                                // other id in this BFS (x itself, and each e.from above) --
-                                // nothing in the edges loop above installs a null at slot x itself
+        if (!victim)
+            continue;  // defensive, matching the peek()-then-check style used for every
+                       // other id in this BFS (x itself, and each e.from above) --
+                       // nothing in the edges loop above installs a null at slot x itself
 
         drop_out_refs(victim);  // logs re-add of victim's outgoing edges
 
@@ -1183,19 +1195,19 @@ std::vector<Change> Transaction::estimate_changes() const {
         const Id x = work.back();
         work.pop_back();
         if (!base_.find_raw(x)) continue;  // already dead even at base() -- nothing to estimate
-        if (!visited.insert(x.index).second) continue;  // cycles terminate here, same as remove_raw()
+        if (!visited.insert(x.index).second)
+            continue;  // cycles terminate here, same as remove_raw()
 
         out.push_back({x, ChangeKind::Deleted, base_.find_raw(x)->tag()});
 
-        base_.for_each_referrer_any(
-            x, [&](Id from, const void*, bool nullable, TypeTag from_tag) {
-                if (!base_.find_raw(from)) return;  // already accounted for, or already dead
-                if (nullable) {
-                    out.push_back({from, ChangeKind::Updated, from_tag});  // estimated null-out
-                } else {
-                    work.push_back(from);  // estimated to die with its target
-                }
-            });
+        base_.for_each_referrer_any(x, [&](Id from, const void*, bool nullable, TypeTag from_tag) {
+            if (!base_.find_raw(from)) return;  // already accounted for, or already dead
+            if (nullable) {
+                out.push_back({from, ChangeKind::Updated, from_tag});  // estimated null-out
+            } else {
+                work.push_back(from);  // estimated to die with its target
+            }
+        });
     }
     return out;
 }
@@ -1260,7 +1272,7 @@ std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
 
 CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
     ++version_;  // the version this attempt is about to publish -- commit_mu_-protected, so no
-                // other thread can be racing this increment
+                 // other thread can be racing this increment
 
     // r: the new, immutable Root that becomes the published state. Every
     // field is a cheap handle copy (shared_ptr vector / persistent-map
@@ -1452,14 +1464,30 @@ CommitResult Model::try_commit(Transaction& txn) {
 // the two live_-emptiness asserts.
 // ---------------------------------------------------------------------------
 
-BulkTransaction Model::begin_bulk() { return BulkTransaction(this); }
+BulkTransaction Model::begin_bulk() {
+    return BulkTransaction(this);
+}
 
+// set_slot() clones via cow() (once per attempt per chunk) and logs the
+// EXACT prior (obj, gen) pair so a rollback can restore whatever occupant
+// this write is displacing -- including a live one, if the slot was already
+// in use. Here, that prior-occupant case cannot happen: commit_bulk()'s wipe
+// (see its own comment) has already emptied every chunk this attempt could
+// possibly touch, via cow()'s own lazy spine growth, so `ch->obj[i]`/
+// `ch->gen[i]` are guaranteed to be null/0 before this write -- there is no
+// occupant to capture, and (since nothing here is ever undone -- see the
+// declaration's doc comment) nothing to restore it for even if there were.
 void Model::set_slot_no_log(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen) {
     Chunk* ch = cow(slot >> kChunkBits);
     ch->obj[slot & kChunkMask] = obj;
     ch->gen[slot & kChunkMask] = gen;
 }
 
+// Same referrers_ push as add_out_refs(), minus the pop_back/erase-if-empty
+// undo closure: with the whole index freshly cleared by the wipe, this can
+// only ever be the first edge for its (from, field) pair -- there is no
+// existing bucket state a mistaken push here could corrupt, and (as above)
+// nothing this attempt can fail into that would need it undone.
 void Model::add_out_refs_no_log(const ObjectBase* o) {
     const Id from = o->id;
     o->each_ref([&](const void* field, const char*, Id target, bool nullable) {
@@ -1468,6 +1496,14 @@ void Model::add_out_refs_no_log(const ObjectBase* o) {
     });
 }
 
+// Same as add_field_keys(), minus capturing/logging the per-field map's
+// prior state. Reads the outer map through a reference (`auto&`, not
+// add_field_keys()'s `auto prev = ...` copy) since there is no "prev" to
+// hold onto -- one fewer PersistentMap handle copy per field per object.
+// Collisions are still the caller's problem, not detected here, same as
+// add_field_keys(): define_keys()'s contract is that each object's key
+// value is unique, and a bulk load that violates it silently overwrites the
+// earlier entry exactly as an ordinary Transaction would.
 void Model::add_field_keys_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
@@ -1476,15 +1512,24 @@ void Model::add_field_keys_no_log(const ObjectBase* o) {
     });
 }
 
+// Same two-level (outer map keyed by field, inner bucket keyed by value)
+// structure as add_cached_fields(), minus logging the outer map's prior
+// state. `sub` is a reference into by_cached_field_, not a copy, for the
+// same reason as add_field_keys_no_log() above.
 void Model::add_cached_fields_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_field([&](const void* field, std::string key) {
         auto& sub = by_cached_field_[field];
         const pmap::PersistentMap<Id>* bucket = sub.get(key);
-        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        sub = sub.set(key,
+                      (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
     });
 }
 
+// Same reverse-multimap structure as add_cached_references() (outer map
+// keyed by field, inner bucket keyed by the TARGET's Id, storing the
+// referrer), minus logging. Same `auto&`-not-copy reasoning as the two
+// helpers above.
 void Model::add_cached_references_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
@@ -1527,8 +1572,9 @@ CommitResult Model::commit_bulk(BulkTransaction& txn) {
         });
         if (bad) {
             // Nothing mutated yet -- txn still owns every object untouched.
-            return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {},
-                                IntegrityError{kUnmappedLocalMsg, Id{}}};
+            return CommitResult{
+                CommitStatus::Invalid, Snapshot{}, {},
+                std::nullopt,          {},         IntegrityError{kUnmappedLocalMsg, Id{}}};
         }
     }
 
