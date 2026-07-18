@@ -724,6 +724,39 @@ TEST(create_then_delete_between_drains_cancels_out) {
     CHECK(mentions_a >= 1);
 }
 
+// Real cross-thread producer/consumer: every other Subscription test above
+// calls push()/try_drain()/collapse() synchronously, in one thread -- never
+// the actual wait()/shutdown() wake-up path that's the entire point of the
+// blocking API. Here a genuinely slow consumer thread (a deliberate sleep
+// per item) forces the writer to overflow a small queue and coalesce under
+// real timing pressure, not a manually-triggered one; and shutdown() must
+// wake the blocked consumer so it exits instead of hanging forever.
+TEST(a_slow_subscriber_thread_wakes_from_wait_after_shutdown_and_sees_coalescing) {
+    Model m;
+    auto sub = m.subscribe(/*queue_depth=*/2);
+
+    std::atomic<int> updates_seen{0};
+    std::atomic<bool> saw_coalesced{false};
+    std::thread consumer([&] {
+        Update u;
+        while (sub->wait(u)) {
+            updates_seen.fetch_add(1, std::memory_order_relaxed);
+            if (u.coalesced) saw_coalesced = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));  // deliberately the bottleneck
+        }
+    });
+
+    constexpr int kCommits = 50;
+    for (int i = 0; i < kCommits; ++i) make_account(m, "A" + std::to_string(i));
+
+    m.shutdown();  // must wake the consumer -- wait() drains whatever's left, then returns false
+    consumer.join();
+
+    CHECK(updates_seen.load() > 0);
+    CHECK(updates_seen.load() <= kCommits);  // never more entries than commits, coalesced or not
+    CHECK(saw_coalesced.load());             // the actual proof that overflow/coalescing fired
+}
+
 // ---------------------------------------------------------------------------
 // Typing
 // ---------------------------------------------------------------------------
@@ -2675,6 +2708,15 @@ TEST(
     std::atomic<std::uint64_t> snaps{0};
     std::atomic<int> readers_ready{0};
     std::atomic<int> next_id{100};
+    std::atomic<std::uint64_t> accessor_calls{0};
+
+    // A live Subscription for the whole run: proves push()/collapse() (the
+    // REAL per-commit path every writer's publish_now() drives, not the
+    // synchronous manual calls the dedicated Subscription tests use) survives
+    // sustained concurrent commit pressure, with nobody draining it -- forcing
+    // repeated overflow/coalescing for the duration of the run.
+    auto sub = m.subscribe(/*queue_depth=*/4);
+    (void)sub;  // never drained on purpose -- see the comment above
 
     auto reader = [&] {
         bool signaled = false;
@@ -2714,6 +2756,134 @@ TEST(
         }
     };
 
+    // Exercises every commit_mu_/ver_mu_/reap_mu_-touching PUBLIC accessor
+    // from a thread that is neither a reader nor a writer, concurrently with
+    // both -- every other test in this file calls these only before or
+    // after a concurrent section, never during one. This is exactly the
+    // kind of multi-entry-point pressure that would expose a lock-order
+    // violation (commit_mu_ -> ver_mu_ -> reap_mu_, never reversed -- see
+    // CLAUDE.md invariant 10) that a single-caller test cannot.
+    auto accessor_hammer = [&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            (void)m.retired_pending();
+            (void)m.current_version();
+            (void)m.exhausted_slots();
+            (void)m.wait_for_reclamation();
+            accessor_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    std::thread r1(reader), r2(reader);
+    while (readers_ready.load(std::memory_order_relaxed) < 2) std::this_thread::yield();
+
+    std::thread w1([&] { writer(11); }), w2([&] { writer(22); }), w3([&] { writer(33); });
+    std::thread acc(accessor_hammer);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    stop = true;
+    w1.join();
+    w2.join();
+    w3.join();
+    r1.join();
+    r2.join();
+    acc.join();
+
+    m.shutdown();  // closes `sub` -- safe now that every writer/reader thread has stopped
+
+    CHECK(snaps.load() > 0);
+    CHECK(resolved.load() > 0);
+    CHECK(accessor_calls.load() > 0);
+
+    Snapshot final_s = m.snapshot();
+    final_s.for_each<Order>(
+        [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.raw()); });
+}
+
+// The intersection the individual hook tests above never cover: every hook
+// added this session (PreTransactionsFn, PreCommitFn, PostCommitFn)
+// installed globally, doing REAL work, at the same time as the flagship
+// stress test's actual cascade-producing multi-writer + reader load. Each
+// hook has its own dedicated correctness test elsewhere, using simple,
+// isolated creates -- this is the only place a hook's own side effects run
+// while a cascade from a DIFFERENT thread is actually in flight. Extend
+// this one (not the flagship test above, which stays hook-free so it keeps
+// testing the base cascade/referrers_ invariant in isolation) if you add a
+// fourth hook.
+TEST(hooks_survive_heavy_concurrent_cascade_churn_without_corruption) {
+    Model m;
+    std::vector<Ref<Account>> accounts;
+    for (int i = 0; i < 4; ++i) accounts.push_back(make_account(m, "A" + std::to_string(i)));
+    std::vector<Ref<Order>> seed_orders;
+    for (int i = 0; i < 10; ++i)
+        seed_orders.push_back(make_order(m, "O" + std::to_string(i), accounts[i % 4]));
+
+    std::atomic<std::uint64_t> pre_transactions_ran{0};
+    std::atomic<std::uint64_t> pre_commit_ran{0};
+    std::atomic<std::uint64_t> post_commit_ran{0};
+    std::atomic<std::uint64_t> post_commit_committed{0};
+    std::atomic<int> next_pretxn_id{0};
+
+    // Every hook does REAL work, not a no-op -- a no-op hook can't expose an
+    // interaction bug with a cascade in flight on another thread.
+    m.set_pre_transactions([&](Model& model, const Transaction&) {
+        pre_transactions_ran.fetch_add(1, std::memory_order_relaxed);
+        Transaction pre = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "PRE" + std::to_string(next_pretxn_id.fetch_add(1, std::memory_order_relaxed));
+        pre.create(std::move(a));
+        (void)model.run_pre_transaction(pre);  // a fresh create can't conflict; always Committed
+    });
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>&) {
+        pre_commit_ran.fetch_add(1, std::memory_order_relaxed);
+        return true;  // this test is about survival under load, not veto logic
+    });
+    m.set_post_commit([&](Model&, const Transaction&, const CommitResult& r) {
+        post_commit_ran.fetch_add(1, std::memory_order_relaxed);
+        if (r.status == CommitStatus::Committed)
+            post_commit_committed.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> resolved{0};
+    std::atomic<int> readers_ready{0};
+    std::atomic<int> next_id{100};
+
+    auto reader = [&] {
+        bool signaled = false;
+        while (!stop.load(std::memory_order_relaxed)) {
+            Snapshot s = m.snapshot();
+            if (!signaled) {
+                readers_ready.fetch_add(1, std::memory_order_relaxed);
+                signaled = true;
+            }
+            s.for_each<Order>([&](const Order& o) {
+                const Account& acct = s.resolve(o.account);  // must never dangle
+                if (acct.name.empty()) ++g_failures;
+                resolved.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+    };
+
+    auto writer = [&](unsigned seed) {
+        std::mt19937 rng(seed);
+        while (!stop.load(std::memory_order_relaxed)) {
+            Transaction txn = m.begin();
+            const int roll = rng() % 100;
+            if (roll < 50) {
+                auto o = std::make_unique<Order>();
+                o->code = "W" + std::to_string(next_id.fetch_add(1, std::memory_order_relaxed));
+                o->account = accounts[rng() % accounts.size()];
+                txn.create(std::move(o));
+            } else if (roll < 80) {
+                if (Order* o = txn.update(seed_orders[rng() % seed_orders.size()]))
+                    o->qty = static_cast<std::int64_t>(rng() % 50);
+            } else {
+                txn.remove(seed_orders[rng() % seed_orders.size()]);
+            }
+            m.try_commit(txn);  // any status is fine; just don't corrupt anything
+        }
+    };
+
     std::thread r1(reader), r2(reader);
     while (readers_ready.load(std::memory_order_relaxed) < 2) std::this_thread::yield();
 
@@ -2727,8 +2897,20 @@ TEST(
     r1.join();
     r2.join();
 
-    CHECK(snaps.load() > 0);
+    m.set_pre_transactions({});
+    m.set_pre_commit({});
+    m.set_post_commit({});
+
     CHECK(resolved.load() > 0);
+    CHECK(pre_transactions_ran.load() > 0);
+    CHECK(pre_commit_ran.load() > 0);
+    CHECK(post_commit_ran.load() > 0);
+    // Every attempt that ran pre_commit_ (i.e. reached apply) also ran
+    // post_commit_ afterward -- the two must stay in lockstep even under
+    // heavy contention, since post_commit_ fires for every non-empty
+    // attempt regardless of its outcome.
+    CHECK(post_commit_ran.load() >= pre_commit_ran.load());
+    CHECK(post_commit_ran.load() >= post_commit_committed.load());
 
     Snapshot final_s = m.snapshot();
     final_s.for_each<Order>(
