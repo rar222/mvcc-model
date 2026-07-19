@@ -1053,19 +1053,21 @@ PERF_TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
     // The whole point of commit_bulk(): no per-object undo-log retention, so
     // its per-item cost lands near the steady-state batched-commit figure,
     // not the single-huge-transaction figure. Measured ratio, repeatedly:
-    // ~11-12x at n=200,000 in the default build, ~12-15x under TSan (whose
-    // own allocator overhead is roughly proportional per-object, so the
-    // ratio survives it). Under ASan specifically, at the ~25x-smaller
-    // n=8,000 scaled() falls back to, the ratio compresses to a stable
-    // ~1.75-1.85x -- ASan's redzone overhead is charged per ALLOCATION, not
-    // per requested byte, and this migration (see persistent_map.h's
-    // PersistentSet) shrank several indexes' per-entry BYTE count without
-    // changing how many allocations building them takes, so it shrinks
-    // ASan's redzone-dominated floor for both paths roughly together,
-    // compressing the ratio between them further than before this change
-    // (previously ~2.2-2.3x at the same size). 1.4x is kept below every
-    // measured floor with margin, not tuned to the letter of one run.
-    CHECK(bulk_kb * 7 < single_txn_kb * 5);
+    // ~11-12x at n=200,000 in the default build, ~12-15x under TSan.
+    //
+    // The ratio is asserted ONLY where kAssertTimings is (the default
+    // build), for the same reason the timing bounds are: under ASan,
+    // redzone overhead is charged per ALLOCATION, not per requested byte,
+    // and every allocation-count optimization in the persistent indexes
+    // (PersistentSet, the inline-entry Leaf, its unique_ptr chain link --
+    // see persistent_map.h) shrank ASan's measured floor for BOTH paths
+    // together, compressing the measured ratio at ASan's reduced n=8,000
+    // from ~2.2x through ~1.8x down to ~1.26x across this file's history
+    // while the default build's ratio stayed ~11x throughout. A floor
+    // asserted on that number would be asserting ASan's allocator profile,
+    // not the model's memory behavior. 5x leaves ~2x margin under the
+    // weakest default-build measurement.
+    if (kAssertTimings) CHECK(bulk_kb * 5 < single_txn_kb);
 }
 
 #endif  // PERF_HAS_MEMORY_SECTION

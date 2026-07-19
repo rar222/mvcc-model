@@ -34,6 +34,7 @@
 // push-down, and bucket shrink/drop-on-empty are tricky enough to want living in
 // exactly one place rather than duplicated between a map and a set version.
 
+#include <cassert>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -88,15 +89,30 @@ class TrieCore {
     // every entry in the trie, since a chain longer than one needs two keys
     // sharing a full 64-bit hash. Measured on the bulk-load memory
     // benchmark, that second allocation was a double-digit share of the
-    // whole per-entry footprint. The chain is immutable like everything
-    // else here: "editing" one rebuilds the links up to the edit point and
-    // shares the tail (see chain_set/chain_erase).
+    // whole per-entry footprint.
+    //
+    // `next` is a unique_ptr, NOT a shared_ptr, on purpose: a shared_ptr
+    // member is 16 bytes and would push the (hash, entry, next) leaf into
+    // the next glibc size class for every entry in the trie, all to enable
+    // tail-sharing that only a length->=2 chain could ever use. Instead,
+    // tails are exclusively OWNED by their head, and every chain edit
+    // deep-copies the surviving links (see chain_copy) -- do not "optimize"
+    // this back to sharing a tail out of an edited chain: without a
+    // refcount, two versions pointing at one tail is a use-after-free the
+    // moment either is destroyed. The copying is free in practice, for the
+    // same reason the sharing was worthless: a chain longer than one link
+    // needs a full 64-bit hash collision (impossible for distinct Ids under
+    // model::IdHash -- a perfect hash -- and astronomically rare for
+    // StringHash), so the chains being copied essentially never have more
+    // than the one link that is being edited anyway. Heads stay shared_ptr
+    // (in Node::leaves): heads ARE genuinely shared, across every node
+    // clone and push-down that path-copying produces.
     struct Leaf {
-        Leaf(std::uint64_t h, Entry e, std::shared_ptr<const Leaf> n)
+        Leaf(std::uint64_t h, Entry e, std::unique_ptr<const Leaf> n)
             : hash(h), entry(std::move(e)), next(std::move(n)) {}
         std::uint64_t hash;
         Entry entry;
-        std::shared_ptr<const Leaf> next;  ///< collision chain; almost always null
+        std::unique_ptr<const Leaf> next;  ///< collision chain; almost always null
     };
 
     struct Node {
@@ -143,35 +159,68 @@ class TrieCore {
         return nullptr;
     }
 
-    // Returns `lf`'s chain with `entry` replacing the link whose key matches,
-    // or appended as a fresh link if none does (reported via `added`). Links
-    // before the edit point are copied; everything after it is shared.
-    static std::shared_ptr<const Leaf> chain_set(const std::shared_ptr<const Leaf>& lf,
-                                                 std::uint64_t hash, const K& key,
-                                                 const Entry& entry, bool& added) {
+    // Deep-copies a tail chain. Every edited chain copies its surviving
+    // links through this rather than sharing them -- see Leaf::next's
+    // comment for why sharing is not an option (and why copying is free).
+    static std::unique_ptr<const Leaf> chain_copy(const Leaf* l) {
+        if (!l) return nullptr;
+        return std::make_unique<Leaf>(l->hash, l->entry, chain_copy(l->next.get()));
+    }
+
+    // Tail-link half of chain_set: `entry` replaces the link whose key
+    // matches, or lands in a fresh link at the end (reported via `added`).
+    static std::unique_ptr<const Leaf> chain_set_links(const Leaf* l, std::uint64_t hash,
+                                                       const K& key, const Entry& entry,
+                                                       bool& added) {
+        if (!l) {
+            added = true;
+            return std::make_unique<Leaf>(hash, entry, nullptr);
+        }
+        if (KeyOf{}(l->entry) == key)
+            return std::make_unique<Leaf>(l->hash, entry, chain_copy(l->next.get()));
+        return std::make_unique<Leaf>(l->hash, l->entry,
+                                      chain_set_links(l->next.get(), hash, key, entry, added));
+    }
+
+    // Returns `lf`'s chain, rebuilt, with `entry` replacing the link whose
+    // key matches or appended as a fresh link if none does (reported via
+    // `added`). The head is built with make_shared (Node holds heads by
+    // shared_ptr, and the fused control block keeps it one allocation);
+    // tail links go through the unique_ptr helpers above.
+    static std::shared_ptr<const Leaf> chain_set(const Leaf* lf, std::uint64_t hash,
+                                                 const K& key, const Entry& entry,
+                                                 bool& added) {
         if (!lf) {
             added = true;
             return std::make_shared<Leaf>(hash, entry, nullptr);
         }
         if (KeyOf{}(lf->entry) == key)
-            return std::make_shared<Leaf>(lf->hash, entry, lf->next);
+            return std::make_shared<Leaf>(lf->hash, entry, chain_copy(lf->next.get()));
         return std::make_shared<Leaf>(lf->hash, lf->entry,
-                                      chain_set(lf->next, hash, key, entry, added));
+                                      chain_set_links(lf->next.get(), hash, key, entry, added));
     }
 
-    // Returns `lf`'s chain with the link whose key matches removed (reported
-    // via `removed`; the chain is shared untouched if the key is absent).
-    // A null result means the chain emptied -- the caller drops the slot.
-    static std::shared_ptr<const Leaf> chain_erase(const std::shared_ptr<const Leaf>& lf,
-                                                   const K& key, bool& removed) {
-        if (!lf) return nullptr;
+    // Tail-link half of chain_erase. Precondition (caller checks via
+    // leaf_get): `key` IS present in `l`'s chain -- which is what lets this
+    // rebuild unconditionally instead of needing a "key absent, share
+    // untouched" path that unique ownership couldn't express anyway.
+    static std::unique_ptr<const Leaf> chain_erase_links(const Leaf* l, const K& key) {
+        assert(l && "caller verified the key is present in this chain");
+        if (KeyOf{}(l->entry) == key) return chain_copy(l->next.get());
+        return std::make_unique<Leaf>(l->hash, l->entry, chain_erase_links(l->next.get(), key));
+    }
+
+    // Returns `lf`'s chain, rebuilt without `key`'s link. Same presence
+    // precondition as chain_erase_links. A null result means the chain
+    // emptied -- the caller drops the slot.
+    static std::shared_ptr<const Leaf> chain_erase(const Leaf* lf, const K& key) {
+        assert(lf && "caller verified the key is present in this chain");
         if (KeyOf{}(lf->entry) == key) {
-            removed = true;
-            return lf->next;
+            const Leaf* t = lf->next.get();
+            if (!t) return nullptr;  // the chain held only this key
+            return std::make_shared<Leaf>(t->hash, t->entry, chain_copy(t->next.get()));
         }
-        auto tail = chain_erase(lf->next, key, removed);
-        if (!removed) return lf;  // key absent below: share the whole chain as-is
-        return std::make_shared<Leaf>(lf->hash, lf->entry, std::move(tail));
+        return std::make_shared<Leaf>(lf->hash, lf->entry, chain_erase_links(lf->next.get(), key));
     }
 
     // ---- set ----
@@ -209,7 +258,7 @@ class TrieCore {
         if (lf->hash == hash) {
             // Same hash: replace-or-append within the chain (true collision or
             // same key).
-            nn->leaves[pos] = chain_set(n->leaves[pos], hash, key, entry, added);
+            nn->leaves[pos] = chain_set(lf, hash, key, entry, added);
             return nn;
         }
 
@@ -218,7 +267,7 @@ class TrieCore {
         if (shift + 5 >= 64) {
             // Ran out of hash bits (astronomically unlikely with distinct hashes,
             // but handle it): merge into one collision chain.
-            nn->leaves[pos] = std::make_shared<Leaf>(hash, entry, n->leaves[pos]);
+            nn->leaves[pos] = std::make_shared<Leaf>(hash, entry, chain_copy(lf));
             added = true;
             return nn;
         }
@@ -259,11 +308,11 @@ class TrieCore {
         }
 
         // Leaf slot.
-        bool chain_removed = false;
-        auto nl = chain_erase(n->leaves[pos], key, chain_removed);
-        if (!chain_removed) return copy_shared(n);  // key absent
+        const Leaf* lf = n->leaves[pos].get();
+        if (!leaf_get(lf, key)) return copy_shared(n);  // key absent
 
         removed = true;
+        auto nl = chain_erase(lf, key);
         if (nl) {
             nn->leaves[pos] = std::move(nl);
             return nn;
