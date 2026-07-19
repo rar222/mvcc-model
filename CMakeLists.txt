@@ -56,19 +56,28 @@ target_link_libraries(model PUBLIC model_flags)
 find_package(Threads REQUIRED)
 target_link_libraries(model PUBLIC Threads::Threads)
 
+# model.h is ~3000 lines of heavy templates (parsing it dominates compile
+# time -- see `ftime-report`), and nearly every test/example TU includes it.
+# Precompile it once here; every other target below reuses this same .gch
+# (REUSE_FROM) instead of paying to reparse and reinstantiate it per TU.
+target_precompile_headers(model PUBLIC include/model/model.h)
+
 # --- demo -------------------------------------------------------------------
 
 add_executable(demo examples/demo.cpp)
 target_link_libraries(demo PRIVATE model)
+target_precompile_headers(demo REUSE_FROM model)
 
 # Two writers racing ~10-change transactions on a small shared pool (so
 # conflicts are common), one subscriber printing every object it receives.
 add_executable(two_writer_demo examples/two_writer_demo.cpp)
 target_link_libraries(two_writer_demo PRIVATE model)
+target_precompile_headers(two_writer_demo REUSE_FROM model)
 
 # Why View holds its Snapshot by pointer and not by value.
 add_executable(bench examples/bench.cpp)
 target_link_libraries(bench PRIVATE model)
+target_precompile_headers(bench REUSE_FROM model)
 
 # try_commit latency vs model size, and vs concurrent writer-thread count --
 # shows apply is still change-proportional (not size-proportional), and that
@@ -76,12 +85,14 @@ target_link_libraries(bench PRIVATE model)
 # writer threads -- that's the documented scope boundary, not a bug).
 add_executable(commit_bench examples/commit_bench.cpp)
 target_link_libraries(commit_bench PRIVATE model)
+target_precompile_headers(commit_bench REUSE_FROM model)
 
 # find_referrers (O(#items) scan) vs find_cached_referrers (O(log n +
 # matches), Root::by_cached_reference) -- read speedup vs. the per-write
 # cost that pays for it. See DESIGN.md's "Lookup families" section.
 add_executable(cached_reference_bench examples/cached_reference_bench.cpp)
 target_link_libraries(cached_reference_bench PRIVATE model)
+target_precompile_headers(cached_reference_bench REUSE_FROM model)
 
 # --- tests ------------------------------------------------------------------
 
@@ -101,6 +112,7 @@ add_executable(model_tests
     tests/test_concurrency_stress.cpp
 )
 target_link_libraries(model_tests PRIVATE model)
+target_precompile_headers(model_tests REUSE_FROM model)
 
 add_test(NAME model_tests COMMAND model_tests)
 set_tests_properties(model_tests PROPERTIES TIMEOUT 300)
@@ -126,5 +138,6 @@ set_tests_properties(two_writer_demo_integration PROPERTIES TIMEOUT 300)
 # ever printed for a human to eyeball -- see the file's own header comment.
 add_executable(performance_tests tests/performance_tests.cpp)
 target_link_libraries(performance_tests PRIVATE model)
+target_precompile_headers(performance_tests REUSE_FROM model)
 add_test(NAME performance_tests COMMAND performance_tests)
 set_tests_properties(performance_tests PROPERTIES TIMEOUT 300)
