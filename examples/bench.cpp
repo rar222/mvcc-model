@@ -1,10 +1,10 @@
-#include "demo/types.h"
+#include "example/types.h"
 #include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <memory>
 #include <string>
-using namespace model; using namespace demo;
+using namespace model; using namespace example;
 
 // The tempting alternative: a View that owns its Snapshot by value, so it's
 // storable and can't dangle. Every traversal step copies the Snapshot.

@@ -14,7 +14,7 @@
 // that never exercises the conflict path hasn't proven anything about a
 // multi-writer design.
 
-#include "demo/types.h"
+#include "example/types.h"
 #include "model/model.h"
 
 #include <algorithm>
@@ -29,7 +29,7 @@
 #include <vector>
 
 using namespace model;
-using namespace demo;
+using namespace example;
 using namespace std::chrono_literals;
 
 namespace {

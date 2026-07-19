@@ -176,7 +176,7 @@ paid for once per commit).
 ```
 include/model/model.h   the model: identity, Ref<>/Opt<>, Object<T>, Snapshot, Transaction, Model
 src/model.cpp           the implementation
-include/demo/types.h    example user types (Account, Order) -- same as the sibling project
+include/example/types.h example user types (Account, Order) -- same as the sibling project
 examples/demo.cpp       3 writer threads racing try_commit(), 2 readers, 1 slow subscriber
 examples/bench.cpp      why View holds its Snapshot by pointer (unchanged from the sibling)
 examples/commit_bench.cpp   commit latency vs. model size, and throughput vs. writer-thread count

@@ -52,7 +52,7 @@
 
 #include "model/model.h"
 
-namespace demo {
+namespace example {
 
 class Account final : public model::Object<Account> {
 public:
@@ -128,4 +128,4 @@ public:
     }
 };
 
-}  // namespace demo
+}  // namespace example

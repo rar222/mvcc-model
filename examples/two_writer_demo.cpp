@@ -14,7 +14,7 @@
 //   cmake --preset asan
 //   cmake --preset tsan
 
-#include "demo/types.h"
+#include "example/types.h"
 #include "model/model.h"
 
 #include <atomic>
@@ -27,7 +27,7 @@
 #include <vector>
 
 using namespace model;
-using namespace demo;
+using namespace example;
 
 namespace {
 

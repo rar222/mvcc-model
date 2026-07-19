@@ -46,7 +46,7 @@ is the tripwire for the central invariant. Do not add `NDEBUG` to the default pr
 ```
 include/model/model.h   Id, ObjectBase, Chunk, Root, Snapshot, Transaction, Model, CommitResult
 src/model.cpp           all of the implementation
-include/demo/types.h    example user types (Account, Order) -- NOT part of the model
+include/example/types.h example user types (Account, Order) -- NOT part of the model
 examples/demo.cpp       concurrent demo: 3 writer threads racing try_commit(), 2 readers, 1 slow subscriber
 examples/commit_bench.cpp   commit latency vs. size, and throughput vs. writer-thread count
 tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that way)

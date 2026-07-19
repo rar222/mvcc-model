@@ -1,11 +1,11 @@
 #pragma once
 //
 // Account/Order: the tests' own copies of the domain types that used to be
-// shared with examples/ via include/demo/types.h. Field-for-field identical
-// (many tests check exact string formats like "ord:O1" that depend on it),
-// but defined here so tests/ has no dependency on include/demo/ or
+// shared with examples/ via include/example/types.h. Field-for-field
+// identical (many tests check exact string formats like "ord:O1" that depend
+// on it), but defined here so tests/ has no dependency on include/example/ or
 // examples/ at all -- the two are free to diverge without either one's
-// tests breaking. See include/demo/types.h for the field-by-field
+// tests breaking. See include/example/types.h for the field-by-field
 // commentary on what each define_X() does; that commentary isn't repeated
 // here to avoid two copies drifting out of sync with each other in meaning
 // (only the code itself is deliberately duplicated, not its explanation).

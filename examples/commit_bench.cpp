@@ -1,4 +1,4 @@
-#include "demo/types.h"
+#include "example/types.h"
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -6,7 +6,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-using namespace model; using namespace demo;
+using namespace model; using namespace example;
 
 // Commit latency vs model size: should stay flat, since apply is proportional
 // to the changeset, not to n_objects (the persistent secondary index derives

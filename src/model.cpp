@@ -15,7 +15,7 @@ namespace model {
 
 namespace detail {
 // Turns typeid(Derived).name() (e.g. "6Widget" or "N4demo7AccountE") into the
-// human-readable "Widget"/"demo::Account" that Object<Derived>::type() hands
+// human-readable "Widget"/"example::Account" that Object<Derived>::type() hands
 // back to callers -- ObjectBase::type() is part of the read-side API (error
 // messages, logging), so a mangled name there would be a usability bug, not
 // just cosmetic. __cxa_demangle is a GCC/Clang runtime extension: it
