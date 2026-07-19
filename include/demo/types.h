@@ -61,7 +61,7 @@ public:
 
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Account::name>(s.name);
+        v.key<&Account::name>(s.name, "name");
     }
 
     /// name is ALSO a scan field: find_by_key gives the unique-index winner,
@@ -69,7 +69,7 @@ public:
     /// field can live in more than one lookup family.
     template <class Self>
     static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Account::name>(s.name);
+        v.key<&Account::name>(s.name, "name");
     }
 };
 
@@ -100,12 +100,12 @@ public:
     template <class Self>
     static void define_cached_references(Self& s, const model::RefIndexReader& v) {
         (void)s;
-        v.index<&Order::account>();
+        v.index<&Order::account>("account");
     }
 
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::computed_key>(s.computed_key());
+        v.key<&Order::computed_key>(s.computed_key(), "computed_key");
     }
 
     /// The scan family: queryable via find_by_scan_field / view_by_scan_field
@@ -114,8 +114,8 @@ public:
     /// independent; a real type would usually pick one per field.
     template <class Self>
     static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::qty>(s.qty);
-        v.key<&Order::computed_key>(s.computed_key());
+        v.key<&Order::qty>(s.qty, "qty");
+        v.key<&Order::computed_key>(s.computed_key(), "computed_key");
     }
 
     /// qty is deliberately non-unique (many orders share a quantity), so it
@@ -123,8 +123,8 @@ public:
     /// s.find_by_cached_field<&Order::qty>(5) -> every order with qty == 5.
     template <class Self>
     static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::qty>(s.qty);
-        v.key<&Order::computed_key>(s.computed_key());
+        v.key<&Order::qty>(s.qty, "qty");
+        v.key<&Order::computed_key>(s.computed_key(), "computed_key");
     }
 };
 
