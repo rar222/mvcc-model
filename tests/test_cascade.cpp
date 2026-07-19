@@ -404,3 +404,112 @@ TEST(a_ref_added_after_a_local_create_was_cancelled_is_rejected_as_invalid) {
     CHECK_EQ(m.snapshot().size(), std::size_t{1});  // only the pre-existing account
 }
 
+// Try to break invariant 8 with churn: several local Orders are created
+// referencing `hub` (via the non-nullable Ref<Account> field) and then
+// immediately removed -- each cycle mints and discards a real slot (see
+// alloc_slot()'s undo log) without ever installing, so hub's referrer
+// count must be completely unaffected by any of them. One local create IS
+// left referencing hub when the transaction commits, so it survives to
+// real installation and must cascade-die alongside hub. hub's own
+// remove() is called twice, proving a repeated remove() intent on the same
+// id is harmless, not a double-delete.
+TEST(repeated_create_and_cancel_churn_around_a_shared_target_finally_deletes_it) {
+    Model m;
+    const Ref<Account> hub = make_account(m, "HUB");  // the shared target, finally removed
+
+    Transaction txn = m.begin();
+
+    // Churn: create a local Order referencing hub, then immediately remove
+    // IT (not hub) -- nothing else pending references this local create,
+    // so each cycle cancels outright and never installs.
+    for (int i = 0; i < 5; ++i) {
+        auto r = std::make_unique<Order>();
+        r->code = "CHURN" + std::to_string(i);
+        r->account = hub;
+        const Ref<Order> local = txn.create(std::move(r));
+        txn.remove(local);  // unreferenced -> cancelled outright
+    }
+
+    // This one DOES survive to real installation, still referencing hub
+    // via a non-nullable Ref<Account> when the transaction commits.
+    auto survivor = std::make_unique<Order>();
+    survivor->code = "SURVIVOR";
+    survivor->account = hub;
+    const Ref<Order> survivor_local = txn.create(std::move(survivor));
+
+    txn.remove(hub);  // hub itself
+    txn.remove(hub);  // called again -- must be harmless, not a double-cascade
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find(hub) == nullptr);                           // hub: finally deleted
+    CHECK(s.find(res.to_real(survivor_local)) == nullptr);   // cascaded via its Ref<> to hub
+    CHECK_EQ(s.size(), std::size_t{0});  // every CHURN* cancelled outright, nothing left at all
+}
+
+// Try to break invariant 9 (reconcile against the FINAL value only) with
+// the same kind of churn, but through an Opt<> field instead of a Ref<>:
+// main_local's `parent` is repeatedly pointed at a churned candidate and
+// then cleared again, for TWO different candidates that each end up
+// cancelled outright (unreferenced by the time they're removed) -- and
+// then pointed at a THIRD candidate that is left referenced at the moment
+// of its own removal, so it installs and is cascade-NULLED out of
+// main_local's Opt<> field rather than cascade-deleting main_local (parent
+// is nullable). The end state: main_local survives, created, with its
+// optional reference finally null -- not dangling, not still pointing at
+// something that no longer exists.
+TEST(repeated_toggling_of_an_optional_reference_across_several_churned_targets_finally_leaves_it_null) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "A1");
+
+    Transaction txn = m.begin();
+
+    auto main_obj = std::make_unique<Order>();
+    main_obj->code = "MAIN";
+    main_obj->account = acc;
+    const Ref<Order> main_local = txn.create(std::move(main_obj));
+
+    // Candidate 1: referenced, then unreferenced, THEN removed -- nothing
+    // pending references it once the Opt<> edge is cleared, so it cancels
+    // outright.
+    auto c1 = std::make_unique<Order>();
+    c1->code = "C1";
+    c1->account = acc;
+    const Ref<Order> c1_local = txn.create(std::move(c1));
+    txn.update(main_local)->parent = c1_local;  // reference added
+    txn.update(main_local)->parent.reset();     // reference removed
+    txn.remove(c1_local);                       // unreferenced now -> cancelled outright
+
+    // Candidate 2: the same add/remove/discard cycle, a second time, to
+    // prove the FIRST cycle's cancellation didn't leave any residue that
+    // would confuse the second.
+    auto c2 = std::make_unique<Order>();
+    c2->code = "C2";
+    c2->account = acc;
+    const Ref<Order> c2_local = txn.create(std::move(c2));
+    txn.update(main_local)->parent = c2_local;
+    txn.update(main_local)->parent.reset();
+    txn.remove(c2_local);
+
+    // Candidate 3: referenced and left referenced at the moment of
+    // removal -- deferred, not cancelled, so it installs and is then
+    // cascade-nulled out of main_local's Opt<> field.
+    auto c3 = std::make_unique<Order>();
+    c3->code = "C3";
+    c3->account = acc;
+    const Ref<Order> c3_local = txn.create(std::move(c3));
+    txn.update(main_local)->parent = c3_local;  // reference added, left in place
+    txn.remove(c3_local);                       // still referenced by pending main_local -> deferred
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    Snapshot s = m.snapshot();
+    const Ref<Order> real_main = res.to_real(main_local);
+    CHECK(s.find(real_main) != nullptr);  // MAIN: finally created, survives
+    CHECK(!s.find(real_main)->parent);    // its optional reference: finally null
+    CHECK_EQ(s.size(), std::size_t{2});   // acc + MAIN only -- C1/C2 cancelled, C3 cascaded away
+}
+
