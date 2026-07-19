@@ -169,6 +169,117 @@ TEST(pre_commit_hook_finds_outgoing_refs_pointing_outside_the_transaction) {
     CHECK(std::find(outside.begin(), outside.end(), a1.raw()) == outside.end());
 }
 
+// The type-agnostic version of the test above: the hook above hardcodes
+// "if tag == type_tag<Order>()" because it only ever has to deal with one
+// ref-bearing type. A model with many object types can't do that -- but it
+// doesn't need to, because ObjectBase::each_ref() already type-erases
+// define_references() for exactly this purpose (see Object<Derived>::
+// each_ref, the same virtual dispatch cascade/nulling themselves use).
+// `peek_raw(id)->each_ref(fn)` walks Account, Order, Node, Record, and Link
+// here with NOT ONE type-specific branch in the hook -- it doesn't even
+// need to know these five types exist.
+TEST(pre_commit_hook_finds_outgoing_refs_across_many_object_types_with_no_per_type_dispatch) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Order> o_old = make_order(m, "OLD", a1);
+    const Ref<Node> n_old = make_node(m, "N_OLD");
+
+    Transaction rt = m.begin();
+    auto r = std::make_unique<Record>();
+    r->label = "R_OLD";
+    r->owner = a1;
+    const Ref<Record> r_old_local = rt.create(std::move(r));
+    const Ref<Record> r_old = commit_ok(m, rt).to_real(r_old_local);
+
+    Transaction lt = m.begin();
+    const Ref<Link> l_a_local = lt.create(std::make_unique<Link>());
+    lt.update(l_a_local)->next = l_a_local;  // self-loop, just to have a valid non-nullable Ref<>
+    const Ref<Link> l_b_local = lt.create(std::make_unique<Link>());
+    lt.update(l_b_local)->next = l_b_local;
+    const CommitResult lres = commit_ok(m, lt);
+    const Ref<Link> l_a = lres.to_real(l_a_local);
+    const Ref<Link> l_b = lres.to_real(l_b_local);
+
+    std::vector<std::pair<TypeTag, Id>> outside;
+    m.set_pre_commit([&](Model& model, const Transaction&, const std::vector<Change>& changes) {
+        std::unordered_set<Id, IdHash> alive;
+        for (const Change& c : changes) {
+            if (c.kind == ChangeKind::Deleted)
+                alive.erase(c.id);
+            else
+                alive.insert(c.id);
+        }
+
+        std::unordered_set<Id, IdHash> referenced;
+        for (const Change& c : changes) {
+            if (!alive.count(c.id)) continue;
+            const ObjectBase* o = model.peek_raw(c.id);
+            if (!o) continue;
+            o->each_ref([&](const void*, const char*, Id target, bool) { referenced.insert(target); });
+        }
+        for (Id id : referenced) {
+            if (alive.count(id)) continue;  // inside the transaction -- not "outside"
+            if (const ObjectBase* o = model.peek_raw(id)) outside.emplace_back(o->tag(), id);
+        }
+        return true;
+    });
+
+    Transaction txn = m.begin();
+
+    // Order: a non-nullable Ref<Account> to an existing account, and an
+    // Opt<Order> to an existing order.
+    auto o1 = std::make_unique<Order>();
+    o1->code = "O1";
+    o1->account = a2;
+    o1->parent = o_old;
+    const Ref<Order> o1_local = txn.create(std::move(o1));
+
+    // Order again, but its Opt<Order> now points at o1 -- INSIDE this same
+    // transaction. Must NOT show up in `outside`.
+    auto o2 = std::make_unique<Order>();
+    o2->code = "O2";
+    o2->account = a1;
+    o2->parent = o1_local;
+    txn.create(std::move(o2));
+
+    // Node: an Opt<Node> to an existing node.
+    auto n1 = std::make_unique<Node>();
+    n1->label = "N1";
+    n1->parent = n_old;
+    txn.create(std::move(n1));
+
+    // Record: a non-nullable Ref<Account> AND an Opt<Record>, both to
+    // existing objects.
+    auto rec1 = std::make_unique<Record>();
+    rec1->label = "REC1";
+    rec1->owner = a1;
+    rec1->related = r_old;
+    txn.create(std::move(rec1));
+
+    // Link: UPDATE an existing one, repointing its non-nullable Ref<Link>
+    // away from its own self-loop toward a different existing Link.
+    txn.update(l_a)->next = l_b;
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    m.set_pre_commit({});
+
+    const auto contains = [&](TypeTag tag, Id id) {
+        return std::find(outside.begin(), outside.end(), std::pair<TypeTag, Id>{tag, id}) !=
+               outside.end();
+    };
+    CHECK_EQ(outside.size(), std::size_t{6});
+    CHECK(contains(type_tag<Account>(), a1.raw()));  // referenced by o2.account AND rec1.owner
+    CHECK(contains(type_tag<Account>(), a2.raw()));
+    CHECK(contains(type_tag<Order>(), o_old.raw()));
+    CHECK(contains(type_tag<Node>(), n_old.raw()));
+    CHECK(contains(type_tag<Record>(), r_old.raw()));
+    CHECK(contains(type_tag<Link>(), l_b.raw()));
+    CHECK(!contains(type_tag<Order>(), o1_local.raw()));       // stale local id, never real
+    CHECK(!contains(type_tag<Order>(), res.to_real(o1_local).raw()));  // real, but inside the txn
+}
+
 // A hook returning false (Vetoed) leaves the model in EXACTLY its
 // pre-attempt state (checked via state_of()), and a later attempt still
 // commits normally once the hook is cleared.

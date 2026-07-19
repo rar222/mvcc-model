@@ -389,7 +389,7 @@ void Model::shutdown() {
     for (auto& s : subs) s->close();
 }
 
-const ObjectBase* Model::peek(Id id) const {
+const ObjectBase* Model::peek_raw(Id id) const {
     if (!id) return nullptr;  // Id{} (default-constructed): never a valid handle, by construction
     // Slot index splits into (chunk index, offset within chunk) via a shift
     // and a mask, rather than division/modulo, because kChunkSize is a power
@@ -508,7 +508,7 @@ std::optional<Model::IntegrityError> Model::validate(
                                      Id{}};
             return;
         }
-        if (!peek(target) && !(pending && pending->count(target)))
+        if (!peek_raw(target) && !(pending && pending->count(target)))
             err = IntegrityError{
                 std::string(o->type()) + " field " + name + " references a dead object", target};
     });
@@ -898,7 +898,7 @@ Model::Diagnostics Model::diagnostics() const {
                         found = true;
                     }
                 });
-                const ObjectBase* obj = peek(sample);
+                const ObjectBase* obj = peek_raw(sample);
                 tc.type_name = obj ? obj->type() : "<no live object of this type>";
             } else {
                 tc.type_name = "<no live object of this type>";
@@ -1123,7 +1123,7 @@ std::optional<Model::IntegrityError> Model::apply_update(
     if (auto err = validate(raw)) return err;
 
     const Id id = raw->id;
-    const ObjectBase* baseline = peek(id);
+    const ObjectBase* baseline = peek_raw(id);
     // try_commit()'s conflict check (check_id_overlap) already guarantees
     // `baseline` is non-null and unchanged since txn.base(): if any other
     // commit had touched this id since then, this attempt would have been
@@ -1166,7 +1166,7 @@ ObjectBase* Model::clone_for_cascade_null(Id id) {
     // why the single-writer sibling project defers reconciliation to a
     // separate pass in the first place; here, deferring to "right after
     // null_ref(), same call site" is simpler and just as correct.)
-    const ObjectBase* cur = peek(id);
+    const ObjectBase* cur = peek_raw(id);
     if (!cur) return nullptr;
 
     ObjectBase* copy = cur->clone();
@@ -1200,7 +1200,7 @@ std::vector<Id> Model::remove_raw(Id id) {
     while (!work.empty()) {
         const Id x = work.back();  // `x`: the id currently being resolved this iteration
         work.pop_back();
-        if (!peek(x)) continue;  // already gone (e.g. cascaded in from another branch of the BFS)
+        if (!peek_raw(x)) continue;  // already gone (e.g. cascaded in from another branch of the BFS)
         if (!visited.insert(x.index).second) continue;  // cycles terminate here
 
         // Copy the referrer list: we are about to mutate it (both directly,
@@ -1216,14 +1216,14 @@ std::vector<Id> Model::remove_raw(Id id) {
         // and will itself be visited (and cascade further) in a later
         // iteration of this same loop.
         for (const RefEdge& e : edges) {
-            if (!peek(e.from)) continue;  // referrer itself already deleted this same pass
+            if (!peek_raw(e.from)) continue;  // referrer itself already deleted this same pass
             if (e.nullable) {
                 // `baseline` is captured BEFORE clone_for_cascade_null() installs
                 // the clone, so reconcile_out_refs (etc.) below can diff
                 // "before this field was nulled" against "after" -- see
                 // clone_for_cascade_null's own comment for why reconciliation
                 // must happen here, after null_ref(), not inside that helper.
-                const ObjectBase* baseline = peek(e.from);
+                const ObjectBase* baseline = peek_raw(e.from);
                 if (ObjectBase* m = clone_for_cascade_null(e.from)) {
                     m->null_ref(e.field);
                     reconcile_out_refs(baseline, m);
@@ -1236,7 +1236,7 @@ std::vector<Id> Model::remove_raw(Id id) {
             }
         }
 
-        const ObjectBase* victim = peek(x);
+        const ObjectBase* victim = peek_raw(x);
         if (!victim)
             continue;  // defensive, matching the peek()-then-check style used for every
                        // other id in this BFS (x itself, and each e.from above) --

@@ -1597,28 +1597,44 @@ public:
         std::lock_guard lk(commit_mu_);
         post_commit_ = std::move(fn);
     }
-
-    /// Typed, checked read of the model's CURRENT writer-side state by Id --
-    /// the same "latest, not just base" view validate() itself reads (see
-    /// the private peek(Id) this wraps). Callable ONLY from inside a
-    /// running PreCommitFn or PreTransactionsFn, which run WHILE the
-    /// calling thread already holds commit_mu_ (invariant 7): that lock is
-    /// what makes reading spine_ here safe, and it is NOT recursive, so
-    /// this must never itself try to acquire it. Calling this from
-    /// anywhere else is a data race on spine_ that only TSan is likely to
-    /// catch -- there is no assert guarding it, the same trust-the-caller
-    /// convention peek(Id) itself already relies on.
+    /// The writer's view of the LATEST state (generation-checked, like
+    /// Snapshot::find_raw but against spine_, which may be mid-commit).
+    /// This is what validate() checks against -- "re-validated against
+    /// latest, not just base" falls out of using peek() here.
+    /// Untyped read of the model's CURRENT writer-side state by Id -- the
+    /// same "latest, not just base" view validate() itself reads (this is
+    /// the ONLY public forwarder to the private peek(Id); peek_as<T> below
+    /// is built on top of it, not a second independent caller of peek()).
+    /// Callable ONLY from inside a running PreCommitFn or PreTransactionsFn,
+    /// which run WHILE the calling thread already holds commit_mu_
+    /// (invariant 7): that lock is what makes reading spine_ here safe, and
+    /// it is NOT recursive, so this must never itself try to acquire it.
+    /// Calling this from anywhere else is a data race on spine_ that only
+    /// TSan is likely to catch -- there is no assert guarding it, the same
+    /// trust-the-caller convention peek(Id) itself already relies on.
     ///
-    /// This is what lets a pre-commit hook do more than see WHICH ids
-    /// changed (Change::id/kind/tag): a Created or Updated object's actual
-    /// field values are otherwise unreachable from inside the hook, since
-    /// by this point apply has already moved the contents out of the
-    /// Transaction's own local_created_/local_updated_ overlay (see
-    /// PreCommitFn's doc comment) -- Transaction::peek_as<T> reads exactly
-    /// that now-emptied overlay, so it cannot help here.
+    /// This is what makes a truly type-agnostic hook possible across a
+    /// model with many object types: ObjectBase::each_ref() is a public
+    /// virtual method every Object<Derived> overrides to dispatch through
+    /// that type's own define_references() (see Object<Derived>::each_ref,
+    /// model.h ~line 727) -- so `peek_raw(id)->each_ref(fn)` walks every
+    /// outgoing Ref<>/Opt<> field of WHATEVER type `id` happens to be, with
+    /// no per-type dispatch table in the caller at all.
+    const ObjectBase* peek_raw(Id id) const;
+
+    /// Typed, checked convenience over peek_raw() -- same contract, same
+    /// safety reasoning, just a checked downcast for a caller that already
+    /// knows (or wants to assert) the concrete type. This is what lets a
+    /// pre-commit hook do more than see WHICH ids changed (Change::id/
+    /// kind/tag): a Created or Updated object's actual field values are
+    /// otherwise unreachable from inside the hook, since by this point
+    /// apply has already moved the contents out of the Transaction's own
+    /// local_created_/local_updated_ overlay (see PreCommitFn's doc
+    /// comment) -- Transaction::peek_as<T> reads exactly that now-emptied
+    /// overlay, so it cannot help here.
     template <class T>
     const T* peek_as(Id id) const {
-        const ObjectBase* o = peek(id);
+        const ObjectBase* o = peek_raw(id);
         return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
     }
 
@@ -1898,12 +1914,6 @@ private:
     // All of the following run only under commit_mu_ (invariant 7), except
     // release_version / reaper_loop / enqueue_retired, which have their own
     // locking noted below.
-
-    /// The writer's view of the LATEST state (generation-checked, like
-    /// Snapshot::find_raw but against spine_, which may be mid-commit).
-    /// This is what validate() checks against -- "re-validated against
-    /// latest, not just base" falls out of using peek() here.
-    const ObjectBase* peek(Id id) const;
 
     /// First touch of a chunk per attempt clones it (tracked in dirty_);
     /// later writes hit the clone in place. Published chunks stay immutable.

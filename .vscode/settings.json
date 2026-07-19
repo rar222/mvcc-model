@@ -5,7 +5,7 @@
   "C_Cpp.default.compileCommands": "${workspaceFolder}/build/default/compile_commands.json",
   "clangd.arguments": ["--compile-commands-dir=${workspaceFolder}/build/default"],
   "files.associations": { "*.h": "cpp" },
-  "editor.formatOnSave": true,
+  "editor.formatOnSave": false,
   "C_Cpp.clang_format_style": "file",
   "files.exclude": { "**/build": true }
 }
