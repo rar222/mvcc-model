@@ -12,13 +12,11 @@
 #include <thread>
 #include <vector>
 
-#include "demo/types.h"
 #include "model/model.h"
 #include "test_harness.h"
 #include "test_helpers.h"
 
 using namespace model;
-using namespace demo;
 
 
 // View<T>::operator[] follows Ref<>/Opt<> fields -- including chained
@@ -209,9 +207,9 @@ TEST(find_cached_referrers_tracks_cascade_delete) {
 
 // The cascade-NULL path of Model::reconcile_cached_references -- see
 // the in-body comment for why a dedicated (Node) type is needed here,
-// since the shared demo types don't cache a nullable reference field.
+// since the shared test types don't cache a nullable reference field.
 TEST(find_cached_referrers_tracks_cascade_null) {
-    // Order::parent is deliberately NOT cached (see demo/types.h), so the
+    // Order::parent is deliberately NOT cached (see tests/test_types.h), so the
     // cascade-null path of Model::reconcile_cached_references needs a
     // CACHED nullable field to exercise -- Node, declared just above, exists
     // purely for this.
@@ -240,7 +238,7 @@ TEST(find_cached_referrers_is_empty_for_a_field_never_declared_cached) {
 
     // parent IS declared in define_references() (so it cascades/nulls
     // correctly) but deliberately NOT in define_cached_references() -- see
-    // demo/types.h. The slow scan still finds it; the indexed form is
+    // tests/test_types.h. The slow scan still finds it; the indexed form is
     // invisible to it, same "undeclared is invisible" rule the other three
     // lookup families share -- there is no silent fallback to the scan.
     CHECK(!m.snapshot().find_referrers<&Order::parent>(hub).empty());

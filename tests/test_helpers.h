@@ -24,12 +24,11 @@
 #include <string>
 #include <vector>
 
-#include "demo/types.h"
 #include "model/model.h"
 #include "test_harness.h"
+#include "test_types.h"
 
 using namespace model;
-using namespace demo;
 
 // A local id returned by Transaction::create() is only meaningful until
 // try_commit() returns (see CommitResult::to_real's doc comment). These

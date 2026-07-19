@@ -12,13 +12,11 @@
 #include <thread>
 #include <vector>
 
-#include "demo/types.h"
 #include "model/model.h"
 #include "test_harness.h"
 #include "test_helpers.h"
 
 using namespace model;
-using namespace demo;
 
 
 // The baseline success path: a straightforward create commits, and the

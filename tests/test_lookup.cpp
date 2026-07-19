@@ -12,13 +12,11 @@
 #include <thread>
 #include <vector>
 
-#include "demo/types.h"
 #include "model/model.h"
 #include "test_harness.h"
 #include "test_helpers.h"
 
 using namespace model;
-using namespace demo;
 
 
 // Snapshot::for_each<T>() visits only objects of exactly that type, even
@@ -401,7 +399,7 @@ TEST(lookup_diagnostics_to_string_is_human_readable) {
     (void)s.find_by_scan_field<&Order::qty>(5);
 
     const std::string report = m.lookup_diagnostics().to_string();
-    // Order::qty is named ("qty") in demo/types.h's define_cached_fields()/
+    // Order::qty is named ("qty") in test_types.h's define_cached_fields()/
     // define_scan_fields() -- registered the moment the Order above was
     // created, well before either lookup call -- so the report shows the
     // real name instead of falling back to a bare address.
@@ -462,7 +460,7 @@ TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
 // find_cached_referrers/for_each_referrer) rather than the value-field one
 // (FieldKeyReader::key(), feeding find_by_cached_field/find_by_scan_field) --
 // a genuinely different code path in record_field_lookup's callers, and one
-// with a real unnamed field sitting in demo/types.h already: Order::account
+// with a real unnamed field sitting in test_types.h already: Order::account
 // is named ("account") in define_cached_references(), but Order::parent is
 // declared in define_references() (so cascade/null still work) and
 // deliberately left OUT of define_cached_references() entirely -- see its

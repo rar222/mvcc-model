@@ -63,8 +63,8 @@
 #include <string>
 #include <vector>
 
-#include "demo/types.h"
 #include "model/model.h"
+#include "test_types.h"
 
 #if defined(__linux__)
 #include <cstdlib>
@@ -77,7 +77,6 @@
 #endif
 
 using namespace model;
-using namespace demo;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -380,7 +379,7 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 
 // Account::name is declared in BOTH define_keys() (find_by_key, unique,
 // O(1)) and define_scan_fields() (find_by_scan_field, O(#accounts) linear
-// scan) -- see demo/types.h. Same field, same data, same query: any timing
+// scan) -- see tests/test_types.h. Same field, same data, same query: any timing
 // difference is attributable entirely to the index, not to anything else.
 PERF_TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
