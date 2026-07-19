@@ -10,6 +10,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "model/model.h"
@@ -69,6 +70,96 @@ TEST(pre_commit_hook_sees_the_fully_resolved_changeset_including_cascade_deletes
     CHECK_EQ(killed, std::size_t{2});
     CHECK_EQ(seen_deletes, std::size_t{2});
     (void)o;
+}
+
+// For every "true" new or updated object in the transaction (Created or
+// Updated in the resolved changeset, but not ALSO Deleted -- a referenced
+// local create can install and immediately cascade-remove within one
+// commit per invariant 8, and that is not a surviving object worth
+// walking), finds every outgoing Ref<>/Opt<> field that points OUTSIDE the
+// transaction -- at an id the transaction itself did not create, update,
+// or remove.
+//
+// This is a GENUINE pre-commit hook: it uses Model::peek_as<T>(), the
+// public wrapper this project's Model gained specifically to close the gap
+// PreCommitFn's own doc comment already promised ("peek_as<T> ... via the
+// Model reference") but, until now, never delivered --
+// Transaction::peek_as<T> can't help here, since apply has already moved
+// the contents out of local_created_/local_updated_ by the time this hook
+// runs (see PreCommitFn's doc comment). Because this runs BEFORE publish, a
+// real caller could use exactly this computation to veto a commit (e.g.
+// "reject any order referencing an account outside a whitelist") -- a
+// post-commit hook structurally cannot do that, since by then it's too
+// late.
+TEST(pre_commit_hook_finds_outgoing_refs_pointing_outside_the_transaction) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");  // to_update's OLD target -- must NOT appear
+    const Ref<Account> a2 = make_account(m, "A2");  // referenced by a brand-new object
+    const Ref<Account> a3 = make_account(m, "A3");  // referenced by a create that survives cascade
+    const Ref<Account> a4 = make_account(m, "A4");  // to_update's NEW target
+    const Ref<Order> existing = make_order(m, "EXISTING", a1);  // referenced by a new object
+    const Ref<Order> to_update = make_order(m, "UPD", a1);      // updated this transaction
+
+    std::vector<Id> outside;
+    m.set_pre_commit([&](Model& model, const Transaction&, const std::vector<Change>& changes) {
+        std::unordered_set<Id, IdHash> touched, deleted;
+        for (const Change& c : changes) {
+            touched.insert(c.id);
+            if (c.kind == ChangeKind::Deleted) deleted.insert(c.id);
+        }
+
+        std::unordered_set<Id, IdHash> referenced;
+        for (const Change& c : changes) {
+            if (deleted.count(c.id) || c.tag != type_tag<Order>()) continue;
+            const Order* o = model.peek_as<Order>(c.id);
+            if (!o) continue;
+            referenced.insert(o->account.raw());
+            if (o->parent) referenced.insert(o->parent.raw());
+        }
+        for (Id id : referenced)
+            if (!touched.count(id)) outside.push_back(id);
+        return true;
+    });
+
+    Transaction txn = m.begin();
+
+    // A referenced local create that gets cascade-removed within the same
+    // transaction -- its outgoing ref (to a3) must NOT count, since it
+    // never survives to be a "true" new object.
+    auto victim = std::make_unique<Order>();
+    victim->code = "VICTIM";
+    victim->account = a3;
+    const Ref<Order> victim_local = txn.create(std::move(victim));
+
+    auto survivor = std::make_unique<Order>();
+    survivor->code = "SURVIVOR";
+    survivor->account = a3;  // this one DOES count -- survivor survives
+    survivor->parent = victim_local;
+    txn.create(std::move(survivor));
+
+    txn.remove(victim_local);  // referenced by pending survivor -> deferred, not cancelled outright
+
+    // A clean, brand-new object referencing two pre-existing, otherwise
+    // untouched objects.
+    auto fresh = std::make_unique<Order>();
+    fresh->code = "FRESH";
+    fresh->account = a2;
+    fresh->parent = existing;
+    txn.create(std::move(fresh));
+
+    txn.update(to_update)->account = a4;  // repoint away from a1, toward a4
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    m.set_pre_commit({});
+
+    CHECK_EQ(outside.size(), std::size_t{4});
+    for (Id id : {a2.raw(), a3.raw(), a4.raw(), existing.raw()})
+        CHECK(std::find(outside.begin(), outside.end(), id) != outside.end());
+    // a1 was to_update's OLD target -- no longer referenced after the
+    // update, so reading it would mean the hook saw a stale value instead
+    // of the final one (invariant 9).
+    CHECK(std::find(outside.begin(), outside.end(), a1.raw()) == outside.end());
 }
 
 // A hook returning false (Vetoed) leaves the model in EXACTLY its
@@ -642,6 +733,121 @@ TEST(post_commit_hook_can_safely_chain_another_try_commit_call) {
     CHECK_EQ(s.size(), std::size_t{2});
     CHECK(s.find_by_key<&Account::name>("ORIGINAL") != nullptr);
     CHECK(s.find_by_key<&Account::name>("CHAINED") != nullptr);
+}
+
+// Computes two derived views of a commit's resolved changeset:
+//   1. "True" new objects: Created, but not ALSO Deleted in the same
+//      changeset -- i.e. NOT a same-transaction create that only ever got
+//      installed to be immediately cascade-removed (a referenced local
+//      create per invariant 8; see removing_a_referenced_local_create_
+//      cascades_at_commit_like_a_committed_remove in test_cascade.cpp).
+//   2. Objects that are themselves UNCHANGED by this transaction, but are
+//      referenced (via any Ref<>/Opt<> field) by something the transaction
+//      DID create or update.
+//
+// This is deliberately a POST-commit hook, even though it's answering the
+// question a PRE-commit hook was asked to answer: PreCommitFn runs AFTER
+// apply but BEFORE publish, and by that point txn's local_created_/
+// local_updated_ have already been moved from during apply (see
+// PreCommitFn's own doc comment) -- there is no public way to read a
+// created/updated object's FIELD VALUES from inside a pre-commit hook, only
+// its id/kind/tag via the Change list itself (Model::peek(Id) exists, but
+// is private; Transaction::peek_as<T> reads the transaction's OWN overlay,
+// which is exactly what's been moved from by the time the hook runs).
+// PostCommitFn runs after commit_mu_ is released, with the real,
+// newly-published CommitResult::snapshot to read from instead -- everything
+// needed to walk references. The a1/a4 assertions below exist specifically
+// to prove the computation reads the FINAL value (invariant 9), not a
+// stale one: to_update is repointed from a1 to a4 mid-transaction, and only
+// a4 -- never a1 -- may show up in the "unchanged, but referenced" list.
+TEST(post_commit_hook_computes_new_objects_and_unchanged_referenced_objects) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");  // to_update's OLD target -- must NOT appear
+    const Ref<Account> a2 = make_account(m, "A2");  // referenced by a brand-new object
+    const Ref<Account> a3 = make_account(m, "A3");  // referenced by a create that survives cascade
+    const Ref<Account> a4 = make_account(m, "A4");  // to_update's NEW target
+    const Ref<Order> existing = make_order(m, "EXISTING", a1);  // referenced by a new object
+    const Ref<Order> to_update = make_order(m, "UPD", a1);      // updated this transaction
+
+    std::vector<Id> new_objects;
+    std::vector<Id> unchanged_referenced;
+    m.set_post_commit([&](Model&, const Transaction&, const CommitResult& r) {
+        if (r.status != CommitStatus::Committed) return;
+
+        std::unordered_set<Id, IdHash> created, deleted, touched;
+        for (const Change& c : r.changes) {
+            touched.insert(c.id);
+            if (c.kind == ChangeKind::Created) created.insert(c.id);
+            if (c.kind == ChangeKind::Deleted) deleted.insert(c.id);
+        }
+
+        // 1. Truly new: Created but not ALSO Deleted in this same changeset.
+        for (Id id : created)
+            if (!deleted.count(id)) new_objects.push_back(id);
+
+        // 2. Referenced-but-unchanged: walk every surviving Created/Updated
+        // object's ref fields against the final, just-published snapshot.
+        // Account has no reference fields, so only Order contributes.
+        std::unordered_set<Id, IdHash> referenced;
+        for (const Change& c : r.changes) {
+            if (c.kind == ChangeKind::Deleted || c.tag != type_tag<Order>()) continue;
+            const Order* o = r.snapshot.find<Order>(Ref<Order>(c.id));
+            if (!o) continue;
+            referenced.insert(o->account.raw());
+            if (o->parent) referenced.insert(o->parent.raw());
+        }
+        for (Id id : referenced)
+            if (!touched.count(id)) unchanged_referenced.push_back(id);
+    });
+
+    Transaction txn = m.begin();
+
+    // A referenced local create that gets cascade-removed within the same
+    // transaction -- must NOT show up in new_objects.
+    auto victim = std::make_unique<Order>();
+    victim->code = "VICTIM";
+    victim->account = a3;
+    const Ref<Order> victim_local = txn.create(std::move(victim));
+
+    auto survivor = std::make_unique<Order>();
+    survivor->code = "SURVIVOR";
+    survivor->account = a3;
+    survivor->parent = victim_local;  // references the about-to-be-removed victim
+    const Ref<Order> survivor_local = txn.create(std::move(survivor));
+
+    txn.remove(victim_local);  // referenced by pending `survivor` -> deferred, not cancelled outright
+
+    // A clean, brand-new object referencing two pre-existing, otherwise
+    // untouched objects.
+    auto fresh = std::make_unique<Order>();
+    fresh->code = "FRESH";
+    fresh->account = a2;
+    fresh->parent = existing;
+    const Ref<Order> fresh_local = txn.create(std::move(fresh));
+
+    txn.update(to_update)->account = a4;  // repoint away from a1, toward a4
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    m.set_post_commit({});
+
+    // --- 1: truly new objects --- (Id has no operator<, only ==, so this
+    // checks set membership directly rather than sorting)
+    CHECK_EQ(new_objects.size(), std::size_t{2});
+    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(survivor_local).raw()) !=
+          new_objects.end());
+    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(fresh_local).raw()) !=
+          new_objects.end());
+    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(victim_local).raw()) ==
+          new_objects.end());  // cancelled-via-cascade -- filtered out
+
+    // --- 2: unchanged objects referenced by created/updated ones ---
+    CHECK_EQ(unchanged_referenced.size(), std::size_t{4});
+    for (Id id : {a2.raw(), a3.raw(), a4.raw(), existing.raw()})
+        CHECK(std::find(unchanged_referenced.begin(), unchanged_referenced.end(), id) !=
+              unchanged_referenced.end());
+    CHECK(std::find(unchanged_referenced.begin(), unchanged_referenced.end(), a1.raw()) ==
+          unchanged_referenced.end());  // stale target -- reading it would be a reconciliation bug
 }
 
 // TSan-targeted: installing/clearing the post-commit hook concurrently with

@@ -1598,6 +1598,30 @@ public:
         post_commit_ = std::move(fn);
     }
 
+    /// Typed, checked read of the model's CURRENT writer-side state by Id --
+    /// the same "latest, not just base" view validate() itself reads (see
+    /// the private peek(Id) this wraps). Callable ONLY from inside a
+    /// running PreCommitFn or PreTransactionsFn, which run WHILE the
+    /// calling thread already holds commit_mu_ (invariant 7): that lock is
+    /// what makes reading spine_ here safe, and it is NOT recursive, so
+    /// this must never itself try to acquire it. Calling this from
+    /// anywhere else is a data race on spine_ that only TSan is likely to
+    /// catch -- there is no assert guarding it, the same trust-the-caller
+    /// convention peek(Id) itself already relies on.
+    ///
+    /// This is what lets a pre-commit hook do more than see WHICH ids
+    /// changed (Change::id/kind/tag): a Created or Updated object's actual
+    /// field values are otherwise unreachable from inside the hook, since
+    /// by this point apply has already moved the contents out of the
+    /// Transaction's own local_created_/local_updated_ overlay (see
+    /// PreCommitFn's doc comment) -- Transaction::peek_as<T> reads exactly
+    /// that now-emptied overlay, so it cannot help here.
+    template <class T>
+    const T* peek_as(Id id) const {
+        const ObjectBase* o = peek(id);
+        return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
+    }
+
     /// Callable ONLY from inside a running PreTransactionsFn callback
     /// (asserted via in_pre_transactions_phase_ -- commit_mu_ is not
     /// recursive, so this must NOT itself try to lock it; it runs already
