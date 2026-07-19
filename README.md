@@ -18,7 +18,8 @@ on the write side:
   many transactions merge into.
 - Readers still take an **O(1) immutable snapshot**. `Ref<T>` still never dangles inside one.
 - No per-object refcounting anywhere — chunks hold raw pointers, lifetime is a version
-  watermark. See [DESIGN.md](DESIGN.md) for why.
+  watermark. See [DESIGN.md](DESIGN.md) for why, and [SNAPSHOTS.md](SNAPSHOTS.md) for how the
+  spine and the HAMT secondary indexes actually copy-on-write and get reclaimed.
 
 ## Build
 
@@ -182,6 +183,7 @@ examples/commit_bench.cpp   commit latency vs. model size, and throughput vs. wr
 tests/tests.cpp         no external dependencies
 CLAUDE.md               design rules, for Claude Code
 DESIGN.md               why it's built this way, and how this differs from the single-writer sibling
+SNAPSHOTS.md            how the spine and HAMT indexes COW and get reclaimed, with diagrams
 ```
 
 ## Status
