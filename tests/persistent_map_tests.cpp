@@ -20,6 +20,16 @@ struct U64Hash {
     std::uint64_t operator()(std::uint64_t k) const noexcept { return k; }
 };
 
+// Degenerate on purpose: collapses every key onto one of three full 64-bit
+// hash values, forcing long collision chains -- the Leaf::next path that a
+// real hash essentially never exercises (two keys must share all 64 hash
+// bits). Differential churn under this hash covers chain insert / replace /
+// erase-at-head / erase-in-middle / iterate, which would otherwise be dead
+// code as far as the test suite could tell.
+struct ClashHash {
+    std::uint64_t operator()(std::uint64_t k) const noexcept { return k % 3; }
+};
+
 }  // namespace
 
 int main() {
@@ -117,6 +127,56 @@ int main() {
 
     std::printf("persistent set (uint64-keyed): %s (fails=%d)\n", fails_set? "FAIL":"OK", fails_set);
     fails += fails_set;
+
+    // Collision-chain coverage: same map and set churn as above, but under
+    // ClashHash, so every key lands in one of three long chains.
+    int fails_clash = 0;
+    {
+        PersistentMap<std::uint64_t, int, ClashHash> cm;
+        std::unordered_map<std::uint64_t,int> cref;
+        auto check_cm = [&](const char* where){
+            if (cm.size() != cref.size()){ std::printf("CLASH-MAP SIZE MISMATCH at %s: pm=%zu ref=%zu\n", where, cm.size(), cref.size()); ++fails_clash; }
+            for (auto& [k,v] : cref){ const int* p = cm.get(k); if(!p||*p!=v){ std::printf("CLASH-MAP GET MISMATCH at %s key=%llu\n", where, (unsigned long long)k); ++fails_clash; return; } }
+            size_t seen=0; cm.for_each([&](std::uint64_t k,int v){ auto it=cref.find(k); if(it==cref.end()||it->second!=v){ std::printf("CLASH-MAP ITER EXTRA at %s key=%llu\n", where, (unsigned long long)k); ++fails_clash; } ++seen; });
+            if (seen != cref.size()){ std::printf("CLASH-MAP ITER COUNT at %s: %zu vs %zu\n", where, seen, cref.size()); ++fails_clash; }
+        };
+        for (int i=0;i<6000 && fails_clash==0;i++){
+            std::uint64_t k = (std::uint64_t)(rng()%150);  // ~50-long chains
+            if (rng()%3){ int v=rng(); cm=cm.set(k,v); cref[k]=v; }
+            else { cm=cm.erase(k); cref.erase(k); }
+            if (i%500==0) check_cm("churn");
+        }
+        check_cm("final");
+    }
+    {
+        PersistentSet<std::uint64_t, ClashHash> cs;
+        std::unordered_set<std::uint64_t> cref;
+        auto check_cs = [&](const char* where){
+            if (cs.size() != cref.size()){ std::printf("CLASH-SET SIZE MISMATCH at %s: ps=%zu ref=%zu\n", where, cs.size(), cref.size()); ++fails_clash; }
+            for (std::uint64_t k : cref){ if(!cs.contains(k)){ std::printf("CLASH-SET CONTAINS MISMATCH at %s key=%llu\n", where, (unsigned long long)k); ++fails_clash; return; } }
+            size_t seen=0; cs.for_each([&](std::uint64_t k){ if(cref.find(k)==cref.end()){ std::printf("CLASH-SET ITER EXTRA at %s key=%llu\n", where, (unsigned long long)k); ++fails_clash; } ++seen; });
+            if (seen != cref.size()){ std::printf("CLASH-SET ITER COUNT at %s: %zu vs %zu\n", where, seen, cref.size()); ++fails_clash; }
+        };
+        for (int i=0;i<6000 && fails_clash==0;i++){
+            std::uint64_t k = (std::uint64_t)(rng()%150);
+            if (rng()%3){ cs=cs.insert(k); cref.insert(k); }
+            else { cs=cs.erase(k); cref.erase(k); }
+            if (i%500==0) check_cs("churn");
+        }
+        check_cs("final");
+
+        // Persistence across chain edits: a derived version's chain surgery
+        // must not disturb the original's chains.
+        PersistentSet<std::uint64_t, ClashHash> ca;
+        for (std::uint64_t i=0;i<90;i++) ca=ca.insert(i);
+        PersistentSet<std::uint64_t, ClashHash> cb = ca;
+        for (std::uint64_t i=0;i<90;i+=2) cb=cb.erase(i);  // gut half of every chain
+        for (std::uint64_t i=0;i<90;i++){ if(!ca.contains(i)){ std::printf("CLASH PERSIST FAIL: ca missing %llu\n", (unsigned long long)i); ++fails_clash; break; } }
+        if (ca.size()!=90){ std::printf("CLASH PERSIST FAIL: ca.size=%zu\n", ca.size()); ++fails_clash; }
+        if (cb.size()!=45){ std::printf("CLASH PERSIST FAIL: cb.size=%zu\n", cb.size()); ++fails_clash; }
+    }
+    std::printf("persistent map/set (collision chains): %s (fails=%d)\n", fails_clash? "FAIL":"OK", fails_clash);
+    fails += fails_clash;
 
     return fails?1:0;
 }

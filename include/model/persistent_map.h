@@ -15,9 +15,9 @@
 //
 // Layout: a 32-ary trie keyed on 5-bit slices of the key's hash. Each internal
 // node holds a 32-bit bitmap and a densely packed array of children; a child is
-// either another node or a leaf bucket. Collisions (full 64-bit hash equal, or
-// deeper than the hash provides) live together in a leaf bucket and are compared
-// by the actual key.
+// either another node or a leaf. A leaf holds ONE entry inline; collisions
+// (full 64-bit hash equal, or deeper than the hash provides) chain leaves
+// together and are compared by the actual key.
 //
 // Key type is a template parameter, hashed via `Hash` -- a stateless functor
 // template parameter, no default, the same convention this project already uses
@@ -82,9 +82,21 @@ struct IdentityKeyOf {
 /// below are both ~30-line forwarding wrappers over this.
 template <class K, class Entry, class Hash, class KeyOf>
 class TrieCore {
+    // One entry INLINE per Leaf, with a chain link for collisions, rather
+    // than a vector of entries: a vector costs a second heap allocation
+    // (its buffer) for every single-entry leaf -- i.e. for essentially
+    // every entry in the trie, since a chain longer than one needs two keys
+    // sharing a full 64-bit hash. Measured on the bulk-load memory
+    // benchmark, that second allocation was a double-digit share of the
+    // whole per-entry footprint. The chain is immutable like everything
+    // else here: "editing" one rebuilds the links up to the edit point and
+    // shares the tail (see chain_set/chain_erase).
     struct Leaf {
+        Leaf(std::uint64_t h, Entry e, std::shared_ptr<const Leaf> n)
+            : hash(h), entry(std::move(e)), next(std::move(n)) {}
         std::uint64_t hash;
-        std::vector<Entry> entries;  // usually 1; >1 only on collision
+        Entry entry;
+        std::shared_ptr<const Leaf> next;  ///< collision chain; almost always null
     };
 
     struct Node {
@@ -126,9 +138,40 @@ class TrieCore {
     }
 
     static const Entry* leaf_get(const Leaf* lf, const K& key) {
-        for (auto& e : lf->entries)
-            if (KeyOf{}(e) == key) return &e;
+        for (const Leaf* l = lf; l; l = l->next.get())
+            if (KeyOf{}(l->entry) == key) return &l->entry;
         return nullptr;
+    }
+
+    // Returns `lf`'s chain with `entry` replacing the link whose key matches,
+    // or appended as a fresh link if none does (reported via `added`). Links
+    // before the edit point are copied; everything after it is shared.
+    static std::shared_ptr<const Leaf> chain_set(const std::shared_ptr<const Leaf>& lf,
+                                                 std::uint64_t hash, const K& key,
+                                                 const Entry& entry, bool& added) {
+        if (!lf) {
+            added = true;
+            return std::make_shared<Leaf>(hash, entry, nullptr);
+        }
+        if (KeyOf{}(lf->entry) == key)
+            return std::make_shared<Leaf>(lf->hash, entry, lf->next);
+        return std::make_shared<Leaf>(lf->hash, lf->entry,
+                                      chain_set(lf->next, hash, key, entry, added));
+    }
+
+    // Returns `lf`'s chain with the link whose key matches removed (reported
+    // via `removed`; the chain is shared untouched if the key is absent).
+    // A null result means the chain emptied -- the caller drops the slot.
+    static std::shared_ptr<const Leaf> chain_erase(const std::shared_ptr<const Leaf>& lf,
+                                                   const K& key, bool& removed) {
+        if (!lf) return nullptr;
+        if (KeyOf{}(lf->entry) == key) {
+            removed = true;
+            return lf->next;
+        }
+        auto tail = chain_erase(lf->next, key, removed);
+        if (!removed) return lf;  // key absent below: share the whole chain as-is
+        return std::make_shared<Leaf>(lf->hash, lf->entry, std::move(tail));
     }
 
     // ---- set ----
@@ -144,9 +187,7 @@ class TrieCore {
             // Empty slot: insert a fresh single-entry leaf.
             auto nn = clone_node(n);
             const std::uint32_t pos = popcount_below(nn->bitmap, idx);
-            auto lf = std::make_shared<Leaf>();
-            lf->hash = hash;
-            lf->entries.push_back(entry);
+            auto lf = std::make_shared<Leaf>(hash, entry, nullptr);
             nn->bitmap |= b;
             nn->children.insert(nn->children.begin() + pos, nullptr);
             nn->leaves.insert(nn->leaves.begin() + pos, lf);
@@ -166,21 +207,9 @@ class TrieCore {
         // Slot holds a leaf.
         const Leaf* lf = n->leaves[pos].get();
         if (lf->hash == hash) {
-            // Same hash: replace-or-append within the bucket (true collision or
+            // Same hash: replace-or-append within the chain (true collision or
             // same key).
-            auto nl = std::make_shared<Leaf>(*lf);
-            bool replaced = false;
-            for (auto& e : nl->entries)
-                if (KeyOf{}(e) == key) {
-                    e = entry;
-                    replaced = true;
-                    break;
-                }
-            if (!replaced) {
-                nl->entries.push_back(entry);
-                added = true;
-            }
-            nn->leaves[pos] = nl;
+            nn->leaves[pos] = chain_set(n->leaves[pos], hash, key, entry, added);
             return nn;
         }
 
@@ -188,10 +217,8 @@ class TrieCore {
         // new subtree, then insert the new key beside it.
         if (shift + 5 >= 64) {
             // Ran out of hash bits (astronomically unlikely with distinct hashes,
-            // but handle it): merge into one collision bucket.
-            auto nl = std::make_shared<Leaf>(*lf);
-            nl->entries.push_back(entry);
-            nn->leaves[pos] = nl;
+            // but handle it): merge into one collision chain.
+            nn->leaves[pos] = std::make_shared<Leaf>(hash, entry, n->leaves[pos]);
             added = true;
             return nn;
         }
@@ -232,22 +259,16 @@ class TrieCore {
         }
 
         // Leaf slot.
-        const Leaf* lf = n->leaves[pos].get();
-        const Entry* hit = leaf_get(lf, key);
-        if (!hit) return copy_shared(n);  // key absent
+        bool chain_removed = false;
+        auto nl = chain_erase(n->leaves[pos], key, chain_removed);
+        if (!chain_removed) return copy_shared(n);  // key absent
 
         removed = true;
-        if (lf->entries.size() > 1) {
-            auto nl = std::make_shared<Leaf>(*lf);
-            for (std::size_t i = 0; i < nl->entries.size(); ++i)
-                if (KeyOf{}(nl->entries[i]) == key) {
-                    nl->entries.erase(nl->entries.begin() + i);
-                    break;
-                }
-            nn->leaves[pos] = nl;
+        if (nl) {
+            nn->leaves[pos] = std::move(nl);
             return nn;
         }
-        // Single-entry leaf: remove the slot entirely.
+        // Chain emptied (it held only this key): remove the slot entirely.
         nn->bitmap &= ~b;
         nn->children.erase(nn->children.begin() + pos);
         nn->leaves.erase(nn->leaves.begin() + pos);
@@ -286,7 +307,7 @@ class TrieCore {
             if (n->children[i])
                 each_in(n->children[i].get(), f);
             else if (n->leaves[i])
-                for (auto& e : n->leaves[i]->entries) f(e);
+                for (const Leaf* l = n->leaves[i].get(); l; l = l->next.get()) f(l->entry);
         }
     }
 
