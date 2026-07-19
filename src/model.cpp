@@ -676,13 +676,13 @@ void Model::add_cached_fields(const ObjectBase* o) {
     o->each_cached_field([&](const void* field, std::string key) {
         // Two-level structure: by_cached_field_[field] is the OUTER map (key
         // string -> bucket); `bucket`, if this key already has other
-        // holders, is the INNER map (Id-bytes -> Id) collecting every object
-        // currently holding that value. `prev` is the outer map's state
-        // before this insert, captured whole for the undo log below.
+        // holders, is the INNER set collecting every object currently
+        // holding that value. `prev` is the outer map's state before this
+        // insert, captured whole for the undo log below.
         auto& sub = by_cached_field_[field];
         auto prev = sub;
-        const pmap::PersistentMap<Id>* bucket = sub.get(key);
-        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
+        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_field_[field] = std::move(prev);
         });
@@ -694,9 +694,9 @@ void Model::drop_cached_fields(const ObjectBase* o) {
     o->each_cached_field([&](const void* field, std::string key) {
         auto& sub = by_cached_field_[field];
         auto prev = sub;
-        const pmap::PersistentMap<Id>* bucket = sub.get(key);
+        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
         if (!bucket) return;  // nothing indexed under this key -- nothing to remove
-        auto nb = bucket->erase(detail::id_key(id));  // nb: the bucket with just this id removed
+        auto nb = bucket->erase(id);  // nb: the bucket with just this id removed
         // An emptied bucket is dropped outright, so a value with no remaining
         // holders doesn't leave a tombstone entry behind.
         sub = nb.empty() ? sub.erase(key) : sub.set(key, nb);
@@ -730,16 +730,15 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
             // Remove this id from its OLD value's bucket (ob), unless that
             // value was never actually indexed (e.g. this field just started
             // returning a cacheable value).
-            if (const pmap::PersistentMap<Id>* ob = sub.get(it->second)) {
-                auto nb = ob->erase(detail::id_key(id));  // ob with this id removed
+            if (const pmap::PersistentSet<Id, IdHash>* ob = sub.get(it->second)) {
+                auto nb = ob->erase(id);  // ob with this id removed
                 sub = nb.empty() ? sub.erase(it->second) : sub.set(it->second, nb);
             }
         }
         // Add this id to its NEW value's bucket, creating that bucket if this
         // is the first object ever to hold this particular value.
-        const pmap::PersistentMap<Id>* bucket = sub.get(new_key);
-        sub = sub.set(new_key,
-                      (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(new_key);
+        sub = sub.set(new_key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_field_[field] = std::move(prev);
         });
@@ -760,9 +759,8 @@ void Model::add_cached_references(const ObjectBase* o) {
         if (!target) return;  // Opt<> currently null: nothing to index
         auto& sub = by_cached_reference_[field];
         auto prev = sub;
-        const pmap::PersistentMap<Id>* bucket = sub.get(detail::id_key(target));
-        sub = sub.set(detail::id_key(target),
-                      (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
+        sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_reference_[field] = std::move(prev);
         });
@@ -775,12 +773,12 @@ void Model::drop_cached_references(const ObjectBase* o) {
         if (!target) return;
         auto& sub = by_cached_reference_[field];
         auto prev = sub;
-        const pmap::PersistentMap<Id>* bucket = sub.get(detail::id_key(target));
+        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
         if (!bucket) return;
-        auto nb = bucket->erase(detail::id_key(id));
+        auto nb = bucket->erase(id);
         // An emptied bucket is dropped outright, so a target with no
         // remaining referrers doesn't leave a tombstone entry behind.
-        sub = nb.empty() ? sub.erase(detail::id_key(target)) : sub.set(detail::id_key(target), nb);
+        sub = nb.empty() ? sub.erase(target) : sub.set(target, nb);
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_reference_[field] = std::move(prev);
         });
@@ -801,16 +799,14 @@ void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBa
         auto& sub = by_cached_reference_[field];
         auto prev = sub;
         if (old_target) {
-            if (const pmap::PersistentMap<Id>* ob = sub.get(detail::id_key(old_target))) {
-                auto nb = ob->erase(detail::id_key(id));
-                sub = nb.empty() ? sub.erase(detail::id_key(old_target))
-                                 : sub.set(detail::id_key(old_target), nb);
+            if (const pmap::PersistentSet<Id, IdHash>* ob = sub.get(old_target)) {
+                auto nb = ob->erase(id);
+                sub = nb.empty() ? sub.erase(old_target) : sub.set(old_target, nb);
             }
         }
         if (new_target) {
-            const pmap::PersistentMap<Id>* bucket = sub.get(detail::id_key(new_target));
-            sub = sub.set(detail::id_key(new_target),
-                          (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+            const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(new_target);
+            sub = sub.set(new_target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
         }
         log([this, field, prev = std::move(prev)]() mutable {
             by_cached_reference_[field] = std::move(prev);
@@ -896,7 +892,7 @@ std::optional<Model::IntegrityError> Model::apply_create(
     const TypeTag tag = raw->tag();
     auto& sub = by_type_[tag];
     auto prev = sub;
-    sub = sub.set(detail::id_key(id), id);
+    sub = sub.insert(id);
     log([this, tag, prev = std::move(prev)]() mutable {
         by_type_[tag] = std::move(prev);
     });
@@ -1075,7 +1071,7 @@ std::vector<Id> Model::remove_raw(Id id) {
         const TypeTag tag = victim->tag();
         auto& sub = by_type_[tag];
         auto prev = sub;
-        sub = sub.erase(detail::id_key(x));
+        sub = sub.erase(x);
         log([this, tag, prev = std::move(prev)]() mutable {
             by_type_[tag] = std::move(prev);
         });
@@ -1525,9 +1521,8 @@ void Model::add_cached_fields_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_field([&](const void* field, std::string key) {
         auto& sub = by_cached_field_[field];
-        const pmap::PersistentMap<Id>* bucket = sub.get(key);
-        sub = sub.set(key,
-                      (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
+        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
     });
 }
 
@@ -1540,9 +1535,8 @@ void Model::add_cached_references_no_log(const ObjectBase* o) {
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;
         auto& sub = by_cached_reference_[field];
-        const pmap::PersistentMap<Id>* bucket = sub.get(detail::id_key(target));
-        sub = sub.set(detail::id_key(target),
-                      (bucket ? *bucket : pmap::PersistentMap<Id>{}).set(detail::id_key(id), id));
+        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
+        sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
     });
 }
 
@@ -1635,7 +1629,7 @@ CommitResult Model::commit_bulk(BulkTransaction& txn) {
 
         set_slot_no_log(id.index, raw, id.gen);
         auto& sub = by_type_[raw->tag()];
-        sub = sub.set(detail::id_key(id), id);
+        sub = sub.insert(id);
         add_out_refs_no_log(raw);
         add_field_keys_no_log(raw);
         add_cached_fields_no_log(raw);

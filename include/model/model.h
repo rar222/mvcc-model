@@ -127,18 +127,6 @@ inline bool is_local(Id id) noexcept {
     return (id.index & kLocalIdBit) != 0;
 }
 
-namespace detail {
-/// Opaque, internal-only string encoding of an Id's raw bytes -- never a
-/// user-visible string. An Id is already unique (index + generation), so
-/// its bytes are a perfectly good PersistentMap key with no extra hashing
-/// collisions to worry about. Used for every index keyed by IDENTITY rather
-/// than by a declared field's value: Root::by_type, and the inner buckets
-/// of Root::by_cached_field / Root::by_cached_reference.
-inline std::string id_key(Id id) {
-    return std::string(reinterpret_cast<const char*>(&id), sizeof(id));
-}
-}  // namespace detail
-
 // ---------------------------------------------------------------------------
 // Type tags -- a cheap, RTTI-free checked downcast
 // ---------------------------------------------------------------------------
@@ -758,16 +746,16 @@ struct Root {
     /// Dense, so a lookup is two indexed loads -- no hashing, no probing.
     std::vector<std::shared_ptr<const Chunk>> spine;
 
-    /// One persistent map per type: every Id of that type, keyed by an
-    /// internal encoding of the Id itself (never a user-visible string --
-    /// there is no mandatory key). This is what makes for_each<T>() (and
-    /// everything built on it: find_all, find_referrers, ...) O(#T objects)
-    /// instead of a full spine scan. Keyed by TypeTag rather than a type-name
-    /// string: the same address-comparison the rest of the model already uses
-    /// for type checks (see type_tag<T>()), so no extra per-type registration
-    /// is needed. One entry per distinct type (small, static-ish), so copying
-    /// it per commit is O(#types), not O(#objects).
-    std::unordered_map<TypeTag, pmap::PersistentMap<Id>> by_type;
+    /// One persistent SET per type: every Id of that type. This is what makes
+    /// for_each<T>() (and everything built on it: find_all, find_referrers,
+    /// ...) O(#T objects) instead of a full spine scan. Keyed by TypeTag
+    /// rather than a type-name string: the same address-comparison the rest
+    /// of the model already uses for type checks (see type_tag<T>()), so no
+    /// extra per-type registration is needed. One entry per distinct type
+    /// (small, static-ish), so copying it per commit is O(#types), not
+    /// O(#objects). A set, not a map: the Id is both the key and the only
+    /// thing worth knowing about it here, so there is no value to store.
+    std::unordered_map<TypeTag, pmap::PersistentSet<Id, IdHash>> by_type;
 
     /// One persistent map per define_keys()-declared field, keyed by the
     /// field's own field_tag<>() -- which already encodes both the type and
@@ -775,29 +763,33 @@ struct Root {
     /// way by_type needs TypeTag. Empty for types that declare none. This is
     /// the unique lookup-by-value index (later write wins); there is no
     /// separate mandatory "primary key" index.
-    std::unordered_map<const void*, pmap::PersistentMap<Id>> by_field;
+    std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_field;
 
     /// One persistent MULTIMAP per define_cached_fields()-declared field:
     /// canonical value string -> a persistent set of every Id whose field
-    /// currently holds that value (inner map keyed by the Id's own bytes,
-    /// the same encoding by_type uses). Unlike by_field, every match is
-    /// kept. The bucket is a persistent map, NEVER a flat vector: a flat
-    /// bucket would make each mutation O(#duplicates of that value), which
-    /// for a low-cardinality field (a status, a category) is O(n) per op --
-    /// the exact size-proportional cost this design exists to avoid.
-    std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_field;
+    /// currently holds that value. Unlike by_field, every match is kept. The
+    /// bucket is a persistent SET, NEVER a flat vector: a flat bucket would
+    /// make each mutation O(#duplicates of that value), which for a
+    /// low-cardinality field (a status, a category) is O(n) per op -- the
+    /// exact size-proportional cost this design exists to avoid.
+    std::unordered_map<const void*,
+                       pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
+                                          pmap::StringHash>>
+        by_cached_field;
 
     /// One persistent MULTIMAP per define_cached_references()-declared
-    /// Ref<>/Opt<> field: TARGET's Id bytes -> a persistent set of every
-    /// REFERRER's Id whose field currently points there. Same bucket
-    /// discipline as by_cached_field (persistent map buckets, never flat
-    /// vectors -- a hub object referenced by thousands would otherwise make
-    /// every one of those referrers' commits O(#referrers)). This is the
-    /// published, read-side counterpart of the writer-private referrers_
+    /// Ref<>/Opt<> field: TARGET's Id -> a persistent set of every REFERRER's
+    /// Id whose field currently points there. Same bucket discipline as
+    /// by_cached_field (persistent set buckets, never flat vectors -- a hub
+    /// object referenced by thousands would otherwise make every one of
+    /// those referrers' commits O(#referrers)). This is the published,
+    /// read-side counterpart of the writer-private referrers_
     /// (Model::referrers_): that index drives cascade delete and can never
     /// be handed to a reader (CLAUDE.md invariant 8), so a field worth fast
     /// reverse lookup needs this SEPARATE, opt-in structure.
-    std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_reference;
+    std::unordered_map<const void*,
+                       pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>>
+        by_cached_reference;
 };
 
 class Model;
@@ -957,9 +949,9 @@ public:
         if (!root_) return out;
         auto it = root_->by_cached_field.find(field_tag<Field>());
         if (it == root_->by_cached_field.end()) return out;
-        const pmap::PersistentMap<Id>* bucket = it->second.get(to_field_key(value));
+        const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(to_field_key(value));
         if (!bucket) return out;
-        bucket->for_each([&](const std::string&, Id id) {
+        bucket->for_each([&](Id id) {
             if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
         });
         return out;
@@ -977,7 +969,7 @@ public:
         if (!root_) return;
         auto it = root_->by_type.find(type_tag<T>());
         if (it == root_->by_type.end()) return;
-        it->second.for_each([&](const std::string&, Id id) {
+        it->second.for_each([&](Id id) {
             if (const T* p = cast<T>(find_raw(id))) f(*p);
         });
     }
@@ -1056,9 +1048,9 @@ public:
         if (!root_) return out;
         auto it = root_->by_cached_reference.find(field_tag<Field>());
         if (it == root_->by_cached_reference.end()) return out;
-        const pmap::PersistentMap<Id>* bucket = it->second.get(detail::id_key(target.raw()));
+        const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target.raw());
         if (!bucket) return out;
-        bucket->for_each([&](const std::string&, Id id) {
+        bucket->for_each([&](Id id) {
             if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
         });
         return out;
@@ -1153,7 +1145,7 @@ private:
     void for_each_referrer_any(Id target, F&& f) const {
         if (!root_ || !target) return;
         for (const auto& [tag, ids] : root_->by_type) {
-            ids.for_each([&](const std::string&, const Id& id) {
+            ids.for_each([&](const Id& id) {
                 const ObjectBase* o = find_raw(id);
                 if (!o) return;
                 o->each_ref([&](const void* field, const char*, Id ref_target, bool nullable) {
@@ -1890,10 +1882,15 @@ private:
                                                ///< cleared per attempt so publish stays immutable
     // The writer's working copies of Root's three indexes -- same persistent
     // structures, so publishing them into a new Root is a cheap map copy.
-    std::unordered_map<TypeTag, pmap::PersistentMap<Id>> by_type_;
-    std::unordered_map<const void*, pmap::PersistentMap<Id>> by_field_;
-    std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_field_;
-    std::unordered_map<const void*, pmap::PersistentMap<pmap::PersistentMap<Id>>> by_cached_reference_;
+    std::unordered_map<TypeTag, pmap::PersistentSet<Id, IdHash>> by_type_;
+    std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_field_;
+    std::unordered_map<const void*,
+                       pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
+                                          pmap::StringHash>>
+        by_cached_field_;
+    std::unordered_map<const void*,
+                       pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>>
+        by_cached_reference_;
 
     /// The reverse index driving cascade delete: target SLOT (bare index --
     /// only the live generation of a slot can ever be referenced, so the

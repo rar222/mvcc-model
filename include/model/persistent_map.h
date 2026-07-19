@@ -1,6 +1,6 @@
 #pragma once
 //
-// A minimal persistent hash map (HAMT: hash array mapped trie).
+// A minimal persistent hash map/set (HAMT: hash array mapped trie).
 //
 // Why this exists: the secondary index (external key -> Id) must be part of every
 // published Root, and Roots are immutable and cheap to derive from one another. A
@@ -9,27 +9,82 @@
 // between versions, so producing a new version path-copies only O(log32 n) nodes.
 //
 // This is a from-scratch, dependency-free implementation (no network to pull
-// immer). It supports exactly what the model needs: set, erase, get, and cheap
-// persistent derivation. It is NOT a general-purpose container.
+// immer). It supports exactly what the model needs: set/insert, erase, get/
+// contains, and cheap persistent derivation. It is NOT a general-purpose
+// container.
 //
 // Layout: a 32-ary trie keyed on 5-bit slices of the key's hash. Each internal
 // node holds a 32-bit bitmap and a densely packed array of children; a child is
 // either another node or a leaf bucket. Collisions (full 64-bit hash equal, or
 // deeper than the hash provides) live together in a leaf bucket and are compared
 // by the actual key.
+//
+// Key type is a template parameter, hashed via `Hash` -- a stateless functor
+// template parameter, no default, the same convention this project already uses
+// for Id-keyed std::unordered_map/std::unordered_set (see model::IdHash). This
+// keeps this header dependency-free of model::Id while still letting Model key a
+// PersistentMap/PersistentSet directly on Id -- see StringHash below for the one
+// instantiation this file provides itself, since every OTHER user of this header
+// lives in model.h/model.cpp and supplies its own Hash (IdHash).
+//
+// PersistentMap<K,V,Hash> and PersistentSet<K,Hash> are both thin wrappers over
+// one shared trie implementation, detail::TrieCore -- the two differ only in
+// what a leaf entry holds (a (K,V) pair, or a bare K) and how a comparison key is
+// extracted from one, via the KeyOf template parameter. Path-copying, collision
+// push-down, and bucket shrink/drop-on-empty are tricky enough to want living in
+// exactly one place rather than duplicated between a map and a set version.
 
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace model::pmap {
 
-template <class V>
-class PersistentMap {
+/// Hasher for a std::string key. FNV-1a, 64-bit -- adequate for dispersing
+/// string keys across the trie. A named, reusable functor (rather than a
+/// private method baked into the trie) so it can be passed as the explicit
+/// Hash argument wherever a PersistentMap is keyed by a real string
+/// (Root::by_field, and the OUTER map of Root::by_cached_field) -- see
+/// model.h's Root for those instantiations.
+struct StringHash {
+    std::uint64_t operator()(const std::string& k) const noexcept {
+        std::uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : k) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+};
+
+namespace detail {
+
+/// Entry = std::pair<K,V> (PersistentMap's shape): the comparison key is the
+/// pair's first half.
+template <class K, class V>
+struct PairKeyOf {
+    const K& operator()(const std::pair<K, V>& e) const noexcept { return e.first; }
+};
+
+/// Entry = K itself (PersistentSet's shape): the entry IS the comparison key,
+/// so "replacing" a matched entry with itself (see TrieCore::set_entry's
+/// collision-bucket step) is a correct, harmless no-op -- no special-casing
+/// needed anywhere in TrieCore for the value-less case.
+template <class K>
+struct IdentityKeyOf {
+    const K& operator()(const K& e) const noexcept { return e; }
+};
+
+/// The trie itself, parameterized on what a leaf actually stores (Entry) and
+/// how to get a K back out of one (KeyOf). PersistentMap and PersistentSet
+/// below are both ~30-line forwarding wrappers over this.
+template <class K, class Entry, class Hash, class KeyOf>
+class TrieCore {
     struct Leaf {
         std::uint64_t hash;
-        std::vector<std::pair<std::string, V>> kvs;  // usually 1; >1 only on collision
+        std::vector<Entry> entries;  // usually 1; >1 only on collision
     };
 
     struct Node {
@@ -41,14 +96,8 @@ class PersistentMap {
         // per occupied slot. Kept as two parallel vectors for simplicity.
     };
 
-    static std::uint64_t hash_key(const std::string& k) noexcept {
-        // FNV-1a, 64-bit. Adequate for dispersing string keys across the trie.
-        std::uint64_t h = 1469598103934665603ull;
-        for (unsigned char c : k) {
-            h ^= c;
-            h *= 1099511628211ull;
-        }
-        return h;
+    static std::uint64_t hash_key(const K& k) noexcept {
+        return static_cast<std::uint64_t>(Hash{}(k));
     }
 
     static std::uint32_t slice(std::uint64_t hash, int shift) noexcept {
@@ -62,7 +111,7 @@ class PersistentMap {
     std::shared_ptr<const Node> root_;
     std::size_t size_ = 0;
 
-    explicit PersistentMap(std::shared_ptr<const Node> r, std::size_t n)
+    explicit TrieCore(std::shared_ptr<const Node> r, std::size_t n)
         : root_(std::move(r)), size_(n) {}
 
     // Return a new node equal to `n` but with slot `pos` replaced/inserted.
@@ -76,9 +125,9 @@ class PersistentMap {
         return c;
     }
 
-    static const V* leaf_get(const Leaf* lf, const std::string& key) {
-        for (auto& kv : lf->kvs)
-            if (kv.first == key) return &kv.second;
+    static const Entry* leaf_get(const Leaf* lf, const K& key) {
+        for (auto& e : lf->entries)
+            if (KeyOf{}(e) == key) return &e;
         return nullptr;
     }
 
@@ -86,8 +135,8 @@ class PersistentMap {
     // Returns the new subtree root for the node at `shift`, and reports whether
     // the key was newly inserted (vs replaced) via `added`.
     static std::shared_ptr<const Node> set_in(const Node* n, std::uint64_t hash,
-                                              int shift, const std::string& key,
-                                              const V& val, bool& added) {
+                                              int shift, const K& key,
+                                              const Entry& entry, bool& added) {
         const std::uint32_t idx = slice(hash, shift);
         const std::uint32_t b = bit(idx);
 
@@ -97,7 +146,7 @@ class PersistentMap {
             const std::uint32_t pos = popcount_below(nn->bitmap, idx);
             auto lf = std::make_shared<Leaf>();
             lf->hash = hash;
-            lf->kvs.push_back({key, val});
+            lf->entries.push_back(entry);
             nn->bitmap |= b;
             nn->children.insert(nn->children.begin() + pos, nullptr);
             nn->leaves.insert(nn->leaves.begin() + pos, lf);
@@ -110,7 +159,7 @@ class PersistentMap {
 
         if (n->children[pos]) {
             // Slot holds a subtree: recurse.
-            nn->children[pos] = set_in(n->children[pos].get(), hash, shift + 5, key, val, added);
+            nn->children[pos] = set_in(n->children[pos].get(), hash, shift + 5, key, entry, added);
             return nn;
         }
 
@@ -121,14 +170,14 @@ class PersistentMap {
             // same key).
             auto nl = std::make_shared<Leaf>(*lf);
             bool replaced = false;
-            for (auto& kv : nl->kvs)
-                if (kv.first == key) {
-                    kv.second = val;
+            for (auto& e : nl->entries)
+                if (KeyOf{}(e) == key) {
+                    e = entry;
                     replaced = true;
                     break;
                 }
             if (!replaced) {
-                nl->kvs.push_back({key, val});
+                nl->entries.push_back(entry);
                 added = true;
             }
             nn->leaves[pos] = nl;
@@ -141,7 +190,7 @@ class PersistentMap {
             // Ran out of hash bits (astronomically unlikely with distinct hashes,
             // but handle it): merge into one collision bucket.
             auto nl = std::make_shared<Leaf>(*lf);
-            nl->kvs.push_back({key, val});
+            nl->entries.push_back(entry);
             nn->leaves[pos] = nl;
             added = true;
             return nn;
@@ -151,7 +200,7 @@ class PersistentMap {
         sub->bitmap = bit(exist_idx);
         sub->children.push_back(nullptr);
         sub->leaves.push_back(n->leaves[pos]);
-        auto sub2 = set_in(sub.get(), hash, shift + 5, key, val, added);
+        auto sub2 = set_in(sub.get(), hash, shift + 5, key, entry, added);
         nn->children[pos] = sub2;
         nn->leaves[pos] = nullptr;
         return nn;
@@ -159,7 +208,7 @@ class PersistentMap {
 
     // ---- erase ----
     static std::shared_ptr<const Node> erase_in(const Node* n, std::uint64_t hash,
-                                                int shift, const std::string& key,
+                                                int shift, const K& key,
                                                 bool& removed) {
         if (!n) return nullptr;
         const std::uint32_t idx = slice(hash, shift);
@@ -184,15 +233,15 @@ class PersistentMap {
 
         // Leaf slot.
         const Leaf* lf = n->leaves[pos].get();
-        const V* hit = leaf_get(lf, key);
+        const Entry* hit = leaf_get(lf, key);
         if (!hit) return copy_shared(n);  // key absent
 
         removed = true;
-        if (lf->kvs.size() > 1) {
+        if (lf->entries.size() > 1) {
             auto nl = std::make_shared<Leaf>(*lf);
-            for (std::size_t i = 0; i < nl->kvs.size(); ++i)
-                if (nl->kvs[i].first == key) {
-                    nl->kvs.erase(nl->kvs.begin() + i);
+            for (std::size_t i = 0; i < nl->entries.size(); ++i)
+                if (KeyOf{}(nl->entries[i]) == key) {
+                    nl->entries.erase(nl->entries.begin() + i);
                     break;
                 }
             nn->leaves[pos] = nl;
@@ -213,8 +262,8 @@ class PersistentMap {
         return clone_node(n);
     }
 
-    static const V* get_in(const Node* n, std::uint64_t hash, int shift,
-                           const std::string& key) {
+    static const Entry* get_in(const Node* n, std::uint64_t hash, int shift,
+                               const K& key) {
         while (n) {
             const std::uint32_t idx = slice(hash, shift);
             const std::uint32_t b = bit(idx);
@@ -237,38 +286,104 @@ class PersistentMap {
             if (n->children[i])
                 each_in(n->children[i].get(), f);
             else if (n->leaves[i])
-                for (auto& kv : n->leaves[i]->kvs) f(kv.first, kv.second);
+                for (auto& e : n->leaves[i]->entries) f(e);
         }
     }
 
 public:
-    PersistentMap() = default;
+    TrieCore() = default;
 
     std::size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
 
-    /// Returns a new map with key=val. O(log32 n) node allocations; shares the
-    /// rest of the structure with `*this`.
-    PersistentMap set(const std::string& key, const V& val) const {
+    /// Returns a new core with key -> entry. O(log32 n) node allocations;
+    /// shares the rest of the structure with `*this`.
+    TrieCore set_entry(const K& key, const Entry& entry) const {
         bool added = false;
-        auto r = set_in(root_.get(), hash_key(key), 0, key, val, added);
-        return PersistentMap(r, size_ + (added ? 1 : 0));
+        auto r = set_in(root_.get(), hash_key(key), 0, key, entry, added);
+        return TrieCore(r, size_ + (added ? 1 : 0));
     }
 
-    /// Returns a new map without `key` (or an equal map if absent).
-    PersistentMap erase(const std::string& key) const {
+    /// Returns a new core without `key` (or an equal core if absent).
+    TrieCore erase_key(const K& key) const {
         bool removed = false;
         auto r = erase_in(root_.get(), hash_key(key), 0, key, removed);
-        return PersistentMap(r, size_ - (removed ? 1 : 0));
+        return TrieCore(r, size_ - (removed ? 1 : 0));
     }
 
-    const V* get(const std::string& key) const {
+    const Entry* get_entry(const K& key) const {
         return get_in(root_.get(), hash_key(key), 0, key);
     }
 
     template <class F>
-    void for_each(F&& f) const {
+    void each_entry(F&& f) const {
         each_in(root_.get(), f);
+    }
+};
+
+}  // namespace detail
+
+template <class K, class V, class Hash>
+class PersistentMap {
+    using Core = detail::TrieCore<K, std::pair<K, V>, Hash, detail::PairKeyOf<K, V>>;
+    Core core_;
+    explicit PersistentMap(Core c) : core_(std::move(c)) {}
+
+public:
+    PersistentMap() = default;
+
+    std::size_t size() const noexcept { return core_.size(); }
+    bool empty() const noexcept { return core_.empty(); }
+
+    /// Returns a new map with key=val. O(log32 n) node allocations; shares the
+    /// rest of the structure with `*this`.
+    PersistentMap set(const K& key, const V& val) const {
+        return PersistentMap(core_.set_entry(key, std::pair<K, V>(key, val)));
+    }
+
+    /// Returns a new map without `key` (or an equal map if absent).
+    PersistentMap erase(const K& key) const { return PersistentMap(core_.erase_key(key)); }
+
+    const V* get(const K& key) const {
+        const std::pair<K, V>* e = core_.get_entry(key);
+        return e ? &e->second : nullptr;
+    }
+
+    template <class F>
+    void for_each(F&& f) const {
+        core_.each_entry([&](const std::pair<K, V>& e) { f(e.first, e.second); });
+    }
+};
+
+/// A persistent SET: like PersistentMap, but there is no value -- the key IS
+/// the entry, so no per-entry storage is spent duplicating what the key
+/// already encodes. Used wherever a PersistentMap's value was always just a
+/// copy of its own key (Root::by_type, and the inner bucket of
+/// Root::by_cached_field/Root::by_cached_reference -- see model.h's Root).
+template <class K, class Hash>
+class PersistentSet {
+    using Core = detail::TrieCore<K, K, Hash, detail::IdentityKeyOf<K>>;
+    Core core_;
+    explicit PersistentSet(Core c) : core_(std::move(c)) {}
+
+public:
+    PersistentSet() = default;
+
+    std::size_t size() const noexcept { return core_.size(); }
+    bool empty() const noexcept { return core_.empty(); }
+
+    /// Returns a new set with `key` present. O(log32 n) node allocations;
+    /// shares the rest of the structure with `*this`.
+    PersistentSet insert(const K& key) const { return PersistentSet(core_.set_entry(key, key)); }
+
+    /// Returns a new set without `key` (or an equal set if absent).
+    PersistentSet erase(const K& key) const { return PersistentSet(core_.erase_key(key)); }
+
+    bool contains(const K& key) const { return core_.get_entry(key) != nullptr; }
+
+    template <class F>
+    void for_each(F&& f) const {
+        core_.each_entry([&](const K& k) { f(k); });
     }
 };
 
