@@ -314,17 +314,21 @@ struct RefNuller {
 
 /// Rewrites every LOCAL placeholder id (see kLocalIdBit) in an object's ref
 /// fields to the real Id it was assigned during try_commit()'s apply phase.
-/// This is what lets a transaction build "create an Account, then create an
-/// Order referencing it" in one go: the Order's Ref<Account> holds a local id
-/// until apply_create() installs the Account and records the mapping, at
-/// which point applying the Order remaps it to the real one. A field that
-/// isn't local (already a real id, or null) is left untouched.
+/// This is what lets a transaction build a graph of new, interlinked
+/// objects in one go -- and because the whole remap table is minted BEFORE
+/// the first create applies (see apply_transaction_contents' pre-mint pass,
+/// and commit_bulk(), which does the same), creates may reference each
+/// other in ANY order: backward, forward, mutually-cyclic, or a field
+/// pointing at the very object being created. Creation order carries no
+/// meaning for reference resolution. A field that isn't local (already a
+/// real id, or null) is left untouched.
 ///
 /// Sets *unmapped (there are no exceptions in this project -- see CLAUDE.md)
 /// if a local id has no entry in the table -- which means it pointed at a
-/// local object that was never created, or one created-then-removed within
-/// the same transaction (see Transaction::remove(), the create-then-uncreate
-/// case). try_commit() then rejects the transaction as CommitStatus::Invalid:
+/// local object that was never created (e.g. a stray local id from some
+/// OTHER transaction), or one created-then-removed within the same
+/// transaction (see Transaction::remove(), the create-then-uncreate case).
+/// try_commit() then rejects the transaction as CommitStatus::Invalid:
 /// a genuine transaction-building bug, not a concurrency conflict (there is
 /// no real Id to check against the transaction's base, so it cannot be
 /// classified as a Conflict -- see Model::validate's use of
@@ -1666,7 +1670,14 @@ private:
     /// surface -- see Id's width note), else mint a fresh slot. Undo-logged.
     std::uint32_t alloc_slot();
 
-    std::optional<IntegrityError> validate(const ObjectBase* o) const;  // nullopt == valid
+    /// nullopt == valid. `pending`, when non-null, names real ids this
+    /// attempt has minted but not yet installed (see the pre-mint pass in
+    /// apply_transaction_contents): a Ref<> to one of those is valid --
+    /// either every create in the attempt installs, or the whole attempt
+    /// rolls back, so "minted" is as good as "installed" for integrity.
+    std::optional<IntegrityError> validate(const ObjectBase* o,
+                                           const std::unordered_set<Id, IdHash>* pending
+                                           = nullptr) const;
 
     // Reverse-index (referrers_) maintenance: add/drop an object's whole
     // outgoing edge set (create/delete), or diff before->after (update).
@@ -1751,8 +1762,12 @@ private:
     // ---- try_commit() internals (ALL require commit_mu_ already held) ------
     // apply_* return nullopt on success, or the integrity violation that
     // aborted this attempt -- the caller must then rollback_apply().
+    // `remap` arrives at apply_create FULLY minted (the pre-mint pass in
+    // apply_transaction_contents), and `pending` is the set of its values:
+    // real ids minted this attempt whose slots may not be installed yet.
     std::optional<IntegrityError> apply_create(std::unique_ptr<ObjectBase> o,
-                                               std::unordered_map<std::uint32_t, Id>& remap);
+                                               std::unordered_map<std::uint32_t, Id>& remap,
+                                               const std::unordered_set<Id, IdHash>& pending);
     std::optional<IntegrityError> apply_update(std::unique_ptr<ObjectBase> clone,
                                                std::unordered_map<std::uint32_t, Id>& remap);
     std::vector<Id> remove_raw(Id id);  // cascade BFS, called from try_commit()'s apply phase

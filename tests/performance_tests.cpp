@@ -229,10 +229,16 @@ double scaling_factor(GrowthOrder order, int n_prev, int n_cur) {
 //     fraction of a microsecond, and a 2x size step only predicts a x1.07
 //     change, so ordinary run-to-run jitter is a larger effect than the
 //     signal: measured step factors ran x0.82-x1.18 across repeat runs
-//     against that x1.07 prediction. (Match counts are held near-constant
-//     across the sweep so this measures index DEPTH; letting matches grow
-//     with n instead put these readings anywhere from 1.5 to 9.9 us and
-//     made them unassertable at any tolerance.)
+//     against that x1.07 prediction -- and, under concurrent machine
+//     load, as low as x0.51 (the lookup measured FASTER at the larger
+//     size, purely from frequency/cache variance). The band is therefore
+//     CEILING-ONLY (lo_mult 0): the regression this suite hunts makes
+//     lookups slower, never faster, so a lower edge on a sub-microsecond
+//     flat read asserts CPU-frequency stability rather than complexity.
+//     (Match counts are held near-constant across the sweep so this
+//     measures index DEPTH; letting matches grow with n instead put these
+//     readings anywhere from 1.5 to 9.9 us and made them unassertable at
+//     any tolerance.)
 //
 //   kLinearWithIndexOverhead -- cascade delete, checked against an n log n
 //     prediction rather than a linear one. Each cascaded victim performs
@@ -256,7 +262,7 @@ struct Tolerance {
 };
 
 constexpr Tolerance kDefaultBand{0.8, 1.2};              // the +/-20% band
-constexpr Tolerance kSmallIndexedRead{0.7, 1.3};         // sub-microsecond: jitter > 20%
+constexpr Tolerance kSmallIndexedRead{0.0, 1.3};         // sub-microsecond: ceiling-only, see above
 constexpr Tolerance kLinearWithIndexOverhead{0.7, 2.0};  // n log n + allocator churn
 
 // For a claim whose absolute timings are too noisy for a step band, but
@@ -675,17 +681,16 @@ PERF_TEST(worst_case_removing_one_referrer_of_a_hub_scales_with_hub_fanout) {
 // scope-boundaries section means by "cascade fan-out from a single
 // remove() intent is still unbounded."
 //
-// A note on what is NOT tested here, because it is not expressible: an
-// arbitrarily DEEP non-nullable chain (a -> b -> c -> ... , removing `a`
-// cascading hop by hop). Every non-nullable Ref must point at something
-// that already exists -- RefRemapper resolves a create's refs BEFORE
-// recording that create's own id, so a self-loop, a same-transaction
-// forward reference, and a null head are all rejected as
-// CommitStatus::Invalid (verified directly against this model). A
-// non-nullable reference graph is therefore always a DAG rooted at
-// objects with no non-nullable refs, and its depth is bounded by the
-// number of distinct types, not by object count. Cascade cost scales with
-// the cascade's SIZE, which is what this test measures.
+// A note on shape: this measures a HUB (breadth), not a deep chain
+// (a -> b -> c -> ..., removing `a` cascading hop by hop). Deep
+// non-nullable chains -- and even non-nullable cycles -- ARE expressible
+// (the remap table is minted in full before any create applies, in both
+// try_commit()'s pre-mint pass and commit_bulk(), so same-transaction
+// forward references and self-loops resolve; see
+// apply_transaction_contents). The hub stays the representative worst
+// case regardless: the cascade BFS does the same per-victim work whether
+// the victims arrive broad or deep, so cost scales with the cascade's
+// SIZE either way, which is what this test measures.
 PERF_TEST(worst_case_removing_a_hub_scales_with_the_size_of_its_cascade) {
     const std::vector<int> fanouts = {scaled(1250), scaled(5000), scaled(20000)};
     constexpr int kTrials = 5;

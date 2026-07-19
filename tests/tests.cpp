@@ -2130,16 +2130,22 @@ TEST(transaction_local_creates_can_reference_each_other_via_placeholder_ids) {
 
 // A local id is meaningless outside the Transaction that minted it: a
 // second Transaction can't peek/exists/update it, and embedding it in a
-// commit is rejected as Invalid rather than silently misresolving.
+// commit is rejected as Invalid -- PROVIDED its raw index doesn't collide
+// with one of the committing transaction's own local indexes (the pre-mint
+// pass maps every own-create index, so a colliding stray id silently
+// aliases instead; that sharper hazard is the NEXT test).
 TEST(a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction) {
     Model m;
     Transaction txn1 = m.begin();
-    auto a = std::make_unique<Account>();
-    a->name = "A1";
+    auto a0 = std::make_unique<Account>();
+    a0->name = "A0";
+    txn1.create(std::move(a0));  // txn1 local index 0
+    auto a1 = std::make_unique<Account>();
+    a1->name = "A1";
     const Ref<Account> a_local =
-        txn1.create(std::move(a));  // placeholder, only meaningful inside txn1
+        txn1.create(std::move(a1));  // txn1 local index 1 -- only meaningful inside txn1
 
-    // A second, independent transaction never saw txn1's create -- to txn2,
+    // A second, independent transaction never saw txn1's creates -- to txn2,
     // a_local is just some id it never issued and never cloned from base().
     Transaction txn2 = m.begin();
     CHECK(txn2.peek(a_local) == nullptr);
@@ -2148,7 +2154,9 @@ TEST(a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction
 
     // Embedding the stray local id in something txn2 commits fails loudly:
     // try_commit()'s remap table (built fresh per attempt) only knows about
-    // local ids THIS transaction's own local_created_ produced.
+    // local ids THIS transaction's own local_created_ produced -- and txn2
+    // has only ONE create (its own index 0), so txn1's index 1 stays
+    // unmapped.
     auto o = std::make_unique<Order>();
     o->code = "O1";
     o->account = a_local;
@@ -2509,6 +2517,123 @@ TEST(removing_a_locally_created_object_cancels_the_create_outright) {
 }
 
 // ---------------------------------------------------------------------------
+// Order-independent local references (the pre-mint pass)
+//
+// The remap table is minted in full before the first create applies (see
+// apply_transaction_contents), so creates in one Transaction may reference
+// each other in any order -- forward, mutually, or themselves -- exactly
+// like commit_bulk(). Only a ref to a local id with no live create behind
+// it (cancelled, or stray from another transaction) still rejects.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The only way to express a NON-nullable cycle: no demo type carries a
+/// Ref<> to its own type (Order::parent is deliberately Opt<>). With the
+/// pre-mint pass, a Ref<Link> cycle is representable -- which also means
+/// the non-nullable reference graph is NOT guaranteed to be a DAG, and a
+/// cascade entering the cycle kills every link in it.
+class Link final : public model::Object<Link> {
+public:
+    std::string label;
+    model::Ref<Link> next;
+
+    template <class Self, class V>
+    static void define_references(Self& s, V&& v) {
+        v(model::field_tag<&Link::next>(), "next", s.next);
+    }
+};
+
+}  // namespace
+
+TEST(a_create_may_reference_itself_within_its_own_transaction) {
+    Model m;
+    Transaction txn = m.begin();
+    const Ref<Link> l = txn.create(std::make_unique<Link>());
+    txn.update(l)->label = "SELF";
+    txn.update(l)->next = l;  // non-nullable self-loop, local id
+
+    CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    const Ref<Link> real = res.to_real(l);
+    Snapshot s = m.snapshot();
+    CHECK(s.find(real) != nullptr);
+    CHECK(s.find(real)->next.raw() == real.raw());  // resolved to itself, not mismapped
+}
+
+TEST(a_create_may_reference_a_later_create_in_the_same_transaction) {
+    Model m;
+    Transaction txn = m.begin();
+    // The Order is created FIRST, its non-nullable account filled in with a
+    // local id minted SECOND -- rejected before the pre-mint pass existed,
+    // now equivalent to the backward form.
+    const Ref<Order> o = txn.create(std::make_unique<Order>());
+    txn.update(o)->code = "FWD";
+    auto acc = std::make_unique<Account>();
+    acc->name = "LATER";
+    const Ref<Account> a = txn.create(std::move(acc));
+    txn.update(o)->account = a;
+
+    CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    Snapshot s = m.snapshot();
+    const Order* op = s.find(res.to_real(o));
+    CHECK(op != nullptr);
+    CHECK_EQ(s.resolve(op->account).name, std::string("LATER"));
+}
+
+TEST(two_creates_forming_a_non_nullable_cycle_commit_and_cascade_as_one) {
+    Model m;
+    Transaction txn = m.begin();
+    const Ref<Link> l1 = txn.create(std::make_unique<Link>());
+    const Ref<Link> l2 = txn.create(std::make_unique<Link>());
+    txn.update(l1)->label = "L1";
+    txn.update(l1)->next = l2;
+    txn.update(l2)->label = "L2";
+    txn.update(l2)->next = l1;  // l1 <-> l2, both edges non-nullable
+
+    CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    const Ref<Link> r1 = res.to_real(l1);
+    const Ref<Link> r2 = res.to_real(l2);
+    {
+        Snapshot s = m.snapshot();
+        CHECK(s.find(r1)->next.raw() == r2.raw());
+        CHECK(s.find(r2)->next.raw() == r1.raw());
+    }
+
+    // A non-nullable cycle lives and dies as a unit: removing either link
+    // cascades to the other (and the BFS's visited set terminates the loop).
+    const std::size_t killed = remove_and_commit(m, r1);
+    CHECK_EQ(killed, std::size_t{2});
+    Snapshot s = m.snapshot();
+    CHECK(s.find(r1) == nullptr);
+    CHECK(s.find(r2) == nullptr);
+}
+
+TEST(a_ref_to_a_cancelled_create_is_still_rejected_as_invalid) {
+    Model m;
+    const Ref<Account> acct = make_account(m, "A1");
+
+    Transaction txn = m.begin();
+    const Ref<Order> victim = txn.create(std::make_unique<Order>());
+    txn.update(victim)->code = "VICTIM";
+    txn.update(victim)->account = acct;
+    auto o = std::make_unique<Order>();
+    o->code = "DANGLER";
+    o->account = acct;
+    o->parent = victim;  // valid when written...
+    txn.create(std::move(o));
+    txn.remove(victim);  // ...then the create it points at is cancelled
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Invalid);
+    CHECK(res.error.has_value());
+    CHECK(!res.error->bad_target);  // a cancelled create has no real id to report
+    CHECK_EQ(m.snapshot().size(), std::size_t{1});  // only the pre-existing account
+}
+
+// ---------------------------------------------------------------------------
 // try_commit correctness: conflicts
 // ---------------------------------------------------------------------------
 
@@ -2844,6 +2969,56 @@ TEST(normal_transaction_and_find_by_key_work_correctly_after_a_bulk_load) {
     std::size_t count = 0;
     s.for_each<Account>([&](const Account&) { ++count; });
     CHECK_EQ(count, std::size_t{2});
+}
+
+// commit_bulk() mints its whole remap table before installing anything, so
+// a batch may contain forward references, self-loops, and cycles -- the
+// same order-independence the ordinary Transaction path gets from its
+// pre-mint pass (see apply_transaction_contents). BulkTransaction has no
+// update(), so a forward or self edge is written using the local id the
+// target WILL get -- deterministic by contract (kLocalIdBit | position in
+// creation order; see BulkTransaction::create's doc comment).
+TEST(bulk_load_accepts_forward_references_self_loops_and_cycles) {
+    Model m;
+    auto local = [](std::uint32_t position) { return Ref<Link>(Id{kLocalIdBit | position, 1}); };
+
+    BulkTransaction t = m.begin_bulk();
+    auto self = std::make_unique<Link>();
+    self->label = "SELF";
+    self->next = local(0);  // position 0: itself -- non-nullable self-loop
+    const Ref<Link> sl = t.create(std::move(self));
+    CHECK(sl.raw() == local(0).raw());  // the predicted id is the minted one
+
+    auto c1 = std::make_unique<Link>();
+    c1->label = "C1";
+    c1->next = local(2);  // forward: position 2 doesn't exist yet
+    const Ref<Link> l1 = t.create(std::move(c1));
+    auto c2 = std::make_unique<Link>();
+    c2->label = "C2";
+    c2->next = local(1);  // backward: closes the non-nullable 2-cycle
+    const Ref<Link> l2 = t.create(std::move(c2));
+
+    CommitResult r = m.commit_bulk(t);
+    CHECK(r.status == CommitStatus::Committed);
+    const Ref<Link> rs = r.to_real(sl);
+    const Ref<Link> r1 = r.to_real(l1);
+    const Ref<Link> r2 = r.to_real(l2);
+    {
+        Snapshot s = m.snapshot();
+        CHECK(s.find(rs)->next.raw() == rs.raw());  // self-loop resolved to itself
+        CHECK(s.find(r1)->next.raw() == r2.raw());  // cycle edges resolved crosswise
+        CHECK(s.find(r2)->next.raw() == r1.raw());
+    }
+
+    // The bulk-built non-nullable cycle lives and dies as a unit, exactly
+    // like the Transaction-built one -- referrers_ came out of the no-log
+    // install path in the state the cascade BFS expects.
+    const std::size_t killed = remove_and_commit(m, r1);
+    CHECK_EQ(killed, std::size_t{2});
+    Snapshot s = m.snapshot();
+    CHECK(s.find(r1) == nullptr);
+    CHECK(s.find(r2) == nullptr);
+    CHECK(s.find(rs) != nullptr);  // the self-loop was never part of that cycle
 }
 
 // The reverse index (referrers_) has to come out of commit_bulk()'s no-log

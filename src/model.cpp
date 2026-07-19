@@ -470,7 +470,8 @@ void Model::set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t ge
     });
 }
 
-std::optional<Model::IntegrityError> Model::validate(const ObjectBase* o) const {
+std::optional<Model::IntegrityError> Model::validate(
+    const ObjectBase* o, const std::unordered_set<Id, IdHash>* pending) const {
     // Referential integrity is enforced *here*, at apply time, against the
     // CURRENT (latest) state -- not the transaction's base. That's what makes
     // "Ref<T> re-validated against latest, not just base" fall out for free,
@@ -479,6 +480,11 @@ std::optional<Model::IntegrityError> Model::validate(const ObjectBase* o) const 
     // the target exist at the transaction's own base()? -- and turn a
     // concurrent deletion into a Conflict rather than an Invalid rejection.
     // See IntegrityError::bad_target and try_commit()'s error handling.
+    //
+    // A target in `pending` (minted this attempt, slot not necessarily
+    // installed yet -- see the pre-mint pass in apply_transaction_contents)
+    // passes: it either installs later in this same attempt or the whole
+    // attempt rolls back, so it can never be published dangling.
     std::optional<IntegrityError> err;
     o->each_ref([&](const void* /*field*/, const char* name, Id target, bool nullable) {
         if (err) return;  // keep the FIRST violation; the attempt aborts either way
@@ -488,7 +494,7 @@ std::optional<Model::IntegrityError> Model::validate(const ObjectBase* o) const 
                                      Id{}};
             return;
         }
-        if (!peek(target))
+        if (!peek(target) && !(pending && pending->count(target)))
             err = IntegrityError{
                 std::string(o->type()) + " field " + name + " references a dead object", target};
     });
@@ -861,31 +867,34 @@ std::vector<std::pair<std::uint64_t, int>> Model::debug_live_versions() const {
 // ---------------------------------------------------------------------------
 
 std::optional<Model::IntegrityError> Model::apply_create(
-    std::unique_ptr<ObjectBase> o, std::unordered_map<std::uint32_t, Id>& remap) {
+    std::unique_ptr<ObjectBase> o, std::unordered_map<std::uint32_t, Id>& remap,
+    const std::unordered_set<Id, IdHash>& pending) {
     const std::uint32_t local_index = o->id.index;  // still local; the remap key
 
-    // May reference an earlier local create in this txn. Nothing is logged
-    // yet, so an unmapped local id can just return; `o` frees itself.
+    // May reference ANY local create in this txn -- earlier, later, or this
+    // very object (the pre-mint pass filled the whole table before the
+    // first create applied). Unmapped now means only a cancelled create or
+    // a stray id from another transaction. Nothing is logged yet, so an
+    // unmapped local id can just return; `o` frees itself.
     bool unmapped = false;
     o->remap_refs(RefRemapper{remap, &unmapped});
     if (unmapped) return IntegrityError{kUnmappedLocalMsg, Id{}};
 
-    const std::uint32_t slot = alloc_slot();
-    const std::uint32_t i = slot & kChunkMask;
-    const std::uint32_t cur_gen =
-        (slot >> kChunkBits) < spine_.size() ? spine_[slot >> kChunkBits]->gen[i] : 0;
-    const std::uint32_t g = cur_gen + 1;  // recycled slot gets a fresh generation
+    const auto minted = remap.find(local_index);
+    assert(minted != remap.end() && "the pre-mint pass covers every live create");
+    o->id = minted->second;
 
-    o->id = Id{slot, g};
-    // On a violation, the slot allocation above is already logged, so
-    // rollback_apply() reclaims it; the object is still owned by `o` and is
-    // freed by unique_ptr on the early return.
-    if (auto err = validate(o.get())) return err;
+    // On a violation, this object's slot allocation (pre-mint pass) is
+    // already logged, so rollback_apply() reclaims it; the object is still
+    // owned by `o` and is freed by unique_ptr on the early return. A target
+    // in `pending` -- minted this attempt, possibly not yet installed -- is
+    // as good as installed here; see validate()'s doc comment.
+    if (auto err = validate(o.get(), &pending)) return err;
 
     const Id id = o->id;
     ObjectBase* raw = o.release();
 
-    set_slot(slot, raw, g);  // logs the inverse (restores prev obj + gen)
+    set_slot(id.index, raw, id.gen);  // logs the inverse (restores prev obj + gen)
 
     // Every object gets an (internal, Id-keyed) entry in its type's
     // enumeration index, unconditionally -- this is what for_each<T>() scans.
@@ -911,8 +920,7 @@ std::optional<Model::IntegrityError> Model::apply_create(
     // empty it first.
     txn_created_.push_back(raw);
 
-    remap[local_index] = id;
-    return std::nullopt;
+    return std::nullopt;  // remap[local_index] was set by the pre-mint pass
 }
 
 std::optional<Model::IntegrityError> Model::apply_update(
@@ -1214,6 +1222,33 @@ std::vector<Change> Transaction::estimate_changes() const {
 
 std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap) {
+    // Pre-mint pass: every live create gets its real id BEFORE anything is
+    // applied, so the remap table is complete when the first remap_refs()
+    // runs -- which is what lets creates in one transaction reference each
+    // other in ANY order: backward, forward, mutually, or themselves, the
+    // same order-independence commit_bulk() gets from minting its whole
+    // table up front. A local id left unmapped after this pass can only be
+    // a cancelled create (remove() of a local id nulls its entry here) or
+    // a stray id from some other transaction -- both still rejected as
+    // Invalid by apply_create/apply_update. alloc_slot() is undo-logged,
+    // so a rollback reclaims every slot minted here.
+    //
+    // `pending` (the minted ids) is what validate() accepts as targets in
+    // place of an installed slot during the create loop below: a minted id
+    // either installs later this same attempt or the whole attempt rolls
+    // back, so integrity holds either way.
+    std::unordered_set<Id, IdHash> pending;
+    for (auto& obj : txn.local_created_) {
+        if (!obj) continue;
+        const std::uint32_t slot = alloc_slot();
+        const std::uint32_t i = slot & kChunkMask;
+        const std::uint32_t cur_gen =
+            (slot >> kChunkBits) < spine_.size() ? spine_[slot >> kChunkBits]->gen[i] : 0;
+        const Id id{slot, cur_gen + 1};  // recycled slot gets a fresh generation
+        remap[obj->id.index] = id;
+        pending.insert(id);
+    }
+
     // Creates first, then updates (reconciled immediately, see apply_update),
     // then deletes resolved last -- in that order, so a same-transaction
     // "repoint away from X, then delete X" sees the repoint already reflected
@@ -1222,11 +1257,14 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // classify_apply_failure()).
     std::optional<IntegrityError> err;
     for (auto& obj : txn.local_created_) {
-        if (obj && (err = apply_create(std::move(obj), remap))) break;  // null: cancelled locally
+        if (obj && (err = apply_create(std::move(obj), remap, pending)))
+            break;  // null: cancelled locally
     }
     if (!err) {
         for (auto& [slot, clone] : txn.local_updated_) {
             (void)slot;
+            // No `pending` needed here: every create installed before the
+            // first update applies, so peek() resolves them directly.
             if (clone && (err = apply_update(std::move(clone), remap))) break;
         }
     }
