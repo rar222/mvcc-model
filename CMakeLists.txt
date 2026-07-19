@@ -86,7 +86,20 @@ target_link_libraries(cached_reference_bench PRIVATE model)
 # --- tests ------------------------------------------------------------------
 
 enable_testing()
-add_executable(model_tests tests/tests.cpp)
+add_executable(model_tests
+    tests/test_harness.cpp
+    tests/test_helpers.cpp
+    tests/test_basics.cpp
+    tests/test_events.cpp
+    tests/test_cascade.cpp
+    tests/test_lookup.cpp
+    tests/test_views.cpp
+    tests/test_transactions.cpp
+    tests/test_hooks.cpp
+    tests/test_commit.cpp
+    tests/test_bulk_load.cpp
+    tests/test_concurrency_stress.cpp
+)
 target_link_libraries(model_tests PRIVATE model)
 
 add_test(NAME model_tests COMMAND model_tests)
