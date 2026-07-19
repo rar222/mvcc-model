@@ -102,22 +102,29 @@ TEST(pre_commit_hook_finds_outgoing_refs_pointing_outside_the_transaction) {
 
     std::vector<Id> outside;
     m.set_pre_commit([&](Model& model, const Transaction&, const std::vector<Change>& changes) {
-        std::unordered_set<Id, IdHash> touched, deleted;
+        // `alive`: insert on Created/Updated, ERASE on Deleted -- reflects
+        // the FINAL state after replaying every change in order, unlike a
+        // separately-accumulated "ever seen as Deleted" set, which would
+        // wrongly treat an id as permanently excluded even if a later
+        // Created/Updated entry for that same id showed up afterward.
+        std::unordered_set<Id, IdHash> alive;
         for (const Change& c : changes) {
-            touched.insert(c.id);
-            if (c.kind == ChangeKind::Deleted) deleted.insert(c.id);
+            if (c.kind == ChangeKind::Deleted)
+                alive.erase(c.id);
+            else
+                alive.insert(c.id);
         }
 
         std::unordered_set<Id, IdHash> referenced;
         for (const Change& c : changes) {
-            if (deleted.count(c.id) || c.tag != type_tag<Order>()) continue;
+            if (!alive.count(c.id) || c.tag != type_tag<Order>()) continue;
             const Order* o = model.peek_as<Order>(c.id);
             if (!o) continue;
             referenced.insert(o->account.raw());
             if (o->parent) referenced.insert(o->parent.raw());
         }
         for (Id id : referenced)
-            if (!touched.count(id)) outside.push_back(id);
+            if (!alive.count(id)) outside.push_back(id);
         return true;
     });
 
@@ -774,30 +781,40 @@ TEST(post_commit_hook_computes_new_objects_and_unchanged_referenced_objects) {
     m.set_post_commit([&](Model&, const Transaction&, const CommitResult& r) {
         if (r.status != CommitStatus::Committed) return;
 
-        std::unordered_set<Id, IdHash> created, deleted, touched;
+        // `created`: ever appeared as a Created change -- a plain historical
+        // fact, unaffected by anything that happens to the id afterward.
+        // `alive`: insert on Created/Updated, ERASE on Deleted -- reflects
+        // the FINAL state after replaying every change in order, unlike a
+        // separately-accumulated "ever seen as Deleted" set, which would
+        // wrongly treat an id as permanently excluded even if a later
+        // Created/Updated entry for that same id showed up afterward.
+        std::unordered_set<Id, IdHash> created, alive;
         for (const Change& c : r.changes) {
-            touched.insert(c.id);
             if (c.kind == ChangeKind::Created) created.insert(c.id);
-            if (c.kind == ChangeKind::Deleted) deleted.insert(c.id);
+            if (c.kind == ChangeKind::Deleted)
+                alive.erase(c.id);
+            else
+                alive.insert(c.id);
         }
 
-        // 1. Truly new: Created but not ALSO Deleted in this same changeset.
+        // 1. Truly new: created AND still alive (not cascade-removed within
+        // this same commit).
         for (Id id : created)
-            if (!deleted.count(id)) new_objects.push_back(id);
+            if (alive.count(id)) new_objects.push_back(id);
 
         // 2. Referenced-but-unchanged: walk every surviving Created/Updated
         // object's ref fields against the final, just-published snapshot.
         // Account has no reference fields, so only Order contributes.
         std::unordered_set<Id, IdHash> referenced;
         for (const Change& c : r.changes) {
-            if (c.kind == ChangeKind::Deleted || c.tag != type_tag<Order>()) continue;
+            if (!alive.count(c.id) || c.tag != type_tag<Order>()) continue;
             const Order* o = r.snapshot.find<Order>(Ref<Order>(c.id));
             if (!o) continue;
             referenced.insert(o->account.raw());
             if (o->parent) referenced.insert(o->parent.raw());
         }
         for (Id id : referenced)
-            if (!touched.count(id)) unchanged_referenced.push_back(id);
+            if (!alive.count(id)) unchanged_referenced.push_back(id);
     });
 
     Transaction txn = m.begin();
