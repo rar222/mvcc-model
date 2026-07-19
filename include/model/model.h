@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -357,6 +358,62 @@ struct RefRemapper {
     }
 };
 
+namespace detail {
+/// Global (process-wide, NOT per-Model) registry: field_tag<Field>() -> a
+/// human name, for fields whose declaration opted in by passing one to
+/// FieldKeyReader::key() or RefIndexReader::index() below. A property of
+/// how the FIELD is declared, not of any particular Model or object
+/// instance -- unlike Model's own (per-Model) field lookup stats, this is
+/// intentionally shared across every Model in the process, the same scope
+/// field_tag<Field>() itself already has.
+///
+/// Naming is opt-in and entirely optional: a field never given a name
+/// still works everywhere (find_by_cached_field, the reverse index, ...) --
+/// it just falls back to being identified by its declaring type and its
+/// opaque address wherever something tries to display it for a human (see
+/// Model::LookupDiagnostics::to_string()).
+inline std::mutex g_field_name_mu;
+inline std::unordered_map<const void*, std::string>& field_names() {
+    static std::unordered_map<const void*, std::string> names;
+    return names;
+}
+
+/// Registers `name` for `field`, the FIRST time this exact call site ever
+/// runs (see register_field_name_once below) -- so the mutex here is taken
+/// at most once per distinct Field, ever, for the life of the process, not
+/// on every define_keys()/define_cached_fields()/define_cached_references()
+/// traversal (those run on every create/update, which would otherwise make
+/// this a real write-side cost). First name wins if ever called twice for
+/// the same field with different strings (shouldn't happen -- a field's
+/// name is fixed by its own declaration).
+inline void register_field_name(const void* field, const char* name) {
+    std::lock_guard lk(g_field_name_mu);
+    field_names().try_emplace(field, name);
+}
+
+/// The name registered for `field`, or empty if none ever was.
+inline std::string field_name_of(const void* field) {
+    std::lock_guard lk(g_field_name_mu);
+    auto it = field_names().find(field);
+    return it != field_names().end() ? it->second : std::string();
+}
+
+/// One-time-per-Field registration, called from FieldKeyReader::key() and
+/// RefIndexReader::index(). The `static` guard is the SAME "instantiate
+/// once per template argument, then it's free" trick field_tag<Field>()
+/// itself relies on (a function-local static's initialization is
+/// thread-safe and happens exactly once) -- extended here to also run a
+/// one-time side-effecting registration instead of merely returning an
+/// address, so every call after the first for a given Field costs one
+/// already-initialized-flag check, never the mutex above.
+template <auto Field>
+inline void register_field_name_once(const char* name) noexcept {
+    if (!name) return;
+    static const bool registered = (register_field_name(field_tag<Field>(), name), true);
+    (void)registered;
+}
+}  // namespace detail
+
 /// Callback shape for declaring WHICH Ref<>/Opt<> fields -- already listed in
 /// define_references() -- should also get a reverse-lookup index. See
 /// define_cached_references() and Snapshot::find_cached_referrers.
@@ -370,11 +427,17 @@ using RefIndexFn = std::function<void(const void* field)>;
 /// static caches the result), not once per object, and if it happened to
 /// return something different for a different instance, only the FIRST
 /// caller's answer would ever be used.
+///
+/// `name`, if supplied, is registered (once, see detail::
+/// register_field_name_once) for display in Model::LookupDiagnostics::
+/// to_string() -- purely cosmetic, like RefReader's own `name` parameter;
+/// nothing correctness-critical reads it.
 struct RefIndexReader {
     const RefIndexFn& fn;
     template <auto Field>
-    void index() const {
+    void index(const char* name = nullptr) const {
         fn(field_tag<Field>());
+        detail::register_field_name_once<Field>(name);
     }
 };
 
@@ -412,11 +475,20 @@ std::string to_field_key(const V& v) {
 /// not a hand-assigned int slot: `v.key<&Gadget::label>(s.label)`. That's
 /// what lets Snapshot::find_by_key<&Gadget::label>(...) look a field up
 /// directly, with no int to keep in sync between declaration and lookup.
+///
+/// `name`, if supplied, is registered (once, see detail::
+/// register_field_name_once) for display in Model::LookupDiagnostics::
+/// to_string() -- purely cosmetic; nothing correctness-critical reads it.
+/// One shape serves define_keys()/define_cached_fields()/
+/// define_scan_fields() alike, so naming a field in any ONE of them (a
+/// field reused across more than one, like Account::name, only needs it
+/// once) names it for all.
 struct FieldKeyReader {
     const FieldKeyFn& fn;
     template <auto Field, class V>
-    void key(const V& v) const {
+    void key(const V& v, const char* name = nullptr) const {
         fn(field_tag<Field>(), to_field_key(v));
+        detail::register_field_name_once<Field>(name);
     }
 };
 
@@ -805,6 +877,41 @@ template <class T>
 class View;
 
 // ---------------------------------------------------------------------------
+// Field lookup stats -- cached vs. uncached call counts, for the life of a Model
+// ---------------------------------------------------------------------------
+
+/// Call counts for one field's cached vs. uncached lookup family --
+/// find_by_scan_field vs. find_by_cached_field, or for_each_referrer/
+/// find_referrers vs. find_cached_referrers. Purely observational: lets a
+/// caller decide, from ACTUAL usage over the model's whole lifetime, whether
+/// define_cached_fields()/define_cached_references() is paying for itself
+/// on a given field, or whether that field should be a scan field (or
+/// nothing) instead. See Model::lookup_stats() and Model::diagnostics().
+struct LookupCounts {
+    std::uint64_t cached_calls = 0;    ///< find_by_cached_field / find_cached_referrers
+    std::uint64_t uncached_calls = 0;  ///< find_by_scan_field / for_each_referrer / find_referrers
+};
+
+/// Identifies one looked-up field: its declaring type (captured as
+/// `typeid(ClassT)` at the call site -- see Model::record_field_lookup) plus
+/// the field itself (`field_tag<Field>()`). At namespace scope, not nested
+/// in Model, because it's also the key type of Model::LookupDiagnostics::
+/// stats -- a PUBLIC-facing shape -- and there's nothing Model-specific
+/// about it: it's just "which field," the same identity field_tag<Field>()
+/// itself already carries.
+struct FieldLookupKey {
+    const std::type_info* type;
+    const void* field;
+    friend bool operator==(FieldLookupKey, FieldLookupKey) noexcept = default;
+};
+struct FieldLookupKeyHash {
+    std::size_t operator()(FieldLookupKey k) const noexcept {
+        return std::hash<const void*>{}(static_cast<const void*>(k.type)) ^
+              (std::hash<const void*>{}(k.field) << 1);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Snapshot -- the read side
 // ---------------------------------------------------------------------------
 
@@ -904,32 +1011,12 @@ public:
     /// define_keys() never mentioned -- the three lookup families share that
     /// rule. For a field queried often enough to deserve an index, declare
     /// it in define_cached_fields() and use find_by_cached_field instead.
+    /// Defined out-of-line (after Model) so its body can call
+    /// Model::record_field_lookup() for LookupCounts -- see that method's
+    /// doc comment for why this can't be inline here.
     template <auto Field>
     std::vector<const member_class_t<decltype(Field)>*> find_by_scan_field(
-        const member_value_t<decltype(Field)>& value) const {
-        using ClassT = member_class_t<decltype(Field)>;
-        std::vector<const ClassT*> out;
-        bool checked = false, declared = false;
-        for_each<ClassT>([&](const ClassT& o) {
-            if (!checked) {
-                // define_scan_fields() is static per type: ask the first
-                // object once, on behalf of the whole scan.
-                checked = true;
-                o.each_scan_field([&](const void* field, std::string) {
-                    if (field == field_tag<Field>()) declared = true;
-                });
-            }
-            if (!declared) return;
-            // Field is either a data member or a nullary const method -- the
-            // same two shapes member_class/member_value accept everywhere else.
-            if constexpr (std::is_member_object_pointer_v<decltype(Field)>) {
-                if (o.*Field == value) out.push_back(&o);
-            } else {
-                if ((o.*Field)() == value) out.push_back(&o);
-            }
-        });
-        return out;
-    }
+        const member_value_t<decltype(Field)>& value) const;
 
     /// View-returning form of find_by_scan_field.
     template <auto Field>
@@ -945,21 +1032,10 @@ public:
     /// nothing matches -- or if the field was never declared cached (an
     /// undeclared field is invisible to this index, same as find_by_key).
     /// Result order is unspecified (index order, not insertion order).
+    /// Defined out-of-line (after Model) -- see find_by_scan_field's comment.
     template <auto Field>
     std::vector<const member_class_t<decltype(Field)>*> find_by_cached_field(
-        const member_value_t<decltype(Field)>& value) const {
-        using ClassT = member_class_t<decltype(Field)>;
-        std::vector<const ClassT*> out;
-        if (!root_) return out;
-        auto it = root_->by_cached_field.find(field_tag<Field>());
-        if (it == root_->by_cached_field.end()) return out;
-        const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(to_field_key(value));
-        if (!bucket) return out;
-        bucket->for_each([&](Id id) {
-            if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
-        });
-        return out;
-    }
+        const member_value_t<decltype(Field)>& value) const;
 
     /// View-returning form of find_by_cached_field.
     template <auto Field>
@@ -1009,14 +1085,10 @@ public:
     /// cached or not -- for one queried often enough to be worth an index,
     /// declare it in define_cached_references() and use
     /// find_cached_referrers instead.
+    /// Defined out-of-line (after Model) -- see find_by_scan_field's comment.
     template <auto Field, class F>
     void for_each_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
-                           F&& f) const {
-        using ClassT = member_class_t<decltype(Field)>;
-        for_each<ClassT>([&](const ClassT& o) {
-            if ((o.*Field).raw() == target.raw()) f(o);
-        });
-    }
+                           F&& f) const;
 
     /// Same scan as for_each_referrer, collected into a vector.
     template <auto Field>
@@ -1044,21 +1116,10 @@ public:
     /// otherwise, same "undeclared is invisible" rule as find_by_cached_field
     /// (there is no silent fallback to the scan; call find_referrers by name
     /// for that). Named the same way: `s.find_cached_referrers<&Order::account>(acct)`.
+    /// Defined out-of-line (after Model) -- see find_by_scan_field's comment.
     template <auto Field>
     std::vector<const member_class_t<decltype(Field)>*> find_cached_referrers(
-        Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
-        using ClassT = member_class_t<decltype(Field)>;
-        std::vector<const ClassT*> out;
-        if (!root_) return out;
-        auto it = root_->by_cached_reference.find(field_tag<Field>());
-        if (it == root_->by_cached_reference.end()) return out;
-        const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target.raw());
-        if (!bucket) return out;
-        bucket->for_each([&](Id id) {
-            if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
-        });
-        return out;
-    }
+        Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
 
     /// View-returning form of find_cached_referrers.
     template <auto Field>
@@ -1158,6 +1219,17 @@ private:
             });
         }
     }
+
+    /// Forwards to the OWNING Model's Model::record_field_lookup(), if this
+    /// Snapshot has an owner (a default-constructed Snapshot's lease_ is
+    /// null, and never reaches any of the four call sites that use this --
+    /// each already returns early on `!root_`, which is null together with
+    /// lease_). Requires the same "must not outlive its Model" precondition
+    /// every other Snapshot method already carries -- lease_ already holds
+    /// this same Model* for release_version() (see Lease), so this adds no
+    /// new lifetime requirement. Defined out-of-line: Model must be a
+    /// complete type to call through lease_->m.
+    void record_field_lookup(const std::type_info& type, const void* field, bool cached) const;
 
     std::shared_ptr<const Root> root_;  ///< the immutable version everything above reads;
                                         ///< shared with the Model and other snapshots
@@ -1628,6 +1700,29 @@ public:
     /// The minimum key is the reclamation watermark. Not for production use.
     std::vector<std::pair<std::uint64_t, int>> debug_live_versions() const;
 
+    /// Every field looked up at least once via find_by_scan_field/
+    /// find_by_cached_field/for_each_referrer/find_referrers/
+    /// find_cached_referrers, for the life of this Model -- see
+    /// Model::lookup_diagnostics(). `stats` is a direct, unformatted copy of
+    /// Model's own internal counters (the atomics read once, into plain
+    /// values -- nothing here is live or updates after the copy): no
+    /// string work happens until to_string() actually needs one, which is
+    /// the only consumer that does. There is no general way in this
+    /// project to recover a field's OWN name from a bare FieldLookupKey
+    /// (member_class_t/field_tag carry no string) -- to_string() demangles
+    /// `type` for the declaring TYPE's name, and falls back to `field`'s
+    /// raw address to disambiguate two looked-up fields on the same type
+    /// that were never given a name (see FieldKeyReader::key()/
+    /// RefIndexReader::index()'s own `name` parameter).
+    class LookupDiagnostics {
+    public:
+        std::unordered_map<FieldLookupKey, LookupCounts, FieldLookupKeyHash> stats;
+
+        /// Human-readable table, sorted by total calls (descending) so the
+        /// fields that matter most for a caching decision sort to the top.
+        std::string to_string() const;
+    };
+
     /// A point-in-time readout of internal state, for observability and
     /// debugging -- nothing here is part of the model's published data, and
     /// nothing here is versioned. See diagnostics()'s own doc comment for
@@ -1696,6 +1791,61 @@ public:
     /// a diagnostics call should never hold up a live commit for longer than
     /// copying one of these sections takes.
     Diagnostics diagnostics() const;
+
+    /// Records one call to a cached-or-not field-lookup function -- called
+    /// only from Snapshot::find_by_scan_field/find_by_cached_field/
+    /// for_each_referrer/find_cached_referrers (via Snapshot::
+    /// record_field_lookup), never directly. Public because Snapshot is not
+    /// a friend and there is no reason to make it one for this: the method
+    /// is safe to call from anywhere, on any live Model, from any thread.
+    ///
+    /// One atomic increment per call, globally visible immediately -- no
+    /// per-thread staging and no explicit flush step, unlike an earlier
+    /// design this replaced: that one kept counts in a thread_local map so
+    /// the actual lookup call never touched an atomic, but a count from a
+    /// thread that never called flush_lookup_stats() itself was invisible to
+    /// every OTHER thread's diagnostics() call, indefinitely -- wrong for
+    /// "how has this Model been used, across every thread, for its whole
+    /// life," which is the actual question this exists to answer.
+    ///
+    /// `type` is `typeid(ClassT)` at the call site -- a stable, process-wide
+    /// address (see FieldLookupKeyHash) -- deliberately NOT demangled here:
+    /// that string work happens only in lookup_diagnostics()/
+    /// LookupDiagnostics::to_string(), which run rarely, off this path. The
+    /// lock taken here is a std::shared_mutex, held SHARED for the
+    /// (steady-state, after the first call for any given field) case where
+    /// the entry already exists, and exclusively only to insert a field
+    /// never seen before on this Model -- see the .cpp for why that split
+    /// is safe.
+    void record_field_lookup(const std::type_info& type, const void* field, bool cached) const;
+
+    /// This field's cached-vs-uncached call counts, for the life of this
+    /// Model -- zero if Field was never looked up via find_by_scan_field/
+    /// find_by_cached_field/for_each_referrer/find_referrers/
+    /// find_cached_referrers. The direct way to ask "is define_cached_
+    /// fields()/define_cached_references() paying for itself on THIS field"
+    /// without needing lookup_diagnostics()'s enumerate-everything list.
+    template <auto Field>
+    LookupCounts lookup_stats() const {
+        using ClassT = member_class_t<decltype(Field)>;
+        return lookup_stats_for(typeid(ClassT), field_tag<Field>());
+    }
+
+    /// Untyped body of lookup_stats<Field>() -- also what lookup_diagnostics()
+    /// builds its report from.
+    LookupCounts lookup_stats_for(const std::type_info& type, const void* field) const;
+
+    /// Every field looked up at least once, for the life of this Model, each
+    /// labeled with its declaring type's demangled name (see
+    /// record_field_lookup's comment on why demangling happens here and
+    /// nowhere hotter). Order is unspecified; LookupDiagnostics::to_string()
+    /// sorts it for display. Deliberately NOT part of Model::Diagnostics/
+    /// diagnostics(): that call is documented as a bounded, point-in-time
+    /// snapshot of a handful of small, fixed-size counters, and this is an
+    /// unbounded, separately-locked (field_lookup_mu_) collection that can
+    /// grow for the life of the Model -- folding it in would make every
+    /// diagnostics() call pay for a query nobody asked for.
+    LookupDiagnostics lookup_diagnostics() const;
 
 private:
     friend struct Snapshot::Lease;
@@ -1934,6 +2084,30 @@ private:
     std::vector<std::shared_ptr<Subscription>> subs_;  ///< every live subscriber; shared_ptr so a
                                                        ///< subscriber outliving shutdown() is safe
 
+    // ---- field lookup stats -------------------------------------------------
+    // Entirely independent of everything above: not touched by try_commit(),
+    // not part of published state, never read back into a decision the model
+    // itself makes. See record_field_lookup()'s doc comment for the design
+    // (a shared_mutex, held shared on the steady-state path) and why it
+    // replaced an earlier thread_local-plus-flush design.
+
+    // FieldLookupKey/FieldLookupKeyHash live at namespace scope, not here --
+    // see FieldLookupKey's own doc comment for why.
+    struct FieldLookupCounters {
+        std::atomic<std::uint64_t> cached{0};
+        std::atomic<std::uint64_t> uncached{0};
+    };
+    mutable std::shared_mutex field_lookup_mu_;  ///< guards field_lookup_counts_'s STRUCTURE
+                                                 ///< only (inserting a field never seen before
+                                                 ///< on this Model) -- the atomics inside an
+                                                 ///< entry already present are updated with
+                                                 ///< only a SHARED lock held, so every call
+                                                 ///< after the first-ever one for a given field
+                                                 ///< contends with inserts only, never with
+                                                 ///< other readers.
+    mutable std::unordered_map<FieldLookupKey, FieldLookupCounters, FieldLookupKeyHash>
+        field_lookup_counts_;
+
     // ---- background reaper --------------------------------------------------
     // Retired objects are handed to a dedicated thread rather than freed inline
     // in try_commit(), so a large cascade never stalls a commit, and destructors
@@ -2025,6 +2199,87 @@ private:
     std::vector<std::function<void()>> undo_;
     std::vector<const ObjectBase*> txn_created_;
 };
+
+// ---------------------------------------------------------------------------
+// Snapshot lookup functions -- defined here, not in the class body, because
+// each needs Model::record_field_lookup(), and Model isn't a complete type
+// until the closing brace above. Snapshot::record_field_lookup ITSELF is
+// defined in model.cpp, not here: it also needs Snapshot::Lease complete,
+// and Lease's own definition lives there, not in this header (see Lease's
+// forward declaration).
+// ---------------------------------------------------------------------------
+
+template <auto Field>
+std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_by_scan_field(
+    const member_value_t<decltype(Field)>& value) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    std::vector<const ClassT*> out;
+    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    bool checked = false, declared = false;
+    for_each<ClassT>([&](const ClassT& o) {
+        if (!checked) {
+            // define_scan_fields() is static per type: ask the first
+            // object once, on behalf of the whole scan.
+            checked = true;
+            o.each_scan_field([&](const void* field, std::string) {
+                if (field == field_tag<Field>()) declared = true;
+            });
+        }
+        if (!declared) return;
+        // Field is either a data member or a nullary const method -- the
+        // same two shapes member_class/member_value accept everywhere else.
+        if constexpr (std::is_member_object_pointer_v<decltype(Field)>) {
+            if (o.*Field == value) out.push_back(&o);
+        } else {
+            if ((o.*Field)() == value) out.push_back(&o);
+        }
+    });
+    return out;
+}
+
+template <auto Field>
+std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_by_cached_field(
+    const member_value_t<decltype(Field)>& value) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    std::vector<const ClassT*> out;
+    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    if (!root_) return out;
+    auto it = root_->by_cached_field.find(field_tag<Field>());
+    if (it == root_->by_cached_field.end()) return out;
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(to_field_key(value));
+    if (!bucket) return out;
+    bucket->for_each([&](Id id) {
+        if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
+    });
+    return out;
+}
+
+template <auto Field, class F>
+void Snapshot::for_each_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                 F&& f) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    for_each<ClassT>([&](const ClassT& o) {
+        if ((o.*Field).raw() == target.raw()) f(o);
+    });
+}
+
+template <auto Field>
+std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_cached_referrers(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    std::vector<const ClassT*> out;
+    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    if (!root_) return out;
+    auto it = root_->by_cached_reference.find(field_tag<Field>());
+    if (it == root_->by_cached_reference.end()) return out;
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target.raw());
+    if (!bucket) return out;
+    bucket->for_each([&](Id id) {
+        if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
+    });
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // Multi-writer commit results

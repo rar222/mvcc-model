@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -2394,7 +2396,8 @@ TEST(estimate_changes_with_cascades_never_races_a_concurrently_hammering_try_com
 // sees are the SAME set of (id, kind, tag) triples. A pure remove() (no
 // creates) keeps every id real on both sides, so this is an exact
 // comparison, not just a size check.
-TEST(estimate_changes_with_cascades_matches_the_pre_commit_hooks_changeset_when_nothing_else_happened) {
+TEST(
+    estimate_changes_with_cascades_matches_the_pre_commit_hooks_changeset_when_nothing_else_happened) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o = make_order(m, "O1", a);
@@ -2430,7 +2433,8 @@ TEST(estimate_changes_with_cascades_matches_the_pre_commit_hooks_changeset_when_
 // before the original transaction actually commits, the estimate (computed
 // against a now-stale base()) and the real changeset PreCommitFn sees
 // diverge -- the estimate is a strict superset of what actually happened.
-TEST(estimate_changes_with_cascades_and_the_pre_commit_hooks_changeset_diverge_after_a_reference_changes) {
+TEST(
+    estimate_changes_with_cascades_and_the_pre_commit_hooks_changeset_diverge_after_a_reference_changes) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Account> b = make_account(m, "B1");
@@ -2633,7 +2637,7 @@ TEST(removing_a_referenced_local_create_cascades_at_commit_like_a_committed_remo
     o->parent = victim;  // Opt<>: nulled by the cascade, not killed
     const Ref<Order> survivor = txn.create(std::move(o));
     txn.remove(victim);
-    CHECK(!txn.exists(victim));           // masked immediately, like a real remove intent
+    CHECK(!txn.exists(victim));            // masked immediately, like a real remove intent
     CHECK(txn.update(victim) == nullptr);  // and no longer writable
 
     const CommitResult res = m.try_commit(txn);
@@ -2967,6 +2971,220 @@ TEST(diagnostics_retained_commit_history_tracks_the_changelog) {
         CHECK(version <= d.version);
         CHECK(change_count >= std::size_t{1});
     }
+}
+
+// ---------------------------------------------------------------------------
+// Field lookup stats (Model::record_field_lookup / lookup_stats<Field> /
+// lookup_diagnostics / Model::LookupDiagnostics::to_string)
+// ---------------------------------------------------------------------------
+
+TEST(lookup_stats_is_zero_before_the_first_call_for_a_field) {
+    Model m;
+    make_account(m, "A1");
+    const LookupCounts c = m.lookup_stats<&Order::qty>();
+    CHECK_EQ(c.cached_calls, std::uint64_t{0});
+    CHECK_EQ(c.uncached_calls, std::uint64_t{0});
+    CHECK(m.lookup_diagnostics().stats.empty());
+}
+
+// find_by_cached_field/find_by_scan_field share one field (Order::qty is
+// declared in BOTH define_cached_fields() and define_scan_fields()), so
+// this exercises the counts staying INDEPENDENT per family on the same
+// field, not just per field.
+TEST(lookup_stats_counts_cached_and_uncached_calls_independently) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    Snapshot s = m.snapshot();
+
+    (void)s.find_by_cached_field<&Order::qty>(5);
+    (void)s.find_by_cached_field<&Order::qty>(5);
+    (void)s.find_by_cached_field<&Order::qty>(7);  // no match -- still a CALL
+    (void)s.find_by_scan_field<&Order::qty>(5);
+
+    const LookupCounts c = m.lookup_stats<&Order::qty>();
+    CHECK_EQ(c.cached_calls, std::uint64_t{3});
+    CHECK_EQ(c.uncached_calls, std::uint64_t{1});
+}
+
+// find_referrers<Field> is a thin wrapper around for_each_referrer<Field> --
+// the count must land once per CALL to the public API, not once per object
+// for_each_referrer happens to visit internally.
+TEST(lookup_stats_counts_find_referrers_once_not_once_per_visited_object) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a);
+    make_order(m, "O2", a);
+    make_order(m, "O3", a);
+    Snapshot s = m.snapshot();
+
+    const auto found = s.find_referrers<&Order::account>(a);
+    CHECK_EQ(found.size(), std::size_t{3});  // visited three objects...
+    const LookupCounts c = m.lookup_stats<&Order::account>();
+    CHECK_EQ(c.uncached_calls, std::uint64_t{1});  // ...but that is ONE call
+
+    (void)s.find_cached_referrers<&Order::account>(a);
+    CHECK_EQ(m.lookup_stats<&Order::account>().cached_calls, std::uint64_t{1});
+}
+
+// Two DISTINCT Models must not share counts, even for the identical field --
+// each Model's field_lookup_counts_ is its own map, keyed within that Model
+// only.
+TEST(lookup_stats_is_independent_per_model) {
+    Model m1;
+    Model m2;
+    make_account(m1, "A1");
+    make_account(m2, "A1");
+    Snapshot s1 = m1.snapshot();
+    Snapshot s2 = m2.snapshot();
+
+    (void)s1.find_by_scan_field<&Account::name>("A1");
+    (void)s1.find_by_scan_field<&Account::name>("A1");
+
+    CHECK_EQ(m1.lookup_stats<&Account::name>().uncached_calls, std::uint64_t{2});
+    CHECK_EQ(m2.lookup_stats<&Account::name>().uncached_calls, std::uint64_t{0});
+}
+
+// The property the atomic-counter redesign exists for: counts recorded from
+// MANY threads, concurrently, are all visible from whichever thread later
+// calls lookup_stats() -- no per-thread staging, no explicit flush call
+// anywhere in this test.
+TEST(lookup_stats_aggregates_concurrent_calls_from_every_thread_with_no_flush) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+
+    constexpr int kThreads = 8;
+    constexpr int kCallsPerThread = 500;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&m] {
+            Snapshot s = m.snapshot();
+            for (int i = 0; i < kCallsPerThread; ++i) (void)s.find_by_cached_field<&Order::qty>(5);
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    CHECK_EQ(m.lookup_stats<&Order::qty>().cached_calls,
+             static_cast<std::uint64_t>(kThreads) * kCallsPerThread);
+}
+
+TEST(lookup_diagnostics_is_labeled_by_declaring_type) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    Snapshot s = m.snapshot();
+    (void)s.find_by_cached_field<&Order::qty>(5);
+    (void)s.find_by_scan_field<&Order::qty>(9);
+
+    const Model::LookupDiagnostics diag = m.lookup_diagnostics();
+    CHECK_EQ(diag.stats.size(), std::size_t{1});
+    // stats stores a raw type_info pointer, not a demangled name (that only
+    // happens in to_string(), see its own test below) -- so the precise,
+    // non-string way to check "labeled by declaring type" is comparing
+    // type_info directly.
+    const auto it = diag.stats.begin();
+    CHECK(*it->first.type == typeid(Order));
+    CHECK_EQ(it->second.cached_calls, std::uint64_t{1});
+    CHECK_EQ(it->second.uncached_calls, std::uint64_t{1});
+}
+
+TEST(lookup_diagnostics_to_string_is_human_readable) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    Snapshot s = m.snapshot();
+
+    CHECK(m.lookup_diagnostics().to_string().find("none") !=
+          std::string::npos);  // nothing called yet
+
+    (void)s.find_by_cached_field<&Order::qty>(5);
+    (void)s.find_by_cached_field<&Order::qty>(5);
+    (void)s.find_by_scan_field<&Order::qty>(5);
+
+    const std::string report = m.lookup_diagnostics().to_string();
+    // Order::qty is named ("qty") in demo/types.h's define_cached_fields()/
+    // define_scan_fields() -- registered the moment the Order above was
+    // created, well before either lookup call -- so the report shows the
+    // real name instead of falling back to a bare address.
+    CHECK(report.find("Order::qty") != std::string::npos);
+    CHECK(report.find("@") == std::string::npos);  // no address fallback needed
+
+    std::printf("LookupDiagnostics: %s\n", report.c_str());
+
+    // Numbers are column-aligned (right-justified, padded with spaces) for
+    // table readability, so check label-then-eventually-digit rather than
+    // pinning the exact width.
+    auto value_after = [&](const char* label) -> std::string {
+        const auto pos = report.find(label);
+        if (pos == std::string::npos) return {};
+        std::size_t i = pos + std::strlen(label);
+        while (i < report.size() && report[i] == ' ') ++i;
+        const std::size_t start = i;
+        while (i < report.size() && std::isdigit(static_cast<unsigned char>(report[i]))) ++i;
+        return report.substr(start, i - start);
+    };
+    CHECK_EQ(value_after("cached="), std::string("2"));
+    CHECK_EQ(value_after("uncached="), std::string("1"));
+}
+
+namespace {
+/// A cached field declared WITHOUT a name (the third argument to .key<>()
+/// left at its default nullptr) -- isolates the fallback path: naming is
+/// opt-in, so a field nobody named must still work, just less legibly.
+class Unnamed final : public model::Object<Unnamed> {
+public:
+    std::int64_t code = 0;
+    template <class Self>
+    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Unnamed::code>(s.code);  // no name argument
+    }
+};
+}  // namespace
+
+TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
+    Model m;
+    Transaction txn = m.begin();
+    auto u = std::make_unique<Unnamed>();
+    u->code = 7;
+    txn.create(std::move(u));
+    commit_ok(m, txn);
+
+    Snapshot s = m.snapshot();
+    (void)s.find_by_cached_field<&Unnamed::code>(7);
+
+    const std::string report = m.lookup_diagnostics().to_string();
+    CHECK(report.find("Unnamed") != std::string::npos);
+    CHECK(report.find("@") != std::string::npos);  // no name registered -- address shown instead
+    CHECK(report.find("Unnamed::") == std::string::npos);  // no name to append after "::"
+}
+
+// Same named/unnamed split as the two tests above, but through the
+// REFERENCE-field entry point (RefIndexReader::index(), feeding
+// find_cached_referrers/for_each_referrer) rather than the value-field one
+// (FieldKeyReader::key(), feeding find_by_cached_field/find_by_scan_field) --
+// a genuinely different code path in record_field_lookup's callers, and one
+// with a real unnamed field sitting in demo/types.h already: Order::account
+// is named ("account") in define_cached_references(), but Order::parent is
+// declared in define_references() (so cascade/null still work) and
+// deliberately left OUT of define_cached_references() entirely -- see its
+// own comment -- so it never reaches RefIndexReader::index() and has no
+// registered name. Both fields live on the SAME type, which is exactly the
+// disambiguation case FieldStat::field exists for.
+TEST(lookup_diagnostics_shows_names_for_reference_fields_too) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> parent_order = make_order(m, "PARENT", a);
+    make_order(m, "CHILD", a, parent_order);
+    Snapshot s = m.snapshot();
+
+    (void)s.find_cached_referrers<&Order::account>(a);
+    (void)s.for_each_referrer<&Order::parent>(parent_order, [](const Order&) {});
+
+    const std::string report = m.lookup_diagnostics().to_string();
+    CHECK(report.find("Order::account") != std::string::npos);   // named
+    CHECK(report.find("Order::parent") == std::string::npos);    // not named
+    CHECK(report.find("Order @") != std::string::npos);          // falls back to an address instead
 }
 
 // ---------------------------------------------------------------------------

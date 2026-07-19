@@ -4,6 +4,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <iomanip>
+#include <sstream>
 
 #if defined(__GNUC__) || defined(__clang__)
 #include <cxxabi.h>
@@ -76,6 +78,18 @@ struct Snapshot::Lease {
 
     ~Lease() { m->release_version(v); }
 };
+
+// Needs Lease complete (the `lease_->m` access) -- see model.h's forward
+// declaration of Lease and this function's own doc comment there. `lease_`
+// is null only for a default-constructed Snapshot, which none of this
+// method's four callers (find_by_scan_field/find_by_cached_field/
+// for_each_referrer/find_cached_referrers) can reach without also failing
+// their own `!root_` check first -- but checking here too costs nothing and
+// doesn't rely on call-site discipline to stay safe.
+void Snapshot::record_field_lookup(const std::type_info& type, const void* field,
+                                   bool cached) const {
+    if (lease_) lease_->m->record_field_lookup(type, field, cached);
+}
 
 // ---------------------------------------------------------------------------
 // Subscription
@@ -934,6 +948,99 @@ Model::Diagnostics Model::diagnostics() const {
     }
 
     return diag;
+}
+
+// ---------------------------------------------------------------------------
+// Field lookup stats
+// ---------------------------------------------------------------------------
+
+void Model::record_field_lookup(const std::type_info& type, const void* field,
+                                bool cached) const {
+    const FieldLookupKey key{&type, field};
+    {
+        // Steady-state path: every call after the first-ever one for this
+        // (type, field) pair on this Model takes only a SHARED lock --
+        // concurrent with every other reader, contending only with the
+        // (rare) insert path below.
+        std::shared_lock rlk(field_lookup_mu_);
+        if (auto it = field_lookup_counts_.find(key); it != field_lookup_counts_.end()) {
+            (cached ? it->second.cached : it->second.uncached)
+                .fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    // First-ever lookup of this field on this Model: the shared lock above
+    // found nothing, so take the exclusive lock to insert it. operator[]
+    // default-constructs a fresh FieldLookupCounters if another thread lost
+    // this same race and inserted first -- either way, `field_lookup_counts_
+    // [key]` after this line is THE entry for `key`, inserted exactly once.
+    std::unique_lock wlk(field_lookup_mu_);
+    FieldLookupCounters& c = field_lookup_counts_[key];
+    (cached ? c.cached : c.uncached).fetch_add(1, std::memory_order_relaxed);
+}
+
+LookupCounts Model::lookup_stats_for(const std::type_info& type, const void* field) const {
+    std::shared_lock lk(field_lookup_mu_);
+    auto it = field_lookup_counts_.find(FieldLookupKey{&type, field});
+    if (it == field_lookup_counts_.end()) return {};
+    return {it->second.cached.load(std::memory_order_relaxed),
+           it->second.uncached.load(std::memory_order_relaxed)};
+}
+
+Model::LookupDiagnostics Model::lookup_diagnostics() const {
+    LookupDiagnostics report;
+    std::shared_lock lk(field_lookup_mu_);
+    report.stats.reserve(field_lookup_counts_.size());
+    for (const auto& [key, counters] : field_lookup_counts_) {
+        report.stats.emplace(key, LookupCounts{counters.cached.load(std::memory_order_relaxed),
+                                               counters.uncached.load(std::memory_order_relaxed)});
+    }
+    return report;
+}
+
+std::string Model::LookupDiagnostics::to_string() const {
+    // A plain vector copy for sorting -- unordered_map itself can't be
+    // sorted in place. This is also the only place demangling `type` (a
+    // real string-allocating, non-trivial operation) ever happens: `stats`
+    // itself stores nothing but a type_info pointer, a field_tag address,
+    // and two integers, so building a LookupDiagnostics never pays for a
+    // name nobody asked to print yet.
+    std::vector<std::pair<FieldLookupKey, LookupCounts>> sorted(stats.begin(), stats.end());
+    std::sort(sorted.begin(), sorted.end(),
+             [](const auto& a, const auto& b) {
+                 return (a.second.cached_calls + a.second.uncached_calls) >
+                       (b.second.cached_calls + b.second.uncached_calls);
+             });
+
+    std::ostringstream out;
+    out << "Field lookup stats (cached vs uncached), " << sorted.size() << " field(s) recorded:\n";
+    if (sorted.empty()) out << "  (none -- no lookup function has been called yet)\n";
+    for (const auto& [key, counts] : sorted) {
+        const std::uint64_t total = counts.cached_calls + counts.uncached_calls;
+        const double cached_pct =
+            total > 0 ? 100.0 * static_cast<double>(counts.cached_calls) / static_cast<double>(total)
+                     : 0.0;
+        // Prefer the real field name (opted in via FieldKeyReader::key()/
+        // RefIndexReader::index() -- see detail::register_field_name_once)
+        // over the address: a real name is a strictly better disambiguator
+        // than a hex address, so once we have one there's no reason to show
+        // both. A field never given a name falls back to the address, same
+        // as before this option existed.
+        const std::string field_name = detail::field_name_of(key.field);
+        std::ostringstream label;
+        label << detail::demangle_type_name(*key.type);
+        if (!field_name.empty()) {
+            label << "::" << field_name;
+        } else {
+            label << " @" << std::hex << std::setw(12) << std::setfill('0')
+                  << reinterpret_cast<std::uintptr_t>(key.field) << std::dec << std::setfill(' ');
+        }
+        out << "  " << std::left << std::setw(34) << label.str() << std::right
+            << "  cached=" << std::setw(8) << counts.cached_calls
+            << "  uncached=" << std::setw(8) << counts.uncached_calls << "  (" << std::fixed
+            << std::setprecision(1) << cached_pct << "% cached)\n";
+    }
+    return out.str();
 }
 
 // ---------------------------------------------------------------------------
