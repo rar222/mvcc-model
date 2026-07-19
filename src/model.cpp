@@ -862,6 +862,80 @@ std::vector<std::pair<std::uint64_t, int>> Model::debug_live_versions() const {
     return {live_.begin(), live_.end()};
 }
 
+Model::Diagnostics Model::diagnostics() const {
+    Diagnostics diag;
+    diag.transactions_begun = next_txn_id_.load(std::memory_order_relaxed) - 1;
+
+    {
+        std::lock_guard lk(commit_mu_);
+        diag.version = version_;
+
+        diag.live_by_type.reserve(by_type_.size());
+        for (const auto& [tag, ids] : by_type_) {
+            (void)tag;  // TypeTag carries no name of its own -- see TypeCount's doc comment
+            Diagnostics::TypeCount tc;
+            tc.live_count = ids.size();
+            if (tc.live_count > 0) {
+                Id sample;
+                bool found = false;
+                ids.for_each([&](const Id& id) {
+                    if (!found) {
+                        sample = id;
+                        found = true;
+                    }
+                });
+                const ObjectBase* obj = peek(sample);
+                tc.type_name = obj ? obj->type() : "<no live object of this type>";
+            } else {
+                tc.type_name = "<no live object of this type>";
+            }
+            diag.live_object_count += tc.live_count;
+            diag.live_by_type.push_back(std::move(tc));
+        }
+
+        diag.chunk_count = spine_.size();
+        diag.slots_allocated = next_slot_;
+        diag.slots_free = free_slots_.size();
+        diag.slots_exhausted = exhausted_slots_;
+
+        diag.key_indexed_fields = by_field_.size();
+        diag.cached_value_indexed_fields = by_cached_field_.size();
+        diag.cached_reference_indexed_fields = by_cached_reference_.size();
+
+        diag.reverse_index_targets = referrers_.size();
+        for (const auto& [slot, edges] : referrers_) {
+            (void)slot;
+            diag.reverse_index_edges += edges.size();
+        }
+
+        diag.pre_transactions_hook_installed = static_cast<bool>(pre_transactions_);
+        diag.pre_commit_hook_installed = static_cast<bool>(pre_commit_);
+
+        diag.reap_backlog = retired_pending_.load(std::memory_order_relaxed) + retired_.size();
+
+        diag.retained_commit_history.reserve(changelog_.size());
+        for (const auto& entry : changelog_)
+            diag.retained_commit_history.emplace_back(entry.version, entry.changes.size());
+    }
+
+    {
+        std::lock_guard lk(ver_mu_);
+        diag.live_snapshot_versions = live_.size();
+        for (const auto& [ver, refcount] : live_) {
+            (void)ver;
+            diag.live_snapshot_refs += static_cast<std::size_t>(refcount);
+        }
+        diag.reclamation_watermark = live_.empty() ? diag.version : live_.begin()->first;
+    }
+
+    {
+        std::lock_guard lk(subs_mu_);
+        diag.subscriber_count = subs_.size();
+    }
+
+    return diag;
+}
+
 // ---------------------------------------------------------------------------
 // try_commit() internals
 // ---------------------------------------------------------------------------

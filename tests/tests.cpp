@@ -2886,6 +2886,90 @@ TEST(changelog_entries_are_pruned_once_no_open_transaction_or_snapshot_needs_the
 }
 
 // ---------------------------------------------------------------------------
+// Model::diagnostics()
+// ---------------------------------------------------------------------------
+
+TEST(diagnostics_reports_object_population_storage_and_indexes) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+
+    const Model::Diagnostics d = m.diagnostics();
+    CHECK_EQ(d.version, m.current_version());
+    CHECK_EQ(d.live_object_count, std::size_t{2});
+    CHECK_EQ(d.live_by_type.size(), std::size_t{2});
+    for (const auto& tc : d.live_by_type) {
+        CHECK_EQ(tc.live_count, std::size_t{1});  // one Account, one Order
+        CHECK(tc.type_name.find("Account") != std::string::npos ||
+              tc.type_name.find("Order") != std::string::npos);
+    }
+    CHECK(d.chunk_count >= std::size_t{1});
+    CHECK(d.slots_allocated >= std::size_t{2});
+
+    // Account::name (define_keys), Order::computed_key (define_keys).
+    CHECK_EQ(d.key_indexed_fields, std::size_t{2});
+    // Order::qty, Order::computed_key (define_cached_fields).
+    CHECK_EQ(d.cached_value_indexed_fields, std::size_t{2});
+    // Order::account (define_cached_references) -- parent is deliberately uncached.
+    CHECK_EQ(d.cached_reference_indexed_fields, std::size_t{1});
+
+    // referrers_ tracks every define_references() field regardless of caching:
+    // one Order.account edge into the Account it was created with.
+    CHECK_EQ(d.reverse_index_targets, std::size_t{1});
+    CHECK_EQ(d.reverse_index_edges, std::size_t{1});
+}
+
+TEST(diagnostics_reports_live_snapshot_pins_and_the_reclamation_watermark) {
+    Model m;
+    make_account(m, "A1");
+
+    const Model::Diagnostics before_pin = m.diagnostics();
+    CHECK_EQ(before_pin.live_snapshot_versions, std::size_t{0});
+
+    {
+        Snapshot pin = m.snapshot();
+        const Model::Diagnostics pinned = m.diagnostics();
+        CHECK_EQ(pinned.live_snapshot_versions, std::size_t{1});
+        CHECK(pinned.live_snapshot_refs >= std::size_t{1});
+        CHECK_EQ(pinned.reclamation_watermark, pin.version());
+    }
+}
+
+TEST(diagnostics_reports_installed_hooks_and_subscriber_count) {
+    Model m;
+    CHECK(!m.diagnostics().pre_commit_hook_installed);
+    CHECK(!m.diagnostics().pre_transactions_hook_installed);
+    CHECK_EQ(m.diagnostics().subscriber_count, std::size_t{0});
+
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return true; });
+    m.set_pre_transactions([](Model&, const Transaction&) {});
+    auto sub = m.subscribe();
+
+    const Model::Diagnostics d = m.diagnostics();
+    CHECK(d.pre_commit_hook_installed);
+    CHECK(d.pre_transactions_hook_installed);
+    CHECK_EQ(d.subscriber_count, std::size_t{1});
+}
+
+// Mirrors changelog_entries_are_pruned_once_no_open_transaction_or_snapshot_needs_them
+// above: retained_commit_history is a lightweight (version, change count) summary
+// of the SAME changelog_ that test exercises, so it should track debug_changelog_size()
+// exactly, entry for entry.
+TEST(diagnostics_retained_commit_history_tracks_the_changelog) {
+    Model m;
+    make_account(m, "A1");
+    make_account(m, "A2");
+    make_account(m, "A3");
+
+    const Model::Diagnostics d = m.diagnostics();
+    CHECK_EQ(d.retained_commit_history.size(), m.debug_changelog_size());
+    for (const auto& [version, change_count] : d.retained_commit_history) {
+        CHECK(version <= d.version);
+        CHECK(change_count >= std::size_t{1});
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bulk load (begin_bulk() / commit_bulk())
 // ---------------------------------------------------------------------------
 //

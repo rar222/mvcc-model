@@ -1628,6 +1628,75 @@ public:
     /// The minimum key is the reclamation watermark. Not for production use.
     std::vector<std::pair<std::uint64_t, int>> debug_live_versions() const;
 
+    /// A point-in-time readout of internal state, for observability and
+    /// debugging -- nothing here is part of the model's published data, and
+    /// nothing here is versioned. See diagnostics()'s own doc comment for
+    /// exactly what each field means and how stale it can be.
+    struct Diagnostics {
+        std::uint64_t version = 0;              ///< == current_version() at the moment of the call
+        std::uint64_t transactions_begun = 0;    ///< next_txn_id_ - 1: Transactions minted so far via
+                                                 ///< begin(), committed or not -- NOT a commit count
+
+        /// Live object count for one type, plus its demangled name. The name
+        /// comes from a live representative object (ObjectBase::type()) --
+        /// TypeTag alone (see model::TypeTag) carries no name, so a type
+        /// whose every object has since been deleted (its by_type_ entry
+        /// still exists, just empty) has no representative to name it.
+        struct TypeCount {
+            std::string type_name;  ///< "<no live object of this type>" if live_count == 0
+            std::size_t live_count = 0;
+        };
+        std::size_t live_object_count = 0;  ///< sum of live_by_type[*].live_count
+        std::vector<TypeCount> live_by_type;
+
+        std::size_t chunk_count = 0;      ///< spine_.size() -- allocated Chunks, kChunkSize slots each
+        std::size_t slots_allocated = 0;  ///< next_slot_ -- high-water mark of ever-allocated slots
+        std::size_t slots_free = 0;       ///< free_slots_.size() -- recycled slots ready for reuse
+        std::size_t slots_exhausted = 0;  ///< == exhausted_slots()
+
+        std::size_t key_indexed_fields = 0;               ///< by_field_.size()
+        std::size_t cached_value_indexed_fields = 0;       ///< by_cached_field_.size()
+        std::size_t cached_reference_indexed_fields = 0;   ///< by_cached_reference_.size()
+        std::size_t reverse_index_targets = 0;  ///< referrers_.size() -- slots with >=1 referrer
+        std::size_t reverse_index_edges = 0;    ///< total referrer edges, summed across all targets
+
+        bool pre_transactions_hook_installed = false;  ///< see set_pre_transactions()
+        bool pre_commit_hook_installed = false;        ///< see set_pre_commit()
+
+        std::size_t live_snapshot_versions = 0;   ///< live_.size() -- distinct pinned versions
+        std::size_t live_snapshot_refs = 0;       ///< total Snapshots + open Transaction bases pinned
+        std::uint64_t reclamation_watermark = 0;  ///< oldest version anything still needs;
+                                                  ///< == version (above) if nothing is pinned
+        std::size_t reap_backlog = 0;             ///< == retired_pending()
+
+        std::size_t subscriber_count = 0;  ///< live Subscriptions (see subscribe())
+
+        /// One (version, change count) pair per commit still retained for
+        /// try_commit()'s id-overlap conflict check -- NOT the changes
+        /// themselves, so this stays cheap regardless of how large any one
+        /// commit was. Oldest first. Pruned the same way changelog_ is
+        /// (prune_changelog): once no live Transaction base / Snapshot could
+        /// still need an entry, it's gone -- so seeing fewer entries on a
+        /// later call is normal, not a bug.
+        std::vector<std::pair<std::uint64_t, std::size_t>> retained_commit_history;
+    };
+
+    /// Builds a Diagnostics readout. Not a hot-path call: takes commit_mu_
+    /// long enough to copy writer-private state (spine/index sizes,
+    /// referrers_, changelog_ summaries), THEN (fully released first)
+    /// ver_mu_ for live_, THEN (also released first) subs_mu_ for the
+    /// subscriber count -- one at a time, never nested, the same
+    /// "sequential, not nested" trick release_version() uses to stay outside
+    /// the commit_mu_ -> ver_mu_ -> reap_mu_ order instead of risking a new
+    /// cycle (invariant 10). Because the three sections are three separate
+    /// critical sections rather than one held together, the result is an
+    /// approximation, not a single atomic instant -- e.g. `version` and
+    /// `live_snapshot_versions` could each reflect a slightly different
+    /// moment if a commit lands in between. That's the right tradeoff here:
+    /// a diagnostics call should never hold up a live commit for longer than
+    /// copying one of these sections takes.
+    Diagnostics diagnostics() const;
+
 private:
     friend struct Snapshot::Lease;
     friend class Transaction;
@@ -1858,8 +1927,10 @@ private:
     std::map<std::uint64_t, int>
         live_;  ///< live snapshot (incl. txn base) versions; min = watermark
 
-    std::mutex subs_mu_;                              ///< guards subs_ only; publish copies the
+    mutable std::mutex subs_mu_;                       ///< guards subs_ only; publish copies the
                                                       ///< list out so pushes run without it held
+                                                      ///< (mutable: diagnostics() locks it from a
+                                                      ///< const method, same as commit_mu_/ver_mu_)
     std::vector<std::shared_ptr<Subscription>> subs_;  ///< every live subscriber; shared_ptr so a
                                                        ///< subscriber outliving shutdown() is safe
 
