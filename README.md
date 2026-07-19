@@ -200,3 +200,99 @@ Known scope boundaries, not bugs (see [CLAUDE.md](CLAUDE.md)): object-write-set 
 full serializable), `try_commit()`'s apply step is fully serialized behind one mutex, and the
 reverse index (`referrers_`) still scans linearly per target — same as the single-writer
 sibling, unaffected by this redesign.
+
+## Glossary
+
+Every abbreviation used in this codebase's comments, docs, and identifiers, what it stands
+for, what it means specifically in this project, and where to find it.
+
+**Core types** (spelled out once here, not re-abbreviated below):
+
+- **`Id`** — short for Identifier: a `{index, generation}` pair naming a slot in the store.
+  Never dangles silently — a stale generation is detected, not aliased. `include/model/model.h`
+- **`Ref<T>`** — short for Reference: a non-nullable, 8-byte handle to a `T` that always
+  resolves inside any snapshot containing its holder; deleting the target cascades. See
+  "Using it" above. `include/model/model.h`
+- **`Opt<T>`** — short for Optional: the nullable counterpart to `Ref<T>`; deleting the
+  target nulls the field instead of cascading. See "Using it" above. `include/model/model.h`
+
+**Concurrency & reclamation design:**
+
+- **MVCC** — Multi-Version Concurrency Control. The project's whole paradigm and the source
+  of its name: readers see an immutable, versioned snapshot instead of taking a lock; writers
+  build a private overlay and publish a new version atomically. Project-wide; see `DESIGN.md`.
+- **OCC** — Optimistic Concurrency Control. The write strategy: a `Transaction` builds
+  entirely locally with no lock taken, then `try_commit()` validates it once against the
+  latest committed state instead of locking upfront. Specifically **object-write-set OCC**
+  (validates only touched ids and every `Ref<>`'s target) rather than full serializable OCC —
+  a documented scope boundary, not a gap. `README.md`, `CLAUDE.md`, `DESIGN.md`.
+- **COW** — Copy-On-Write. Published state (`Root`, its `Chunk`s) is cloned only when a
+  commit actually dirties it; everything else stays shared, byte-for-byte, between versions —
+  why publishing a new snapshot is cheap. `DESIGN.md`, `src/model.cpp`.
+- **RCU** — Read-Copy-Update. Loosely describes the model's epoch/version-watermark
+  reclamation: an object is freed only once no live snapshot's pinned version could still see
+  it — reclamation by tracking who might still be reading, not by refcounting. `DESIGN.md`
+  ("version-based (epoch/RCU) reclamation").
+- **RAII** — Resource Acquisition Is Initialization. `Snapshot`'s version pin/release:
+  pinning happens in the constructor, releasing (and waking the reaper) happens in the
+  destructor, so a `Snapshot` going out of scope is what tells the reaper a version may now
+  be reclaimable. `include/model/model.h`.
+- **BFS** — Breadth-First Search. The traversal cascade delete uses to walk the reverse
+  index (`referrers_`) outward from a removed id, resolved once inside `try_commit()`'s
+  serialized apply phase — never eagerly. Its visited-set is what keeps it safe against
+  reference cycles (see DAG, below). `Model::remove_raw` in `src/model.cpp`; `CLAUDE.md`
+  invariant 8.
+- **DAG** — Directed Acyclic Graph. Called out as something the non-nullable `Ref<>`
+  reference graph is explicitly **not** guaranteed to be: a same-transaction pre-minted local
+  id can create a genuine `Ref<>` cycle, which the cascade BFS's visited-set has to survive.
+  `tests/tests.cpp` (the `Link` type and its cascade-cycle tests).
+
+**Hot-path tricks** (see CLAUDE.md's "Things that look like improvements but are not"):
+
+- **CRTP** — Curiously Recurring Template Pattern. `Object<Derived>` — the base every user
+  type derives from (`class Order : public model::Object<Order>`) — uses it to give each
+  type its `TypeTag` and default `clone()`/reference-visiting machinery without a
+  vtable-heavy type hierarchy. `include/model/model.h`.
+- **RTTI** — Run-Time Type Information. Deliberately avoided on the read path: the
+  hand-rolled `TypeTag` (one virtual call plus a pointer compare) replaces what
+  `dynamic_cast`/`typeid`-based downcasting would cost at millions of calls/sec.
+  `include/model/model.h`; `CLAUDE.md` ("Why a hand-rolled TypeTag instead of dynamic_cast?").
+- **ABI** — Application Binary Interface. Used only for diagnostic type-name demangling:
+  Itanium-ABI (GCC/Clang) mangled names are demangled for readable diagnostics; MSVC's names
+  are already readable and pass through unchanged. `include/model/model.h`
+  (`demangle_type_name`).
+- **FNV-1a** — Fowler–Noll–Vo hash, variant 1a. The string-hashing algorithm behind
+  `StringHash`, used to key `PersistentMap`/`PersistentSet` instances on real `std::string`
+  keys (e.g. `Root::by_field`). `include/model/persistent_map.h`.
+- **HAMT** — Hash Array Mapped Trie. The from-scratch persistent (immutable,
+  structure-sharing) map/set backing the model's secondary indexes — deriving a new version
+  path-copies only O(log32 n) nodes instead of the whole index. `include/model/persistent_map.h`.
+
+**Tooling & build:**
+
+- **ASan** — AddressSanitizer. One of the two sanitizer presets that must stay clean before
+  any change to the model counts as done (see `CLAUDE.md`). Catches use-after-free — the
+  central risk of a design that frees objects by version watermark instead of refcounting.
+  Also enables UBSan. `CMakeLists.txt`, `CMakePresets.json` (`asan` preset).
+- **TSan** — ThreadSanitizer. The other mandatory sanitizer preset. Catches data races, and
+  matters more here than in the single-writer sibling project because it's the one that
+  actually exercises concurrent `try_commit()` calls racing each other. `CMakeLists.txt`,
+  `CMakePresets.json` (`tsan` preset).
+- **UBSan** — UndefinedBehaviorSanitizer. Bundled into the `asan` preset (`MODEL_ASAN` turns
+  on both). `CMakeLists.txt`.
+- **NDEBUG** — the standard C++ macro that disables `assert()`. Deliberately **not** defined
+  in the default preset: `Snapshot::resolve()`'s assert is the tripwire for the model's
+  central invariant (invariant 1), so disabling it would hide the exact bug class the design
+  most needs to catch. `CLAUDE.md`.
+- **GCC / MSVC** — GNU Compiler Collection / Microsoft Visual C++. The compilers this
+  project targets (GCC 11+, Clang 14+, MSVC 19.30+, for C++20 support). `README.md` (Build
+  section).
+
+**General:**
+
+- **API** — Application Programming Interface. Notably invoked to explain why `Model`'s old
+  single-writer create/update/remove/commit methods and the new `Transaction`-based one are
+  deliberately never allowed to coexist (see `CLAUDE.md` invariant 7).
+- **GC** — Garbage Collection. Used loosely as a section label ("Changelog / GC") over
+  changelog-pruning tests; the model's actual reclamation mechanism is the version-watermark
+  reaper described under RCU, above — not a general-purpose GC. `tests/tests.cpp`.
