@@ -183,6 +183,67 @@ TEST(update_returns_null_for_a_dead_id) {
     CHECK(!txn.exists(o));
 }
 
+// Try to break invariant 1 (Ref<> never dangles) by racing a create against
+// a remove of its OWN target inside one transaction: apply_transaction_
+// contents() installs creates (and their referrers_ edges) BEFORE it
+// resolves remove_intents_ (see that function's own ordering comment), so
+// the cascade BFS that removes `a` sees the brand-new Order as a referrer
+// too, even though the Order never existed before this very commit. If the
+// ordering were reversed, this would publish a dangling Ref<Account> that
+// no reader could ever have seen coming.
+TEST(create_referencing_a_target_removed_in_the_same_transaction_cascades_it_too) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+
+    Transaction txn = m.begin();
+    auto o = std::make_unique<Order>();
+    o->code = "NEW";
+    o->account = a;  // brand-new object, non-nullable Ref<> to a
+    const Ref<Order> local = txn.create(std::move(o));
+    txn.remove(a);  // same transaction ALSO removes the very thing it just pointed at
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    std::size_t killed = 0;
+    for (const Change& c : res.changes)
+        if (c.kind == ChangeKind::Deleted) ++killed;
+    CHECK_EQ(killed, std::size_t{2});  // a, and the brand-new order that referenced it
+
+    const Ref<Order> real = res.to_real(local);
+    Snapshot s = m.snapshot();
+    CHECK(s.find(a) == nullptr);
+    CHECK(s.find(real) == nullptr);  // never visible to any reader -- born and cascaded in one commit
+    CHECK_EQ(s.size(), std::size_t{0});
+}
+
+// Same break attempt, aimed at an EXISTING committed object instead of a
+// brand-new one: apply_update() reconciles referrers_ against the update's
+// FINAL value (invariant 9) before the remove_intents_ loop runs, so the
+// cascade BFS sees the repointed edge -- not the stale one -- and kills the
+// updated object too, via the target it was reassigned to THIS transaction.
+TEST(update_repointing_to_a_target_removed_in_the_same_transaction_cascades_the_repointed_object_too) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Order> o = make_order(m, "O1", a1);
+
+    Transaction txn = m.begin();
+    txn.update(o)->account = a2;  // repoint o's non-nullable Ref<> to a2
+    txn.remove(a2);               // same transaction removes a2
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    std::size_t killed = 0;
+    for (const Change& c : res.changes)
+        if (c.kind == ChangeKind::Deleted) ++killed;
+    CHECK_EQ(killed, std::size_t{2});  // a2, and o (now pointing at it)
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find(a2) == nullptr);
+    CHECK(s.find(o) == nullptr);   // cascaded via the NEW edge, not the stale a1 one
+    CHECK(s.find(a1) != nullptr);  // untouched -- o no longer points at it by the time of the cascade
+}
+
 
 TEST(a_create_may_reference_itself_within_its_own_transaction) {
     Model m;

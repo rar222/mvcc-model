@@ -205,6 +205,50 @@ TEST(set_pre_commit_can_race_try_commit_without_a_data_race) {
     CHECK(m.snapshot().size() > 0);
 }
 
+// Try to break invariant 10 (snapshot()/Transaction-building never take
+// commit_mu_) WITHOUT a wall-clock guess: a pre-commit hook parks a
+// committer thread INSIDE the commit_mu_-held critical section (pre_commit_
+// runs from commit_main_locked(), under the same lock_guard try_commit()
+// takes -- see model.cpp) until released, and release only happens AFTER a
+// concurrent snapshot() call -- issued from the main thread only once the
+// hook is PROVABLY parked -- has already returned. If snapshot() took
+// commit_mu_ even briefly, that snapshot() call could never return (nothing
+// else ever releases the hook), and this test hangs until ctest's own
+// TIMEOUT kills it: a deadlock is a hang here, not a flaky timing check.
+TEST(snapshot_never_blocks_behind_a_commit_holding_commit_mu) {
+    Model m;
+    make_account(m, "SEED");
+
+    std::atomic<bool> hook_entered{false};
+    std::atomic<bool> release_hook{false};
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>&) {
+        hook_entered.store(true, std::memory_order_release);
+        while (!release_hook.load(std::memory_order_acquire)) std::this_thread::yield();
+        return true;
+    });
+
+    std::thread committer([&] {
+        Transaction txn = m.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "HELD";
+        txn.create(std::move(a));
+        (void)m.try_commit(txn);  // parks inside the hook, holding commit_mu_ the whole time
+    });
+
+    while (!hook_entered.load(std::memory_order_acquire)) std::this_thread::yield();
+
+    // The committer is now provably parked inside the critical section --
+    // nothing releases it until AFTER this call returns.
+    const Snapshot s = m.snapshot();
+    CHECK_EQ(s.size(), std::size_t{1});  // pre-commit state only; the pending create isn't published yet
+
+    release_hook.store(true, std::memory_order_release);
+    committer.join();
+    m.set_pre_commit({});
+
+    CHECK_EQ(m.snapshot().size(), std::size_t{2});
+}
+
 // A create() whose Ref<> target was already dead even at the
 // Transaction's OWN base is classified Invalid (a build-time bug), not
 // Conflict, with bad_target naming the dead id.
@@ -243,6 +287,33 @@ TEST(create_with_a_null_nonnullable_ref_is_rejected_as_invalid) {
     CHECK(res.error.has_value());
     CHECK(!res.error->bad_target);  // a null Ref has no target to report
     CHECK_EQ(m.snapshot().size(), std::size_t{0});
+}
+
+// Try to break invariant 2 (RefNuller has no overload that can clear a
+// Ref<T>) from the OTHER direction: not "leave it null," but "explicitly
+// write a null Ref<> onto an already-live, non-nullable field via update()."
+// apply_update() runs the SAME validate() as apply_create() (see
+// apply_update's own call site in model.cpp), so this must be rejected
+// exactly like the create-path test above -- and, being an Invalid classify
+// rather than a Conflict, must unwind completely: the object's account
+// field is untouched afterward, not left half-written.
+TEST(update_setting_a_non_nullable_ref_to_null_is_rejected_as_invalid) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a);
+
+    Transaction txn = m.begin();
+    txn.update(o)->account = Ref<Account>{};  // explicitly null out a non-nullable field
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Invalid);
+    CHECK(res.error.has_value());
+    CHECK(!res.error->bad_target);  // a null Ref has no target to report
+
+    // Unwound completely: o still points at a, exactly as before the attempt.
+    Snapshot s = m.snapshot();
+    CHECK(s.find(o)->account == a);
+    CHECK(s.find(a) != nullptr);
 }
 
 

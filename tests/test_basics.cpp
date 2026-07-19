@@ -101,6 +101,27 @@ TEST(old_snapshot_sees_old_values) {
     CHECK(v1.version() < v2.version());
 }
 
+// Try to break invariant 3 (published state is immutable) by hammering
+// the SAME id many times instead of once: if try_commit()'s apply step
+// ever mutated an already-published object in place instead of cloning,
+// a snapshot pinned before the churn would drift as the churn proceeds --
+// this is the test that would catch a stray in-place write fastest, since
+// old_snapshot_sees_old_values above only exercises a single update.
+TEST(a_pinned_snapshot_never_changes_no_matter_how_much_the_same_object_is_updated_afterward) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a, {}, 0);
+
+    const Snapshot pinned = m.snapshot();
+    CHECK_EQ(pinned.find(o)->qty, std::int64_t{0});
+
+    for (int i = 1; i <= 200; ++i) {
+        update_field(m, o, [i](Order* p) { p->qty = i; });
+        CHECK_EQ(pinned.find(o)->qty, std::int64_t{0});                    // never drifts
+        CHECK_EQ(m.snapshot().find(o)->qty, static_cast<std::int64_t>(i));  // latest always current
+    }
+}
+
 // An older Snapshot can still find and read a since-deleted object --
 // the reclamation invariant (nothing freed while a reader can reach it)
 // made directly observable; see the in-body comment for the ASan angle.
@@ -249,6 +270,39 @@ TEST(reaper_frees_eventually_after_snapshots_drop) {
 
     {
         Snapshot drop = std::move(pin);
+    }
+    CHECK_EQ(m.wait_for_reclamation(), std::size_t{0});
+}
+
+// Try to break invariant 4's OTHER clause: it names "a reader (or an open
+// Transaction's base())" in the same breath, but every reclamation test
+// above only pins with a Snapshot. base() is just an ordinary Snapshot
+// under the hood (see Transaction::base()'s own doc comment), so this
+// proves that pinning actually holds for an open, never-committed
+// Transaction too -- through sustained, UNRELATED churn from other
+// transactions, not just one op. Getting this wrong is a use-after-free
+// only ASan catches, exactly like the Snapshot case above.
+TEST(an_open_transactions_base_pins_reclamation_across_heavy_unrelated_churn) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a);
+
+    Transaction txn = m.begin();  // pins base() at the current version; never committed
+
+    // Heavy, UNRELATED churn from other transactions while txn stays open --
+    // recycles slots and generations txn's base() has nothing to do with.
+    for (int i = 0; i < 50; ++i) {
+        const Ref<Account> throwaway = make_account(m, "T" + std::to_string(i));
+        remove_and_commit(m, throwaway);
+    }
+    remove_and_commit(m, o);  // finally remove what txn's base() can actually see
+
+    CHECK(m.wait_for_reclamation() > 0);   // pinned by txn.base(), cannot free yet
+    CHECK(txn.base().find(o) != nullptr);  // still resolvable through the open transaction's base
+    CHECK_EQ(txn.base().find(o)->code, std::string("O1"));
+
+    {
+        Transaction drop = std::move(txn);
     }
     CHECK_EQ(m.wait_for_reclamation(), std::size_t{0});
 }
