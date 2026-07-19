@@ -1184,7 +1184,7 @@ Transaction Snapshot::begin() const {
     return lease_->m->begin(*this);
 }
 
-std::vector<Change> Transaction::estimate_changes() const {
+std::vector<Change> Transaction::estimate_changes_with_cascades() const {
     // Creates and updates are already known exactly -- no estimation needed.
     std::vector<Change> out = pending_changes_;
     if (remove_intents_.empty()) return out;
@@ -1194,7 +1194,7 @@ std::vector<Change> Transaction::estimate_changes() const {
     // commit_mu_-protected and unreachable from here (Transaction building
     // is lock-free -- invariant 10), so this walks base()'s published state
     // directly via for_each_referrer_any(), at O(total live objects) cost
-    // per pending remove. See estimate_changes()'s own doc comment for the
+    // per pending remove. See estimate_changes_with_cascades()'s own doc comment for the
     // "estimate, not guarantee" caveats.
     std::unordered_set<std::uint32_t> visited;
     std::vector<Id> work(remove_intents_.begin(), remove_intents_.end());
@@ -1269,6 +1269,15 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
         }
     }
     if (!err) {
+        // Deferred local removes first (see Transaction::remove_impl): each
+        // one's create just installed above, so its real id comes out of the
+        // remap table and takes the exact same cascade BFS a committed id
+        // does -- referrers_ already reflects every install and reconcile.
+        for (std::uint32_t idx : txn.local_remove_intents_) {
+            const auto it = remap.find(kLocalIdBit | idx);
+            assert(it != remap.end() && "a deferred-removed create is still live, so it was minted");
+            if (it != remap.end()) remove_raw(it->second);
+        }
         for (Id rid : txn.remove_intents_) remove_raw(rid);
     }
     return err;

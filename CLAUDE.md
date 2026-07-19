@@ -83,12 +83,18 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
    that could be held instead of `commit_mu_` while touching it.
 8. **Cascade delete is resolved once, at commit time, never eagerly.**
    `Transaction::remove()` only records an intent (a real `Id`, added to
-   `remove_intents_`) or, for a same-transaction local create, cancels it outright. The
-   actual BFS against `referrers_` runs inside `try_commit()`'s serialized apply phase
+   `remove_intents_`) or, for a same-transaction local create, cancels it outright when
+   nothing else pending references it — a still-referenced local create is instead
+   deferred (`local_remove_intents_`): it installs at apply time and is then removed by
+   the same commit-time BFS, so local and committed removes share one cascade semantics.
+   The actual BFS against `referrers_` runs inside `try_commit()`'s serialized apply phase
    (`Model::remove_raw`), the one place `referrers_` is safe to read. Do not make
    `Transaction::remove()` resolve cascade fan-out itself — that would require a
    transaction-local reverse index, which is exactly the "shared mutable structure many
-   transactions touch" problem this whole design exists to avoid. See DESIGN.md.
+   transactions touch" problem this whole design exists to avoid. (`remove_impl`'s
+   referenced-or-not scan is a one-shot linear walk of the transaction's own overlay, not
+   an index, and it decides only WHERE the remove resolves, never what it fans out to.)
+   See DESIGN.md.
 9. **Reconciliation of `referrers_`/`by_field_` for an update must run AFTER the object is
    fully written, never before.** `Transaction::update()` hands back a mutable pointer to a
    clone the caller may write to any number of times, in any order, before commit;

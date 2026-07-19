@@ -742,7 +742,8 @@ TEST(a_slow_subscriber_thread_wakes_from_wait_after_shutdown_and_sees_coalescing
         while (sub->wait(u)) {
             updates_seen.fetch_add(1, std::memory_order_relaxed);
             if (u.coalesced) saw_coalesced = true;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));  // deliberately the bottleneck
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(2));  // deliberately the bottleneck
         }
     });
 
@@ -1236,7 +1237,8 @@ TEST(set_pre_commit_can_race_try_commit_without_a_data_race) {
         } while (!stop.load(std::memory_order_relaxed));
     });
     for (int i = 0; i < 500; ++i)
-        m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return true; });
+        m.set_pre_commit(
+            [](Model&, const Transaction&, const std::vector<Change>&) { return true; });
     m.set_pre_commit({});
     stop = true;
     committer.join();
@@ -1353,7 +1355,7 @@ TEST(a_failing_pre_transaction_reports_precommit_conflict_and_skips_the_main_tra
 
     CommitResult res = m.try_commit(txn);
     CHECK(res.status == CommitStatus::PrecommitConflict);
-    CHECK(res.error.has_value());  // forwarded from the failing pre-transaction
+    CHECK(res.error.has_value());                   // forwarded from the failing pre-transaction
     CHECK_EQ(m.snapshot().size(), std::size_t{0});  // main txn never applied
 
     // txn was never consumed -- retry it as-is once the hook is well-behaved.
@@ -1563,7 +1565,8 @@ TEST(post_commit_hook_is_not_invoked_for_an_empty_transaction) {
 TEST(post_commit_hook_sees_a_vetoed_result_too) {
     Model m;
     std::optional<CommitStatus> seen_status;
-    m.set_post_commit([&](Model&, const Transaction&, const CommitResult& r) { seen_status = r.status; });
+    m.set_post_commit(
+        [&](Model&, const Transaction&, const CommitResult& r) { seen_status = r.status; });
     m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
 
     Transaction txn = m.begin();
@@ -2275,9 +2278,9 @@ TEST(remove_intent_is_not_yet_visible_as_deleted_in_pending_changes) {
     CHECK(m.snapshot().find(o) == nullptr);
 }
 
-// With no pending remove() intents, estimate_changes() has nothing to
+// With no pending remove() intents, estimate_changes_with_cascades() has nothing to
 // estimate -- it's exactly pending_changes(), verbatim.
-TEST(estimate_changes_with_no_pending_removes_matches_pending_changes_exactly) {
+TEST(estimate_changes_with_cascades_with_no_pending_removes_matches_pending_changes_exactly) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     Transaction txn = m.begin();
@@ -2287,7 +2290,7 @@ TEST(estimate_changes_with_no_pending_removes_matches_pending_changes_exactly) {
     txn.create(std::move(o));
     txn.update(a)->balance = 99;
 
-    const std::vector<Change> estimate = txn.estimate_changes();
+    const std::vector<Change> estimate = txn.estimate_changes_with_cascades();
     const std::vector<Change>& pending = txn.pending_changes();
     CHECK_EQ(estimate.size(), pending.size());
     for (std::size_t i = 0; i < estimate.size(); ++i) {
@@ -2301,14 +2304,14 @@ TEST(estimate_changes_with_no_pending_removes_matches_pending_changes_exactly) {
 // whose (non-nullable) account field points at it -- Deleted for both,
 // computed read-only against base(), matching what the real try_commit()
 // (checked afterward) actually produces.
-TEST(estimate_changes_estimates_a_non_nullable_cascade_delete) {
+TEST(estimate_changes_with_cascades_estimates_a_non_nullable_cascade_delete) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o = make_order(m, "O1", a);
 
     Transaction txn = m.begin();
     txn.remove(a);
-    const std::vector<Change> estimate = txn.estimate_changes();
+    const std::vector<Change> estimate = txn.estimate_changes_with_cascades();
 
     std::size_t deletes = 0;
     bool saw_account = false, saw_order = false;
@@ -2333,7 +2336,7 @@ TEST(estimate_changes_estimates_a_non_nullable_cascade_delete) {
 // A pending remove() of an Order estimates an Updated (not a Deleted) for
 // any OTHER Order whose Opt<Order> parent field points at it -- the
 // nullable-cascade-null case, distinct from the non-nullable case above.
-TEST(estimate_changes_estimates_a_nullable_cascade_null_as_updated_not_deleted) {
+TEST(estimate_changes_with_cascades_estimates_a_nullable_cascade_null_as_updated_not_deleted) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> parent = make_order(m, "P1", a);
@@ -2341,7 +2344,7 @@ TEST(estimate_changes_estimates_a_nullable_cascade_null_as_updated_not_deleted) 
 
     Transaction txn = m.begin();
     txn.remove(parent);
-    const std::vector<Change> estimate = txn.estimate_changes();
+    const std::vector<Change> estimate = txn.estimate_changes_with_cascades();
 
     bool saw_parent_deleted = false, saw_child_updated = false, saw_child_deleted = false;
     for (const Change& c : estimate) {
@@ -2355,12 +2358,12 @@ TEST(estimate_changes_estimates_a_nullable_cascade_null_as_updated_not_deleted) 
 }
 
 // TSan-targeted, same pattern as set_pre_commit_can_race_try_commit_
-// without_a_data_race: estimate_changes() takes no lock at all (commit_mu_
+// without_a_data_race: estimate_changes_with_cascades() takes no lock at all (commit_mu_
 // is unreachable from Transaction-building code -- invariant 10), so
 // calling it repeatedly from one thread must never race with another
 // thread hammering try_commit() concurrently. The real assertion here is
 // TSan's (ctest --preset tsan).
-TEST(estimate_changes_never_races_a_concurrently_hammering_try_commit) {
+TEST(estimate_changes_with_cascades_never_races_a_concurrently_hammering_try_commit) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     for (int i = 0; i < 20; ++i) make_order(m, "O" + std::to_string(i), a);
@@ -2380,18 +2383,18 @@ TEST(estimate_changes_never_races_a_concurrently_hammering_try_commit) {
 
     Transaction txn = m.begin();
     txn.remove(a);
-    for (int i = 0; i < 200; ++i) CHECK(!txn.estimate_changes().empty());
+    for (int i = 0; i < 200; ++i) CHECK(!txn.estimate_changes_with_cascades().empty());
 
     stop = true;
     committer.join();
 }
 
 // When nothing else touches the model between building the estimate and
-// actually committing, estimate_changes() and the changeset PreCommitFn
+// actually committing, estimate_changes_with_cascades() and the changeset PreCommitFn
 // sees are the SAME set of (id, kind, tag) triples. A pure remove() (no
 // creates) keeps every id real on both sides, so this is an exact
 // comparison, not just a size check.
-TEST(estimate_changes_matches_the_pre_commit_hooks_changeset_when_nothing_else_happened) {
+TEST(estimate_changes_with_cascades_matches_the_pre_commit_hooks_changeset_when_nothing_else_happened) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o = make_order(m, "O1", a);
@@ -2399,7 +2402,7 @@ TEST(estimate_changes_matches_the_pre_commit_hooks_changeset_when_nothing_else_h
 
     Transaction txn = m.begin();
     txn.remove(a);  // cascades to o
-    const std::vector<Change> estimate = txn.estimate_changes();
+    const std::vector<Change> estimate = txn.estimate_changes_with_cascades();
 
     std::vector<Change> seen;
     m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>& changes) {
@@ -2427,7 +2430,7 @@ TEST(estimate_changes_matches_the_pre_commit_hooks_changeset_when_nothing_else_h
 // before the original transaction actually commits, the estimate (computed
 // against a now-stale base()) and the real changeset PreCommitFn sees
 // diverge -- the estimate is a strict superset of what actually happened.
-TEST(estimate_changes_and_the_pre_commit_hooks_changeset_diverge_after_a_reference_changes) {
+TEST(estimate_changes_with_cascades_and_the_pre_commit_hooks_changeset_diverge_after_a_reference_changes) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Account> b = make_account(m, "B1");
@@ -2435,7 +2438,7 @@ TEST(estimate_changes_and_the_pre_commit_hooks_changeset_diverge_after_a_referen
 
     Transaction txn = m.begin();  // base() still sees o.account == a
     txn.remove(a);
-    const std::vector<Change> estimate = txn.estimate_changes();
+    const std::vector<Change> estimate = txn.estimate_changes_with_cascades();
 
     // Estimated cascade: a itself, plus o (its non-nullable account field
     // still points at a, as far as txn's base() can see).
@@ -2468,7 +2471,7 @@ TEST(estimate_changes_and_the_pre_commit_hooks_changeset_diverge_after_a_referen
     CHECK(seen[0].kind == ChangeKind::Deleted);
 
     // The estimate (2 deletes, computed before the repoint) and reality (1
-    // delete, after it) disagree -- exactly the staleness estimate_changes()'s
+    // delete, after it) disagree -- exactly the staleness estimate_changes_with_cascades()'s
     // own doc comment warns about.
     CHECK(estimate.size() != seen.size());
 }
@@ -2611,7 +2614,12 @@ TEST(two_creates_forming_a_non_nullable_cycle_commit_and_cascade_as_one) {
     CHECK(s.find(r2) == nullptr);
 }
 
-TEST(a_ref_to_a_cancelled_create_is_still_rejected_as_invalid) {
+// remove() of a local create that another pending object references DEFERS
+// instead of cancelling (see Transaction::remove_impl): the create installs
+// at apply time and is then removed by the same cascade BFS a committed id
+// gets -- so an Opt<> referrer survives with the field nulled, exactly as
+// if the victim had been committed first.
+TEST(removing_a_referenced_local_create_cascades_at_commit_like_a_committed_remove) {
     Model m;
     const Ref<Account> acct = make_account(m, "A1");
 
@@ -2620,16 +2628,83 @@ TEST(a_ref_to_a_cancelled_create_is_still_rejected_as_invalid) {
     txn.update(victim)->code = "VICTIM";
     txn.update(victim)->account = acct;
     auto o = std::make_unique<Order>();
+    o->code = "SURVIVOR";
+    o->account = acct;
+    o->parent = victim;  // Opt<>: nulled by the cascade, not killed
+    const Ref<Order> survivor = txn.create(std::move(o));
+    txn.remove(victim);
+    CHECK(!txn.exists(victim));           // masked immediately, like a real remove intent
+    CHECK(txn.update(victim) == nullptr);  // and no longer writable
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    const Ref<Order> real_victim = res.to_real(victim);
+    const Ref<Order> real_survivor = res.to_real(survivor);
+
+    // The victim was genuinely created then removed within the one commit:
+    // both events appear in the changeset, and the published state has no
+    // trace of it.
+    std::size_t victim_created = 0, victim_deleted = 0;
+    for (const Change& c : res.changes) {
+        if (c.id == real_victim.raw() && c.kind == ChangeKind::Created) ++victim_created;
+        if (c.id == real_victim.raw() && c.kind == ChangeKind::Deleted) ++victim_deleted;
+    }
+    CHECK_EQ(victim_created, std::size_t{1});
+    CHECK_EQ(victim_deleted, std::size_t{1});
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find(real_victim) == nullptr);
+    const Order* sp = s.find(real_survivor);
+    CHECK(sp != nullptr);
+    CHECK(!sp->parent);  // nulled by the cascade, same as a committed-victim remove
+}
+
+// The Ref<> (non-nullable) flavor, with a transitive hop: victim <- A <- B,
+// all three pending in the same transaction. Removing the victim drags the
+// whole chain down, exactly as if all three had been committed first.
+TEST(removing_a_referenced_local_create_cascades_transitively_through_pending_creates) {
+    Model m;
+    Transaction txn = m.begin();
+    const Ref<Link> victim = txn.create(std::make_unique<Link>());
+    txn.update(victim)->label = "VICTIM";
+    txn.update(victim)->next = victim;  // self-loop: satisfies its own non-nullable field
+    const Ref<Link> a = txn.create(std::make_unique<Link>());
+    txn.update(a)->label = "A";
+    txn.update(a)->next = victim;
+    const Ref<Link> b = txn.create(std::make_unique<Link>());
+    txn.update(b)->label = "B";
+    txn.update(b)->next = a;
+    txn.remove(victim);
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    Snapshot s = m.snapshot();
+    CHECK(s.find(res.to_real(victim)) == nullptr);
+    CHECK(s.find(res.to_real(a)) == nullptr);  // Ref<> referrer: died with the victim
+    CHECK(s.find(res.to_real(b)) == nullptr);  // and transitively, its own referrer
+    CHECK_EQ(s.size(), std::size_t{0});
+}
+
+// The referenced-or-not decision is taken AT the remove() call: a ref
+// written toward a local id AFTER its create was already cancelled is a
+// build bug, and still rejects as Invalid (the unmapped-local path).
+TEST(a_ref_added_after_a_local_create_was_cancelled_is_rejected_as_invalid) {
+    Model m;
+    const Ref<Account> acct = make_account(m, "A1");
+
+    Transaction txn = m.begin();
+    const Ref<Order> victim = txn.create(std::make_unique<Order>());
+    txn.remove(victim);  // unreferenced at this point -> cancelled outright
+    auto o = std::make_unique<Order>();
     o->code = "DANGLER";
     o->account = acct;
-    o->parent = victim;  // valid when written...
+    o->parent = victim;  // written AFTER the cancel: nothing will ever map it
     txn.create(std::move(o));
-    txn.remove(victim);  // ...then the create it points at is cancelled
 
     const CommitResult res = m.try_commit(txn);
     CHECK(res.status == CommitStatus::Invalid);
     CHECK(res.error.has_value());
-    CHECK(!res.error->bad_target);  // a cancelled create has no real id to report
+    CHECK(!res.error->bad_target);                  // a cancelled create has no real id to report
     CHECK_EQ(m.snapshot().size(), std::size_t{1});  // only the pre-existing account
 }
 
@@ -2959,7 +3034,8 @@ TEST(normal_transaction_and_find_by_key_work_correctly_after_a_bulk_load) {
         CHECK(m.commit_bulk(t).status == CommitStatus::Committed);
     }
 
-    const Ref<Account> a2 = make_account(m, "C2");  // an ordinary Transaction, on top of the bulk load
+    const Ref<Account> a2 =
+        make_account(m, "C2");  // an ordinary Transaction, on top of the bulk load
     update_field(m, a2, [](Account* a) { a->balance = 42; });
 
     Snapshot s = m.snapshot();
@@ -3031,8 +3107,8 @@ TEST(cascade_delete_works_correctly_on_bulk_loaded_data) {
     auto acc = std::make_unique<Account>();
     acc->name = "Hub";
     const Ref<Account> a = t.create(std::move(acc));
-    auto other = std::make_unique<Account>();  // unrelated -- keeps grandchild's own
-    other->name = "Other";                    // non-nullable Ref<Account> satisfied after
+    auto other = std::make_unique<Account>();           // unrelated -- keeps grandchild's own
+    other->name = "Other";                              // non-nullable Ref<Account> satisfied after
     const Ref<Account> b = t.create(std::move(other));  // `a` is removed, so only `parent` nulls
     auto child = std::make_unique<Order>();
     child->code = "child";

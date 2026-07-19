@@ -1140,7 +1140,7 @@ private:
     /// this cheap, is the writer's commit_mu_-protected reverse index and is
     /// unreachable from the read side (invariant 7) -- so this is O(total live
     /// objects), strictly for occasional/diagnostic use (see
-    /// Transaction::estimate_changes(), its only caller), never a hot path.
+    /// Transaction::estimate_changes_with_cascades(), its only caller), never a hot path.
     /// Private and friended to Transaction rather than public: exposing an
     /// O(#everything) scan as ordinary public API would invite exactly the
     /// misuse the single-Field scan family already warns against, multiplied
@@ -2287,10 +2287,20 @@ public:
     /// would cascade-die from this intent still peek()/exists() as alive
     /// until commit -- cascade effects are invisible locally, by design (the
     /// alternative is a duplicate local reverse index, real complexity for a
-    /// narrow benefit). If `r` is a local id (created earlier in this same
-    /// transaction, never committed), the create is cancelled outright
-    /// instead: there's no real id yet for anything else to reference, so
-    /// there's nothing to resolve at commit time either.
+    /// narrow benefit). The removed object ITSELF is masked immediately,
+    /// real or local.
+    ///
+    /// If `r` is a local id (created earlier in this same transaction,
+    /// never committed) and nothing else pending references it, the create
+    /// is simply cancelled outright: nothing was ever published, so there
+    /// is nothing to resolve at commit time. If another pending object DOES
+    /// reference it, the remove defers instead: the create still installs
+    /// during apply and is then removed by the same commit-time cascade BFS
+    /// a committed id gets -- so an Opt<> referrer is nulled and a Ref<>
+    /// referrer cascades, identical semantics whether the target ever
+    /// committed or not. (The referenced-or-not decision is taken at THIS
+    /// call: a ref added to an already-cancelled local id afterward is a
+    /// build bug and still rejects as Invalid at commit.)
     template <class T>
     void remove(Ref<T> r) {
         remove_impl(r.raw());
@@ -2398,8 +2408,13 @@ public:
     ///     whether a real commit would be accepted as Conflict-free;
     ///   - it's computed against base(), which can go stale the instant
     ///     another writer commits something that would change the
-    ///     cascade's shape.
-    std::vector<Change> estimate_changes() const;
+    ///     cascade's shape;
+    ///   - DEFERRED LOCAL removes (a remove() of a still-referenced local
+    ///     create, see remove_impl) are not cascade-estimated at all: their
+    ///     victim still appears as Created (accurate -- it will be), but
+    ///     the same-commit Deleted for it, and any fan-out into other
+    ///     pending objects, only shows up in CommitResult::changes.
+    std::vector<Change> estimate_changes_with_cascades() const;
 
 private:
     friend class Model;
@@ -2426,6 +2441,11 @@ private:
     ObjectBase* update_impl(Id id) {
         if (is_local(id)) {
             const std::uint32_t idx = id.index & ~kLocalIdBit;
+            // Masked like peek_impl: a deferred-removed local can't be
+            // written to any more than a remove-intended real id can.
+            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+                local_remove_intents_.end())
+                return nullptr;
             return idx < local_created_.size() ? local_created_[idx].get() : nullptr;
         }
         if (remove_intents_.count(id)) return nullptr;
@@ -2449,15 +2469,32 @@ private:
         return raw;
     }
 
-    /// Untyped body of remove()/remove(): for a LOCAL id, cancels the
-    /// create() outright -- drops the owned object and scrubs it from
-    /// pending_changes() -- since nothing has ever been published for it to
-    /// reference. For a real id, just records the intent (remove_intents_);
-    /// no cascade work happens here, see the class-level remove() doc for why.
+    /// Untyped body of remove()/remove(): for a real id, just records the
+    /// intent (remove_intents_); no cascade work happens here, see the
+    /// class-level remove() doc for why. For a LOCAL id, the choice is made
+    /// here, once, based on what the transaction holds RIGHT NOW:
+    ///   - unreferenced: cancel the create outright -- drop the owned
+    ///     object and scrub it from pending_changes() -- since nothing was
+    ///     ever published for anything to reference;
+    ///   - referenced by another pending object: DEFER (record the local
+    ///     index in local_remove_intents_) -- the create still installs at
+    ///     apply time and is then fed, via its freshly minted real id, to
+    ///     the exact same cascade BFS a committed remove gets. Its Created
+    ///     entry stays in pending_changes(), because it genuinely will be
+    ///     created (and then deleted) by the commit.
     void remove_impl(Id id) {
         if (is_local(id)) {
             const std::uint32_t idx = id.index & ~kLocalIdBit;
-            if (idx < local_created_.size()) local_created_[idx].reset();  // cancel locally
+            if (idx >= local_created_.size() || !local_created_[idx])
+                return;  // never created here, or already cancelled: nothing to do
+            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+                local_remove_intents_.end())
+                return;  // already deferred: remove() is idempotent
+            if (locally_referenced(id)) {
+                local_remove_intents_.push_back(idx);
+                return;
+            }
+            local_created_[idx].reset();  // cancel locally
             auto rm = [&](const Change& c) { return c.id == id; };
             pending_changes_.erase(
                 std::remove_if(pending_changes_.begin(), pending_changes_.end(), rm),
@@ -2465,6 +2502,27 @@ private:
             return;
         }
         remove_intents_.insert(id);
+    }
+
+    /// Does any OTHER pending object (a live local create, or an update
+    /// clone) hold a Ref<>/Opt<> whose target is `local`? Purely
+    /// transaction-local -- walks this transaction's own overlay via
+    /// each_ref(), touching no shared state (invariant 10 intact). The
+    /// victim's own fields are excluded: a self-loop dies with its owner.
+    bool locally_referenced(Id local) const {
+        bool found = false;
+        auto scan = [&](const ObjectBase* o) {
+            if (!o || found || o->id == local) return;
+            o->each_ref([&](const void*, const char*, Id target, bool) {
+                if (target == local) found = true;
+            });
+        };
+        for (const auto& up : local_created_) scan(up.get());
+        for (const auto& [slot, up] : local_updated_) {
+            (void)slot;
+            scan(up.get());
+        }
+        return found;
     }
 
     /// Untyped body of peek()/peek()/peek_as(): resolves `id` against this
@@ -2478,6 +2536,13 @@ private:
         const ObjectBase* o = nullptr;
         if (is_local(id)) {
             const std::uint32_t idx = id.index & ~kLocalIdBit;
+            // A deferred local remove masks its target exactly like a real
+            // remove intent does below -- "removed as far as this
+            // transaction can tell", even though the create still installs
+            // (and is then removed) at apply time.
+            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+                local_remove_intents_.end())
+                return nullptr;
             o = idx < local_created_.size() ? local_created_[idx].get() : nullptr;
         } else if (remove_intents_.count(id)) {
             return nullptr;
@@ -2508,6 +2573,11 @@ private:
         update_baseline_;                            ///< points into base_'s Root,
                                                      ///< kept alive by base_ itself
     std::unordered_set<Id, IdHash> remove_intents_;  ///< real ids only -- see remove_impl
+    std::vector<std::uint32_t> local_remove_intents_;  ///< DEFERRED local removes (bare local
+                                                       ///< indexes): creates that install at apply
+                                                       ///< time and are then cascade-removed, see
+                                                       ///< remove_impl. Usually empty; linear
+                                                       ///< std::find is fine at this size.
     std::uint32_t next_local_id_ = 0;      ///< mints local ids; per-TRANSACTION, so the same
                                            ///< value recurs across transactions (see create())
     std::vector<Change> pending_changes_;  ///< what pending_changes() returns, in call order
