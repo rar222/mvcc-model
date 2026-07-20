@@ -82,6 +82,20 @@ struct ExplicitlyImperfectHash {
     static constexpr bool is_perfect = false;
 };
 
+// A small POD VALUE type, distinct from the `int` every PersistentMap test
+// above stores -- mirrors the shape of model::Id (two uint32 fields, memberwise
+// equality) without depending on model.h (see this file's own top comment and
+// U64Hash's comment for why). Root::by_field (model.h) is exactly
+// PersistentMap<std::string, Id, StringHash>: a struct value, not a
+// primitive. Never used as a KEY/hashed here -- only as the V in a
+// PersistentMap<std::string, FakeId, StringHash> below -- so it needs
+// equality but no hash.
+struct FakeId {
+    std::uint32_t index = 0;
+    std::uint32_t gen = 0;
+    friend bool operator==(FakeId, FakeId) noexcept = default;
+};
+
 // Compile-time-only coverage of the trait-detection machinery itself
 // (detail::hash_is_perfect_v, persistent_map.h) -- a template option in its
 // own right, independent of any trie behavior it later gates.
@@ -193,6 +207,163 @@ void check_set_edge_cases(const char* label, const K& k1, const K& k2, const K& 
     s = s.erase(k2);
     require(s.size() == 0, "erasing every key empties the set");
     require(s.empty(), "erasing every key -> empty() true");
+}
+
+// Nested-container coverage: PersistentMap<K, PersistentSet<V,Hash2>, Hash>.
+// Root::by_cached_field and Root::by_cached_reference (model.h) both store a
+// PersistentSet as the VALUE of an outer PersistentMap -- an outer map from
+// a key (a cached field's string value, or a cached reference's target Id)
+// to an inner "bucket" set of every Id currently holding that value. Every
+// map test above stores a primitive/POD value; nothing yet nests one
+// persistent container inside another as a value. check_nested_bucket_map
+// exercises exactly src/model.cpp's own bucket discipline (see
+// add_cached_fields/drop_cached_fields, add_cached_references/
+// drop_cached_references): get-or-default on insert, and drop the outer key
+// entirely when its bucket empties on erase -- not a simplified stand-in for
+// that pattern, the same one, against a
+// std::unordered_map<K, std::unordered_set<uint64_t>> reference.
+template <class K, class Hash, class MakeKey>
+void check_nested_bucket_map(const char* label, int iters, MakeKey make_key) {
+    using Bucket = PersistentSet<std::uint64_t, PerfectU64Hash>;
+    std::mt19937 rng(4242);
+    PersistentMap<K, Bucket, Hash> outer;
+    std::unordered_map<K, std::unordered_set<std::uint64_t>> ref;
+
+    auto check_equal = [&](const char* where) {
+        if (outer.size() != ref.size()) {
+            std::printf("NESTED(%s) SIZE MISMATCH at %s: outer=%zu ref=%zu\n", label, where,
+                        outer.size(), ref.size());
+            ++g_failures;
+        }
+        for (auto& [k, bucket] : ref) {
+            const Bucket* b = outer.get(k);
+            if (!b) {
+                std::printf("NESTED(%s) MISSING BUCKET at %s\n", label, where);
+                ++g_failures;
+                continue;
+            }
+            if (b->size() != bucket.size()) {
+                std::printf("NESTED(%s) BUCKET SIZE MISMATCH at %s\n", label, where);
+                ++g_failures;
+            }
+            for (std::uint64_t v : bucket) {
+                if (!b->contains(v)) {
+                    std::printf("NESTED(%s) BUCKET CONTAINS MISMATCH at %s\n", label, where);
+                    ++g_failures;
+                }
+            }
+        }
+        // The drop-when-empty discipline means a present bucket must never be
+        // empty -- an emptied bucket should have taken its outer key with it.
+        outer.for_each([&](const K&, const Bucket& b) {
+            if (b.empty()) {
+                std::printf("NESTED(%s) EMPTY BUCKET LEFT BEHIND at %s\n", label, where);
+                ++g_failures;
+            }
+        });
+    };
+
+    const int base = g_failures;
+    for (int i = 0; i < iters && g_failures == base; i++) {
+        K key = make_key(rng() % 40);
+        std::uint64_t id = rng() % 500;
+        if (rng() % 3) {
+            // Insert: get-or-default then insert -- model.cpp's own pattern
+            // (e.g. add_cached_fields), not `outer[key].insert(id)`.
+            const Bucket* b = outer.get(key);
+            outer = outer.set(key, (b ? *b : Bucket{}).insert(id));
+            ref[key].insert(id);
+        } else {
+            // Erase: drop the outer key entirely when the bucket empties
+            // (e.g. drop_cached_fields), so no bucket is ever present-but-empty.
+            const Bucket* b = outer.get(key);
+            if (b) {
+                auto nb = b->erase(id);
+                outer = nb.empty() ? outer.erase(key) : outer.set(key, nb);
+            }
+            auto it = ref.find(key);
+            if (it != ref.end()) {
+                it->second.erase(id);
+                if (it->second.empty()) ref.erase(it);
+            }
+        }
+        if (i % 200 == 0) check_equal("churn");
+    }
+    check_equal("final");
+}
+
+// Structural analog of Root::by_cached_field: PersistentMap<std::string,
+// PersistentSet<Id,IdHash>, StringHash>. K/Hash are the SAME types the model
+// actually uses (pmap::StringHash) -- only the bucket's element type is the
+// U64Hash-family Id stand-in this file already relies on elsewhere.
+TEST(nested_bucket_map_string_keyed_matches_by_cached_field_pattern) {
+    check_nested_bucket_map<std::string, StringHash>(
+        "string-keyed", 6000, [](std::uint32_t n) { return "k" + std::to_string(n); });
+}
+
+// Structural analog of Root::by_cached_reference: PersistentMap<Id,
+// PersistentSet<Id,IdHash>, IdHash> -- an outer map keyed by the SAME
+// perfect-hash family as model::IdHash (see PerfectU64Hash's own comment),
+// whose value is itself a PersistentSet.
+TEST(nested_bucket_map_perfect_hash_keyed_matches_by_cached_reference_pattern) {
+    check_nested_bucket_map<std::uint64_t, PerfectU64Hash>(
+        "perfect-hash-keyed", 6000, [](std::uint32_t n) { return (std::uint64_t)n; });
+}
+
+// Structural analog of Root::by_field: PersistentMap<std::string, Id,
+// StringHash> -- SAME K and Hash as the model (pmap::StringHash), with
+// FakeId (see its own comment above) standing in for Id as a non-primitive
+// VALUE, exercising set()/get()/erase()/for_each() copying a struct instead
+// of an int.
+TEST(string_keyed_map_with_struct_value_matches_unordered_map) {
+    std::mt19937 rng(777);
+    PersistentMap<std::string, FakeId, StringHash> pm;
+    std::unordered_map<std::string, FakeId> ref;
+    std::uint32_t next_gen = 1;
+
+    const int base = g_failures;
+    auto check_equal = [&](const char* where) {
+        if (pm.size() != ref.size()) {
+            std::printf("STRUCT-VAL SIZE MISMATCH at %s: pm=%zu ref=%zu\n", where, pm.size(),
+                        ref.size());
+            ++g_failures;
+        }
+        for (auto& [k, v] : ref) {
+            const FakeId* p = pm.get(k);
+            if (!p || !(*p == v)) {
+                std::printf("STRUCT-VAL GET MISMATCH at %s key=%s\n", where, k.c_str());
+                ++g_failures;
+                return;
+            }
+        }
+        size_t seen = 0;
+        pm.for_each([&](const std::string& k, const FakeId& v) {
+            auto it = ref.find(k);
+            if (it == ref.end() || !(it->second == v)) {
+                std::printf("STRUCT-VAL ITER EXTRA at %s key=%s\n", where, k.c_str());
+                ++g_failures;
+            }
+            ++seen;
+        });
+        if (seen != ref.size()) {
+            std::printf("STRUCT-VAL ITER COUNT at %s: %zu vs %zu\n", where, seen, ref.size());
+            ++g_failures;
+        }
+    };
+
+    for (int i = 0; i < 8000 && g_failures == base; i++) {
+        std::string k = "f" + std::to_string(rng() % 800);
+        if (rng() % 3) {
+            FakeId v{(std::uint32_t)(rng() % 1000), next_gen++};
+            pm = pm.set(k, v);
+            ref[k] = v;
+        } else {
+            pm = pm.erase(k);
+            ref.erase(k);
+        }
+        if (i % 300 == 0) check_equal("churn");
+    }
+    check_equal("final");
 }
 
 // Speed: set()/contains() must grow like O(log32 n) as the population
