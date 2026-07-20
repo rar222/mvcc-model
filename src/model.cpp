@@ -1095,6 +1095,13 @@ std::optional<Model::IntegrityError> Model::apply_create(
     changes_.push_back({id, ChangeKind::Created, tag});
     log([this] { changes_.pop_back(); });
 
+    // Undo: the inverse of a create is removing it. No snapshot data
+    // needed -- unlike pending_undo_'s other two action kinds, there is no
+    // pre-image to capture. Not logged for rollback -- see pending_undo_'s
+    // own comment: it's cleared wholesale in rollback_apply(), not
+    // unwound entry-by-entry like changes_.
+    pending_undo_.push_back({UndoAction::Kind::Remove, id, nullptr});
+
     // Never published, nothing else owns it: rollback_apply() deletes
     // everything in txn_created_. Deliberately NOT logged as an undo op -- the
     // rollback delete loop consumes this list directly, and a pop-undo would
@@ -1128,6 +1135,12 @@ std::optional<Model::IntegrityError> Model::apply_update(
     // `baseline` is non-null and unchanged since txn.base(): if any other
     // commit had touched this id since then, this attempt would have been
     // rejected as a Conflict before ever reaching apply.
+
+    // Undo: capture BEFORE baseline is retired -- this IS the pre-image a
+    // RestoreUpdate action needs. Same reasoning as changes_: not logged
+    // for rollback, since pending_undo_ is cleared wholesale on failure.
+    pending_undo_.push_back(
+        {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(baseline->clone())});
 
     retire(baseline);
     log([this] { retired_.pop_back(); });
@@ -1168,6 +1181,12 @@ ObjectBase* Model::clone_for_cascade_null(Id id) {
     // null_ref(), same call site" is simpler and just as correct.)
     const ObjectBase* cur = peek_raw(id);
     if (!cur) return nullptr;
+
+    // Undo: same action kind as apply_update's -- "this survivor's field
+    // got cascade-nulled" and "this object got explicitly updated" are the
+    // same fix from undo's perspective: restore the captured pre-image.
+    pending_undo_.push_back(
+        {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(cur->clone())});
 
     ObjectBase* copy = cur->clone();
     log([copy] { delete copy; });
@@ -1241,6 +1260,13 @@ std::vector<Id> Model::remove_raw(Id id) {
             continue;  // defensive, matching the peek()-then-check style used for every
                        // other id in this BFS (x itself, and each e.from above) --
                        // nothing in the edges loop above installs a null at slot x itself
+
+        // Undo: the inverse of a delete is recreating it -- x's `id` here
+        // is the OLD one, permanently stale the moment this BFS finishes
+        // (invariant 5: generation never recycles). Captured before
+        // anything below touches victim's data.
+        pending_undo_.push_back(
+            {UndoAction::Kind::Recreate, x, std::unique_ptr<ObjectBase>(victim->clone())});
 
         drop_out_refs(victim);  // logs re-add of victim's outgoing edges
 
@@ -1345,6 +1371,8 @@ void Model::rollback_apply() {
     txn_created_.clear();
 
     changes_.clear();  // any survivors were popped by the log; clear defensively
+    pending_undo_.clear();  // not log()-replayed like changes_ -- see its own comment; a blunt
+                            // clear is correct either way, since a failed attempt keeps nothing
     dirty_.clear();
 }
 
@@ -1554,6 +1582,31 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
     changelog_.push_back({r->version, changes_});
     prune_changelog();
 
+    // Undo list: this commit's own touched ids invalidate any existing
+    // entry that overlaps them (see undo_list_'s own comment for what
+    // "conflicts" means here), whether or not this commit produced undo
+    // data of its own; then append this commit's own entry, if it has any
+    // (a commit_bulk()-style wipe, or an attempt with only
+    // no-op-since-cancelled local creates, has none).
+    {
+        std::unordered_set<Id, IdHash> touched;
+        for (const Change& c : changes_) touched.insert(c.id);
+
+        for (auto it = undo_list_.begin(); it != undo_list_.end();) {
+            bool conflicts = false;
+            for (Id id : touched)
+                if (it->touched.count(id)) {
+                    conflicts = true;
+                    break;
+                }
+            it = conflicts ? undo_list_.erase(it) : std::next(it);
+        }
+
+        if (!pending_undo_.empty())
+            undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched)});
+    }
+    pending_undo_.clear();
+
     std::vector<Change> resolved = std::move(changes_);
 
     changes_.clear();
@@ -1563,6 +1616,71 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
 
     return CommitResult{CommitStatus::Committed, pub,         std::move(resolved), std::nullopt,
                         std::move(remap),        std::nullopt};
+}
+
+// ---------------------------------------------------------------------------
+// Undo list
+// ---------------------------------------------------------------------------
+
+std::vector<Model::UndoSummary> Model::list_undo() const {
+    std::lock_guard lk(commit_mu_);
+    std::vector<UndoSummary> out;
+    out.reserve(undo_list_.size());
+    for (const UndoEntry& e : undo_list_) out.push_back({e.version, e.actions.size()});
+    return out;
+}
+
+std::optional<Model::UndoEntry> Model::take_undo(std::uint64_t version) {
+    std::lock_guard lk(commit_mu_);
+    for (auto it = undo_list_.begin(); it != undo_list_.end(); ++it) {
+        if (it->version != version) continue;
+        UndoEntry taken = std::move(*it);
+        undo_list_.erase(it);
+        return taken;
+    }
+    return std::nullopt;
+}
+
+void Model::clear_undo_list() {
+    std::lock_guard lk(commit_mu_);
+    undo_list_.clear();
+}
+
+CommitResult Model::apply_undo(const UndoEntry& entry) {
+    Transaction inv = begin();
+    std::unordered_map<Id, Id, IdHash> old_to_new;
+    std::vector<Id> local(entry.actions.size());
+
+    // Pass 1: mint every Recreate action's new local id up front (mirrors
+    // the pre-mint pass), so pass 2 can remap victim-to-victim edges
+    // regardless of which order they appear in `entry.actions`.
+    for (std::size_t i = 0; i < entry.actions.size(); ++i) {
+        const UndoAction& a = entry.actions[i];
+        if (a.kind == UndoAction::Kind::Recreate) {
+            local[i] = inv.create_raw(std::unique_ptr<ObjectBase>(a.snapshot->clone()));
+            old_to_new[a.id] = local[i];
+        }
+    }
+
+    const UndoRemapper remapper{old_to_new};
+    for (std::size_t i = 0; i < entry.actions.size(); ++i) {
+        const UndoAction& a = entry.actions[i];
+        switch (a.kind) {
+            case UndoAction::Kind::Recreate:
+                if (ObjectBase* p = inv.update_raw(local[i])) p->remap_undo_refs(remapper);
+                break;
+            case UndoAction::Kind::Remove:
+                inv.remove_raw(a.id);
+                break;
+            case UndoAction::Kind::RestoreUpdate: {
+                std::unique_ptr<ObjectBase> remapped(a.snapshot->clone());
+                remapped->remap_undo_refs(remapper);
+                if (ObjectBase* p = inv.update_raw(a.id)) p->assign_from(*remapped);
+                break;
+            }
+        }
+    }
+    return try_commit(inv);
 }
 
 CommitResult Model::commit_pretransaction_locked(Transaction& txn) {

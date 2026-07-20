@@ -358,6 +358,34 @@ struct RefRemapper {
     }
 };
 
+/// The mirror image of RefRemapper: RefRemapper only ever rewrites LOCAL
+/// ids (the pre-mint pass); this rewrites OLD REAL ids that are themselves
+/// being recreated by THIS SAME undo application (see Model::apply_undo),
+/// leaving every other id -- still alive and unaffected -- completely
+/// untouched. Kept as its own type rather than generalizing RefRemapper,
+/// matching this codebase's own stated preference (see commit_bulk()'s
+/// _no_log split) for separate, grep-able names over a flag threaded
+/// through shared logic. No "unmapped" failure mode: an id not in `table`
+/// simply passes through unchanged, which is correct here -- it names
+/// something outside this undo entry, not a build-time bug to reject.
+struct UndoRemapper {
+    const std::unordered_map<Id, Id, IdHash>& table;  // old real id -> new local id
+
+    Id resolve(Id id) const {
+        auto it = table.find(id);
+        return it != table.end() ? it->second : id;
+    }
+
+    template <class T>
+    void operator()(const void*, const char*, Ref<T>& r) const {
+        r = Ref<T>(resolve(r.raw()));
+    }
+    template <class T>
+    void operator()(const void*, const char*, Opt<T>& r) const {
+        if (r.raw()) r = Opt<T>(resolve(r.raw()));
+    }
+};
+
 namespace detail {
 /// Global (process-wide, NOT per-Model) registry: field_tag<Field>() -> a
 /// human name, for fields whose declaration opted in by passing one to
@@ -559,11 +587,22 @@ public:
     virtual ~ObjectBase() = default;  ///< objects are deleted through base pointers
 
     /// A faithful copy of the derived object (Object<Derived> implements it
-    /// via the copy constructor -- keep derived types copyable). This is the
-    /// copy-on-write primitive: Transaction::update() clones the committed
-    /// object for local editing, and the cascade BFS clones a referrer
-    /// before nulling one field, so published state is never mutated.
+    /// via the copy constructor -- keep derived types copyable AND
+    /// copy-assignable, see assign_from below). This is the copy-on-write
+    /// primitive: Transaction::update() clones the committed object for
+    /// local editing, and the cascade BFS clones a referrer before nulling
+    /// one field, so published state is never mutated.
     virtual ObjectBase* clone() const = 0;
+
+    /// Overwrite this object's own fields with `other`'s (Object<Derived>
+    /// implements it via the copy-assignment operator -- the same
+    /// copyability clone() already requires, just assigned instead of
+    /// constructed). Used by Model::apply_undo to restore a RestoreUpdate
+    /// action's captured pre-image onto a currently-live object generically,
+    /// without knowing its concrete type. `other` must be the same concrete
+    /// type as `this` -- same precondition tag()-checked casts everywhere
+    /// else in this API already carry, just not re-asserted here.
+    virtual void assign_from(const ObjectBase& other) = 0;
 
     /// The type's identity, for the checked downcast (see TypeTag). Always
     /// type_tag<Derived>() -- Object<Derived> implements it.
@@ -592,6 +631,13 @@ public:
     /// called by Model::apply_create/apply_update, once, during try_commit()'s
     /// apply phase -- see RefRemapper's own comment for why this exists.
     virtual void remap_refs(const RefRemapper&) {}
+
+    /// Same idea as remap_refs, via UndoRemapper instead of RefRemapper --
+    /// a separate virtual because remap_refs() is hard-bound to that one
+    /// concrete visitor type (unlike each_ref(), which takes a type-erased
+    /// std::function). Only ever called by Model::apply_undo. See
+    /// UndoRemapper's own comment for why this exists.
+    virtual void remap_undo_refs(const UndoRemapper&) {}
 
     /// Fields declared in define_keys(), for fast lookup (Snapshot::find_by_key).
     /// Zero or more -- there is no mandatory key at all; a type that declares
@@ -715,6 +761,10 @@ class Object : public ObjectBase {
 public:
     ObjectBase* clone() const override { return new Derived(static_cast<const Derived&>(*this)); }
 
+    void assign_from(const ObjectBase& other) override {
+        static_cast<Derived&>(*this) = static_cast<const Derived&>(other);
+    }
+
     TypeTag tag() const noexcept override { return type_tag<Derived>(); }
 
     const char* type() const override {
@@ -735,6 +785,11 @@ public:
     }
 
     void remap_refs(const RefRemapper& remapper) override {
+        if constexpr (detail::has_define_references<Derived>::value)
+            Derived::define_references(static_cast<Derived&>(*this), remapper);
+    }
+
+    void remap_undo_refs(const UndoRemapper& remapper) override {
         if constexpr (detail::has_define_references<Derived>::value)
             Derived::define_references(static_cast<Derived&>(*this), remapper);
     }
@@ -1887,6 +1942,80 @@ public:
     /// diagnostics() call pay for a query nobody asked for.
     LookupDiagnostics lookup_diagnostics() const;
 
+    /// One step of a committed transaction's inverse, captured for free at
+    /// the exact point apply already reads the relevant pre-image pointer
+    /// (see apply_create/apply_update/clone_for_cascade_null/remove_raw in
+    /// model.cpp). `Recreate`'s object gets a genuinely NEW id when
+    /// resurrected -- generation never recycles (invariant 5) -- so its
+    /// `id` here is the OLD one, informational only.
+    struct UndoAction {
+        enum class Kind : std::uint8_t { Recreate, Remove, RestoreUpdate };  // mirrors ChangeKind's style
+        Kind kind;
+        Id id;                                ///< Remove/RestoreUpdate: the real id to act on.
+                                               ///< Recreate: the OLD id (about to become stale).
+        std::unique_ptr<ObjectBase> snapshot;  ///< pre-image clone (Recreate, RestoreUpdate); null for Remove
+    };
+
+    /// One committed transaction's full inverse recipe. `touched` is every
+    /// id that commit's OWN changes_ mentioned (Created ∪ Updated ∪
+    /// Deleted) -- deliberately broader than just the ids apply_undo()
+    /// would need to act on, so a later commit touching ANY of them
+    /// invalidates this entry (see the undo list's own comment, next to
+    /// undo_list_, for why the broad reading was chosen over a narrower
+    /// one that would only watch RestoreUpdate targets).
+    struct UndoEntry {
+        std::uint64_t version;
+        std::vector<UndoAction> actions;
+        std::unordered_set<Id, IdHash> touched;
+    };
+
+    /// Lightweight, copyable summary of one UndoEntry still in the list --
+    /// what list_undo() returns, so browsing what's available doesn't force
+    /// copying every entry's (potentially many) snapshot clones.
+    struct UndoSummary {
+        std::uint64_t version;
+        std::size_t action_count;
+    };
+
+    /// Every undo entry still in the list, oldest first. See UndoEntry's
+    /// own comment for what "still in the list" means -- an entry a later
+    /// commit conflicted with is silently gone by the time this is called,
+    /// same as a pruned changelog_ entry.
+    std::vector<UndoSummary> list_undo() const;
+
+    /// Removes and returns ownership of the entry for `version`, or
+    /// nullopt if no such entry is in the list (never committed with undo
+    /// data, already taken, or pruned by a later conflicting commit).
+    /// Ownership transfer, not a copy: UndoEntry holds move-only
+    /// unique_ptr<ObjectBase> clones. Once taken, this entry is the
+    /// caller's alone -- it will never be pruned out from under them (it's
+    /// no longer in undo_list_ to prune), and calling apply_undo() with it
+    /// is safe to retry as many times as they like (apply_undo clones
+    /// internally; it never consumes the entry it's given).
+    std::optional<UndoEntry> take_undo(std::uint64_t version);
+
+    /// Drops every entry, to reclaim memory (per-entry snapshot clones are
+    /// proportional to that commit's OWN change size, but a long-running
+    /// Model with many commits and nobody ever calling take_undo() would
+    /// otherwise retain all of them forever -- this is that explicit,
+    /// caller-driven reclaim, the same "give the primitive, let the caller
+    /// bound it" tradeoff Subscription's queue depth already makes).
+    void clear_undo_list();
+
+    /// Builds a fresh Transaction from `entry` and commits it: mints a new
+    /// local id for every Recreate action first (mirrors the pre-mint
+    /// pass, so victim-to-victim edges among resurrected objects remap
+    /// correctly regardless of order -- see UndoRemapper), then applies
+    /// every action, remapping each captured snapshot's own ref fields
+    /// (old real id -> new local id, for anything ALSO being recreated
+    /// this same call) before writing it. Takes `entry` by const reference
+    /// and clones every action's snapshot again rather than consuming it,
+    /// so a Conflict/Invalid result never destroys the caller's only copy
+    /// -- they can inspect what beat them (Model::snapshot()) and retry.
+    /// Not called from inside any hook: this calls begin()/try_commit()
+    /// itself, exactly like any other ordinary application code would.
+    CommitResult apply_undo(const UndoEntry& entry);
+
 private:
     friend struct Snapshot::Lease;
     friend class Transaction;
@@ -2199,12 +2328,31 @@ private:
     std::uint32_t next_slot_ = 0;            ///< high-water mark: next never-used slot
     std::size_t exhausted_slots_ = 0;        ///< see exhausted_slots() accessor
     std::vector<Change> changes_;  ///< scratch: this attempt's resolved changeset
+    std::vector<UndoAction> pending_undo_;  ///< scratch: this attempt's inverse, parallel to changes_ --
+                                            ///< cleared on rollback (rollback_apply), moved into
+                                            ///< undo_list_ on publish (publish_now)
     std::vector<std::pair<std::uint64_t, const ObjectBase*>> retired_;
     ///< ^ this attempt's retirees, same shape as reap_queue_: handed to the
     ///< reaper on publish, drained back out by the undo log on rollback
     PreCommitFn pre_commit_;  ///< empty = no hook; swapped only under commit_mu_ (set_pre_commit)
     std::deque<ChangelogEntry>
         changelog_;  ///< for try_commit()'s conflict check; see prune_changelog
+
+    /// One entry per successful commit that had any undo data (see
+    /// UndoEntry), oldest first. Unlike changelog_ (pruned by the
+    /// reclamation watermark -- a LIFETIME concern), an entry here is
+    /// pruned by CONFLICT: publish_now() drops any existing entry whose
+    /// own `touched` set intersects the just-published commit's, on the
+    /// theory that this is the broadest, simplest-to-state definition of
+    /// "a later commit invalidated this undo" -- even a Remove action
+    /// (idempotent-safe against most later changes) or a Recreate action
+    /// (whose old id can never be touched again) gets pruned this way, a
+    /// deliberately conservative choice over a narrower one that would
+    /// only watch RestoreUpdate targets. Otherwise unbounded: nothing
+    /// caps its size automatically, matching this project's existing "give
+    /// the primitive, let the caller bound it" pattern (Subscription's
+    /// queue depth) -- see clear_undo_list().
+    std::vector<UndoEntry> undo_list_;
 
     PreTransactionsFn pre_transactions_;  ///< empty = no hook; swapped only under commit_mu_
                                           ///< (set_pre_transactions)
@@ -2611,11 +2759,22 @@ public:
     template <class T>
     Ref<T> create(std::unique_ptr<T> o) {
         static_assert(std::is_base_of_v<ObjectBase, T>, "T must derive from Object<T>");
+        return Ref<T>(create_raw(std::move(o)));
+    }
+
+    /// Untyped counterpart of create<T> -- for a caller building a
+    /// Transaction generically across many object types, without a
+    /// per-type dispatch table (same reasoning as Model::peek_raw
+    /// alongside peek_as<T>). Returns the bare local Id instead of a typed
+    /// Ref<T>, since there is no T to name here. Used by Model::apply_undo
+    /// to recreate a cascade-deleted object without knowing its type.
+    Id create_raw(std::unique_ptr<ObjectBase> o) {
         const Id local_id{kLocalIdBit | next_local_id_++, 1};
         o->id = local_id;
+        const TypeTag tag = o->tag();
         local_created_.push_back(std::move(o));
-        pending_changes_.push_back({local_id, ChangeKind::Created, type_tag<T>()});
-        return Ref<T>(local_id);
+        pending_changes_.push_back({local_id, ChangeKind::Created, tag});
+        return local_id;
     }
 
     /// Copy-on-write handle, scoped to this transaction: clones from base()
@@ -2634,6 +2793,12 @@ public:
     T* update(Opt<T> r) {
         return static_cast<T*>(update_impl(r.raw()));
     }
+
+    /// Untyped counterpart of update<T> -- same reasoning as create_raw.
+    /// Used by Model::apply_undo, both for a just-recreated local object
+    /// (remapping its own ref fields) and for restoring a still-real
+    /// object's pre-image (RestoreUpdate actions).
+    ObjectBase* update_raw(Id id) { return update_impl(id); }
 
     /// Records an INTENT to delete -- unlike the single-writer design's
     /// remove(), this does NOT resolve cascade fan-out now (that can only be
@@ -2669,6 +2834,11 @@ public:
     void remove(Opt<T> r) {
         remove_impl(r.raw());
     }
+
+    /// Untyped counterpart of remove<T> -- same reasoning as create_raw.
+    /// (Model::remove_raw already exists with unrelated semantics -- the
+    /// cascade BFS, on a different class -- no collision.)
+    void remove_raw(Id id) { remove_impl(id); }
 
     /// "Is `r` alive as far as THIS transaction can tell?" -- peek() != null,
     /// so it honors local creates, edits, and remove() intents, but NOT other
