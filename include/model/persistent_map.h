@@ -144,7 +144,8 @@ class TrieCore {
     // e.g. model::IdHash), "impossible" above is exact, not just likely: a
     // chain longer than one link can never legitimately occur, so there is
     // nothing to link to in the first place. NoChain is that case's `next`:
-    // zero-sized (via [[no_unique_address]]), and its get() always reports
+    // zero-sized (via [[no_unique_address]] -- see Leaf's own comment for
+    // what that attribute actually buys here), and its get() always reports
     // "no tail" -- which is EXACTLY the value a real, empty
     // unique_ptr<const Leaf> would also report, so every generic walker
     // below (leaf_get, each_in, chain_copy's base case, ...) needs no
@@ -165,16 +166,51 @@ class TrieCore {
     struct Leaf {
         Leaf(Entry e, ChainLink n) : entry(std::move(e)), next(std::move(n)) {}
         Entry entry;
-        [[no_unique_address]] ChainLink next;  ///< collision chain; empty under a perfect Hash
+
+        /// Collision chain; ChainLink is std::unique_ptr<const Leaf> under a
+        /// non-perfect Hash (a real 8-byte pointer -- the attribute is a
+        /// no-op there, nothing empty to shrink), or NoChain under a
+        /// perfect one.
+        ///
+        /// [[no_unique_address]] (C++20) tells the compiler this member
+        /// doesn't need its own distinct address the way every object
+        /// normally must -- so when ChainLink is the empty NoChain, the
+        /// compiler may overlap its storage with `entry` instead of the
+        /// usual >=1-byte-plus-padding an empty member would otherwise cost
+        /// (every object, even an empty one, still needs a UNIQUE address
+        /// by default -- sizeof(NoChain) is 1, not 0 -- unless told
+        /// otherwise). Same idea as the empty-base-optimization trick, just
+        /// for an ordinary member instead of a base class. The payoff: for
+        /// a perfect Hash (model::IdHash) a Leaf costs exactly what Entry
+        /// alone costs -- zero overhead for a chain link that, by
+        /// construction, can never legitimately point anywhere -- which
+        /// matters here because TrieCore/Leaf backs every persistent index
+        /// this project's Model maintains at 100k-1M objects. Same
+        /// cost-consciousness as the two comments above (no cached `hash`
+        /// field; unique_ptr, not shared_ptr, for the real chain case).
+        [[no_unique_address]] ChainLink next;
     };
 
+    // Each occupied bit in `bitmap` has exactly one child, either a Node or
+    // a Leaf -- so two parallel vector<shared_ptr<...>>, one always null per
+    // occupied slot, would waste a whole shared_ptr's worth of storage (16
+    // bytes) on every slot, AND pay for two separate vector headers (24
+    // bytes each) and two separate heap buffers per node, when one of each
+    // would do. `slots` holds ONE type-erased shared_ptr<const void> per
+    // occupied slot instead -- still correctly destructing as a Node or Leaf
+    // regardless of the erasure, since shared_ptr's control block fixes the
+    // deleter at CONSTRUCTION (make_shared<Node>/make_shared<Leaf>), not at
+    // whatever type the pointer is later held as -- and `is_leaf`, a second
+    // bitmap parallel to (a subset of) `bitmap` and indexed the SAME way (by
+    // idx, 0-31, not by the compacted vector position), records which. A
+    // slot's actual type is always known before it's dereferenced (every
+    // caller already branches on is_leaf first), so the cast back
+    // (static_cast<const Node*>/static_cast<const Leaf*>) is never
+    // ambiguous.
     struct Node {
         std::uint32_t bitmap = 0;
-        // Each present bit has a child: either a Node or a Leaf.
-        std::vector<std::shared_ptr<const Node>> children;
-        std::vector<std::shared_ptr<const Leaf>> leaves;
-        // children[k]/leaves[k] correspond positionally; exactly one is non-null
-        // per occupied slot. Kept as two parallel vectors for simplicity.
+        std::uint32_t is_leaf = 0;  ///< subset of bitmap: which occupied idx-slots hold a Leaf
+        std::vector<std::shared_ptr<const void>> slots;  ///< positionally compacted, idx order
     };
 
     static std::uint64_t hash_key(const K& k) noexcept {
@@ -204,10 +240,17 @@ class TrieCore {
         auto c = std::make_shared<Node>();
         if (n) {
             c->bitmap = n->bitmap;
-            c->children = n->children;
-            c->leaves = n->leaves;
+            c->is_leaf = n->is_leaf;
+            c->slots = n->slots;
         }
         return c;
+    }
+
+    static const Node* as_node(const std::shared_ptr<const void>& s) noexcept {
+        return static_cast<const Node*>(s.get());
+    }
+    static const Leaf* as_leaf(const std::shared_ptr<const void>& s) noexcept {
+        return static_cast<const Leaf*>(s.get());
     }
 
     static const Entry* leaf_get(const Leaf* lf, const K& key) {
@@ -333,8 +376,8 @@ class TrieCore {
             // kPerfectHash), and nullptr has no conversion to NoChain.
             auto lf = std::make_shared<Leaf>(entry, ChainLink{});
             nn->bitmap |= b;
-            nn->children.insert(nn->children.begin() + pos, nullptr);
-            nn->leaves.insert(nn->leaves.begin() + pos, lf);
+            nn->is_leaf |= b;
+            nn->slots.insert(nn->slots.begin() + pos, std::move(lf));
             added = true;
             return nn;
         }
@@ -342,21 +385,21 @@ class TrieCore {
         const std::uint32_t pos = popcount_below(n->bitmap, idx);
         auto nn = clone_node(n);
 
-        if (n->children[pos]) {
+        if (!(n->is_leaf & b)) {
             // Slot holds a subtree: recurse.
-            nn->children[pos] = set_in(n->children[pos].get(), hash, shift + 5, key, entry, added);
+            nn->slots[pos] = set_in(as_node(n->slots[pos]), hash, shift + 5, key, entry, added);
             return nn;
         }
 
         // Slot holds a leaf. Its hash isn't stored -- rederive it from its
         // own entry (see Leaf's comment); this recompute happens at most
         // once per level of an O(log32 n) insert, never on a read path.
-        const Leaf* lf = n->leaves[pos].get();
+        const Leaf* lf = as_leaf(n->slots[pos]);
         const std::uint64_t lf_hash = entry_hash(lf->entry);
         if (lf_hash == hash) {
             // Same hash: replace-or-append within the chain (true collision or
             // same key).
-            nn->leaves[pos] = chain_set(lf, key, entry, added);
+            nn->slots[pos] = chain_set(lf, key, entry, added);
             return nn;
         }
 
@@ -365,18 +408,18 @@ class TrieCore {
         if (shift + 5 >= 64) {
             // Ran out of hash bits (astronomically unlikely with distinct hashes,
             // but handle it): merge into one collision chain.
-            nn->leaves[pos] = std::make_shared<Leaf>(entry, chain_copy(lf));
+            nn->slots[pos] = std::make_shared<Leaf>(entry, chain_copy(lf));
             added = true;
             return nn;
         }
         auto sub = std::make_shared<Node>();
         const std::uint32_t exist_idx = slice(lf_hash, shift + 5);
         sub->bitmap = bit(exist_idx);
-        sub->children.push_back(nullptr);
-        sub->leaves.push_back(n->leaves[pos]);
+        sub->is_leaf = bit(exist_idx);
+        sub->slots.push_back(n->slots[pos]);
         auto sub2 = set_in(sub.get(), hash, shift + 5, key, entry, added);
-        nn->children[pos] = sub2;
-        nn->leaves[pos] = nullptr;
+        nn->slots[pos] = sub2;
+        nn->is_leaf &= ~b;  // this slot now holds a Node, not a Leaf
         return nn;
     }
 
@@ -392,33 +435,33 @@ class TrieCore {
         const std::uint32_t pos = popcount_below(n->bitmap, idx);
         auto nn = clone_node(n);
 
-        if (n->children[pos]) {
-            auto sub = erase_in(n->children[pos].get(), hash, shift + 5, key, removed);
+        if (!(n->is_leaf & b)) {
+            auto sub = erase_in(as_node(n->slots[pos]), hash, shift + 5, key, removed);
             if (sub && sub->bitmap != 0) {
-                nn->children[pos] = sub;
+                nn->slots[pos] = sub;
                 return nn;
             }
             // Subtree emptied: drop this slot.
             nn->bitmap &= ~b;
-            nn->children.erase(nn->children.begin() + pos);
-            nn->leaves.erase(nn->leaves.begin() + pos);
+            nn->is_leaf &= ~b;
+            nn->slots.erase(nn->slots.begin() + pos);
             return nn;
         }
 
         // Leaf slot.
-        const Leaf* lf = n->leaves[pos].get();
+        const Leaf* lf = as_leaf(n->slots[pos]);
         if (!leaf_get(lf, key)) return copy_shared(n);  // key absent
 
         removed = true;
         auto nl = chain_erase(lf, key);
         if (nl) {
-            nn->leaves[pos] = std::move(nl);
+            nn->slots[pos] = std::move(nl);
             return nn;
         }
         // Chain emptied (it held only this key): remove the slot entirely.
         nn->bitmap &= ~b;
-        nn->children.erase(nn->children.begin() + pos);
-        nn->leaves.erase(nn->leaves.begin() + pos);
+        nn->is_leaf &= ~b;
+        nn->slots.erase(nn->slots.begin() + pos);
         return nn;
     }
 
@@ -437,24 +480,33 @@ class TrieCore {
             const std::uint32_t b = bit(idx);
             if (!(n->bitmap & b)) return nullptr;
             const std::uint32_t pos = popcount_below(n->bitmap, idx);
-            if (n->children[pos]) {
-                n = n->children[pos].get();
+            if (!(n->is_leaf & b)) {
+                n = as_node(n->slots[pos]);
                 shift += 5;
                 continue;
             }
-            return leaf_get(n->leaves[pos].get(), key);
+            return leaf_get(as_leaf(n->slots[pos]), key);
         }
         return nullptr;
     }
 
+    // Walks idx 0..31 (not the compacted slot position directly) because
+    // is_leaf is indexed by idx, same as bitmap -- `pos` tracks the matching
+    // position in `slots` alongside as occupied bits are found, the same
+    // relationship popcount_below computes on demand elsewhere.
     template <class F>
     static void each_in(const Node* n, F& f) {
         if (!n) return;
-        for (std::size_t i = 0; i < n->children.size(); ++i) {
-            if (n->children[i])
-                each_in(n->children[i].get(), f);
-            else if (n->leaves[i])
-                for (const Leaf* l = n->leaves[i].get(); l; l = l->next.get()) f(l->entry);
+        std::uint32_t pos = 0;
+        for (std::uint32_t idx = 0; idx < 32; ++idx) {
+            const std::uint32_t b = bit(idx);
+            if (!(n->bitmap & b)) continue;
+            if (n->is_leaf & b) {
+                for (const Leaf* l = as_leaf(n->slots[pos]); l; l = l->next.get()) f(l->entry);
+            } else {
+                each_in(as_node(n->slots[pos]), f);
+            }
+            ++pos;
         }
     }
 
