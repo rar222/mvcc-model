@@ -14,7 +14,7 @@
 namespace model {
 
 namespace detail {
-// Turns typeid(Derived).name() (e.g. "6Widget" or "N4demo7AccountE") into the
+// Turns typeid(Derived).name() (e.g. "6Widget" or "N4example7AccountE") into the
 // human-readable "Widget"/"example::Account" that Object<Derived>::type() hands
 // back to callers -- ObjectBase::type() is part of the read-side API (error
 // messages, logging), so a mangled name there would be a usability bug, not
@@ -1049,7 +1049,7 @@ std::string Model::LookupDiagnostics::to_string() const {
 
 std::optional<Model::IntegrityError> Model::apply_create(
     std::unique_ptr<ObjectBase> o, std::unordered_map<std::uint32_t, Id>& remap,
-    const std::unordered_set<Id, IdHash>& pending) {
+    const std::unordered_set<Id, IdHash>& pending, bool keep_undo) {
     const std::uint32_t local_index = o->id.index;  // still local; the remap key
 
     // May reference ANY local create in this txn -- earlier, later, or this
@@ -1099,8 +1099,10 @@ std::optional<Model::IntegrityError> Model::apply_create(
     // needed -- unlike pending_undo_'s other two action kinds, there is no
     // pre-image to capture. Not logged for rollback -- see pending_undo_'s
     // own comment: it's cleared wholesale in rollback_apply(), not
-    // unwound entry-by-entry like changes_.
-    pending_undo_.push_back({UndoAction::Kind::Remove, id, nullptr});
+    // unwound entry-by-entry like changes_. Skipped entirely (not just
+    // discarded later) when keep_undo is false -- see try_commit_without_
+    // undo()'s own comment for why that distinction matters.
+    if (keep_undo) pending_undo_.push_back({UndoAction::Kind::Remove, id, nullptr});
 
     // Never published, nothing else owns it: rollback_apply() deletes
     // everything in txn_created_. Deliberately NOT logged as an undo op -- the
@@ -1112,7 +1114,7 @@ std::optional<Model::IntegrityError> Model::apply_create(
 }
 
 std::optional<Model::IntegrityError> Model::apply_update(
-    std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap) {
+    std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo) {
     ObjectBase* raw = clone.release();
 
     // Log the clone's deletion FIRST (before anything can fail), so in
@@ -1139,8 +1141,11 @@ std::optional<Model::IntegrityError> Model::apply_update(
     // Undo: capture BEFORE baseline is retired -- this IS the pre-image a
     // RestoreUpdate action needs. Same reasoning as changes_: not logged
     // for rollback, since pending_undo_ is cleared wholesale on failure.
-    pending_undo_.push_back(
-        {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(baseline->clone())});
+    // The clone() itself -- not just its retention -- is skipped when
+    // keep_undo is false; see try_commit_without_undo()'s own comment.
+    if (keep_undo)
+        pending_undo_.push_back(
+            {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(baseline->clone())});
 
     retire(baseline);
     log([this] { retired_.pop_back(); });
@@ -1165,7 +1170,7 @@ std::optional<Model::IntegrityError> Model::apply_update(
     return std::nullopt;
 }
 
-ObjectBase* Model::clone_for_cascade_null(Id id) {
+ObjectBase* Model::clone_for_cascade_null(Id id, bool keep_undo) {
     // remove_raw()'s cascade BFS calls this for every NULLABLE referrer of a
     // victim: clone, install, and hand back a mutable pointer so the caller
     // can null_ref() the one field that pointed at the victim. Structurally
@@ -1185,8 +1190,10 @@ ObjectBase* Model::clone_for_cascade_null(Id id) {
     // Undo: same action kind as apply_update's -- "this survivor's field
     // got cascade-nulled" and "this object got explicitly updated" are the
     // same fix from undo's perspective: restore the captured pre-image.
-    pending_undo_.push_back(
-        {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(cur->clone())});
+    // Skipped entirely (not just discarded) when keep_undo is false.
+    if (keep_undo)
+        pending_undo_.push_back(
+            {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(cur->clone())});
 
     ObjectBase* copy = cur->clone();
     log([copy] { delete copy; });
@@ -1202,7 +1209,7 @@ ObjectBase* Model::clone_for_cascade_null(Id id) {
     return copy;
 }
 
-std::vector<Id> Model::remove_raw(Id id) {
+std::vector<Id> Model::remove_raw(Id id, bool keep_undo) {
     // Breadth-first cascade delete, resolved here (at apply time, under
     // commit_mu_) and never eagerly (invariant 8). `work` is the BFS
     // frontier -- ids still waiting to be visited, seeded with the one
@@ -1243,7 +1250,7 @@ std::vector<Id> Model::remove_raw(Id id) {
                 // clone_for_cascade_null's own comment for why reconciliation
                 // must happen here, after null_ref(), not inside that helper.
                 const ObjectBase* baseline = peek_raw(e.from);
-                if (ObjectBase* m = clone_for_cascade_null(e.from)) {
+                if (ObjectBase* m = clone_for_cascade_null(e.from, keep_undo)) {
                     m->null_ref(e.field);
                     reconcile_out_refs(baseline, m);
                     reconcile_field_keys(baseline, m);
@@ -1264,9 +1271,11 @@ std::vector<Id> Model::remove_raw(Id id) {
         // Undo: the inverse of a delete is recreating it -- x's `id` here
         // is the OLD one, permanently stale the moment this BFS finishes
         // (invariant 5: generation never recycles). Captured before
-        // anything below touches victim's data.
-        pending_undo_.push_back(
-            {UndoAction::Kind::Recreate, x, std::unique_ptr<ObjectBase>(victim->clone())});
+        // anything below touches victim's data. Skipped entirely (not
+        // just discarded) when keep_undo is false.
+        if (keep_undo)
+            pending_undo_.push_back(
+                {UndoAction::Kind::Recreate, x, std::unique_ptr<ObjectBase>(victim->clone())});
 
         drop_out_refs(victim);  // logs re-add of victim's outgoing edges
 
@@ -1430,7 +1439,7 @@ std::vector<Change> Transaction::estimate_changes_with_cascades() const {
 }
 
 std::optional<Model::IntegrityError> Model::apply_transaction_contents(
-    Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap) {
+    Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo) {
     // Pre-mint pass: every live create gets its real id BEFORE anything is
     // applied, so the remap table is complete when the first remap_refs()
     // runs -- which is what lets creates in one transaction reference each
@@ -1466,7 +1475,7 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // classify_apply_failure()).
     std::optional<IntegrityError> err;
     for (auto& obj : txn.local_created_) {
-        if (obj && (err = apply_create(std::move(obj), remap, pending)))
+        if (obj && (err = apply_create(std::move(obj), remap, pending, keep_undo)))
             break;  // null: cancelled locally
     }
     if (!err) {
@@ -1474,20 +1483,20 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
             (void)slot;
             // No `pending` needed here: every create installed before the
             // first update applies, so peek() resolves them directly.
-            if (clone && (err = apply_update(std::move(clone), remap))) break;
+            if (clone && (err = apply_update(std::move(clone), remap, keep_undo))) break;
         }
     }
     if (!err) {
-        // Deferred local removes first (see Transaction::remove_impl): each
+        // Deferred local removes first (see Transaction::remove_raw): each
         // one's create just installed above, so its real id comes out of the
         // remap table and takes the exact same cascade BFS a committed id
         // does -- referrers_ already reflects every install and reconcile.
         for (std::uint32_t idx : txn.local_remove_intents_) {
             const auto it = remap.find(kLocalIdBit | idx);
             assert(it != remap.end() && "a deferred-removed create is still live, so it was minted");
-            if (it != remap.end()) remove_raw(it->second);
+            if (it != remap.end()) remove_raw(it->second, keep_undo);
         }
-        for (Id rid : txn.remove_intents_) remove_raw(rid);
+        for (Id rid : txn.remove_intents_) remove_raw(rid, keep_undo);
     }
     return err;
 }
@@ -1511,7 +1520,8 @@ CommitResult Model::classify_apply_failure(IntegrityError err, const Transaction
 }
 
 std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
-                                                   std::unordered_map<std::uint32_t, Id>& remap) {
+                                                   std::unordered_map<std::uint32_t, Id>& remap,
+                                                   bool keep_undo) {
     if (std::vector<Id> overlap = check_id_overlap(txn); !overlap.empty()) {
         return CommitResult{CommitStatus::Conflict,
                             Snapshot{},
@@ -1520,14 +1530,14 @@ std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
                             {},
                             std::nullopt};
     }
-    if (auto err = apply_transaction_contents(txn, remap)) {
+    if (auto err = apply_transaction_contents(txn, remap, keep_undo)) {
         return classify_apply_failure(std::move(*err), txn);
     }
     return std::nullopt;  // applied; remap is populated, changes_ may or may not be empty
 }
 
 CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std::string undo_name,
-                                std::any undo_data) {
+                                std::any undo_data, bool keep_undo) {
     ++version_;  // the version this attempt is about to publish -- commit_mu_-protected, so no
                  // other thread can be racing this increment
 
@@ -1603,7 +1613,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
             it = conflicts ? undo_list_.erase(it) : std::next(it);
         }
 
-        if (!pending_undo_.empty())
+        if (keep_undo && !pending_undo_.empty())
             undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched),
                                   std::move(undo_name), std::move(undo_data)});
     }
@@ -1728,7 +1738,7 @@ CommitResult Model::run_pre_transaction(Transaction& txn) {
     return result;
 }
 
-CommitResult Model::commit_main_locked(Transaction& txn) {
+CommitResult Model::commit_main_locked(Transaction& txn, bool keep_undo) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
     if (pre_transactions_) {
@@ -1761,7 +1771,7 @@ CommitResult Model::commit_main_locked(Transaction& txn) {
     // transaction, unlike a pre-transaction (run_pre_transaction()),
     // must still go through the pre_commit_ veto hook below.
     std::unordered_map<std::uint32_t, Id> remap;
-    if (auto failure = check_and_apply(txn, remap)) return std::move(*failure);
+    if (auto failure = check_and_apply(txn, remap, keep_undo)) return std::move(*failure);
 
     if (changes_.empty()) {
         // Everything in txn had already been applied by an earlier
@@ -1781,10 +1791,10 @@ CommitResult Model::commit_main_locked(Transaction& txn) {
         return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
     }
 
-    return publish_now(std::move(remap), txn.name(), txn.data());
+    return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo);
 }
 
-CommitResult Model::try_commit(Transaction& txn) {
+CommitResult Model::try_commit_core(Transaction& txn, bool keep_undo) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
     if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
@@ -1799,11 +1809,19 @@ CommitResult Model::try_commit(Transaction& txn) {
     CommitResult result = [&] {
         std::lock_guard commit_lk(commit_mu_);
         post_commit_copy = post_commit_;
-        return commit_main_locked(txn);
+        return commit_main_locked(txn, keep_undo);
     }();
 
     if (post_commit_copy) post_commit_copy(*this, txn, result);
     return result;
+}
+
+CommitResult Model::try_commit(Transaction& txn) {
+    return try_commit_core(txn, /*keep_undo=*/true);
+}
+
+CommitResult Model::try_commit_without_undo(Transaction& txn) {
+    return try_commit_core(txn, /*keep_undo=*/false);
 }
 
 // ---------------------------------------------------------------------------

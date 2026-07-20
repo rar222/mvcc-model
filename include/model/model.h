@@ -1558,6 +1558,18 @@ public:
     /// apply) -- discard it and begin() a fresh Transaction to retry.
     CommitResult try_commit(Transaction& txn);
 
+    /// Identical to try_commit() in every observable way EXCEPT one: this
+    /// commit is never added to the undo list (see UndoEntry/undo_list_).
+    /// Not just "captured, then immediately discarded" -- the per-object
+    /// pre-image capture (a clone() per changed/removed object; see
+    /// pending_undo_'s own comment) never happens at all, so this is the
+    /// call to reach for when that extra clone cost matters and you know
+    /// you'll never want to undo this particular commit. Existing
+    /// undo_list_ entries are still pruned as usual if this commit
+    /// conflicts with them (see publish_now()) -- only the ADDITION of a
+    /// new entry for THIS commit is skipped.
+    CommitResult try_commit_without_undo(Transaction& txn);
+
     // ---- bulk load (EXCLUSIVE ACCESS ONLY -- read this before using) -------
     //
     // try_commit()'s per-object undo log -- log() every mutation's exact
@@ -2162,17 +2174,25 @@ private:
     // `remap` arrives at apply_create FULLY minted (the pre-mint pass in
     // apply_transaction_contents), and `pending` is the set of its values:
     // real ids minted this attempt whose slots may not be installed yet.
+    // `keep_undo` (default true, so every pre-existing call site is
+    // unaffected) gates ONLY the pending_undo_ capture -- try_commit_
+    // without_undo() is the one caller that passes false, all the way down
+    // this whole chain, so it skips the per-object clone() entirely rather
+    // than capturing it and throwing it away.
     std::optional<IntegrityError> apply_create(std::unique_ptr<ObjectBase> o,
                                                std::unordered_map<std::uint32_t, Id>& remap,
-                                               const std::unordered_set<Id, IdHash>& pending);
+                                               const std::unordered_set<Id, IdHash>& pending,
+                                               bool keep_undo = true);
     std::optional<IntegrityError> apply_update(std::unique_ptr<ObjectBase> clone,
-                                               std::unordered_map<std::uint32_t, Id>& remap);
-    std::vector<Id> remove_raw(Id id);  // cascade BFS, called from try_commit()'s apply phase
+                                               std::unordered_map<std::uint32_t, Id>& remap,
+                                               bool keep_undo = true);
+    std::vector<Id> remove_raw(Id id, bool keep_undo = true);  // cascade BFS, called from
+                                                               // try_commit()'s apply phase
     // remove_raw's helper for a NULLABLE referrer: clone + install, so the
     // caller can null_ref() the field that pointed at the victim, then
     // reconcile immediately. See the .cpp for why reconciliation must happen
     // in the caller, after null_ref() -- not in here.
-    ObjectBase* clone_for_cascade_null(Id id);
+    ObjectBase* clone_for_cascade_null(Id id, bool keep_undo = true);
 
     /// The conflict check: every slot this transaction updated or intends to
     /// remove, tested against every changelog entry newer than its base.
@@ -2198,7 +2218,7 @@ private:
     /// success; the caller must then check changes_ and eventually publish
     /// or, on failure, pass the returned error to classify_apply_failure().
     std::optional<IntegrityError> apply_transaction_contents(
-        Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap);
+        Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo = true);
 
     /// Unwinds the failed apply attempt (rollback_apply()) and turns the
     /// IntegrityError into the right CommitResult: Conflict(RefIntegrity) if
@@ -2211,7 +2231,8 @@ private:
     /// not be empty"; otherwise the CommitResult IS the final result (a
     /// Conflict from either the overlap check or classify_apply_failure()).
     std::optional<CommitResult> check_and_apply(Transaction& txn,
-                                                 std::unordered_map<std::uint32_t, Id>& remap);
+                                                 std::unordered_map<std::uint32_t, Id>& remap,
+                                                 bool keep_undo = true);
 
     /// The publish tail: version bump, new Root, atomic store under ver_mu_,
     /// subscriber notify, retirees handed to the reaper, changelog append,
@@ -2220,9 +2241,13 @@ private:
     /// `undo_name`/`undo_data` are copied onto this commit's UndoEntry, if
     /// it gets one (see pending_undo_'s own comment) -- callers with no
     /// Transaction to draw them from (commit_bulk(), which never produces
-    /// undo data at all) pass empty defaults.
+    /// undo data at all) pass empty defaults. `keep_undo` gates only
+    /// whether THIS commit gets added as a new entry -- existing undo_list_
+    /// entries this commit conflicts with are pruned regardless (see
+    /// try_commit_without_undo()'s own doc comment for why that split is
+    /// deliberate).
     CommitResult publish_now(std::unordered_map<std::uint32_t, Id> remap, std::string undo_name = "",
-                             std::any undo_data = {});
+                             std::any undo_data = {}, bool keep_undo = true);
 
     /// check_and_apply() + publish_now(), with NO veto-hook seam -- used only
     /// by run_pre_transaction(), which must never invoke pre_commit_
@@ -2233,13 +2258,22 @@ private:
     /// held.
     CommitResult commit_pretransaction_locked(Transaction& txn);
 
-    /// The body of try_commit() that actually needs commit_mu_: everything
-    /// from the pre-transactions phase through check_and_apply(), the
-    /// pre_commit_ veto, and publish_now(). Factored out of try_commit()
-    /// itself so that function can copy post_commit_ out (see PostCommitFn)
+    /// The body of try_commit()/try_commit_without_undo() that actually
+    /// needs commit_mu_: everything from the pre-transactions phase through
+    /// check_and_apply(), the pre_commit_ veto, and publish_now(). Factored
+    /// out so try_commit_core() can copy post_commit_ out (see PostCommitFn)
     /// and invoke it AFTER the std::lock_guard wrapping this call has gone
     /// out of scope, instead of while still holding commit_mu_.
-    CommitResult commit_main_locked(Transaction& txn);
+    CommitResult commit_main_locked(Transaction& txn, bool keep_undo = true);
+
+    /// Shared body of try_commit()/try_commit_without_undo(): the empty-
+    /// transaction fast path, then commit_mu_ + post_commit_ copy-out +
+    /// commit_main_locked() + post_commit_ invoked (unlocked) afterward.
+    /// The ONLY difference between the two public entry points is which
+    /// `keep_undo` value they pass here -- factored into one place rather
+    /// than duplicated so the post_commit_-outside-the-lock ordering (see
+    /// commit_main_locked's own comment) can't drift between two copies.
+    CommitResult try_commit_core(Transaction& txn, bool keep_undo);
 
     // ---- read/publish path -------------------------------------------------
     // root_ is atomic so snapshot() acquires the current version with a lock-free

@@ -430,3 +430,62 @@ TEST(applying_an_undo_produces_a_new_undo_entry_of_its_own) {
     const auto after_undo2 = m.list_undo();
     CHECK_EQ(after_undo2.size(), std::size_t{1});  // the chain keeps going
 }
+
+// ---------------------------------------------------------------------------
+// try_commit_without_undo(): identical commit behavior, but never adds an
+// entry to the undo list.
+// ---------------------------------------------------------------------------
+
+TEST(try_commit_without_undo_commits_normally_but_adds_no_undo_entry) {
+    Model m;
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "A1";
+    txn.create(std::move(a));
+    const CommitResult res = m.try_commit_without_undo(txn);
+
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find_by_key<&Account::name>("A1") != nullptr);  // committed normally
+    CHECK(m.list_undo().empty());  // but no undo entry for it
+}
+
+// Existing undo_list_ entries are still pruned if a try_commit_without_undo()
+// commit conflicts with them -- only the ADDITION of a new entry is skipped,
+// not the conflict check against what's already there (see publish_now()).
+TEST(try_commit_without_undo_still_prunes_conflicting_existing_undo_entries) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 100);
+    CHECK_EQ(m.list_undo().size(), std::size_t{1});  // the create's own entry
+
+    Transaction txn = m.begin();
+    txn.update(a)->balance = 999;
+    const CommitResult res = m.try_commit_without_undo(txn);
+
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK_EQ(m.snapshot().find(a)->balance, std::int64_t{999});  // committed normally
+    CHECK(m.list_undo().empty());  // the create's entry touched `a` too -- pruned
+}
+
+// Covers the Recreate and RestoreUpdate capture sites too (create/update are
+// covered by the two tests above): a cascade removal produces neither for a
+// try_commit_without_undo() commit, even though the cascade itself (the
+// victim's removal and the survivor's field nulled) still happens correctly.
+TEST(try_commit_without_undo_produces_no_undo_entry_even_for_a_cascade) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Account> hub = make_account(m, "HUB");
+    const Ref<Order> mid1 = make_order(m, "MID1", hub);
+    make_order(m, "MID2", hub, mid1);
+    const Ref<Order> surv = make_order(m, "SURV", a, mid1);
+    m.clear_undo_list();  // only interested in the removal below
+
+    Transaction txn = m.begin();
+    txn.remove(hub);
+    const CommitResult res = m.try_commit_without_undo(txn);
+
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find(hub) == nullptr);
+    CHECK(m.snapshot().find(surv) != nullptr);
+    CHECK(!m.snapshot().find(surv)->parent);  // cascade-null still happened correctly
+    CHECK(m.list_undo().empty());             // but none of it was captured for undo
+}
