@@ -9,8 +9,10 @@
 // tests double as a spec for what Stage 2 has to reproduce automatically.
 
 #include <any>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -560,4 +562,179 @@ TEST(run_pre_transaction_without_undo_still_prunes_conflicting_existing_undo_ent
     CHECK_EQ(summaries.size(), std::size_t{1});  // only the main txn's (OTHER's) entry
     CHECK_EQ(summaries.front().action_count, std::size_t{1});
     for (const auto& s : summaries) CHECK(s.version != create_version);  // a's create entry: pruned
+}
+
+// ---------------------------------------------------------------------------
+// Multi-threaded undo: the undo list is commit_mu_-protected exactly like
+// changelog_/referrers_ (invariant 7), so every guarantee below already
+// follows from that -- these tests make it directly observable instead of
+// just trusting the reasoning. Following this suite's own established
+// discipline (see test_concurrency_stress.cpp): no CHECK() from inside a
+// thread body, ever -- results are collected into atomics or per-thread-
+// owned slots, and every CHECK happens in the main thread after join().
+// ---------------------------------------------------------------------------
+
+// A commit's undo entry is just data once take_undo() hands it to a caller
+// -- nothing ties it to the thread that produced it. One thread commits and
+// takes the entry; a completely different thread applies it.
+TEST(a_different_thread_can_apply_another_threads_undo_entry) {
+    Model m;
+    std::optional<Model::UndoEntry> entry;
+    CommitStatus write_status{};
+
+    std::thread writer([&] {
+        Transaction txn = m.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "FROM_WRITER";
+        txn.create(std::move(a));
+        const CommitResult res = m.try_commit(txn);
+        write_status = res.status;
+        if (res.status == CommitStatus::Committed) {
+            auto taken = m.take_undo(res.snapshot.version());
+            if (taken.has_value()) entry = std::move(taken);
+        }
+    });
+    writer.join();
+    CHECK(write_status == CommitStatus::Committed);
+    CHECK(entry.has_value());
+
+    CommitStatus undo_status{};
+    std::thread undoer([&] {
+        const CommitResult undo_res = m.apply_undo(*entry);
+        undo_status = undo_res.status;
+    });
+    undoer.join();
+    CHECK(undo_status == CommitStatus::Committed);
+    CHECK(m.snapshot().find_by_key<&Account::name>("FROM_WRITER") == nullptr);
+}
+
+// Several threads hammer ONE shared Account (so their commits genuinely
+// conflict and overlap) while each ALSO owns one private Account nobody
+// else ever touches. publish_now()'s pruning must be exact: every earlier
+// entry touching the shared Account gets invalidated by whichever commit
+// touches it next, leaving exactly one survivor for it, while every
+// private entry -- never overlapped by anything -- survives untouched.
+TEST(concurrent_conflicting_commits_prune_exactly_the_undo_entries_they_invalidate) {
+    Model m;
+    const Ref<Account> shared = make_account(m, "SHARED", 0);
+    m.clear_undo_list();  // only interested in what happens below
+
+    constexpr int kThreads = 6;
+    constexpr int kRoundsPerThread = 40;
+    std::atomic<int> private_creates{0};
+    std::atomic<int> shared_commits{0};
+
+    std::vector<std::thread> pool;
+    for (int t = 0; t < kThreads; ++t) {
+        pool.emplace_back([&, t] {
+            Transaction own_txn = m.begin();
+            auto o = std::make_unique<Account>();
+            o->name = "PRIVATE" + std::to_string(t);
+            own_txn.create(std::move(o));
+            if (m.try_commit(own_txn).status == CommitStatus::Committed)
+                private_creates.fetch_add(1, std::memory_order_relaxed);
+
+            for (int i = 0; i < kRoundsPerThread; ++i) {
+                Transaction txn = m.begin();
+                txn.update(shared)->balance = t * 1000 + i;
+                if (m.try_commit(txn).status == CommitStatus::Committed)
+                    shared_commits.fetch_add(1, std::memory_order_relaxed);
+                // Conflicts are expected and fine here -- many threads racing
+                // the same object via OCC -- just don't corrupt anything.
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+
+    CHECK_EQ(private_creates.load(), kThreads);
+    CHECK(shared_commits.load() > 0);
+
+    // Exactly one entry survives for `shared`, plus one per thread for its
+    // own private object.
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{kThreads + 1});
+
+    // Every survivor can be taken and later applied without conflict --
+    // proof that the survivors are genuinely independent of each other and
+    // of everything that got pruned along the way.
+    std::vector<Model::UndoEntry> taken;
+    for (const auto& s : summaries) {
+        auto entry = m.take_undo(s.version);
+        CHECK(entry.has_value());
+        if (entry.has_value()) taken.push_back(std::move(*entry));
+    }
+    CHECK(m.list_undo().empty());  // every survivor was taken
+
+    for (const auto& entry : taken) CHECK(m.apply_undo(entry).status == CommitStatus::Committed);
+
+    for (int t = 0; t < kThreads; ++t)
+        CHECK(m.snapshot().find_by_key<&Account::name>("PRIVATE" + std::to_string(t)) == nullptr);
+    CHECK(m.snapshot().find(shared) != nullptr);  // restored, not removed -- RestoreUpdate, not Recreate
+}
+
+// Several threads each commit SEVERAL independent private transactions --
+// one NEW Account per commit, never the same id touched twice -- so nothing
+// ever overlaps, either across threads or within one thread's own history
+// (sequentially updating the SAME id would self-prune its own earlier entry;
+// that's genuinely a conflict, per publish_now()'s own rule, and is exactly
+// what the test above already covers). Afterward, each thread undoes ALL of
+// its own transactions, in commit order, one thread per history, all
+// running concurrently again -- proving private-object undo entries are
+// fully independent of both other threads' forward work AND other threads'
+// concurrent undo work.
+TEST(each_writer_thread_can_undo_all_of_its_own_private_transactions_in_order) {
+    Model m;
+    constexpr int kThreads = 4;
+    constexpr int kCommitsPerThread = 7;
+
+    std::vector<std::vector<std::uint64_t>> per_thread_versions(kThreads);
+    std::atomic<int> writers_ok{0};
+
+    std::vector<std::thread> writers;
+    for (int t = 0; t < kThreads; ++t) {
+        writers.emplace_back([&, t] {
+            bool ok = true;
+            for (int i = 0; i < kCommitsPerThread; ++i) {
+                Transaction txn = m.begin();
+                auto a = std::make_unique<Account>();
+                a->name = "THREAD" + std::to_string(t) + "_" + std::to_string(i);
+                txn.create(std::move(a));
+                const CommitResult res = m.try_commit(txn);
+                ok = ok && (res.status == CommitStatus::Committed);
+                per_thread_versions[t].push_back(res.snapshot.version());
+            }
+            if (ok) writers_ok.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& th : writers) th.join();
+    CHECK_EQ(writers_ok.load(), kThreads);
+
+    // Every commit created a DIFFERENT, private object -- nothing pruned
+    // anything: kThreads * kCommitsPerThread entries total, one per commit.
+    CHECK_EQ(m.list_undo().size(), static_cast<std::size_t>(kThreads * kCommitsPerThread));
+
+    std::atomic<int> undoers_ok{0};
+    std::vector<std::thread> undoers;
+    for (int t = 0; t < kThreads; ++t) {
+        undoers.emplace_back([&, t] {
+            bool ok = true;
+            for (std::uint64_t version : per_thread_versions[t]) {  // in commit order
+                auto entry = m.take_undo(version);
+                ok = ok && entry.has_value();
+                if (entry.has_value()) {
+                    const CommitResult res = m.apply_undo(*entry);
+                    ok = ok && (res.status == CommitStatus::Committed);
+                }
+            }
+            if (ok) undoers_ok.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& th : undoers) th.join();
+    CHECK_EQ(undoers_ok.load(), kThreads);
+
+    // Every one of every thread's own transactions was undone.
+    for (int t = 0; t < kThreads; ++t)
+        for (int i = 0; i < kCommitsPerThread; ++i)
+            CHECK(m.snapshot().find_by_key<&Account::name>(
+                      "THREAD" + std::to_string(t) + "_" + std::to_string(i)) == nullptr);
 }
