@@ -479,6 +479,45 @@ TEST(transaction_id_is_unique_per_transaction_and_stable_across_a_move) {
     CHECK_EQ(c.id(), id_before_move);
 }
 
+// CommitResult::to_real()'s doc comment: "a ref that was never local...
+// passes through unchanged." A ref obtained from an already-committed
+// object (never a local placeholder) must come back byte-for-byte
+// identical after a completely unrelated commit, whether it's read
+// straight off base() or is simply the handle the caller already had.
+TEST(to_real_passes_through_a_ref_that_was_never_local) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 10);
+
+    Transaction txn = m.begin();
+    // Read the SAME real id back through base() -- still not local.
+    const Account* from_base = txn.base().find(a);
+    CHECK(from_base != nullptr);
+    const Ref<Account> a_from_base(from_base->id);
+    CHECK_EQ(a_from_base.raw(), a.raw());
+
+    // Unrelated create, so the commit actually does something (to_real() on
+    // an empty-transaction fast path is a degenerate case tested elsewhere).
+    auto o = std::make_unique<Order>();
+    o->code = "O1";
+    o->account = a;
+    txn.create(std::move(o));
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    // Neither `a` nor `a_from_base` was ever a local id -- to_real() must
+    // hand each straight back, unchanged.
+    CHECK(res.to_real(a).raw() == a.raw());
+    CHECK(res.to_real(a_from_base).raw() == a.raw());
+
+    // Opt<T> form, same guarantee: a non-local Opt passes through unchanged,
+    // whether it's null or set.
+    const Opt<Account> opt_set(a.raw());
+    CHECK(res.to_real(opt_set).raw() == a.raw());
+    const Opt<Account> opt_null{};
+    CHECK(!res.to_real(opt_null));
+}
+
 // The defining proof of the correlation mechanism: PreTransactionsFn,
 // PreCommitFn, and PostCommitFn all receive a `const Transaction&` for one
 // try_commit() attempt, and it is the SAME Transaction throughout -- all

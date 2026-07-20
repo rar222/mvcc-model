@@ -142,6 +142,143 @@ TEST(ref_integrity_is_revalidated_against_latest_not_just_base) {
     CHECK(ra.conflict->reason == ConflictReason::RefIntegrity);
 }
 
+// Same setup as ref_integrity_is_revalidated_against_latest_not_just_base
+// above, but checking WHAT classify_apply_failure() reports, not just the
+// reason enum: ConflictInfo::ids for a RefIntegrity conflict names the
+// specific dangling target (err.bad_target), not the id(s) this transaction
+// itself wrote (there are none -- the create is local, and the Account was
+// never touched by a_txn at all).
+TEST(conflict_info_ids_names_the_dangling_target_for_ref_integrity) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+
+    Snapshot base = m.snapshot();
+    Transaction a_txn = m.begin(base);
+    Transaction b_txn = m.begin(base);
+
+    b_txn.remove(a);
+    CHECK(m.try_commit(b_txn).status == CommitStatus::Committed);
+
+    auto o = std::make_unique<Order>();
+    o->code = "O1";
+    o->account = a;  // new Order -> now-dead Account
+    a_txn.create(std::move(o));
+
+    const CommitResult ra = m.try_commit(a_txn);
+    CHECK(ra.status == CommitStatus::Conflict);
+    CHECK(ra.conflict.has_value());
+    CHECK(ra.conflict->reason == ConflictReason::RefIntegrity);
+    CHECK_EQ(ra.conflict->ids.size(), std::size_t{1});
+    CHECK(std::find(ra.conflict->ids.begin(), ra.conflict->ids.end(), a.raw()) !=
+          ra.conflict->ids.end());
+}
+
+// check_id_overlap() collects EVERY colliding id from the changelog, not
+// just the first one it sees -- a transaction that touches several ids,
+// racing a concurrent commit that touched several of the SAME ids, must
+// see all of them in conflict->ids.
+TEST(id_set_overlap_conflict_reports_every_overlapping_id_not_just_one) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1", 0);
+    const Ref<Account> a2 = make_account(m, "A2", 0);
+    const Ref<Account> a3 = make_account(m, "A3", 0);
+
+    Snapshot base = m.snapshot();
+    Transaction winner = m.begin(base);
+    Transaction loser = m.begin(base);
+
+    // The winner touches a1 and a2 only.
+    winner.update(a1)->balance = 111;
+    winner.update(a2)->balance = 222;
+    CHECK(m.try_commit(winner).status == CommitStatus::Committed);
+
+    // The loser touches a1, a2 (both overlapping) AND a3 (no overlap).
+    loser.update(a1)->balance = 999;
+    loser.update(a2)->balance = 999;
+    loser.update(a3)->balance = 999;
+
+    const CommitResult res = m.try_commit(loser);
+    CHECK(res.status == CommitStatus::Conflict);
+    CHECK(res.conflict.has_value());
+    CHECK(res.conflict->reason == ConflictReason::IdSetOverlap);
+    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a1.raw()) !=
+          res.conflict->ids.end());
+    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a2.raw()) !=
+          res.conflict->ids.end());
+    // a3 never collided -- it must NOT be reported as an overlap id.
+    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a3.raw()) ==
+          res.conflict->ids.end());
+}
+
+// The documented wrinkle on CommitResult::snapshot: an empty Transaction
+// (no creates/updates/removes) takes try_commit()'s fast path and returns
+// Committed with the TRANSACTION'S OWN base() as its snapshot -- even if a
+// concurrent commit has since moved the model to a later version. "Nothing
+// changed, so any version is after this commit" is the doc comment's own
+// reasoning; this test proves the returned snapshot is the STALE base, not
+// whatever is latest at the moment try_commit() actually runs.
+TEST(empty_transaction_fast_path_returns_the_transactions_own_possibly_stale_base_as_its_snapshot) {
+    Model m;
+    make_account(m, "A1");
+
+    Transaction empty_txn = m.begin();  // pins base() at version V; never touched
+    const std::uint64_t v = empty_txn.base_version();
+
+    // A DIFFERENT transaction commits something unrelated, advancing the
+    // model past V.
+    make_account(m, "A2");
+    CHECK(m.current_version() > v);
+
+    const CommitResult res = m.try_commit(empty_txn);
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK_EQ(res.snapshot.version(), v);
+    CHECK(res.snapshot.version() != m.current_version());
+}
+
+// Diagnostics::reap_backlog is documented as == retired_pending() -- both
+// read the SAME underlying commit_mu_-protected state, just through two
+// different public accessors. Churn some removes while a Snapshot holds an
+// older version pinned (so there's a genuine non-zero backlog), and confirm
+// the two calls agree.
+TEST(diagnostics_reap_backlog_matches_retired_pending) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    std::vector<Ref<Order>> orders;
+    for (int i = 0; i < 5; ++i) orders.push_back(make_order(m, "O" + std::to_string(i), a));
+
+    Snapshot pin = m.snapshot();  // holds the pre-removal version alive
+    for (const Ref<Order>& o : orders) remove_and_commit(m, o);
+
+    CHECK(m.retired_pending() > 0);
+    CHECK_EQ(m.diagnostics().reap_backlog, m.retired_pending());
+}
+
+// Diagnostics::slots_free/slots_exhausted track exactly what their doc
+// comments say: (a) a removed, reclaimed object's slot becomes available
+// again (free_slots_ grows); (b) debug_set_generation()-forced exhaustion
+// (same testing seam the single-threaded exhaustion tests in test_basics.cpp
+// use) is reflected in slots_exhausted, in lockstep with exhausted_slots().
+TEST(diagnostics_slots_free_and_slots_exhausted_track_recycling) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o1 = make_order(m, "O1", a);
+    const std::uint32_t slot = o1.raw().index;
+
+    const std::size_t free_before = m.diagnostics().slots_free;
+    remove_and_commit(m, o1);
+    CHECK_EQ(m.wait_for_reclamation(), std::size_t{0});  // nothing pins the old version here
+    CHECK_EQ(m.diagnostics().slots_free, free_before + 1);
+
+    // Force that freed slot toward exhaustion (mirrors
+    // an_exhausted_slot_is_retired_not_reused in test_basics.cpp), then
+    // trigger a create so alloc_slot() actually pops and retires it.
+    m.debug_set_generation(slot, kGenMax);
+    make_order(m, "O2", a);
+
+    CHECK_EQ(m.exhausted_slots(), std::size_t{1});
+    CHECK_EQ(m.diagnostics().slots_exhausted, m.exhausted_slots());
+}
+
 // A hub-and-spoke cascade (1 account, 20 dependent orders) kills exactly
 // the expected count in one commit, confirming try_commit()'s deferred
 // cascade resolution matches what an eager, synchronous BFS would do.
@@ -268,5 +405,83 @@ TEST(diagnostics_retained_commit_history_tracks_the_changelog) {
         CHECK(version <= d.version);
         CHECK(change_count >= std::size_t{1});
     }
+}
+
+// Drives every CommitStatus at least once and checks each lands in its own
+// counter, cumulatively -- one bucket per Diagnostics::commits_* field, no
+// cross-contamination between them.
+TEST(diagnostics_commit_outcome_counters_tally_every_status_independently) {
+    Model m;
+    const Model::Diagnostics before = m.diagnostics();
+
+    // Committed.
+    const Ref<Account> a = make_account(m, "A1", 0);
+
+    // Conflict (IdSetOverlap): two transactions racing the same id.
+    {
+        Transaction t1 = m.begin(m.snapshot());
+        Transaction t2 = m.begin(m.snapshot());
+        t1.update(a)->balance = 111;
+        t2.update(a)->balance = 222;
+        CHECK(m.try_commit(t1).status == CommitStatus::Committed);
+        CHECK(m.try_commit(t2).status == CommitStatus::Conflict);
+    }
+
+    // Invalid: a create referencing an already-dead target at the txn's own base.
+    {
+        const Ref<Account> victim = make_account(m, "VICTIM");
+        remove_and_commit(m, victim);
+        Transaction txn = m.begin();
+        auto o = std::make_unique<Order>();
+        o->code = "BAD";
+        o->account = victim;
+        txn.create(std::move(o));
+        CHECK(m.try_commit(txn).status == CommitStatus::Invalid);
+    }
+
+    // Vetoed: pre-commit hook says no.
+    {
+        m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
+        Transaction txn = m.begin();
+        auto o = std::make_unique<Order>();
+        o->code = "VETOED";
+        o->account = a;
+        txn.create(std::move(o));
+        CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
+        m.set_pre_commit({});
+    }
+
+    // PrecommitConflict: a pre-transaction fails, so the main transaction never runs.
+    {
+        m.set_pre_transactions([](Model& model, const Transaction&) {
+            Transaction pre = model.begin();
+            auto o = std::make_unique<Order>();
+            o->code = "PRE_BAD";  // account left default -> null non-nullable Ref
+            pre.create(std::move(o));
+            (void)model.run_pre_transaction_without_undo(pre);
+        });
+        Transaction txn = m.begin();
+        auto o = std::make_unique<Order>();
+        o->code = "NEVER_APPLIED";
+        o->account = a;
+        txn.create(std::move(o));
+        CHECK(m.try_commit(txn).status == CommitStatus::PrecommitConflict);
+        m.set_pre_transactions({});
+    }
+
+    const Model::Diagnostics after = m.diagnostics();
+    // Several Committed calls happen along the way as setup (seeding `a`,
+    // t1's winning update, VICTIM's create and remove) -- assert only that
+    // it moved, not an exact count, so this stays independent of exactly
+    // how much setup each case needs. The failing pre-transaction's own
+    // Invalid result (run_pre_transaction_without_undo, inside the
+    // PrecommitConflict case) is never counted here at all -- only the
+    // outer try_commit() call that wraps it is, and that one comes back
+    // PrecommitConflict, not Invalid -- see record_commit_outcome().
+    CHECK(after.commits_succeeded > before.commits_succeeded);
+    CHECK_EQ(after.commits_conflicted, before.commits_conflicted + 1);
+    CHECK_EQ(after.commits_invalid, before.commits_invalid + 1);
+    CHECK_EQ(after.commits_vetoed, before.commits_vetoed + 1);
+    CHECK_EQ(after.commits_precommit_conflicted, before.commits_precommit_conflicted + 1);
 }
 

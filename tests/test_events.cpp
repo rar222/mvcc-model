@@ -128,3 +128,62 @@ TEST(a_slow_subscriber_thread_wakes_from_wait_after_shutdown_and_sees_coalescing
     CHECK(saw_coalesced.load());             // the actual proof that overflow/coalescing fired
 }
 
+// Two Subscriptions on the same Model are entirely independent queues: a
+// slow (never-drained) subscriber overflowing and coalescing must not steal
+// or fold away any of the individual deliveries a fast, promptly-draining
+// subscriber sees. One subscriber's backpressure is purely local to it.
+TEST(multiple_independent_subscribers_receive_independent_coalescing_streams) {
+    Model m;
+    auto fast = m.subscribe(/*depth=*/8);
+    auto slow = m.subscribe(/*depth=*/2);
+
+    constexpr int kCommits = 20;
+    for (int i = 0; i < kCommits; ++i) {
+        make_account(m, "A" + std::to_string(i));
+
+        // Drained every commit -- never allowed to build up, so it must never
+        // coalesce and must see exactly this commit's own one-object changeset.
+        Update u;
+        CHECK(fast->try_drain(u));
+        CHECK(!u.coalesced);
+        CHECK_EQ(u.changes.size(), std::size_t{1});
+        CHECK(!fast->try_drain(u));  // nothing else queued behind it
+    }
+
+    // `slow` was never drained during the loop above (queue depth 2, 20
+    // commits) -- it must have overflowed and coalesced, exactly like
+    // overflow_coalesces_instead_of_growing, entirely independent of `fast`
+    // having drained every single one of the same 20 commits cleanly.
+    int batches = 0;
+    bool saw_coalesced = false;
+    Update u;
+    while (slow->try_drain(u)) {
+        ++batches;
+        if (u.coalesced) saw_coalesced = true;
+    }
+    CHECK(batches <= 3);   // bounded, not 20
+    CHECK(saw_coalesced);  // the slow subscriber's queue actually overflowed
+}
+
+// Model::shutdown() copies the current subscriber list and closes exactly
+// those (see its implementation) -- it is not a persistent "the model is
+// shut down" flag that subscribe() consults. So: (1) calling it with zero
+// subscribers must not crash or assert, and (2) a Subscription created
+// AFTER a shutdown() call starts open, not closed -- it only becomes closed
+// once a LATER shutdown() call sees it in the list. That is exactly why
+// Model::subscribe()'s doc comment says "Subscribe BEFORE shutdown()": this
+// is a documented footgun, not something the API auto-detects for you.
+TEST(subscribing_after_shutdown_returns_a_subscription_that_immediately_reports_closed) {
+    Model m;
+    m.shutdown();  // zero subscribers -- must not crash or assert
+
+    auto late = m.subscribe(/*queue_depth=*/4);
+    m.shutdown();  // shutdown() is repeatable: closes whatever is registered NOW, `late` included
+
+    // closed_ is true and the queue is empty, so wait()'s predicate is
+    // already satisfied -- this returns false immediately, no blocking.
+    Update u;
+    CHECK(!late->wait(u));
+    CHECK(!late->try_drain(u));
+}
+

@@ -565,6 +565,171 @@ TEST(run_pre_transaction_without_undo_still_prunes_conflicting_existing_undo_ent
 }
 
 // ---------------------------------------------------------------------------
+// run_pre_transaction(): the WITH-undo counterpart of the _without_undo()
+// tests above -- the pre-transaction's own commit gets its own undo entry
+// too, independent of the main transaction's.
+// ---------------------------------------------------------------------------
+
+// The pre-transaction's own commit (run via run_pre_transaction(), not
+// _without_undo()) produces its own undo entry, keyed by its OWN published
+// version (not the main transaction's) -- and applying it reverses only the
+// pre-transaction's effect, leaving the main transaction's own commit alone.
+TEST(run_pre_transaction_captures_an_undo_entry_for_the_pre_transaction) {
+    Model m;
+    std::uint64_t pre_version = 0;
+    m.set_pre_transactions([&](Model& model, const Transaction&) {
+        Transaction pre = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "PRE";
+        pre.create(std::move(a));
+        CommitResult r = model.run_pre_transaction(pre);
+        CHECK(r.status == CommitStatus::Committed);
+        pre_version = r.snapshot.version();
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "MAIN";
+    txn.create(std::move(a));
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    m.set_pre_transactions({});
+
+    CHECK(m.snapshot().find_by_key<&Account::name>("PRE") != nullptr);
+    CHECK(m.snapshot().find_by_key<&Account::name>("MAIN") != nullptr);
+
+    // Two independent entries: the pre-transaction's own, and the main
+    // transaction's own -- nothing about run_pre_transaction() folds its
+    // capture into the main commit's entry.
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{2});
+
+    auto pre_entry = m.take_undo(pre_version);
+    CHECK(pre_entry.has_value());
+    CHECK_EQ(pre_entry->actions.size(), std::size_t{1});
+    CHECK(pre_entry->actions.front().kind == Model::UndoAction::Kind::Remove);
+
+    const CommitResult undo_res = m.apply_undo(*pre_entry);
+    CHECK(undo_res.status == CommitStatus::Committed);
+    // Only PRE's effect is reversed -- MAIN, committed separately by a
+    // different call, is untouched by undoing PRE.
+    CHECK(m.snapshot().find_by_key<&Account::name>("PRE") == nullptr);
+    CHECK(m.snapshot().find_by_key<&Account::name>("MAIN") != nullptr);
+}
+
+// apply_undo() is not special-cased against concurrency: it is just
+// begin()+try_commit() (see its own doc comment), so a commit that lands
+// between its begin() (which fixes the reconstruction's base) and its own
+// check_id_overlap is exactly as real a race as any two writer threads
+// hammering try_commit() -- it is reported as an ordinary Conflict, not
+// silently absorbed or misclassified as Invalid. Simulated deterministically
+// via the pre-transactions hook: PreTransactionsFn runs at the very start of
+// ANY try_commit() attempt (including the one apply_undo() makes internally)
+// -- from apply_undo()'s reconstruction's perspective, a commit landing there
+// is indistinguishable from a different writer thread racing it (see
+// main_transaction_conflicts_with_a_pre_transaction_touching_the_same_object
+// in test_hooks.cpp, which establishes the same equivalence for an ordinary
+// transaction).
+TEST(apply_undo_can_itself_report_conflict_against_a_concurrent_commit) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 100);
+    m.clear_undo_list();  // only interested in the update's own entry below
+
+    update_field(m, a, [](Account* p) { p->balance = 999; });
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{1});
+    auto entry = m.take_undo(summaries.front().version);
+    CHECK(entry.has_value());
+
+    // A "concurrent" commit that lands after apply_undo()'s begin() (fixing
+    // its base) but before its own conflict check -- touching the SAME
+    // object the taken entry's RestoreUpdate action targets.
+    m.set_pre_transactions([a](Model& model, const Transaction&) {
+        Transaction concurrent = model.begin();
+        concurrent.update(a)->balance = 555;
+        CommitResult r = model.run_pre_transaction_without_undo(concurrent);
+        CHECK(r.status == CommitStatus::Committed);
+    });
+
+    const CommitResult undo_res = m.apply_undo(*entry);
+    CHECK(undo_res.status == CommitStatus::Conflict);
+    CHECK(undo_res.conflict.has_value());
+    CHECK(undo_res.conflict->reason == ConflictReason::IdSetOverlap);
+
+    m.set_pre_transactions({});
+    // The "concurrent" commit's value stands -- the undo lost the race, and
+    // (being a Conflict, not Committed) never touched published state.
+    CHECK_EQ(m.snapshot().find(a)->balance, std::int64_t{555});
+}
+
+// take_undo() of a version that never had an undo entry at all -- distinct
+// from the already-tested "pruned" case (a_later_conflicting_commit_
+// invalidates_an_earlier_undo_entry above): this version is real (committed
+// via try_commit_without_undo(), so it genuinely exists as a snapshot
+// version) but simply never produced undo data to begin with, and an
+// entirely made-up version number behaves the same way.
+TEST(take_undo_of_an_unknown_version_returns_nullopt) {
+    Model m;
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "A1";
+    txn.create(std::move(a));
+    const CommitResult res = m.try_commit_without_undo(txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    CHECK(!m.take_undo(res.snapshot.version()).has_value());  // real version, no undo entry
+    CHECK(!m.take_undo(std::uint64_t{999999}).has_value());   // never a real version at all
+}
+
+// take_undo() removes an entry from the live list (per its own doc comment),
+// but the UndoEntry it hands back is the caller's alone from that point on --
+// a later clear_undo_list() call (which only ever touches undo_list_ itself)
+// must not reach into an entry that already left the list.
+TEST(clear_undo_list_does_not_affect_an_already_taken_entrys_usability) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{1});
+    auto entry = m.take_undo(summaries.front().version);
+    CHECK(entry.has_value());
+    CHECK(m.list_undo().empty());  // already gone from the live list
+
+    m.clear_undo_list();  // a no-op on the (already empty) live list here
+
+    const CommitResult undo_res = m.apply_undo(*entry);
+    CHECK(undo_res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find(a) == nullptr);
+}
+
+// Pruning is keyed on actual touched-id overlap (publish_now()'s own rule),
+// not "any later commit invalidates everything": a commit that creates a
+// brand-new, entirely unrelated object shares no id with an earlier entry
+// and must leave it untouched.
+TEST(undo_entry_survives_an_unrelated_commit_that_touches_no_shared_id) {
+    Model m;
+    const Ref<Account> x = make_account(m, "X", 10);
+    const auto summaries_x = m.list_undo();
+    CHECK_EQ(summaries_x.size(), std::size_t{1});
+    const std::uint64_t version_x = summaries_x.front().version;
+
+    make_account(m, "Y");  // unrelated -- touches only Y's (brand-new) id
+
+    const auto after = m.list_undo();
+    CHECK_EQ(after.size(), std::size_t{2});  // both X's and Y's entries survive
+    bool found_x = false;
+    for (const auto& s : after)
+        if (s.version == version_x) found_x = true;
+    CHECK(found_x);
+
+    auto entry = m.take_undo(version_x);
+    CHECK(entry.has_value());
+    const CommitResult undo_res = m.apply_undo(*entry);
+    CHECK(undo_res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find(x) == nullptr);
+    CHECK(m.snapshot().find_by_key<&Account::name>("Y") != nullptr);  // Y, untouched throughout
+}
+
+// ---------------------------------------------------------------------------
 // Multi-threaded undo: the undo list is commit_mu_-protected exactly like
 // changelog_/referrers_ (invariant 7), so every guarantee below already
 // follows from that -- these tests make it directly observable instead of

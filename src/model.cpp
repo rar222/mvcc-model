@@ -880,6 +880,13 @@ Model::Diagnostics Model::diagnostics() const {
     Diagnostics diag;
     diag.transactions_begun = next_txn_id_.load(std::memory_order_relaxed) - 1;
 
+    diag.commits_succeeded = commits_succeeded_.load(std::memory_order_relaxed);
+    diag.commits_conflicted = commits_conflicted_.load(std::memory_order_relaxed);
+    diag.commits_vetoed = commits_vetoed_.load(std::memory_order_relaxed);
+    diag.commits_invalid = commits_invalid_.load(std::memory_order_relaxed);
+    diag.commits_precommit_conflicted =
+        commits_precommit_conflicted_.load(std::memory_order_relaxed);
+
     {
         std::lock_guard lk(commit_mu_);
         diag.version = version_;
@@ -1804,11 +1811,29 @@ CommitResult Model::commit_main_locked(Transaction& txn, bool keep_undo) {
     return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo);
 }
 
+// One counter per CommitStatus (see the Diagnostics::commits_* doc
+// comment); noexcept because it's called from try_commit_core()'s hot
+// path and must never be a reason a commit attempt could throw under
+// -fno-exceptions.
+void Model::record_commit_outcome(CommitStatus status) noexcept {
+    switch (status) {
+        case CommitStatus::Committed: commits_succeeded_.fetch_add(1, std::memory_order_relaxed); break;
+        case CommitStatus::Conflict: commits_conflicted_.fetch_add(1, std::memory_order_relaxed); break;
+        case CommitStatus::Vetoed: commits_vetoed_.fetch_add(1, std::memory_order_relaxed); break;
+        case CommitStatus::Invalid: commits_invalid_.fetch_add(1, std::memory_order_relaxed); break;
+        case CommitStatus::PrecommitConflict:
+            commits_precommit_conflicted_.fetch_add(1, std::memory_order_relaxed);
+            break;
+    }
+}
+
 CommitResult Model::try_commit_core(Transaction& txn, bool keep_undo) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
-    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
+    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty()) {
+        record_commit_outcome(CommitStatus::Committed);
         return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
+    }
 
     // post_commit_copy: post_commit_ read out (a std::function copy, cheap)
     // while commit_mu_ is still held by the lambda below -- that's the only
@@ -1821,6 +1846,7 @@ CommitResult Model::try_commit_core(Transaction& txn, bool keep_undo) {
         post_commit_copy = post_commit_;
         return commit_main_locked(txn, keep_undo);
     }();
+    record_commit_outcome(result.status);
 
     if (post_commit_copy) post_commit_copy(*this, txn, result);
     return result;

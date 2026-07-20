@@ -928,6 +928,7 @@ class Model;
 class Transaction;
 class BulkTransaction;
 struct CommitResult;
+enum class CommitStatus;
 
 template <class T>
 class View;
@@ -1896,6 +1897,25 @@ public:
         /// still need an entry, it's gone -- so seeing fewer entries on a
         /// later call is normal, not a bug.
         std::vector<std::pair<std::uint64_t, std::size_t>> retained_commit_history;
+
+        /// Cumulative try_commit()/try_commit_without_undo() outcome counts
+        /// since this Model was constructed -- monotonically increasing,
+        /// never reset, never pruned (unlike retained_commit_history above,
+        /// which only covers the still-live changelog window). This is the
+        /// number to watch for whether writers are thrashing against each
+        /// other at this Model's target scale (many writer threads racing
+        /// try_commit()): a rising commits_conflicted relative to
+        /// commits_succeeded means real contention, not a bug. Does NOT
+        /// include run_pre_transaction()/run_pre_transaction_without_undo()
+        /// calls (their outcome is folded into the enclosing try_commit()
+        /// call's own PrecommitConflict, exactly once) or
+        /// commit_bulk_without_undo() (a single-writer, exclusive-access
+        /// path with no OCC contention to observe).
+        std::uint64_t commits_succeeded = 0;
+        std::uint64_t commits_conflicted = 0;
+        std::uint64_t commits_vetoed = 0;
+        std::uint64_t commits_invalid = 0;
+        std::uint64_t commits_precommit_conflicted = 0;
     };
 
     /// Builds a Diagnostics readout. Not a hot-path call: takes commit_mu_
@@ -2307,6 +2327,24 @@ private:
     /// counter can't live behind the same lock version_/next_slot_/etc. do.
     /// Starts at 1 so 0 is free to mean "no transaction" wherever useful.
     std::atomic<std::uint64_t> next_txn_id_{1};
+
+    /// Cumulative try_commit()/try_commit_without_undo() outcomes, one
+    /// counter per CommitStatus, since Model construction -- never reset,
+    /// never decremented. Plain atomics rather than commit_mu_-protected:
+    /// record_commit_outcome() is called from try_commit_core() both
+    /// inside AND outside the commit_mu_ critical section (the
+    /// empty-transaction fast path returns Committed before commit_mu_ is
+    /// ever taken), so a lock-free counter is the only shape that covers
+    /// both call sites without extending the locked region just for
+    /// bookkeeping. See Diagnostics' commits_* fields and
+    /// record_commit_outcome().
+    std::atomic<std::uint64_t> commits_succeeded_{0};
+    std::atomic<std::uint64_t> commits_conflicted_{0};
+    std::atomic<std::uint64_t> commits_vetoed_{0};
+    std::atomic<std::uint64_t> commits_invalid_{0};
+    std::atomic<std::uint64_t> commits_precommit_conflicted_{0};
+
+    void record_commit_outcome(CommitStatus status) noexcept;
 
     mutable std::mutex ver_mu_;
     std::map<std::uint64_t, int>

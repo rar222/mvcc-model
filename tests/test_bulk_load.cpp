@@ -85,6 +85,106 @@ TEST(bulk_transaction_update_returns_null_for_an_id_this_batch_never_created) {
     CHECK(t.update(a) != nullptr);  // sanity: a valid local id still resolves
 }
 
+// BulkTransaction::size() is a direct reflection of objects_.size() (see
+// create()'s own comment: "no remove() to cancel an entry and leave a
+// hole"), so it should track every create() one-for-one with no batching or
+// lag, the same running-count property the sibling test above sets up but
+// never itself asserts on.
+TEST(bulk_transaction_size_reports_pending_object_count) {
+    Model m;
+    BulkTransaction t = m.begin_bulk();
+    CHECK_EQ(t.size(), std::size_t{0});
+
+    auto a1 = std::make_unique<Account>();
+    a1->name = "A1";
+    const Ref<Account> a = t.create(std::move(a1));
+    CHECK_EQ(t.size(), std::size_t{1});
+
+    auto a2 = std::make_unique<Account>();
+    a2->name = "A2";
+    t.create(std::move(a2));
+    CHECK_EQ(t.size(), std::size_t{2});
+
+    auto ord = std::make_unique<Order>();
+    ord->code = "O1";
+    ord->account = a;
+    t.create(std::move(ord));
+    CHECK_EQ(t.size(), std::size_t{3});
+}
+
+// The BulkTransaction analog of
+// a_local_id_from_one_transaction_does_not_resolve_in_a_different_transaction
+// (test_transactions.cpp): BulkTransaction::update_raw() is a plain bounds
+// check against THIS batch's own objects_ (see its doc comment -- no
+// per-Model tagging at all), so a local id minted by a DIFFERENT, smaller
+// BulkTransaction is simply out of range rather than aliasing into this
+// batch's own local table.
+TEST(bulk_transaction_update_on_an_id_from_a_different_bulk_transaction_returns_null) {
+    Model m;
+    BulkTransaction t1 = m.begin_bulk();
+    auto a0 = std::make_unique<Account>();
+    a0->name = "A0";
+    t1.create(std::move(a0));  // t1 local index 0
+    auto a1 = std::make_unique<Account>();
+    a1->name = "A1";
+    const Ref<Account> a1_local = t1.create(std::move(a1));  // t1 local index 1
+
+    BulkTransaction t2 = m.begin_bulk();
+    auto own = std::make_unique<Account>();
+    own->name = "OWN";
+    const Ref<Account> own_local = t2.create(std::move(own));  // t2's only object: local index 0
+
+    // t1's index-1 id is out of range for t2 (whose objects_ has size 1) --
+    // never touches t2's own object at index 0.
+    CHECK(t2.update(a1_local) == nullptr);
+    CHECK(t2.update(own_local) != nullptr);  // sanity: t2's own local id still resolves
+}
+
+// commit_bulk_without_undo()'s doc comment: "if any object's Ref<>/Opt<>
+// fails to resolve WITHIN this batch ... rejects as CommitStatus::Invalid
+// with NOTHING touched: the whole batch is validated before any mutation
+// begins." This exercises that with a MIXED batch -- one object whose
+// forward ref gets legitimately fixed up via update() (so a naive
+// object-at-a-time validator might be fooled into accepting it) alongside a
+// second, unrelated object left with a genuinely dangling ref -- and checks
+// that the fixed-up object doesn't get partially installed either.
+TEST(bulk_load_rejects_a_batch_where_a_fixed_up_forward_ref_coexists_with_a_genuinely_dangling_one) {
+    Model m;
+    const std::uint64_t before = m.current_version();
+
+    BulkTransaction t = m.begin_bulk();
+
+    // Object 1: forward ref to an Account created later in the same batch,
+    // legitimately fixed up via update() -- same pattern as
+    // bulk_transaction_update_fixes_up_a_forward_reference_after_the_fact.
+    auto ord1 = std::make_unique<Order>();
+    ord1->code = "FIXED";
+    const Ref<Order> o1 = t.create(std::move(ord1));  // account left null for now
+
+    auto acc = std::make_unique<Account>();
+    acc->name = "A1";
+    const Ref<Account> a = t.create(std::move(acc));
+    t.update(o1)->account = a;  // now legitimately valid
+
+    // Object 2: a completely separate Order left with a genuinely dangling
+    // ref -- never created anywhere in this batch.
+    auto ord2 = std::make_unique<Order>();
+    ord2->code = "DANGLING";
+    ord2->account = Ref<Account>(Id{kLocalIdBit | 999u, 1});
+    t.create(std::move(ord2));
+
+    CommitResult r = m.commit_bulk_without_undo(t);
+    CHECK(r.status == CommitStatus::Invalid);
+    CHECK_EQ(m.current_version(), before);  // no wipe, no publish
+
+    // Nothing partially installed -- not even the object whose forward ref
+    // was legitimately fixed up.
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.size(), std::size_t{0});
+    CHECK(s.find_by_key<&Account::name>("A1") == nullptr);
+    CHECK(s.find_by_key<&Order::computed_key>("ord:FIXED") == nullptr);
+}
+
 TEST(bulk_load_wipes_all_pre_existing_data) {
     Model m;
     make_account(m, "old1");

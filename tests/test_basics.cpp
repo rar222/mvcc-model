@@ -256,6 +256,140 @@ TEST(a_stale_handle_never_aliases_across_exhaustion) {
 }
 
 
+// debug_live_versions()'s doc comment: "(version, refcount) for every
+// currently-live snapshot registration (readers' Snapshots AND every open
+// Transaction::base())." Two Snapshots taken at the SAME version (no commit
+// in between) must combine into ONE entry with refcount 2 -- not two
+// separate entries -- and a Transaction's base() pinning a DIFFERENT version
+// is its own, separate entry. Dropping one of the two same-version Snapshots
+// decrements that entry's count without touching the other's.
+TEST(debug_live_versions_reports_every_pinned_snapshot_and_transaction_base) {
+    Model m;
+    make_account(m, "A1");
+    const std::uint64_t v1 = m.current_version();
+
+    Snapshot s1 = m.snapshot();
+    Snapshot s2 = m.snapshot();  // same version as s1 -- combines into one entry, refcount 2
+
+    {
+        const auto versions = m.debug_live_versions();
+        int count_at_v1 = 0;
+        for (const auto& [ver, cnt] : versions) {
+            if (ver == v1) count_at_v1 = cnt;
+        }
+        CHECK_EQ(count_at_v1, 2);
+    }
+
+    make_account(m, "A2");
+    const std::uint64_t v2 = m.current_version();
+    CHECK(v2 > v1);
+
+    Transaction txn = m.begin();  // pins a DIFFERENT version, v2, its own entry
+    CHECK_EQ(txn.base_version(), v2);
+
+    {
+        const auto versions = m.debug_live_versions();
+        CHECK_EQ(versions.size(), std::size_t{2});
+        // The minimum key is the reclamation watermark -- v1 (still pinned
+        // twice) sorts first, v2 (txn's base) second.
+        CHECK_EQ(versions[0].first, v1);
+        CHECK_EQ(versions[0].second, 2);
+        CHECK_EQ(versions[1].first, v2);
+        CHECK_EQ(versions[1].second, 1);
+    }
+
+    // Dropping ONE of the two same-version Snapshots decrements v1's count
+    // to 1 -- v2's entry (txn's base) is untouched.
+    { Snapshot drop = std::move(s2); }
+
+    {
+        const auto versions = m.debug_live_versions();
+        CHECK_EQ(versions.size(), std::size_t{2});
+        int count_at_v1 = 0, count_at_v2 = 0;
+        for (const auto& [ver, cnt] : versions) {
+            if (ver == v1) count_at_v1 = cnt;
+            if (ver == v2) count_at_v2 = cnt;
+        }
+        CHECK_EQ(count_at_v1, 1);
+        CHECK_EQ(count_at_v2, 1);
+    }
+}
+
+// alloc_slot() only ever runs under commit_mu_ (invariant 7), so the real
+// question under concurrency isn't "can two threads pop the same free slot"
+// (the lock rules that out by construction) -- it's whether that lock
+// discipline actually holds up: several writer threads hammering try_commit()
+// concurrently, racing each other to pop a pool of slots this test has
+// deliberately poisoned to kGenMax (same testing seam as
+// an_exhausted_slot_is_retired_not_reused above), must retire EXACTLY the
+// poisoned slots -- no fewer (a lost slot), no more (a double-issued Id),
+// and the bookkeeping (slots_allocated/slots_free/slots_exhausted/
+// live_object_count) must reconcile exactly afterward.
+TEST(concurrent_alloc_slot_under_exhaustion_never_double_hands_out_a_withdrawn_slot) {
+    Model m;
+
+    // Build up a pool of freed slots, then poison every one of them.
+    constexpr int kPoisoned = 40;
+    std::vector<std::uint32_t> poisoned_slots;
+    {
+        std::vector<Ref<Account>> temp;
+        for (int i = 0; i < kPoisoned; ++i) temp.push_back(make_account(m, "TEMP" + std::to_string(i)));
+        for (const Ref<Account>& r : temp) poisoned_slots.push_back(r.raw().index);
+        for (const Ref<Account>& r : temp) remove_and_commit(m, r);
+    }
+    CHECK_EQ(poisoned_slots.size(), static_cast<std::size_t>(kPoisoned));
+    for (std::uint32_t slot : poisoned_slots) m.debug_set_generation(slot, kGenMax);
+    CHECK_EQ(m.diagnostics().slots_free, static_cast<std::size_t>(kPoisoned));
+
+    // Several writer threads doing plain, unrelated creates (no removes) --
+    // conflict-free by construction (check_id_overlap() never looks at
+    // creates), so every commit here is expected to succeed. With
+    // free_slots_ a LIFO stack holding exactly the kPoisoned poisoned slots
+    // and nothing else, and total creates well over kPoisoned, every single
+    // poisoned slot is guaranteed to get popped, found exhausted, and
+    // permanently retired -- deterministically, regardless of thread
+    // interleaving, since alloc_slot() is fully serialized behind commit_mu_.
+    constexpr int kThreads = 4;
+    constexpr int kCreatesPerThread = 20;  // kThreads * kCreatesPerThread == 80 > kPoisoned
+    std::atomic<int> committed{0};
+
+    auto writer = [&](int thread_idx) {
+        for (int i = 0; i < kCreatesPerThread; ++i) {
+            Transaction txn = m.begin();
+            auto a = std::make_unique<Account>();
+            a->name = "W" + std::to_string(thread_idx) + "_" + std::to_string(i);
+            txn.create(std::move(a));
+            const CommitResult res = m.try_commit(txn);
+            if (res.status == CommitStatus::Committed) committed.fetch_add(1);
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (int t = 0; t < kThreads; ++t) pool.emplace_back(writer, t);
+    for (auto& th : pool) th.join();
+
+    CHECK_EQ(committed.load(), kThreads * kCreatesPerThread);
+
+    // Every poisoned slot was popped exactly once and retired -- none left
+    // in circulation, none silently lost or double-counted.
+    CHECK_EQ(m.exhausted_slots(), static_cast<std::size_t>(kPoisoned));
+
+    const Model::Diagnostics d = m.diagnostics();
+    CHECK_EQ(d.slots_exhausted, m.exhausted_slots());
+    CHECK_EQ(d.slots_free, std::size_t{0});  // no removes happened during the concurrent phase
+    CHECK_EQ(d.live_object_count, static_cast<std::size_t>(kThreads * kCreatesPerThread));
+    // The core no-lost/no-double-issued-slot invariant: every ever-allocated
+    // slot index is in exactly one of these three buckets.
+    CHECK_EQ(d.slots_allocated, d.live_object_count + d.slots_free + d.slots_exhausted);
+
+    // No two objects were ever handed the same Id: a final scan sees exactly
+    // as many distinct Accounts as commits succeeded.
+    Snapshot final_s = m.snapshot();
+    std::size_t seen = 0;
+    final_s.for_each<Account>([&](const Account&) { ++seen; });
+    CHECK_EQ(seen, static_cast<std::size_t>(kThreads * kCreatesPerThread));
+}
+
 // wait_for_reclamation() as a barrier: it reports work still pinned
 // while a Snapshot is held, and reports fully drained once that Snapshot
 // is dropped.

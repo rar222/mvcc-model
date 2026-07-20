@@ -638,6 +638,58 @@ TEST(an_earlier_successful_pre_transaction_stays_committed_even_if_a_later_one_f
     CHECK(s.find_by_key<&Account::name>("MAIN_NEVER_APPLIED") == nullptr);
 }
 
+// The variant of a_failing_pre_transaction_reports_precommit_conflict_and_
+// skips_the_main_transaction where the pre-transaction itself loses a real
+// Conflict (not Invalid): its Transaction is built BEFORE an unrelated,
+// ordinary commit touches the same object (Transaction-building never takes
+// commit_mu_ -- invariant 10 -- so this is legal to do ahead of installing
+// any hook at all), making it genuinely stale by the time the hook finally
+// runs it via run_pre_transaction_without_undo(). try_commit() must still
+// report PrecommitConflict for the main attempt, but this time res.conflict
+// -- not just res.error -- is populated, carrying the underlying Conflict's
+// own reason/ids through unchanged (see CommitResult::conflict's own doc
+// comment: "also set if status == PrecommitConflict and the failing
+// pre-transaction's own outcome was itself a Conflict").
+TEST(precommit_conflict_reports_conflict_reason_when_the_failing_pretransaction_was_itself_a_conflict) {
+    Model m;
+    const Ref<Account> a = make_account(m, "SHARED", 0);
+
+    // Built now, from a base that is about to go stale -- this is the
+    // Transaction the hook will (much later) hand to
+    // run_pre_transaction_without_undo().
+    Transaction pre = m.begin();
+    pre.update(a)->name = "FROM_PRE";
+
+    // An ordinary, unrelated commit that touches the SAME object -- by the
+    // time `pre` actually runs, its base predates this, so it is doomed to
+    // an IdSetOverlap Conflict, exactly like two racing writer threads.
+    update_field(m, a, [](Account* p) { p->balance = 111; });
+
+    m.set_pre_transactions([&](Model& model, const Transaction&) {
+        CommitResult r = model.run_pre_transaction_without_undo(pre);
+        CHECK(r.status == CommitStatus::Conflict);
+    });
+
+    Transaction txn = m.begin();
+    auto o = std::make_unique<Account>();
+    o->name = "NEVER_APPLIED";
+    txn.create(std::move(o));
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::PrecommitConflict);
+    CHECK(res.conflict.has_value());  // forwarded from the failing pre-transaction's OWN Conflict
+    CHECK(res.conflict->reason == ConflictReason::IdSetOverlap);
+    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a.raw()) !=
+          res.conflict->ids.end());
+    CHECK_EQ(m.snapshot().size(), std::size_t{1});  // main txn never applied
+
+    m.set_pre_transactions({});
+    CHECK(m.snapshot().find_by_key<&Account::name>("NEVER_APPLIED") == nullptr);
+    // pre's stale rename never landed; the unrelated commit's balance did.
+    CHECK_EQ(m.snapshot().find(a)->name, std::string("SHARED"));
+    CHECK_EQ(m.snapshot().find(a)->balance, std::int64_t{111});
+}
+
 // The main transaction gets its conflict-checking against a pre-transaction
 // for free: both target the same Account's slot, so the main transaction
 // (built from a base that predates the pre-transaction) reports an ordinary

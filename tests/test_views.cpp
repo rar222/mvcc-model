@@ -335,3 +335,85 @@ TEST(for_each_view_is_type_filtered) {
     CHECK_EQ(total, std::int64_t{1 + 2 + 5 + 5});
 }
 
+// Order::computed_key() is declared in all THREE lookup families at once
+// (define_keys(), define_scan_fields(), define_cached_fields() -- see
+// tests/test_types.h), so a single update() that changes what it returns
+// must reconcile all three indexes together, not just the one family most
+// tests happen to exercise.
+TEST(updating_a_field_declared_in_all_three_lookup_families_reconciles_key_scan_and_cached_together) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "OLD", a);  // computed_key() == "ord:OLD"
+
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:OLD"), s.find(o));
+    CHECK_EQ(s.find_by_scan_field<&Order::computed_key>("ord:OLD").size(), std::size_t{1});
+    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:OLD").size(), std::size_t{1});
+
+    update_field(m, o, [](Order* p) { p->code = "NEW"; });  // computed_key() now "ord:NEW"
+
+    s = m.snapshot();
+    CHECK(s.find_by_key<&Order::computed_key>("ord:OLD") == nullptr);
+    CHECK(s.find_by_scan_field<&Order::computed_key>("ord:OLD").empty());
+    CHECK(s.find_by_cached_field<&Order::computed_key>("ord:OLD").empty());
+
+    CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:NEW"), s.find(o));
+    CHECK_EQ(s.find_by_scan_field<&Order::computed_key>("ord:NEW").size(), std::size_t{1});
+    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:NEW").size(), std::size_t{1});
+}
+
+// Same undo-log discipline as veto_rollback_restores_the_field_key_index
+// (test_hooks.cpp) and veto_rollback_restores_the_cached_field_index above,
+// but on a field that lives in by_field_ AND by_cached_field_ at once
+// (Order::computed_key): a vetoed change must leave BOTH indexes exactly as
+// they were, not one rolled back and the other not.
+TEST(veto_rollback_restores_a_field_declared_in_multiple_lookup_families_simultaneously) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "OLD", a);  // computed_key() == "ord:OLD"
+
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
+    Transaction txn = m.begin();
+    txn.update(o)->code = "NEW";
+    CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
+    m.set_pre_commit({});
+
+    make_account(m, "UNRELATED");  // publish a fresh root carrying both indexes
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.find(o)->computed_key(), std::string("ord:OLD"));
+
+    CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:OLD"), s.find(o));
+    CHECK(s.find_by_key<&Order::computed_key>("ord:NEW") == nullptr);
+
+    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:OLD").size(), std::size_t{1});
+    CHECK(s.find_by_cached_field<&Order::computed_key>("ord:NEW").empty());
+}
+
+// A cascade-deleted object must drop out of every lookup family it
+// participates in AT ONCE -- find_by_key, find_by_scan_field, and
+// find_by_cached_field on computed_key (all three families), plus the
+// scan/cached families on qty -- not just whichever one a narrower test
+// happens to check.
+TEST(cascade_delete_removes_an_object_from_every_lookup_family_it_participates_in_at_once) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a, {}, 5);  // computed_key() == "ord:O1", qty == 5
+
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:O1"), s.find(o));
+    CHECK_EQ(s.find_by_scan_field<&Order::computed_key>("ord:O1").size(), std::size_t{1});
+    CHECK_EQ(s.find_by_scan_field<&Order::qty>(5).size(), std::size_t{1});
+    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:O1").size(), std::size_t{1});
+    CHECK_EQ(s.find_by_cached_field<&Order::qty>(5).size(), std::size_t{1});
+
+    remove_and_commit(m, a);  // Order::account is a non-nullable Ref<Account> -- cascades, kills o
+
+    s = m.snapshot();
+    CHECK(s.find(o) == nullptr);
+    CHECK(s.find_by_key<&Order::computed_key>("ord:O1") == nullptr);
+    CHECK(s.find_by_scan_field<&Order::computed_key>("ord:O1").empty());
+    CHECK(s.find_by_scan_field<&Order::qty>(5).empty());
+    CHECK(s.find_by_cached_field<&Order::computed_key>("ord:O1").empty());
+    CHECK(s.find_by_cached_field<&Order::qty>(5).empty());
+}
+
