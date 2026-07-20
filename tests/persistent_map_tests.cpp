@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -30,6 +33,198 @@ struct U64Hash {
 struct ClashHash {
     std::uint64_t operator()(std::uint64_t k) const noexcept { return k % 3; }
 };
+
+// Identical body to U64Hash above, but ALSO declares is_perfect = true --
+// genuinely so, since identity is bijective on uint64_t. Nothing in this
+// file previously instantiated TrieCore with a Hash that opts into this:
+// only model::IdHash (declared perfect in model.h) ever took that path, and
+// only indirectly, through the full Model in tests/test_*.cpp, never in
+// this dedicated low-level HAMT suite. Every churn/persistence/edge-case
+// block below that uses this Hash exercises TrieCore's collision-chain-free
+// Leaf shape (NoChain) and the "always replace, never append" branches in
+// chain_set/chain_erase (persistent_map.h) for the first time in this file.
+struct PerfectU64Hash {
+    std::uint64_t operator()(std::uint64_t k) const noexcept { return k; }
+    static constexpr bool is_perfect = true;
+};
+
+// Declares is_perfect = false EXPLICITLY, as opposed to U64Hash/StringHash/
+// ClashHash simply never mentioning it -- exercises the other half of
+// hash_is_perfect_v's std::bool_constant<Hash::is_perfect> branch (not just
+// its SFINAE default-to-false fallback). Never instantiates a trie -- the
+// static_asserts below are the entire test.
+struct ExplicitlyImperfectHash {
+    std::uint64_t operator()(std::uint64_t k) const noexcept { return k; }
+    static constexpr bool is_perfect = false;
+};
+
+// Compile-time-only coverage of the trait-detection machinery itself
+// (detail::hash_is_perfect_v, persistent_map.h) -- a template option in its
+// own right, independent of any trie behavior it later gates.
+static_assert(!detail::hash_is_perfect_v<StringHash>, "never declares is_perfect -> defaults false");
+static_assert(!detail::hash_is_perfect_v<U64Hash>, "never declares is_perfect -> defaults false");
+static_assert(!detail::hash_is_perfect_v<ClashHash>, "never declares is_perfect -> defaults false");
+static_assert(!detail::hash_is_perfect_v<ExplicitlyImperfectHash>, "explicit false stays false");
+static_assert(detail::hash_is_perfect_v<PerfectU64Hash>, "explicit true is detected");
+
+}  // namespace
+
+namespace {
+
+// Deterministic (non-random) edge cases that the random-churn differential
+// tests exercise only probabilistically, if at all: the empty-container
+// start state (root_ == nullptr -- get_in/erase_in/each_in's `if (!n)`
+// guards), erasing a key that was never present (copy_shared's "not
+// present, reuse unchanged" path in erase_in), and re-writing a key that's
+// already there (chain_set's/chain_erase's "replace" branch under BOTH the
+// chained and the perfect-hash Leaf shape, plus IdentityKeyOf's own
+// documented "replacing a matched entry with itself is a harmless no-op"
+// for PersistentSet). Templated on <K, Hash> so the identical checks run,
+// with no risk of drifting apart, against a string-keyed default Hash, a
+// u64-keyed default Hash, a deliberately colliding Hash, and a genuinely
+// perfect Hash -- see the calls in main().
+template <class K, class Hash>
+int check_map_edge_cases(const char* label, const K& k1, const K& k2, const K& k_absent) {
+    int local_fails = 0;
+    auto require = [&](bool cond, const char* what) {
+        if (!cond) {
+            std::printf("EDGE FAIL (map/%s): %s\n", label, what);
+            ++local_fails;
+        }
+    };
+
+    PersistentMap<K, int, Hash> m;
+    require(m.size() == 0, "fresh map size == 0");
+    require(m.empty(), "fresh map empty()");
+    require(m.get(k1) == nullptr, "fresh map get() is null for any key");
+    bool visited = false;
+    m.for_each([&](const K&, int) { visited = true; });
+    require(!visited, "fresh map for_each never invokes f");
+
+    // Erase of an absent key from an EMPTY map (root_ == nullptr): a no-op,
+    // not a crash -- erase_in's `if (!n) return nullptr;` guard.
+    m = m.erase(k_absent);
+    require(m.size() == 0, "erase on empty map stays empty");
+
+    m = m.set(k1, 100);
+    m = m.set(k2, 200);
+    require(m.size() == 2, "two distinct keys -> size 2");
+
+    // Erase of an absent key from a NON-empty map: copy_shared's "not
+    // present" path -- unrelated keys must be untouched.
+    m = m.erase(k_absent);
+    require(m.size() == 2, "erase of absent key leaves size unchanged");
+    require(m.get(k1) && *m.get(k1) == 100, "erase of absent key: k1 survives");
+    require(m.get(k2) && *m.get(k2) == 200, "erase of absent key: k2 survives");
+
+    // set() of an ALREADY-PRESENT key: value updates, size does not grow --
+    // chain_set's "replace" branch (KeyOf{}(lf->entry) == key, or, under a
+    // perfect Hash, the unconditional replace).
+    m = m.set(k1, 101);
+    require(m.size() == 2, "re-set of existing key doesn't grow size");
+    require(m.get(k1) && *m.get(k1) == 101, "re-set of existing key updates value");
+    require(m.get(k2) && *m.get(k2) == 200, "re-set of k1 leaves k2 untouched");
+
+    // Draining to empty exercises erase_in's "chain emptied"/"subtree
+    // emptied, drop this slot" branches from a TINY map, not only as an
+    // incidental side effect of the large random churn elsewhere.
+    m = m.erase(k1);
+    m = m.erase(k2);
+    require(m.size() == 0, "erasing every key empties the map");
+    require(m.empty(), "erasing every key -> empty() true");
+    require(m.get(k1) == nullptr, "erased key no longer found");
+
+    return local_fails;
+}
+
+template <class K, class Hash>
+int check_set_edge_cases(const char* label, const K& k1, const K& k2, const K& k_absent) {
+    int local_fails = 0;
+    auto require = [&](bool cond, const char* what) {
+        if (!cond) {
+            std::printf("EDGE FAIL (set/%s): %s\n", label, what);
+            ++local_fails;
+        }
+    };
+
+    PersistentSet<K, Hash> s;
+    require(s.size() == 0, "fresh set size == 0");
+    require(s.empty(), "fresh set empty()");
+    require(!s.contains(k1), "fresh set contains() is false for any key");
+    bool visited = false;
+    s.for_each([&](const K&) { visited = true; });
+    require(!visited, "fresh set for_each never invokes f");
+
+    s = s.erase(k_absent);
+    require(s.size() == 0, "erase on empty set stays empty");
+
+    s = s.insert(k1);
+    s = s.insert(k2);
+    require(s.size() == 2, "two distinct keys -> size 2");
+
+    s = s.erase(k_absent);
+    require(s.size() == 2, "erase of absent key leaves size unchanged");
+    require(s.contains(k1) && s.contains(k2), "erase of absent key leaves both present");
+
+    // insert() of an ALREADY-PRESENT key: IdentityKeyOf's documented
+    // "replacing a matched entry with itself is a correct, harmless no-op"
+    // (see its own comment in persistent_map.h) -- size must not grow.
+    s = s.insert(k1);
+    require(s.size() == 2, "re-insert of existing key doesn't grow size");
+    require(s.contains(k1) && s.contains(k2), "re-insert of existing key leaves both present");
+
+    s = s.erase(k1);
+    s = s.erase(k2);
+    require(s.size() == 0, "erasing every key empties the set");
+    require(s.empty(), "erasing every key -> empty() true");
+
+    return local_fails;
+}
+
+// Speed: set()/contains() must grow like O(log32 n) as the population
+// grows, never O(n) -- a regression that turned path-copying into a full
+// deep copy (or a lookup into a linear scan) would still pass every
+// correctness check above; only a timing-SHAPE check catches it. Same
+// self-contained best-of/steady_clock discipline as
+// tests/performance_tests.cpp's own check_scaling -- duplicated here rather
+// than shared, since this file is deliberately dependency-free of the rest
+// of tests/ (see its own top comment), matching persistent_map.h's own
+// independence from the rest of the model.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+constexpr bool kSlowSanitizedBuild = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+constexpr bool kSlowSanitizedBuild = true;
+#else
+constexpr bool kSlowSanitizedBuild = false;
+#endif
+#else
+constexpr bool kSlowSanitizedBuild = false;
+#endif
+
+int scaled_n(int n) {
+    return kSlowSanitizedBuild ? std::max(50, n / 50) : n;
+}
+
+template <class F>
+double time_ms(F&& f) {
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Minimum across trials: scheduling jitter/cache misses can only push a
+// single reading UP, never down, so the minimum is the least-corrupted
+// estimate -- same rationale as tests/performance_tests.cpp's best_of.
+template <class F>
+double best_of(int trials, F&& f) {
+    double best = f();
+    for (int t = 1; t < trials; ++t) {
+        const double v = f();
+        if (v < best) best = v;
+    }
+    return best;
+}
 
 }  // namespace
 
@@ -363,6 +558,308 @@ int main() {
     std::printf("persistent map/set (collision chains): %s (fails=%d)\n",
                 fails_clash ? "FAIL" : "OK", fails_clash);
     fails += fails_clash;
+
+    // Perfect-hash coverage: same differential-churn discipline as the
+    // U64Hash blocks above, but under PerfectU64Hash (is_perfect = true) --
+    // the ONE template option nothing in this file exercised directly
+    // before now (see PerfectU64Hash's own comment). Every set()/erase()
+    // below runs through TrieCore's NoChain Leaf and chain_set/chain_erase's
+    // perfect-hash branches, not the general chained ones.
+    int fails_perfect = 0;
+    {
+        PersistentMap<std::uint64_t, int, PerfectU64Hash> pm3;
+        std::unordered_map<std::uint64_t, int> ref3;
+        auto check_pm3 = [&](const char* where) {
+            if (pm3.size() != ref3.size()) {
+                std::printf("PERFECT-MAP SIZE MISMATCH at %s: pm=%zu ref=%zu\n", where, pm3.size(),
+                            ref3.size());
+                ++fails_perfect;
+            }
+            for (auto& [k, v] : ref3) {
+                const int* p = pm3.get(k);
+                if (!p || *p != v) {
+                    std::printf("PERFECT-MAP GET MISMATCH at %s key=%llu\n", where,
+                                (unsigned long long)k);
+                    ++fails_perfect;
+                    return;
+                }
+            }
+            size_t seen = 0;
+            pm3.for_each([&](std::uint64_t k, int v) {
+                auto it = ref3.find(k);
+                if (it == ref3.end() || it->second != v) {
+                    std::printf("PERFECT-MAP ITER EXTRA at %s key=%llu\n", where,
+                                (unsigned long long)k);
+                    ++fails_perfect;
+                }
+                ++seen;
+            });
+            if (seen != ref3.size()) {
+                std::printf("PERFECT-MAP ITER COUNT at %s: %zu vs %zu\n", where, seen, ref3.size());
+                ++fails_perfect;
+            }
+        };
+        for (int i = 0; i < 20000 && fails_perfect == 0; i++) {
+            std::uint64_t k = (std::uint64_t)(rng() % 2000);
+            if (rng() % 3) {
+                int v = rng();
+                pm3 = pm3.set(k, v);
+                ref3[k] = v;
+            } else {
+                pm3 = pm3.erase(k);
+                ref3.erase(k);
+            }
+            if (i % 500 == 0) check_pm3("churn");
+        }
+        check_pm3("final");
+
+        // Persistence under the perfect-hash Leaf shape specifically: a
+        // derived version's set()/erase() (chain_set's/chain_erase's
+        // "replace"/"always empties" branches) must not disturb an older
+        // version sharing the same nodes.
+        PersistentMap<std::uint64_t, int, PerfectU64Hash> pa;
+        for (std::uint64_t i = 0; i < 1000; i++) pa = pa.set(i, (int)i);
+        PersistentMap<std::uint64_t, int, PerfectU64Hash> pb = pa;
+        for (std::uint64_t i = 0; i < 1000; i++) pb = pb.set(i, (int)i + 100000);  // re-set every key
+        pb = pb.set(9999, 7);
+        pb = pb.erase(500);
+        for (std::uint64_t i = 0; i < 1000; i++) {
+            const int* p = pa.get(i);
+            if (!p || *p != (int)i) {
+                std::printf("PERFECT-MAP PERSIST FAIL: pa[%llu] changed\n", (unsigned long long)i);
+                ++fails_perfect;
+                break;
+            }
+        }
+        if (pa.get(9999)) {
+            std::printf("PERFECT-MAP PERSIST FAIL: 9999 leaked into pa\n");
+            ++fails_perfect;
+        }
+        if (!pa.get(500)) {
+            std::printf("PERFECT-MAP PERSIST FAIL: 500 erased from pa\n");
+            ++fails_perfect;
+        }
+        if (pa.size() != 1000) {
+            std::printf("PERFECT-MAP PERSIST FAIL: pa.size=%zu\n", pa.size());
+            ++fails_perfect;
+        }
+        if (pb.size() != 1000) {
+            std::printf("PERFECT-MAP PERSIST FAIL: pb.size=%zu\n", pb.size());
+            ++fails_perfect;
+        }
+    }
+    {
+        PersistentSet<std::uint64_t, PerfectU64Hash> ps2;
+        std::unordered_set<std::uint64_t> refs2;
+        auto check_ps2 = [&](const char* where) {
+            if (ps2.size() != refs2.size()) {
+                std::printf("PERFECT-SET SIZE MISMATCH at %s: ps=%zu ref=%zu\n", where, ps2.size(),
+                            refs2.size());
+                ++fails_perfect;
+            }
+            for (std::uint64_t k : refs2) {
+                if (!ps2.contains(k)) {
+                    std::printf("PERFECT-SET CONTAINS MISMATCH at %s key=%llu\n", where,
+                                (unsigned long long)k);
+                    ++fails_perfect;
+                    return;
+                }
+            }
+            size_t seen = 0;
+            ps2.for_each([&](std::uint64_t k) {
+                if (refs2.find(k) == refs2.end()) {
+                    std::printf("PERFECT-SET ITER EXTRA at %s key=%llu\n", where,
+                                (unsigned long long)k);
+                    ++fails_perfect;
+                }
+                ++seen;
+            });
+            if (seen != refs2.size()) {
+                std::printf("PERFECT-SET ITER COUNT at %s: %zu vs %zu\n", where, seen, refs2.size());
+                ++fails_perfect;
+            }
+        };
+        for (int i = 0; i < 20000 && fails_perfect == 0; i++) {
+            std::uint64_t k = (std::uint64_t)(rng() % 2000);
+            if (rng() % 3) {
+                ps2 = ps2.insert(k);
+                refs2.insert(k);
+            } else {
+                ps2 = ps2.erase(k);
+                refs2.erase(k);
+            }
+            if (i % 500 == 0) check_ps2("churn");
+        }
+        check_ps2("final");
+
+        // Draining an entire populated set back to empty, under the
+        // perfect-hash Leaf shape -- exercises chain_erase's "always
+        // empties the slot" branch, and erase_in's subtree-collapse
+        // (bitmap shrink) branch, repeatedly, from a real, non-trivial
+        // multi-level tree.
+        PersistentSet<std::uint64_t, PerfectU64Hash> sa2;
+        for (std::uint64_t i = 0; i < 1000; i++) sa2 = sa2.insert(i);
+        PersistentSet<std::uint64_t, PerfectU64Hash> sb2 = sa2;
+        for (std::uint64_t i = 0; i < 1000; i++) sb2 = sb2.erase(i);  // empty sb2 entirely
+        sb2 = sb2.insert(9999);
+        for (std::uint64_t i = 0; i < 1000; i++) {
+            if (!sa2.contains(i)) {
+                std::printf("PERFECT-SET PERSIST FAIL: sa2 missing %llu\n", (unsigned long long)i);
+                ++fails_perfect;
+                break;
+            }
+        }
+        if (sa2.contains(9999)) {
+            std::printf("PERFECT-SET PERSIST FAIL: 9999 leaked into sa2\n");
+            ++fails_perfect;
+        }
+        if (sa2.size() != 1000) {
+            std::printf("PERFECT-SET PERSIST FAIL: sa2.size=%zu\n", sa2.size());
+            ++fails_perfect;
+        }
+        if (sb2.size() != 1) {
+            std::printf("PERFECT-SET PERSIST FAIL: sb2.size=%zu\n", sb2.size());
+            ++fails_perfect;
+        }
+    }
+    std::printf("persistent map/set (perfect hash): %s (fails=%d)\n", fails_perfect ? "FAIL" : "OK",
+                fails_perfect);
+    fails += fails_perfect;
+
+    // Deterministic edge cases (see the two templates' own comments),
+    // across every Hash flavor this file defines: a string-keyed default
+    // Hash, a u64-keyed default Hash, a deliberately colliding Hash, and a
+    // genuinely perfect Hash. Random churn above hits most of these paths
+    // eventually but never deterministically or in isolation.
+    int fails_edge = 0;
+    fails_edge += check_map_edge_cases<std::string, StringHash>("StringHash", "alpha", "beta",
+                                                                 "nonexistent");
+    fails_edge += check_map_edge_cases<std::uint64_t, U64Hash>("U64Hash", 1, 2, 999);
+    fails_edge += check_map_edge_cases<std::uint64_t, ClashHash>("ClashHash", 1, 2, 999);
+    fails_edge +=
+        check_map_edge_cases<std::uint64_t, PerfectU64Hash>("PerfectU64Hash", 1, 2, 999);
+    fails_edge += check_set_edge_cases<std::string, StringHash>("StringHash", "alpha", "beta",
+                                                                 "nonexistent");
+    fails_edge += check_set_edge_cases<std::uint64_t, U64Hash>("U64Hash", 1, 2, 999);
+    fails_edge += check_set_edge_cases<std::uint64_t, ClashHash>("ClashHash", 1, 2, 999);
+    fails_edge +=
+        check_set_edge_cases<std::uint64_t, PerfectU64Hash>("PerfectU64Hash", 1, 2, 999);
+    std::printf("persistent map/set (deterministic edge cases): %s (fails=%d)\n",
+                fails_edge ? "FAIL" : "OK", fails_edge);
+    fails += fails_edge;
+
+    // Speed: set()/contains() latency must grow like O(log32 n), not O(n),
+    // as the population grows -- see the timing helpers' own comment. Run
+    // against PersistentSet<uint64_t, PerfectU64Hash>: the newest code path
+    // (NoChain, merged children/leaves slots) and the one most representative
+    // of the model's actual hot instantiations (Root::by_type,
+    // by_cached_reference -- both keyed by model::Id via model::IdHash,
+    // itself declared perfect).
+    {
+        using PSet = PersistentSet<std::uint64_t, PerfectU64Hash>;
+        const int n_small = scaled_n(2000);
+        const int n_large = scaled_n(200000);
+
+        PSet base_small;
+        for (int i = 0; i < n_small; ++i) base_small = base_small.insert((std::uint64_t)i);
+        PSet base_large;
+        for (int i = 0; i < n_large; ++i) base_large = base_large.insert((std::uint64_t)i);
+
+        constexpr int kOpsPerTrial = 200;
+        // Fresh, never-before-seen keys each trial (well past either
+        // population's range) -- an insert, not a replace, every time: the
+        // worst case for path-copying, and the one that actually allocates.
+        auto set_op_us = [&](const PSet& base) {
+            return best_of(5,
+                           [&] {
+                               return time_ms([&] {
+                                   PSet t = base;
+                                   for (int i = 0; i < kOpsPerTrial; ++i)
+                                       t = t.insert(10000000ull + (std::uint64_t)i);
+                               });
+                           }) *
+                  1000.0 / kOpsPerTrial;
+        };
+        auto get_op_us = [&](const PSet& base, int n) {
+            return best_of(5,
+                           [&] {
+                               return time_ms([&] {
+                                   for (int i = 0; i < kOpsPerTrial; ++i) {
+                                       const bool c = base.contains((std::uint64_t)(i % n));
+                                       if (!c) std::printf("SPEED SETUP BUG: expected key missing\n");
+                                   }
+                               });
+                           }) *
+                  1000.0 / kOpsPerTrial;
+        };
+
+        const double set_small_us = set_op_us(base_small);
+        const double set_large_us = set_op_us(base_large);
+        const double get_small_us = get_op_us(base_small, n_small);
+        const double get_large_us = get_op_us(base_large, n_large);
+
+        const double n_ratio = (double)n_large / n_small;
+        const double log_ratio = std::log((double)n_large) / std::log((double)n_small);
+        const double set_ratio = set_small_us > 0 ? set_large_us / set_small_us : 0.0;
+        const double get_ratio = get_small_us > 0 ? get_large_us / get_small_us : 0.0;
+
+        std::printf("\nspeed (PersistentSet<uint64_t, PerfectU64Hash>, n: %d -> %d, %.0fx):\n",
+                    n_small, n_large, n_ratio);
+        std::printf(
+            "  insert()   %8.4f us -> %8.4f us   (x%.2f; O(log n) predicts x%.2f, O(n) predicts "
+            "x%.0f)\n",
+            set_small_us, set_large_us, set_ratio, log_ratio, n_ratio);
+        std::printf(
+            "  contains() %8.4f us -> %8.4f us   (x%.2f; O(log n) predicts x%.2f, O(n) predicts "
+            "x%.0f)\n",
+            get_small_us, get_large_us, get_ratio, log_ratio, n_ratio);
+
+        // Asserted only outside a sanitizer build: under asan/tsan the
+        // population is 50x smaller (scaled_n) and per-operation
+        // instrumentation overhead is not proportional to algorithmic work
+        // -- same rationale as tests/performance_tests.cpp's kAssertTimings.
+        // A generous ceiling, not a tight band: real O(log32 n) growth here
+        // predicts roughly x1.6 (log32 of a 100x population increase); this
+        // only needs to catch a regression toward O(n) (which would show
+        // ~100x) or O(n log n), not pin the exact constant.
+        if (!kSlowSanitizedBuild) {
+            int fails_speed = 0;
+            if (set_ratio > 10.0) {
+                std::printf(
+                    "SPEED FAIL: insert() grew x%.2f over a %.0fx population increase -- looks "
+                    "linear, not log n\n",
+                    set_ratio, n_ratio);
+                ++fails_speed;
+            }
+            if (get_ratio > 10.0) {
+                std::printf(
+                    "SPEED FAIL: contains() grew x%.2f over a %.0fx population increase -- looks "
+                    "linear, not log n\n",
+                    get_ratio, n_ratio);
+                ++fails_speed;
+            }
+            std::printf("persistent map/set (speed): %s (fails=%d)\n",
+                        fails_speed ? "FAIL" : "OK", fails_speed);
+            fails += fails_speed;
+        } else {
+            std::printf("persistent map/set (speed): SKIPPED (sanitizer build, see above)\n");
+        }
+    }
+
+    // NOT tested: set_in's "ran out of hash bits" merge-into-one-chain
+    // fallback (persistent_map.h, guarded by `if (shift + 5 >= 64)`). It is
+    // provably unreachable by any two DISTINCT 64-bit hash values: 13 levels
+    // of 5-bit slices (shift = 0, 5, ..., 60) partition all 64 bits with no
+    // gaps, so two hashes that still haven't diverged by shift=60 have
+    // agreed on every bit and are therefore equal -- contradicting the
+    // "different hash sharing this slot" precondition that guards entry
+    // into that branch in the first place. Reaching it would require a
+    // Hash::operator() that returns different values for the same key
+    // across calls (undefined behavior for any Hash, per this file's own
+    // differential tests, which all assume determinism) -- not a "general
+    // usage pattern," a broken Hash contract. Left as the one deliberately
+    // uncovered line, same as CLAUDE.md's own "Known scope boundaries"
+    // convention: documented, not silently skipped.
 
     return fails ? 1 : 0;
 }

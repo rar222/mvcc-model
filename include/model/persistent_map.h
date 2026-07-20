@@ -207,6 +207,37 @@ class TrieCore {
     // caller already branches on is_leaf first), so the cast back
     // (static_cast<const Node*>/static_cast<const Leaf*>) is never
     // ambiguous.
+    // Why 32-bit (32-ary, 5-bit slices), not 64-bit (64-ary, 6-bit slices),
+    // at this project's target scale (100k-1M objects, see the file header):
+    // widening the bitmap looks like "half as many levels to path-copy per
+    // commit," but it isn't, in this range. Depth is ceil(log_32 n) vs.
+    // ceil(log_64 n): at n=100,000 that's 4 vs. 3 (one level saved), but at
+    // n=1,000,000 -- the TOP of the target range -- it's 4 vs. 4 (32^4 =
+    // 1,048,576, so 32-ary doesn't even need a 5th level yet; 64-ary only
+    // pulls ahead past 64^4 = 16.7M, well outside this project's stated
+    // scale). A marginal, inconsistent depth win at best across the actual
+    // range this trie is sized for.
+    //
+    // Meanwhile it makes the cost that actually matters WORSE: the file
+    // header's own stated goal is path-copying "only O(log32 n) NODES" per
+    // commit, but each node copy isn't free -- `slots` is a
+    // vector<shared_ptr<const void>>, so copying a node costs one
+    // shared_ptr copy per populated child. 64-ary raises the worst case
+    // from 32 shared_ptrs per node to 64, for the same or greater depth
+    // across this range -- strictly worse for the operation this whole
+    // structure exists to keep cheap, not better.
+    //
+    // It would also cost real complexity, not just a wider type: bit()'s
+    // `1u << idx` becomes UB for idx>=32 (needs `1ull << idx`);
+    // popcount_below's __builtin_popcount (32-bit) would need
+    // __builtin_popcountll; and slice()'s 5-bit extraction plus the
+    // hash-exhaustion depth check in set_in (`shift + 5 >= 64`) would both
+    // need re-deriving around 6-bit slices and a different max-depth
+    // constant. 32-ary is also the standard choice in this space for
+    // exactly this reason (Clojure's PersistentHashMap, Scala's HashMap,
+    // immer) -- not an arbitrary pick that happened to land here. Do not
+    // "widen" this without new numbers showing this project's scale target
+    // has actually grown past where 32-ary stops being enough.
     struct Node {
         std::uint32_t bitmap = 0;
         std::uint32_t is_leaf = 0;  ///< subset of bitmap: which occupied idx-slots hold a Leaf
