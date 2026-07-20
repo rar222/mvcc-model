@@ -489,3 +489,75 @@ TEST(try_commit_without_undo_produces_no_undo_entry_even_for_a_cascade) {
     CHECK(!m.snapshot().find(surv)->parent);  // cascade-null still happened correctly
     CHECK(m.list_undo().empty());             // but none of it was captured for undo
 }
+
+// ---------------------------------------------------------------------------
+// run_pre_transaction_without_undo(): same split, applied to a
+// pre-transaction instead of the main one.
+// ---------------------------------------------------------------------------
+
+// The pre-transaction's own commit produces no undo entry, but the MAIN
+// transaction (an ordinary try_commit()) still gets its own -- proving the
+// suppression is per-call, not something that leaks across the two.
+TEST(run_pre_transaction_without_undo_commits_normally_but_adds_no_undo_entry) {
+    Model m;
+    m.set_pre_transactions([](Model& model, const Transaction&) {
+        Transaction pre = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "PRE";
+        pre.create(std::move(a));
+        CommitResult r = model.run_pre_transaction_without_undo(pre);
+        CHECK(r.status == CommitStatus::Committed);
+    });
+
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "MAIN";
+    txn.create(std::move(a));
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    m.set_pre_transactions({});
+
+    CHECK(m.snapshot().find_by_key<&Account::name>("PRE") != nullptr);   // committed normally
+    CHECK(m.snapshot().find_by_key<&Account::name>("MAIN") != nullptr);
+
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{1});  // only MAIN's entry -- PRE's was suppressed
+    auto entry = m.take_undo(summaries.front().version);
+    CHECK(entry.has_value());
+    CHECK_EQ(entry->actions.size(), std::size_t{1});
+    const CommitResult undo_res = m.apply_undo(*entry);
+    CHECK(undo_res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find_by_key<&Account::name>("MAIN") == nullptr);  // MAIN undone
+    CHECK(m.snapshot().find_by_key<&Account::name>("PRE") != nullptr);   // PRE unaffected -- never listed
+}
+
+// Existing undo_list_ entries are still pruned if a run_pre_transaction_
+// without_undo() commit conflicts with them -- same "prune regardless,
+// append conditionally" rule as try_commit_without_undo().
+TEST(run_pre_transaction_without_undo_still_prunes_conflicting_existing_undo_entries) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 100);
+    const std::uint64_t create_version = m.list_undo().front().version;  // the create's own entry
+
+    m.set_pre_transactions([&](Model& model, const Transaction&) {
+        Transaction pre = model.begin();
+        pre.update(a)->balance = 999;
+        CommitResult r = model.run_pre_transaction_without_undo(pre);
+        CHECK(r.status == CommitStatus::Committed);
+    });
+
+    Transaction txn = m.begin();
+    auto other = std::make_unique<Account>();
+    other->name = "OTHER";
+    txn.create(std::move(other));
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    m.set_pre_transactions({});
+
+    CHECK_EQ(m.snapshot().find(a)->balance, std::int64_t{999});  // pre-transaction committed normally
+
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{1});  // only the main txn's (OTHER's) entry
+    CHECK_EQ(summaries.front().action_count, std::size_t{1});
+    for (const auto& s : summaries) CHECK(s.version != create_version);  // a's create entry: pruned
+}

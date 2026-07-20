@@ -1444,7 +1444,7 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // applied, so the remap table is complete when the first remap_refs()
     // runs -- which is what lets creates in one transaction reference each
     // other in ANY order: backward, forward, mutually, or themselves, the
-    // same order-independence commit_bulk() gets from minting its whole
+    // same order-independence commit_bulk_without_undo() gets from minting its whole
     // table up front. A local id left unmapped after this pass can only be
     // a cancelled create (remove() of a local id nulls its entry here) or
     // a stray id from some other transaction -- both still rejected as
@@ -1597,7 +1597,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     // entry that overlaps them (see undo_list_'s own comment for what
     // "conflicts" means here), whether or not this commit produced undo
     // data of its own; then append this commit's own entry, if it has any
-    // (a commit_bulk()-style wipe, or an attempt with only
+    // (a commit_bulk_without_undo()-style wipe, or an attempt with only
     // no-op-since-cancelled local creates, has none).
     {
         std::unordered_set<Id, IdHash> touched;
@@ -1696,14 +1696,14 @@ CommitResult Model::apply_undo(const UndoEntry& entry) {
     return try_commit(inv);
 }
 
-CommitResult Model::commit_pretransaction_locked(Transaction& txn) {
+CommitResult Model::commit_pretransaction_locked(Transaction& txn, bool keep_undo) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
     if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
         return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
 
     std::unordered_map<std::uint32_t, Id> remap;  // local Id::index -> real Id, this attempt only
-    if (auto failure = check_and_apply(txn, remap)) return std::move(*failure);
+    if (auto failure = check_and_apply(txn, remap, keep_undo)) return std::move(*failure);
 
     if (changes_.empty()) {
         // Everything in txn had already been applied by an earlier
@@ -1713,10 +1713,10 @@ CommitResult Model::commit_pretransaction_locked(Transaction& txn) {
             CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
     }
 
-    return publish_now(std::move(remap), txn.name(), txn.data());
+    return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo);
 }
 
-CommitResult Model::run_pre_transaction(Transaction& txn) {
+CommitResult Model::run_pre_transaction_core(Transaction& txn, bool keep_undo) {
     // Crash, don't return a bad CommitResult: this function does no locking of its own -- it
     // goes straight into commit_pretransaction_locked(), which requires commit_mu_ ALREADY
     // held. Called from anywhere outside the one window try_commit()
@@ -1724,18 +1724,28 @@ CommitResult Model::run_pre_transaction(Transaction& txn) {
     // state (spine_, referrers_, ...) with no synchronization at all --
     // corruption, not a recoverable error. See the doc comment in model.h.
     assert(in_pre_transactions_phase_ &&
-           "run_pre_transaction() called outside a running PreTransactionsFn callback");
+           "run_pre_transaction()/run_pre_transaction_without_undo() called outside a running "
+           "PreTransactionsFn callback");
     assert(!precommit_failed_ &&
-           "run_pre_transaction() called again after an earlier pre-transaction this same "
-           "attempt already failed -- check the return value and stop");
+           "run_pre_transaction()/run_pre_transaction_without_undo() called again after an "
+           "earlier pre-transaction this same attempt already failed -- check the return value "
+           "and stop");
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
-    CommitResult result = commit_pretransaction_locked(txn);
+    CommitResult result = commit_pretransaction_locked(txn, keep_undo);
     if (result.status != CommitStatus::Committed) {
         precommit_failed_ = true;
         precommit_failure_ = std::make_unique<CommitResult>(result);
     }
     return result;
+}
+
+CommitResult Model::run_pre_transaction(Transaction& txn) {
+    return run_pre_transaction_core(txn, /*keep_undo=*/true);
+}
+
+CommitResult Model::run_pre_transaction_without_undo(Transaction& txn) {
+    return run_pre_transaction_core(txn, /*keep_undo=*/false);
 }
 
 CommitResult Model::commit_main_locked(Transaction& txn, bool keep_undo) {
@@ -1825,7 +1835,7 @@ CommitResult Model::try_commit_without_undo(Transaction& txn) {
 }
 
 // ---------------------------------------------------------------------------
-// begin_bulk() / commit_bulk() -- see the section comment on the
+// begin_bulk() / commit_bulk_without_undo() -- see the section comment on the
 // declarations in model.h for the exclusive-access precondition. Everything
 // below assumes it holds; there is no way to check it from in here beyond
 // the two live_-emptiness asserts.
@@ -1838,7 +1848,7 @@ BulkTransaction Model::begin_bulk() {
 // set_slot() clones via cow() (once per attempt per chunk) and logs the
 // EXACT prior (obj, gen) pair so a rollback can restore whatever occupant
 // this write is displacing -- including a live one, if the slot was already
-// in use. Here, that prior-occupant case cannot happen: commit_bulk()'s wipe
+// in use. Here, that prior-occupant case cannot happen: commit_bulk_without_undo()'s wipe
 // (see its own comment) has already emptied every chunk this attempt could
 // possibly touch, via cow()'s own lazy spine growth, so `ch->obj[i]`/
 // `ch->gen[i]` are guaranteed to be null/0 before this write -- there is no
@@ -1907,7 +1917,7 @@ void Model::add_cached_references_no_log(const ObjectBase* o) {
     });
 }
 
-CommitResult Model::commit_bulk(BulkTransaction& txn) {
+CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     assert(txn.model_ == this && "BulkTransaction belongs to a different Model");
 
     // Checkpoint 1/2: the exclusivity precondition, checked (not enforced --
@@ -1915,7 +1925,7 @@ CommitResult Model::commit_bulk(BulkTransaction& txn) {
     {
         std::lock_guard lk(ver_mu_);
         assert(live_.empty() &&
-               "commit_bulk() requires exclusive access -- see its declaration's doc comment");
+               "commit_bulk_without_undo() requires exclusive access -- see its declaration's doc comment");
     }
 
     std::lock_guard commit_lk(commit_mu_);
@@ -1948,7 +1958,7 @@ CommitResult Model::commit_bulk(BulkTransaction& txn) {
     {
         std::lock_guard lk(ver_mu_);
         assert(live_.empty() &&
-               "commit_bulk() requires exclusive access -- see its declaration's doc comment");
+               "commit_bulk_without_undo() requires exclusive access -- see its declaration's doc comment");
     }
 
     // Pass 2: wipe. No live Snapshot exists (asserted above), so every

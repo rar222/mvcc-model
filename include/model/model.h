@@ -319,7 +319,7 @@ struct RefNuller {
 /// This is what lets a transaction build a graph of new, interlinked
 /// objects in one go -- and because the whole remap table is minted BEFORE
 /// the first create applies (see apply_transaction_contents' pre-mint pass,
-/// and commit_bulk(), which does the same), creates may reference each
+/// and commit_bulk_without_undo(), which does the same), creates may reference each
 /// other in ANY order: backward, forward, mutually-cyclic, or a field
 /// pointing at the very object being created. Creation order carries no
 /// meaning for reference resolution. A field that isn't local (already a
@@ -364,7 +364,7 @@ struct RefRemapper {
 /// being recreated by THIS SAME undo application (see Model::apply_undo),
 /// leaving every other id -- still alive and unaffected -- completely
 /// untouched. Kept as its own type rather than generalizing RefRemapper,
-/// matching this codebase's own stated preference (see commit_bulk()'s
+/// matching this codebase's own stated preference (see commit_bulk_without_undo()'s
 /// _no_log split) for separate, grep-able names over a flag threaded
 /// through shared logic. No "unmapped" failure mode: an id not in `table`
 /// simply passes through unchanged, which is correct here -- it names
@@ -1587,17 +1587,17 @@ public:
     // replaces the ENTIRE model or doesn't run at all -- there is no
     // partial-failure state worth rolling back TO.
     //
-    // begin_bulk()/commit_bulk() trade that guarantee away, deliberately
+    // begin_bulk()/commit_bulk_without_undo() trade that guarantee away, deliberately
     // and only here, for exactly that case: wipe the whole Model and load a
     // fresh graph in one shot, at close to the steady-state per-object
     // cost, with no per-object undo logging at all.
     //
     // THE PRECONDITION, and why it is load-bearing rather than advisory:
-    // commit_bulk() requires that NO OTHER THREAD is doing ANYTHING with
-    // this Model for the ENTIRE begin_bulk()..commit_bulk() window --
+    // commit_bulk_without_undo() requires that NO OTHER THREAD is doing ANYTHING with
+    // this Model for the ENTIRE begin_bulk()..commit_bulk_without_undo() window --
     // holding a Snapshot, holding a Transaction, calling snapshot() or
     // subscribe(), or having an undrained Subscription queue (a queued
-    // Update pins a Snapshot too). This is checked -- commit_bulk() asserts
+    // Update pins a Snapshot too). This is checked -- commit_bulk_without_undo() asserts
     // live_ is empty, both before it starts wiping and again immediately
     // before it publishes -- but the assert is a tripwire, not a lock:
     // commit_mu_ is held throughout for internal consistency with every
@@ -1642,7 +1642,7 @@ public:
     /// section comment above for the precondition this REQUIRES -- calling
     /// this while any other thread holds a Snapshot of this Model is
     /// undefined behavior, not a checked error.
-    CommitResult commit_bulk(BulkTransaction& txn);
+    CommitResult commit_bulk_without_undo(BulkTransaction& txn);
 
     /// Install (or clear, with {}) the pre-commit hook. See PreCommitFn.
     /// Takes the commit lock, so it is safe to call while other threads
@@ -1749,6 +1749,15 @@ public:
     /// the call site instead of a silent, load-dependent one discovered
     /// later. See CLAUDE.md's "prefer failing loudly."
     CommitResult run_pre_transaction(Transaction& txn);
+
+    /// Identical to run_pre_transaction() in every observable way EXCEPT
+    /// one: this pre-transaction's commit is never added to the undo list
+    /// (see Model::try_commit_without_undo()'s own doc comment -- same
+    /// reasoning, same "skip the clone() entirely, not just discard it"
+    /// behavior, applied to a pre-transaction instead of the main one).
+    /// Existing undo_list_ entries are still pruned as usual if this
+    /// pre-transaction's commit conflicts with them.
+    CommitResult run_pre_transaction_without_undo(Transaction& txn);
 
     /// Reported via CommitResult::error (status == Invalid) when a
     /// Transaction's own creates or updates would violate referential
@@ -2141,7 +2150,7 @@ private:
     /// cow(); logs the exact inverse (previous object + generation).
     void set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen);
 
-    // ---- commit_bulk() internals only -- see the section comment above
+    // ---- commit_bulk_without_undo() internals only -- see the section comment above
     // Model::begin_bulk() before reaching for these anywhere else --------
     //
     // Exact behavioral twins of set_slot()/add_out_refs()/add_field_keys()/
@@ -2149,7 +2158,7 @@ private:
     // call each one makes. That single omission is the entire point: it is
     // the act of LOGGING (capturing and retaining the prior state so it can
     // be replayed) that makes a huge, single Transaction expensive, not the
-    // index mutation itself -- see commit_bulk()'s own comment for the
+    // index mutation itself -- see commit_bulk_without_undo()'s own comment for the
     // measured cost this avoids. Calling these from anywhere a failure
     // might need to be unwound is a correctness bug: nothing here is
     // undo-able, on purpose.
@@ -2160,7 +2169,7 @@ private:
     // would silently reintroduce the exact per-object undo-log retention
     // this whole mechanism exists to avoid, with no signal at the call site
     // and nothing for the type system to catch. Separate names mean
-    // "commit_bulk() calls the _no_log ones" is a static, grep-able fact
+    // "commit_bulk_without_undo() calls the _no_log ones" is a static, grep-able fact
     // instead of something you have to trace a boolean through.
     void set_slot_no_log(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen);
     void add_out_refs_no_log(const ObjectBase* o);
@@ -2240,7 +2249,7 @@ private:
     /// left to reject. Consumes changes_ (member scratch) into the result.
     /// `undo_name`/`undo_data` are copied onto this commit's UndoEntry, if
     /// it gets one (see pending_undo_'s own comment) -- callers with no
-    /// Transaction to draw them from (commit_bulk(), which never produces
+    /// Transaction to draw them from (commit_bulk_without_undo(), which never produces
     /// undo data at all) pass empty defaults. `keep_undo` gates only
     /// whether THIS commit gets added as a new entry -- existing undo_list_
     /// entries this commit conflicts with are pruned regardless (see
@@ -2250,13 +2259,14 @@ private:
                              std::any undo_data = {}, bool keep_undo = true);
 
     /// check_and_apply() + publish_now(), with NO veto-hook seam -- used only
-    /// by run_pre_transaction(), which must never invoke pre_commit_
-    /// for a pre-transaction (that hook is reserved for the main
-    /// transaction). try_commit() does NOT call this: the main transaction
-    /// still needs the veto seam between apply and publish, so it inlines
-    /// check_and_apply() + publish_now() itself. Requires commit_mu_ already
-    /// held.
-    CommitResult commit_pretransaction_locked(Transaction& txn);
+    /// by run_pre_transaction()/run_pre_transaction_without_undo(), which
+    /// must never invoke pre_commit_ for a pre-transaction (that hook is
+    /// reserved for the main transaction). try_commit() does NOT call this:
+    /// the main transaction still needs the veto seam between apply and
+    /// publish, so it inlines check_and_apply() + publish_now() itself.
+    /// Requires commit_mu_ already held. `keep_undo` is exactly
+    /// publish_now()'s own parameter, passed straight through.
+    CommitResult commit_pretransaction_locked(Transaction& txn, bool keep_undo = true);
 
     /// The body of try_commit()/try_commit_without_undo() that actually
     /// needs commit_mu_: everything from the pre-transactions phase through
@@ -2274,6 +2284,14 @@ private:
     /// than duplicated so the post_commit_-outside-the-lock ordering (see
     /// commit_main_locked's own comment) can't drift between two copies.
     CommitResult try_commit_core(Transaction& txn, bool keep_undo);
+
+    /// Shared body of run_pre_transaction()/run_pre_transaction_without_
+    /// undo(): the two asserts, commit_pretransaction_locked(), and
+    /// recording precommit_failed_/precommit_failure_ on anything other
+    /// than Committed. The ONLY difference between the two public entry
+    /// points is which `keep_undo` value they pass here -- same reasoning
+    /// as try_commit_core().
+    CommitResult run_pre_transaction_core(Transaction& txn, bool keep_undo);
 
     // ---- read/publish path -------------------------------------------------
     // root_ is atomic so snapshot() acquires the current version with a lock-free
@@ -2657,20 +2675,20 @@ struct CommitResult {
 };
 
 // ---------------------------------------------------------------------------
-// BulkTransaction -- the builder half of Model::begin_bulk()/commit_bulk()
+// BulkTransaction -- the builder half of Model::begin_bulk()/commit_bulk_without_undo()
 // ---------------------------------------------------------------------------
 
 /// The bulk-load builder: create() plus a narrow, local-only update() --
 /// still no remove()/peek(), and no base to read against (there is nothing
-/// meaningful to read -- commit_bulk() wipes the model before installing
+/// meaningful to read -- commit_bulk_without_undo() wipes the model before installing
 /// this). See Model::begin_bulk()'s section comment for the full contract,
-/// including the exclusive-access precondition commit_bulk() requires.
+/// including the exclusive-access precondition commit_bulk_without_undo() requires.
 ///
 /// Building one touches no shared state, exactly like Transaction -- create()
 /// just mints a local id (see is_local()) and stores the object locally.
 /// Objects created here can reference each other freely, in any order,
 /// through the Ref<T>/Opt<T> returned by create(), the same way same-
-/// transaction local creates work on an ordinary Transaction; commit_bulk()
+/// transaction local creates work on an ordinary Transaction; commit_bulk_without_undo()
 /// remaps every one of those local ids to its real id in one pass. A forward
 /// reference -- pointing at an object this batch hasn't created yet -- can be
 /// fixed up after the fact with update() instead of predicting a future
@@ -2683,7 +2701,7 @@ struct CommitResult {
 /// see Transaction::remove()); this type's create() uses objects_.size() as
 /// the next local index precisely BECAUSE it never needs to leave a hole --
 /// unifying the two would force one scheme onto the other. More importantly,
-/// if this were a base of Transaction, Model::commit_bulk(BulkTransaction&)
+/// if this were a base of Transaction, Model::commit_bulk_without_undo(BulkTransaction&)
 /// would silently accept a Transaction upcast and wipe/reload the whole
 /// model from just its local_created_, discarding its base_, local_updated_,
 /// and remove_intents_ without a warning. Keeping them unrelated types means
@@ -2699,7 +2717,7 @@ public:
     /// Ref<T>/Opt<T> target for any other object created on this SAME
     /// BulkTransaction, before or after this call. Meaningless outside it;
     /// see CommitResult::to_real() for translating one into its real,
-    /// post-commit form once commit_bulk() succeeds.
+    /// post-commit form once commit_bulk_without_undo() succeeds.
     template <class T>
     Ref<T> create(std::unique_ptr<T> o) {
         static_assert(std::is_base_of_v<ObjectBase, T>, "T must derive from Object<T>");
@@ -2741,7 +2759,7 @@ public:
         return idx < objects_.size() ? objects_[idx].get() : nullptr;
     }
 
-    /// How many objects are pending. Diagnostic; commit_bulk() doesn't need
+    /// How many objects are pending. Diagnostic; commit_bulk_without_undo() doesn't need
     /// it, but a caller sanity-checking a large generated batch might.
     std::size_t size() const noexcept { return objects_.size(); }
 
@@ -2751,7 +2769,7 @@ private:
     /// Only Model::begin_bulk() constructs one.
     explicit BulkTransaction(Model* m) : model_(m) {}
 
-    Model* model_ = nullptr;  ///< asserted against cross-model misuse in commit_bulk()
+    Model* model_ = nullptr;  ///< asserted against cross-model misuse in commit_bulk_without_undo()
     std::vector<std::unique_ptr<ObjectBase>> objects_;  ///< index == local id's low bits
 };
 

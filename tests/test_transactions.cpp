@@ -502,7 +502,7 @@ TEST(pre_transactions_pre_commit_and_post_commit_all_see_the_same_transaction_id
         auto a = std::make_unique<Account>();
         a->name = "PRE";
         pre.create(std::move(a));
-        CHECK(model.run_pre_transaction(pre).status == CommitStatus::Committed);
+        CHECK(model.run_pre_transaction_without_undo(pre).status == CommitStatus::Committed);
     });
     m.set_pre_commit([&](Model&, const Transaction& main_txn, const std::vector<Change>&) {
         seen_in_pre_commit = main_txn.id();

@@ -191,7 +191,7 @@ Ref<T> pick_live(const Transaction& txn, const std::vector<Ref<T>>& v, std::mt19
 /// the non-nullable reference graph is NOT guaranteed to be a DAG, and a
 /// cascade entering the cycle kills every link in it. Shared between
 /// test_cascade.cpp (pre-mint-pass tests) and test_bulk_load.cpp (which
-/// reuses it for the same self-loop/cycle shape via commit_bulk()).
+/// reuses it for the same self-loop/cycle shape via commit_bulk_without_undo()).
 class Link final : public model::Object<Link> {
 public:
     std::string label;

@@ -19,9 +19,9 @@
 using namespace model;
 
 //
-// None of these tests hold a Snapshot or Transaction across a commit_bulk()
+// None of these tests hold a Snapshot or Transaction across a commit_bulk_without_undo()
 // call -- that's the exclusive-access precondition documented on
-// Model::commit_bulk() itself, and violating it is undefined behavior, not a
+// Model::commit_bulk_without_undo() itself, and violating it is undefined behavior, not a
 // checked error (see the assert in the implementation, which is a tripwire
 // for misuse during development, not a guard these tests should lean on).
 
@@ -36,7 +36,7 @@ TEST(bulk_load_into_a_fresh_model_installs_everything_with_cross_object_local_re
     ord->account = a;  // forward reference to another object in the SAME batch
     const Ref<Order> o = t.create(std::move(ord));
 
-    CommitResult r = m.commit_bulk(t);
+    CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Committed);
     const Ref<Account> real_a = r.to_real(a);
     const Ref<Order> real_o = r.to_real(o);
@@ -65,7 +65,7 @@ TEST(bulk_transaction_update_fixes_up_a_forward_reference_after_the_fact) {
 
     t.update(o)->account = a;  // now that `a` exists, fix up the forward ref
 
-    CommitResult r = m.commit_bulk(t);
+    CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Committed);
     const Ref<Account> real_a = r.to_real(a);
     const Ref<Order> real_o = r.to_real(o);
@@ -95,7 +95,7 @@ TEST(bulk_load_wipes_all_pre_existing_data) {
     auto acc = std::make_unique<Account>();
     acc->name = "new1";
     t.create(std::move(acc));
-    CommitResult r = m.commit_bulk(t);
+    CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Committed);
 
     Snapshot s = m.snapshot();
@@ -120,7 +120,7 @@ TEST(bulk_load_rejects_an_out_of_range_local_ref_with_nothing_mutated) {
     ord->account = Ref<Account>(Id{kLocalIdBit | 999u, 1});
     t.create(std::move(ord));
 
-    CommitResult r = m.commit_bulk(t);
+    CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Invalid);
     CHECK_EQ(m.current_version(), before);  // no wipe, no publish -- rejected before any mutation
     CHECK(m.snapshot().find_by_key<&Account::name>("survivor") != nullptr);
@@ -135,7 +135,7 @@ TEST(bulk_load_rejects_a_null_non_nullable_ref) {
     ord->code = "O1";  // ord->account (Ref<Account>, non-nullable) left null
     t.create(std::move(ord));
 
-    CommitResult r = m.commit_bulk(t);
+    CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Invalid);
     CHECK_EQ(m.current_version(), before);
 }
@@ -150,7 +150,7 @@ TEST(bulk_load_rejects_a_reference_to_a_pre_wipe_real_id) {
     ord->account = old_real;  // a REAL id, not local -- can't survive the wipe
     t.create(std::move(ord));
 
-    CommitResult r = m.commit_bulk(t);
+    CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Invalid);
 }
 
@@ -161,7 +161,7 @@ TEST(normal_transaction_and_find_by_key_work_correctly_after_a_bulk_load) {
         auto acc = std::make_unique<Account>();
         acc->name = "C1";
         t.create(std::move(acc));
-        CHECK(m.commit_bulk(t).status == CommitStatus::Committed);
+        CHECK(m.commit_bulk_without_undo(t).status == CommitStatus::Committed);
     }
 
     const Ref<Account> a2 =
@@ -177,7 +177,7 @@ TEST(normal_transaction_and_find_by_key_work_correctly_after_a_bulk_load) {
     CHECK_EQ(count, std::size_t{2});
 }
 
-// commit_bulk() mints its whole remap table before installing anything, so
+// commit_bulk_without_undo() mints its whole remap table before installing anything, so
 // a batch may contain forward references, self-loops, and cycles -- the
 // same order-independence the ordinary Transaction path gets from its
 // pre-mint pass (see apply_transaction_contents). BulkTransaction has no
@@ -204,7 +204,7 @@ TEST(bulk_load_accepts_forward_references_self_loops_and_cycles) {
     c2->next = local(1);  // backward: closes the non-nullable 2-cycle
     const Ref<Link> l2 = t.create(std::move(c2));
 
-    CommitResult r = m.commit_bulk(t);
+    CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Committed);
     const Ref<Link> rs = r.to_real(sl);
     const Ref<Link> r1 = r.to_real(l1);
@@ -227,7 +227,7 @@ TEST(bulk_load_accepts_forward_references_self_loops_and_cycles) {
     CHECK(s.find(rs) != nullptr);  // the self-loop was never part of that cycle
 }
 
-// The reverse index (referrers_) has to come out of commit_bulk()'s no-log
+// The reverse index (referrers_) has to come out of commit_bulk_without_undo()'s no-log
 // installation path in exactly the state cascade delete expects -- this
 // exercises that by cascading a non-nullable ref and nulling a nullable one,
 // entirely on bulk-loaded data.
@@ -250,7 +250,7 @@ TEST(cascade_delete_works_correctly_on_bulk_loaded_data) {
     grandchild->parent = c;  // nullable: survives, but parent gets nulled
     const Ref<Order> g = t.create(std::move(grandchild));
 
-    CommitResult r = m.commit_bulk(t);
+    CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Committed);
     const Ref<Account> real_a = r.to_real(a);
     const Ref<Order> real_c = r.to_real(c);

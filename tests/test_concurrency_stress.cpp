@@ -161,7 +161,7 @@ TEST(hooks_survive_heavy_concurrent_cascade_churn_without_corruption) {
         auto a = std::make_unique<Account>();
         a->name = "PRE" + std::to_string(next_pretxn_id.fetch_add(1, std::memory_order_relaxed));
         pre.create(std::move(a));
-        (void)model.run_pre_transaction(pre);  // a fresh create can't conflict; always Committed
+        (void)model.run_pre_transaction_without_undo(pre);  // a fresh create can't conflict; always Committed
     });
     m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>&) {
         pre_commit_ran.fetch_add(1, std::memory_order_relaxed);

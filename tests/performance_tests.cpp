@@ -684,7 +684,7 @@ PERF_TEST(worst_case_removing_one_referrer_of_a_hub_scales_with_hub_fanout) {
 // (a -> b -> c -> ..., removing `a` cascading hop by hop). Deep
 // non-nullable chains -- and even non-nullable cycles -- ARE expressible
 // (the remap table is minted in full before any create applies, in both
-// try_commit()'s pre-mint pass and commit_bulk(), so same-transaction
+// try_commit()'s pre-mint pass and commit_bulk_without_undo(), so same-transaction
 // forward references and self-loops resolve; see
 // apply_transaction_contents). The hub stays the representative worst
 // case regardless: the cascade BFS does the same per-victim work whether
@@ -1001,14 +1001,14 @@ namespace {
 // Same shape as seed_one_type_spread_across_buckets, but built on ONE
 // BulkTransaction instead of one huge Transaction: the buckets themselves
 // are part of the same batch (cross-object local refs, exactly like any
-// other BulkTransaction), and commit_bulk() installs everything with no
+// other BulkTransaction), and commit_bulk_without_undo() installs everything with no
 // per-object undo logging at all. This is the direct memory-cost comparison
-// that motivated Model::begin_bulk()/commit_bulk() in the first place (see
+// that motivated Model::begin_bulk()/commit_bulk_without_undo() in the first place (see
 // their doc comments): a single Transaction with n creates retains n
 // undo-log closures, each capturing a whole PersistentMap root, simultaneously,
 // until the WHOLE transaction resolves -- measured at ~13-17x the
 // steady-state per-object cost. A bulk load has nothing to roll back to
-// (see commit_bulk()'s own doc comment), so it never pays that cost.
+// (see commit_bulk_without_undo()'s own doc comment), so it never pays that cost.
 template <class T>
 void seed_one_type_via_bulk_load(Model& m, int n) {
     const int n_buckets = std::max(50, n / kItemsPerBucket);
@@ -1025,7 +1025,7 @@ void seed_one_type_via_bulk_load(Model& m, int n) {
         o->bucket = buckets[static_cast<std::size_t>(i) % buckets.size()];
         t.create(std::move(o));
     }
-    (void)m.commit_bulk(t);
+    (void)m.commit_bulk_without_undo(t);
 }
 
 }  // namespace
@@ -1054,7 +1054,7 @@ PERF_TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
 
     CHECK(single_txn_kb > 0);
     CHECK(bulk_kb > 0);
-    // The whole point of commit_bulk(): no per-object undo-log retention, so
+    // The whole point of commit_bulk_without_undo(): no per-object undo-log retention, so
     // its per-item cost lands near the steady-state batched-commit figure,
     // not the single-huge-transaction figure. Measured ratio, repeatedly:
     // ~11-12x at n=200,000 in the default build, ~12-15x under TSan.
