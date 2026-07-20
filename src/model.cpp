@@ -296,7 +296,7 @@ void Model::reaper_loop() {
             return true;
         });
         reap_queue_.erase(it, reap_queue_.end());
-        if (freed) retired_pending_.fetch_sub(freed, std::memory_order_relaxed);
+        if (freed) reap_backlog_.fetch_sub(freed, std::memory_order_relaxed);
 
         // Completing a pass -- even one that freed nothing -- advances the
         // round counter and wakes wait_for_reclamation(), whose contract is
@@ -314,10 +314,10 @@ void Model::enqueue_retired(std::vector<std::pair<std::uint64_t, const ObjectBas
     if (batch.empty())
         return;  // nothing to hand off (e.g. a commit that touched no existing object)
     // Counted BEFORE being made visible in reap_queue_ (under reap_mu_
-    // below), so retired_pending() -- which adds this atomic to
+    // below), so reap_backlog() -- which adds this atomic to
     // reap_queue_.size() -- never transiently UNDERcounts a batch that's
     // already enqueued but not yet reflected here; the reverse order could.
-    retired_pending_.fetch_add(batch.size(), std::memory_order_relaxed);
+    reap_backlog_.fetch_add(batch.size(), std::memory_order_relaxed);
     {
         std::lock_guard lk(reap_mu_);
         for (auto& e : batch) reap_queue_.push_back(e);
@@ -932,7 +932,7 @@ Model::Diagnostics Model::diagnostics() const {
         diag.pre_transactions_hook_installed = static_cast<bool>(pre_transactions_);
         diag.pre_commit_hook_installed = static_cast<bool>(pre_commit_);
 
-        diag.reap_backlog = retired_pending_.load(std::memory_order_relaxed) + retired_.size();
+        diag.reap_backlog = reap_backlog_.load(std::memory_order_relaxed) + retired_.size();
 
         diag.retained_commit_history.reserve(changelog_.size());
         for (const auto& entry : changelog_)
@@ -986,7 +986,7 @@ void Model::record_field_lookup(const std::type_info& type, const void* field,
     (cached ? c.cached : c.uncached).fetch_add(1, std::memory_order_relaxed);
 }
 
-LookupCounts Model::lookup_stats_for(const std::type_info& type, const void* field) const {
+LookupCounts Model::lookup_stats_raw(const std::type_info& type, const void* field) const {
     std::shared_lock lk(field_lookup_mu_);
     auto it = field_lookup_counts_.find(FieldLookupKey{&type, field});
     if (it == field_lookup_counts_.end()) return {};
@@ -1677,7 +1677,7 @@ CommitResult Model::apply_undo(const UndoEntry& entry) {
     for (std::size_t i = 0; i < entry.actions.size(); ++i) {
         const UndoAction& a = entry.actions[i];
         if (a.kind == UndoAction::Kind::Recreate) {
-            local[i] = inv.create_raw(std::unique_ptr<ObjectBase>(a.snapshot->clone()));
+            local[i] = inv.create_raw(std::unique_ptr<ObjectBase>(a.previous_value->clone()));
             old_to_new[a.id] = local[i];
         }
     }
@@ -1693,7 +1693,7 @@ CommitResult Model::apply_undo(const UndoEntry& entry) {
                 inv.remove_raw(a.id);
                 break;
             case UndoAction::Kind::RestoreUpdate: {
-                std::unique_ptr<ObjectBase> remapped(a.snapshot->clone());
+                std::unique_ptr<ObjectBase> remapped(a.previous_value->clone());
                 remapped->remap_undo_refs(remapper);
                 if (ObjectBase* p = inv.update_raw(a.id)) p->assign_from(*remapped);
                 break;
@@ -2014,7 +2014,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     // regardless of which local index refers to which -- order doesn't
     // matter the way it does for apply_create()'s incremental remap.
     // Keyed by the FULL local Id::index (kLocalIdBit set), matching what
-    // RefRemapper::resolve() looks up -- not the bare 0-based position.
+    // RefRemapper::translate() looks up -- not the bare 0-based position.
     std::unordered_map<std::uint32_t, Id> remap;
     remap.reserve(txn.objects_.size());
     for (std::size_t i = 0; i < txn.objects_.size(); ++i)

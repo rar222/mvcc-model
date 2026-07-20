@@ -259,7 +259,7 @@ int main() {
     std::printf("\n[summary] %llu commits, %llu conflicts across both writers\n",
                 static_cast<unsigned long long>(g_committed.load()),
                 static_cast<unsigned long long>(g_conflicts.load()));
-    std::printf("[reclaim] after barrier: %zu still pinned, %zu backlog\n", still_pinned, m.retired_pending());
+    std::printf("[reclaim] after barrier: %zu still pinned, %zu backlog\n", still_pinned, m.reap_backlog());
 
     assert(g_conflicts.load() > 0 &&
           "two writers racing ~10-change transactions on a 21-object seed pool should produce at "

@@ -340,7 +340,12 @@ struct RefRemapper {
     const std::unordered_map<std::uint32_t, Id>& table;  // local Id::index -> real Id
     bool* unmapped;  // set on a local id with no mapping; the apply aborts
 
-    Id resolve(Id id) const {
+    /// Local id -> real id, by table lookup -- NOT a Snapshot::resolve()-style
+    /// dereference (nothing here ever returns an object, only another Id), so
+    /// this is named the same way CommitResult::to_real() explains its own
+    /// naming: "resolve" is reserved elsewhere in this header for the
+    /// dereferencing operation. See to_real()'s doc comment.
+    Id translate(Id id) const {
         auto it = table.find(id.index);
         if (it == table.end()) {
             *unmapped = true;
@@ -351,11 +356,11 @@ struct RefRemapper {
 
     template <class T>
     void operator()(const void*, const char*, Ref<T>& r) const {
-        if (is_local(r.raw())) r = Ref<T>(resolve(r.raw()));
+        if (is_local(r.raw())) r = Ref<T>(translate(r.raw()));
     }
     template <class T>
     void operator()(const void*, const char*, Opt<T>& r) const {
-        if (r.raw() && is_local(r.raw())) r = Opt<T>(resolve(r.raw()));
+        if (r.raw() && is_local(r.raw())) r = Opt<T>(translate(r.raw()));
     }
 };
 
@@ -372,18 +377,21 @@ struct RefRemapper {
 struct UndoRemapper {
     const std::unordered_map<Id, Id, IdHash>& table;  // old real id -> new local id
 
-    Id resolve(Id id) const {
+    /// Old real id -> new local id, by table lookup -- same "not a
+    /// Snapshot::resolve()-style dereference" reasoning as RefRemapper::
+    /// translate(), which this mirrors.
+    Id translate(Id id) const {
         auto it = table.find(id);
         return it != table.end() ? it->second : id;
     }
 
     template <class T>
     void operator()(const void*, const char*, Ref<T>& r) const {
-        r = Ref<T>(resolve(r.raw()));
+        r = Ref<T>(translate(r.raw()));
     }
     template <class T>
     void operator()(const void*, const char*, Opt<T>& r) const {
-        if (r.raw()) r = Opt<T>(resolve(r.raw()));
+        if (r.raw()) r = Opt<T>(translate(r.raw()));
     }
 };
 
@@ -1341,7 +1349,7 @@ struct Change {
 /// try_commit() itself or otherwise begin a new transaction -- this runs
 /// inside an existing try_commit(), which already holds the commit lock.
 /// The same lock also rules out calling current_version(),
-/// retired_pending(), exhausted_slots(), or set_pre_commit() from the hook
+/// reap_backlog(), exhausted_slots(), or set_pre_commit() from the hook
 /// (self-deadlock on the non-recursive commit_mu_); snapshot() is fine, and
 /// yields the still-current PRE-commit version, since the transaction being
 /// inspected has not published yet.
@@ -1774,14 +1782,17 @@ public:
     };
 
     /// Objects retired but not yet freed, because a reader might still see them.
-    /// Serviced by the background reaper, so this counts its backlog.
-    /// retired_ is commit_mu_-protected (unlike the single-writer sibling,
-    /// where it was safe to read unsynchronized from the one writer thread
-    /// that owned it -- here any thread may call this while another holds
-    /// commit_mu_, so the read needs the same lock apply() does).
-    std::size_t retired_pending() const {
+    /// Serviced by the background reaper, so this counts its backlog --
+    /// exactly the same quantity Diagnostics::reap_backlog reports, just
+    /// without diagnostics()'s cost of also copying spine/index sizes and
+    /// the live-snapshot/subscriber sections. retired_ is commit_mu_-
+    /// protected (unlike the single-writer sibling, where it was safe to
+    /// read unsynchronized from the one writer thread that owned it -- here
+    /// any thread may call this while another holds commit_mu_, so the read
+    /// needs the same lock apply() does).
+    std::size_t reap_backlog() const {
         std::lock_guard lk(commit_mu_);
-        return retired_pending_.load(std::memory_order_relaxed) + retired_.size();
+        return reap_backlog_.load(std::memory_order_relaxed) + retired_.size();
     }
 
     /// Block until the background reaper has freed everything currently
@@ -1885,7 +1896,7 @@ public:
         std::size_t live_snapshot_refs = 0;       ///< total Snapshots + open Transaction bases pinned
         std::uint64_t reclamation_watermark = 0;  ///< oldest version anything still needs;
                                                   ///< == version (above) if nothing is pinned
-        std::size_t reap_backlog = 0;             ///< == retired_pending()
+        std::size_t reap_backlog = 0;             ///< == reap_backlog()
 
         std::size_t subscriber_count = 0;  ///< live Subscriptions (see subscribe())
 
@@ -1970,12 +1981,14 @@ public:
     template <auto Field>
     LookupCounts lookup_stats() const {
         using ClassT = member_class_t<decltype(Field)>;
-        return lookup_stats_for(typeid(ClassT), field_tag<Field>());
+        return lookup_stats_raw(typeid(ClassT), field_tag<Field>());
     }
 
-    /// Untyped body of lookup_stats<Field>() -- also what lookup_diagnostics()
+    /// Untyped counterpart of lookup_stats<Field>() -- same "_raw" naming as
+    /// create_raw/update_raw/remove_raw/peek_raw/find_by_key_raw for the
+    /// untyped body behind a typed template. Also what lookup_diagnostics()
     /// builds its report from.
-    LookupCounts lookup_stats_for(const std::type_info& type, const void* field) const;
+    LookupCounts lookup_stats_raw(const std::type_info& type, const void* field) const;
 
     /// Every field looked up at least once, for the life of this Model, each
     /// labeled with its declaring type's demangled name (see
@@ -1998,9 +2011,17 @@ public:
     struct UndoAction {
         enum class Kind : std::uint8_t { Recreate, Remove, RestoreUpdate };  // mirrors ChangeKind's style
         Kind kind;
-        Id id;                                ///< Remove/RestoreUpdate: the real id to act on.
-                                               ///< Recreate: the OLD id (about to become stale).
-        std::unique_ptr<ObjectBase> snapshot;  ///< pre-image clone (Recreate, RestoreUpdate); null for Remove
+        Id id;  ///< Remove/RestoreUpdate: the real id to act on.
+               ///< Recreate: the OLD id (about to become stale).
+
+        /// The object's value as of just before the change this action
+        /// undoes -- a clone (Recreate, RestoreUpdate), null for Remove.
+        /// Named to match Transaction::peek_before(), the read-side analog
+        /// of the same idea ("the value... before any local edit") -- NOT
+        /// `snapshot`, which would collide with the unrelated `Snapshot`
+        /// class (a whole-model, point-in-time view) this single object's
+        /// clone has nothing to do with.
+        std::unique_ptr<ObjectBase> previous_value;
     };
 
     /// One committed transaction's full inverse recipe. `touched` is every
@@ -2386,13 +2407,16 @@ private:
     // in try_commit(), so a large cascade never stalls a commit, and destructors
     // run off both the committing thread and any reader thread.
     std::thread reaper_;               ///< started by the ctor, joined by the dtor
-    std::mutex reap_mu_;               ///< guards everything below except retired_pending_
+    std::mutex reap_mu_;               ///< guards everything below except reap_backlog_
     std::condition_variable reap_cv_;  ///< wakes the reaper: work arrived, or stopping
     std::condition_variable reap_done_cv_;  ///< wakes wait_for_reclamation(): a pass finished
     std::vector<std::pair<std::uint64_t, const ObjectBase*>> reap_queue_;
     ///< ^ (version at which each object became invisible, object); freed once
     ///< the live watermark reaches that version
-    std::atomic<std::size_t> retired_pending_{0};  ///< reaper backlog, for observability
+    std::atomic<std::size_t> reap_backlog_{0};  ///< reaper backlog, cheaply answer "how far behind is the background reaper right now?" 
+                                                ///< — e.g. to monitor whether cascade-heavy churn is outpacing reclamation — without
+                                                ///< paying reap_mu_ contention or reap_queue_.size()'s cost under load. It's kept as a
+                                                ///< separate atomic specifically so that check doesn't need reap_mu_ at all
     std::uint64_t reap_done_round_ = 0;            ///< bumped after each reap pass
     bool dirty_reap_ = false;                      ///< a reap pass is due
     bool reaper_stop_ = false;                     ///< dtor -> reaper: drain and exit
@@ -2689,14 +2713,16 @@ struct CommitResult {
     /// a local id from a Conflict/Vetoed/Invalid attempt was never installed
     /// anywhere; begin() a fresh Transaction and create() again instead.
     ///
-    /// Named to_real(), not resolve(): "resolve" already means two OTHER
-    /// things in this header -- Snapshot::resolve() (an unchecked, never-
-    /// null dereference to `const T&`/`const T*`, trusting the published
-    /// invariant) and Transaction::peek()'s doc contrasts itself against
-    /// that same meaning. This is neither: no dereference happens here at
-    /// all, just a local-id -> real-id translation (Ref<T> in, Ref<T> out) --
-    /// the same translation RefRemapper performs on the writer side, during
-    /// apply, via local_remap's table. See RefRemapper's own comment.
+    /// Named to_real(), not resolve(): "resolve" already means one thing in
+    /// this header -- Snapshot::resolve() (an unchecked, never-null
+    /// dereference to `const T&`/`const T*`, trusting the published
+    /// invariant), which Transaction::peek()'s doc contrasts itself
+    /// against. This is neither: no dereference happens here at all, just a
+    /// local-id -> real-id translation (Ref<T> in, Ref<T> out) -- the same
+    /// translation RefRemapper::translate() performs on the writer side,
+    /// during apply, via local_remap's table (named translate(), not
+    /// resolve(), for exactly this same reason). See RefRemapper's own
+    /// comment.
     template <class T>
     Ref<T> to_real(Ref<T> local) const {
         if (!is_local(local.raw())) return local;

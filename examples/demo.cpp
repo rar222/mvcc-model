@@ -353,7 +353,7 @@ int main() {
                 static_cast<unsigned long long>(g_refs_resolved.load()),
                 static_cast<unsigned long long>(g_null_parents.load()));
     std::printf("[reclaim] after barrier: %zu still pinned, %zu backlog\n", still_pinned,
-                m.retired_pending());
+                m.reap_backlog());
 
     assert(g_conflicts.load() > 0 &&
           "three writer threads racing on a shared object graph should produce at least one "

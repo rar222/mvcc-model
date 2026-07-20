@@ -138,7 +138,7 @@ TEST(deleted_object_survives_in_older_snapshot) {
     CHECK(m.snapshot().find(o) == nullptr);  // gone from the new version
     CHECK(old.find(o) != nullptr);           // still there in the old one
     CHECK_EQ(old.find(o)->code, std::string("O1"));
-    CHECK(m.retired_pending() > 0);  // held back from the free list
+    CHECK(m.reap_backlog() > 0);  // held back from the free list
 }
 
 // wait_for_reclamation() reports objects as pinned while a Snapshot holds
@@ -152,7 +152,7 @@ TEST(reclamation_advances_when_snapshots_are_dropped) {
     {
         Snapshot pin = m.snapshot();
         remove_and_commit(m, o);
-        CHECK(m.retired_pending() > 0);       // pinned by `pin`
+        CHECK(m.reap_backlog() > 0);       // pinned by `pin`
         CHECK(m.wait_for_reclamation() > 0);  // still pinned: barrier confirms it can't free
     }
     // `pin` is gone; the next commit's watermark should free the backlog.

@@ -283,12 +283,12 @@ TEST(empty_transaction_fast_path_returns_the_transactions_own_possibly_stale_bas
     CHECK(res.snapshot.version() != m.current_version());
 }
 
-// Diagnostics::reap_backlog is documented as == retired_pending() -- both
-// read the SAME underlying commit_mu_-protected state, just through two
-// different public accessors. Churn some removes while a Snapshot holds an
-// older version pinned (so there's a genuine non-zero backlog), and confirm
-// the two calls agree.
-TEST(diagnostics_reap_backlog_matches_retired_pending) {
+// Diagnostics::reap_backlog is documented as == reap_backlog() -- both read
+// the SAME underlying commit_mu_-protected state, just through two
+// different public accessors (a single-value one, and the full readout).
+// Churn some removes while a Snapshot holds an older version pinned (so
+// there's a genuine non-zero backlog), and confirm the two calls agree.
+TEST(diagnostics_reap_backlog_matches_model_reap_backlog) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     std::vector<Ref<Order>> orders;
@@ -297,8 +297,8 @@ TEST(diagnostics_reap_backlog_matches_retired_pending) {
     Snapshot pin = m.snapshot();  // holds the pre-removal version alive
     for (const Ref<Order>& o : orders) remove_and_commit(m, o);
 
-    CHECK(m.retired_pending() > 0);
-    CHECK_EQ(m.diagnostics().reap_backlog, m.retired_pending());
+    CHECK(m.reap_backlog() > 0);
+    CHECK_EQ(m.diagnostics().reap_backlog, m.reap_backlog());
 }
 
 // Diagnostics::slots_free/slots_exhausted track exactly what their doc

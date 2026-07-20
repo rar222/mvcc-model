@@ -95,7 +95,7 @@ TEST(
     // CLAUDE.md invariant 10) that a single-caller test cannot.
     auto accessor_hammer = [&] {
         while (!stop.load(std::memory_order_relaxed)) {
-            (void)m.retired_pending();
+            (void)m.reap_backlog();
             (void)m.current_version();
             (void)m.exhausted_slots();
             (void)m.wait_for_reclamation();

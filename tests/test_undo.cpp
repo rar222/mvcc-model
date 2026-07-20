@@ -28,7 +28,10 @@ struct TestUndoAction {
     enum class Kind { Recreate, Remove, RestoreUpdate };
     Kind kind;
     Id id;
-    std::unique_ptr<ObjectBase> snapshot;  // pre-image clone (Recreate, RestoreUpdate); null for Remove
+    // pre-image clone (Recreate, RestoreUpdate); null for Remove. Named to
+    // match the real Model::UndoAction::previous_value -- not `snapshot`,
+    // which would collide with the unrelated Snapshot class.
+    std::unique_ptr<ObjectBase> previous_value;
 };
 
 /// Preview of Stage 2's Model::apply_undo: mints every Recreate action's new
@@ -44,7 +47,7 @@ CommitResult apply_test_undo(Model& m, const std::vector<TestUndoAction>& action
 
     for (std::size_t i = 0; i < actions.size(); ++i)
         if (actions[i].kind == TestUndoAction::Kind::Recreate) {
-            local[i] = inv.create_raw(std::unique_ptr<ObjectBase>(actions[i].snapshot->clone()));
+            local[i] = inv.create_raw(std::unique_ptr<ObjectBase>(actions[i].previous_value->clone()));
             old_to_new[actions[i].id] = local[i];
         }
 
@@ -59,7 +62,7 @@ CommitResult apply_test_undo(Model& m, const std::vector<TestUndoAction>& action
                 inv.remove_raw(a.id);
                 break;
             case TestUndoAction::Kind::RestoreUpdate: {
-                std::unique_ptr<ObjectBase> remapped(a.snapshot->clone());
+                std::unique_ptr<ObjectBase> remapped(a.previous_value->clone());
                 remapped->remap_undo_refs(remapper);
                 if (ObjectBase* p = inv.update_raw(a.id)) p->assign_from(*remapped);
                 break;
