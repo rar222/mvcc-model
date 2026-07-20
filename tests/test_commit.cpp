@@ -60,6 +60,54 @@ TEST(two_concurrent_transactions_touching_disjoint_ids_both_succeed) {
     CHECK_EQ(s.find(a2)->balance, 200);
 }
 
+// DESIGN.md is explicit that this is object-write-set OCC, not full
+// serializable OCC: "two transactions that only read overlapping state,
+// without either writing or referencing it, can both commit even if the
+// result is a write-skew anomaly." That's prose describing intended
+// behavior, not something any test pins down -- this is that pin, so a
+// future change can't silently strengthen OR weaken the guarantee without
+// a test noticing (see CLAUDE.md's "Known scope boundaries").
+//
+// Two accounts share a combined-overdraft invariant enforced only by each
+// transaction reading BOTH balances before deciding to debit ONE of them.
+// T1 and T2 both read the same pre-debit snapshot (sum=200, limit=100),
+// each independently concludes its own 100 debit is safe, and each writes
+// only its own account -- disjoint write sets, no Ref<> between the two
+// Accounts, so nothing in the object-write-set model has any reason to
+// conflict them. Both commit; the combined invariant ends up violated
+// anyway. That is write skew, and it is expected, not a bug.
+TEST(two_transactions_reading_the_same_invariant_and_writing_disjoint_ids_both_commit_as_write_skew) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1", 100);
+    const Ref<Account> a2 = make_account(m, "A2", 100);
+    constexpr std::int64_t kCombinedOverdraftLimit = 100;
+
+    const Snapshot base = m.snapshot();
+    CHECK_EQ(base.find(a1)->balance + base.find(a2)->balance, std::int64_t{200});
+
+    Transaction t1 = m.begin(base);
+    Transaction t2 = m.begin(base);
+
+    // Each transaction reads BOTH balances off its own (shared) base before
+    // deciding to debit just one -- the read that establishes the invariant
+    // is never turned into a write, so it never enters either write set.
+    const std::int64_t t1_combined = t1.base().find(a1)->balance + t1.base().find(a2)->balance;
+    CHECK(t1_combined - 100 >= kCombinedOverdraftLimit);
+    t1.update(a1)->balance -= 100;
+
+    const std::int64_t t2_combined = t2.base().find(a1)->balance + t2.base().find(a2)->balance;
+    CHECK(t2_combined - 100 >= kCombinedOverdraftLimit);
+    t2.update(a2)->balance -= 100;
+
+    CHECK(m.try_commit(t1).status == CommitStatus::Committed);
+    CHECK(m.try_commit(t2).status == CommitStatus::Committed);  // NOT a Conflict: disjoint write sets
+
+    Snapshot s = m.snapshot();
+    const std::int64_t final_combined = s.find(a1)->balance + s.find(a2)->balance;
+    CHECK_EQ(final_combined, std::int64_t{0});                    // invariant actually violated
+    CHECK(final_combined < kCombinedOverdraftLimit);              // < 100, below the enforced floor
+}
+
 // Two transactions racing an update to the SAME id: the first commit
 // wins, the second is rejected as Conflict/IdSetOverlap, and a fresh
 // retry against the new base succeeds cleanly.

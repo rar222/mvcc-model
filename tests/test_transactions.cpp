@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -477,6 +478,35 @@ TEST(transaction_id_is_unique_per_transaction_and_stable_across_a_move) {
     const std::uint64_t id_before_move = a.id();
     Transaction c = std::move(a);
     CHECK_EQ(c.id(), id_before_move);
+}
+
+// Transaction carries no thread affinity -- it's just a local overlay plus
+// a pinned Snapshot base, both plain data (invariant 10: begin() never
+// touches commit_mu_) -- so building it on one thread and committing it on
+// another must work exactly like doing both on the same thread. This is
+// the natural shape for a worker-pool architecture (a request handled on
+// some worker thread, the actual try_commit() serialized through one
+// dedicated writer thread), but nothing else here exercises the handoff:
+// every other concurrency test builds AND commits on the same thread.
+TEST(a_transaction_built_on_one_thread_commits_correctly_on_another) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 0);
+
+    std::optional<Transaction> handoff;
+    std::thread builder([&] {
+        Transaction txn = m.begin();
+        auto o = std::make_unique<Order>();
+        o->code = "FROM_BUILDER_THREAD";
+        o->account = a;
+        txn.create(std::move(o));
+        handoff = std::move(txn);  // moved out to the joining thread below
+    });
+    builder.join();
+
+    CHECK(handoff.has_value());
+    const CommitResult res = m.try_commit(*handoff);  // committed from THIS (the test's) thread
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find_by_key<&Order::computed_key>("ord:FROM_BUILDER_THREAD") != nullptr);
 }
 
 // CommitResult::to_real()'s doc comment: "a ref that was never local...

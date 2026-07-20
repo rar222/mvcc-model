@@ -513,3 +513,53 @@ TEST(repeated_toggling_of_an_optional_reference_across_several_churned_targets_f
     CHECK_EQ(s.size(), std::size_t{2});   // acc + MAIN only -- C1/C2 cancelled, C3 cascaded away
 }
 
+namespace {
+/// Only used by the diamond test below: two non-nullable Ref<Order> fields,
+/// so a single object can be a referrer of TWO different Orders at once --
+/// the shape needed to make the cascade BFS discover the SAME object from
+/// two different frontiers in one walk. No existing fixture type (Account,
+/// Order, Record, Link, ...) has two non-nullable ref fields.
+class Hub final : public model::Object<Hub> {
+public:
+    model::Ref<Order> left;
+    model::Ref<Order> right;
+
+    template <class Self, class V>
+    static void define_references(Self& s, V&& v) {
+        v(model::field_tag<&Hub::left>(), "left", s.left);
+        v(model::field_tag<&Hub::right>(), "right", s.right);
+    }
+};
+}  // namespace
+
+// Every other cascade test here is either a straight chain
+// (cascade_is_transitive_and_mixed) or a cycle (cascade_terminates_on_
+// cycles) -- neither exercises fan-IN convergence, where the BFS reaches
+// the SAME object from two different dying targets in one walk. Here `hub`
+// non-nullably references both o1 and o2, and both die (as non-nullable
+// referrers of `acc`) in the same cascade -- so the BFS finds `hub` once
+// via o1's referrer list, then AGAIN via o2's, while `hub` is already
+// queued/dying. The visited-set must dedupe: `hub` dies exactly once, not
+// twice -- a double-process would double-count `killed` at best, or
+// double-erase hub's own referrer/field-key edges at worst (corruption,
+// not just a wrong count).
+TEST(cascade_bfs_dedupes_an_object_reached_from_two_different_dying_targets) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "A1");
+    const Ref<Order> o1 = make_order(m, "O1", acc);
+    const Ref<Order> o2 = make_order(m, "O2", acc);
+
+    Transaction txn = m.begin();
+    auto h = std::make_unique<Hub>();
+    h->left = o1;
+    h->right = o2;
+    txn.create(std::move(h));
+    commit_ok(m, txn);
+
+    const std::size_t killed = remove_and_commit(m, acc);
+    CHECK_EQ(killed, std::size_t{4});  // acc, o1, o2, hub -- hub counted once
+
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.size(), std::size_t{0});
+}
+

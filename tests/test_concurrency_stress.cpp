@@ -405,3 +405,48 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
     }
 }
 
+// Liveness/fairness, not correctness: every writer thread races
+// try_commit() against the SAME single id every single attempt -- the
+// most adversarial contention shape, since every in-flight attempt from
+// every thread conflicts with every other thread's. commit_mu_ serializes
+// apply, but nothing about that serialization is meant to let one thread
+// keep winning while another is starved out indefinitely. Distinct from
+// concurrent_stress_many_writer_threads_hammering_try_commit_..., which
+// checks that concurrent commits never corrupt anything but never asks
+// whether any one thread's writes actually got through -- a starved
+// thread there would be invisible to that test. Bounded retries (not a
+// blocking wait) so a genuine starvation bug fails this test loudly
+// instead of hanging the suite.
+TEST(every_writer_thread_eventually_lands_a_commit_under_sustained_single_id_contention) {
+    Model m;
+    const Ref<Account> hot = make_account(m, "HOT", 0);
+
+    constexpr int kThreads = 6;
+    constexpr int kMaxAttemptsPerThread = 20000;  // generous: this FAILS, not hangs, if exceeded
+    std::vector<std::thread> workers;
+    std::vector<char> succeeded(kThreads, 0);   // each index written only by its own thread
+    std::vector<int> attempts_used(kThreads, 0);
+
+    for (int i = 0; i < kThreads; ++i) {
+        workers.emplace_back([&, i] {
+            int attempts = 0;
+            for (; attempts < kMaxAttemptsPerThread; ++attempts) {
+                Transaction txn = m.begin();
+                txn.update(hot)->balance += 1;  // every thread, every attempt: the same id
+                if (m.try_commit(txn).status == CommitStatus::Committed) {
+                    succeeded[i] = 1;
+                    ++attempts;  // count the winning attempt too
+                    break;
+                }
+            }
+            attempts_used[i] = attempts;
+        });
+    }
+    for (auto& t : workers) t.join();
+
+    for (int i = 0; i < kThreads; ++i) {
+        CHECK(succeeded[i] != 0);
+        CHECK(attempts_used[i] < kMaxAttemptsPerThread);  // same fact, phrased for a readable failure
+    }
+}
+
