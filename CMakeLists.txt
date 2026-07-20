@@ -119,7 +119,10 @@ add_test(NAME model_tests COMMAND model_tests)
 set_tests_properties(model_tests PROPERTIES TIMEOUT 300)
 
 # The persistent index (HAMT) is differential-tested against std::unordered_map.
-add_executable(persistent_map_tests tests/persistent_map_tests.cpp)
+# Shares tests/test_harness.cpp/.h with model_tests (TEST()/CHECK()/g_failures/
+# main()) -- test_harness.h has no model.h dependency, so this stays independent
+# of libmodel (model_flags only: compiler flags, not the model library itself).
+add_executable(persistent_map_tests tests/persistent_map_tests.cpp tests/test_harness.cpp)
 target_link_libraries(persistent_map_tests PRIVATE model_flags)
 target_include_directories(persistent_map_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_test(NAME persistent_map_tests COMMAND persistent_map_tests)
