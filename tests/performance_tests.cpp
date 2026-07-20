@@ -67,10 +67,11 @@
 #include "test_types.h"
 
 #if defined(__linux__)
-#include <cstdlib>
 #include <malloc.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <cstdlib>
 #define PERF_HAS_MEMORY_SECTION 1
 #else
 #define PERF_HAS_MEMORY_SECTION 0
@@ -111,7 +112,7 @@ struct Registrar {
 
 #define CHECK(cond)                                                       \
     do {                                                                  \
-        if (!(cond)) {                                                   \
+        if (!(cond)) {                                                    \
             std::printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
             ++g_failures;                                                 \
         }                                                                 \
@@ -140,7 +141,9 @@ constexpr bool kSlowSanitizedBuild = false;
 constexpr bool kSlowSanitizedBuild = false;
 #endif
 
-int scaled(int n) { return kSlowSanitizedBuild ? std::max(20, n / 25) : n; }
+int scaled(int n) {
+    return kSlowSanitizedBuild ? std::max(20, n / 25) : n;
+}
 
 // Timing-derived bounds are asserted ONLY in the default build. Under a
 // sanitizer this suite still runs every path (which is the point of
@@ -273,12 +276,13 @@ constexpr Tolerance kLinearWithIndexOverhead{0.7, 2.0};  // n log n + allocator 
 // the measured gap runs from ~5x at the smallest size to ~1000x at the
 // largest, so a 3x minimum has enormous headroom while still failing
 // outright if the index ever stops being asymptotically better.
-void check_gap_widens(const char* label, double small_scan, double small_indexed,
-                       double large_scan, double large_indexed, double min_growth) {
+void check_gap_widens(const char* label, double small_scan, double small_indexed, double large_scan,
+                      double large_indexed, double min_growth) {
     const double small_ratio = small_scan / small_indexed;
     const double large_ratio = large_scan / large_indexed;
-    std::printf("    %-24s gap: %.1fx at smallest size -> %.1fx at largest (need >= %.1fx growth)\n",
-                label, small_ratio, large_ratio, min_growth);
+    std::printf(
+        "    %-24s gap: %.1fx at smallest size -> %.1fx at largest (need >= %.1fx growth)\n", label,
+        small_ratio, large_ratio, min_growth);
     if (!kAssertTimings) return;  // see kAssertTimings
     CHECK(large_ratio >= small_ratio * min_growth);
 }
@@ -295,7 +299,7 @@ void check_gap_widens(const char* label, double small_scan, double small_indexed
 // directly encodes the actual claim ("this grows like log n", not "this
 // takes under 50 ms").
 void check_scaling(const char* label, GrowthOrder order, const std::vector<int>& sizes,
-                    const std::vector<double>& times, Tolerance tol = kDefaultBand) {
+                   const std::vector<double>& times, Tolerance tol = kDefaultBand) {
     for (std::size_t i = 1; i < sizes.size(); ++i) {
         const double factor = scaling_factor(order, sizes[i - 1], sizes[i]);
         const double expected = times[i - 1] * factor;
@@ -352,7 +356,7 @@ void seed_accounts(Model& m, int n, std::vector<Ref<Account>>& out) {
 // size sweep -- the same reason examples/cached_reference_bench.cpp scales
 // its bucket count with population (bucket_count_for).
 void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orders,
-                  std::vector<Ref<Order>>& out, int qty_mod = 50) {
+                 std::vector<Ref<Order>>& out, int qty_mod = 50) {
     constexpr int kBatch = 2000;
     out.clear();
     out.reserve(static_cast<std::size_t>(n_orders));
@@ -394,7 +398,8 @@ PERF_TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
         constexpr int kKeyReps = 5000;
         key_us.push_back(best_of(15, [&] {
             return time_ms([&] {
-                       for (int i = 0; i < kKeyReps; ++i) (void)s.find_by_key<&Account::name>(probe);
+                       for (int i = 0; i < kKeyReps; ++i)
+                           (void)s.find_by_key<&Account::name>(probe);
                    }) *
                    1000.0 / kKeyReps;
         }));
@@ -492,7 +497,8 @@ PERF_TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_populatio
         const int reps = std::max(5, 200000 / n);
         scan_us.push_back(best_of(5, [&] {
             return time_ms([&] {
-                       for (int i = 0; i < reps; ++i) (void)s.find_referrers<&Order::account>(target);
+                       for (int i = 0; i < reps; ++i)
+                           (void)s.find_referrers<&Order::account>(target);
                    }) *
                    1000.0 / reps;
         }));
@@ -511,9 +517,10 @@ PERF_TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_populatio
     }
     // Matches held ~constant across the sweep (account count scales with
     // n above), so this isolates the index's O(log n) term.
-    check_scaling("find_cached_referrers", GrowthOrder::kLogN, sizes, indexed_us, kSmallIndexedRead);
-    check_gap_widens("cached_referrers vs scan", scan_us.front(), indexed_us.front(), scan_us.back(),
-                     indexed_us.back(), 3.0);
+    check_scaling("find_cached_referrers", GrowthOrder::kLogN, sizes, indexed_us,
+                  kSmallIndexedRead);
+    check_gap_widens("cached_referrers vs scan", scan_us.front(), indexed_us.front(),
+                     scan_us.back(), indexed_us.back(), 3.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +605,7 @@ namespace {
 // collapse to just the hub's own neighborhood -- fanout is the one
 // deliberately varying axis.
 void seed_hub_with_fanout(Model& m, int fanout, int background, Ref<Account>& hub,
-                           std::vector<Ref<Order>>& hub_orders) {
+                          std::vector<Ref<Order>>& hub_orders) {
     std::vector<Ref<Account>> bg_accounts;
     seed_accounts(m, background, bg_accounts);
     std::vector<Ref<Order>> bg_orders;
@@ -970,14 +977,14 @@ PERF_TEST(cached_reference_index_memory_overhead_is_present_but_bounded) {
     const long baseline_kb = measure_child_peak_kb([] { /* just process startup cost */ });
 
     const long uncached_kb = measure_child_peak_kb([kN] {
-        Model m;
-        seed_one_type_spread_across_buckets<MemUncached>(m, kN);
-    }) - baseline_kb;
+                                 Model m;
+                                 seed_one_type_spread_across_buckets<MemUncached>(m, kN);
+                             }) - baseline_kb;
 
     const long cached_kb = measure_child_peak_kb([kN] {
-        Model m;
-        seed_one_type_spread_across_buckets<MemCached>(m, kN);
-    }) - baseline_kb;
+                               Model m;
+                               seed_one_type_spread_across_buckets<MemCached>(m, kN);
+                           }) - baseline_kb;
 
     const double overhead = uncached_kb > 0 ? static_cast<double>(cached_kb) / uncached_kb : 0.0;
     std::printf("  n=%d   uncached=%ld KB   cached=%ld KB   overhead=%.2fx\n", kN, uncached_kb,
@@ -1035,14 +1042,14 @@ PERF_TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
     const long baseline_kb = measure_child_peak_kb([] { /* just process startup cost */ });
 
     const long single_txn_kb = measure_child_peak_kb([kN] {
-        Model m;
-        seed_one_type_spread_across_buckets<MemUncached>(m, kN);
-    }) - baseline_kb;
+                                   Model m;
+                                   seed_one_type_spread_across_buckets<MemUncached>(m, kN);
+                               }) - baseline_kb;
 
     const long bulk_kb = measure_child_peak_kb([kN] {
-        Model m;
-        seed_one_type_via_bulk_load<MemUncached>(m, kN);
-    }) - baseline_kb;
+                             Model m;
+                             seed_one_type_via_bulk_load<MemUncached>(m, kN);
+                         }) - baseline_kb;
 
     const double single_bpi = kN > 0 ? single_txn_kb * 1024.0 / kN : 0.0;
     const double bulk_bpi = kN > 0 ? bulk_kb * 1024.0 / kN : 0.0;
