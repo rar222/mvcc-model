@@ -1380,17 +1380,17 @@ void Model::rollback_apply() {
 // begin() / try_commit()
 // ---------------------------------------------------------------------------
 
-Transaction Model::begin() {
-    return begin(snapshot());
+Transaction Model::begin(std::string name, std::any data) {
+    return begin(snapshot(), std::move(name), std::move(data));
 }
 
-Transaction Model::begin(Snapshot base) {
-    return Transaction(this, std::move(base));
+Transaction Model::begin(Snapshot base, std::string name, std::any data) {
+    return Transaction(this, std::move(base), std::move(name), std::move(data));
 }
 
-Transaction Snapshot::begin() const {
+Transaction Snapshot::begin(std::string name, std::any data) const {
     assert(lease_ && "begin() on a default-constructed Snapshot -- no Model to build against");
-    return lease_->m->begin(*this);
+    return lease_->m->begin(*this, std::move(name), std::move(data));
 }
 
 std::vector<Change> Transaction::estimate_changes_with_cascades() const {
@@ -1526,7 +1526,8 @@ std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
     return std::nullopt;  // applied; remap is populated, changes_ may or may not be empty
 }
 
-CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
+CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std::string undo_name,
+                                std::any undo_data) {
     ++version_;  // the version this attempt is about to publish -- commit_mu_-protected, so no
                  // other thread can be racing this increment
 
@@ -1603,7 +1604,8 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap) {
         }
 
         if (!pending_undo_.empty())
-            undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched)});
+            undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched),
+                                  std::move(undo_name), std::move(undo_data)});
     }
     pending_undo_.clear();
 
@@ -1626,7 +1628,8 @@ std::vector<Model::UndoSummary> Model::list_undo() const {
     std::lock_guard lk(commit_mu_);
     std::vector<UndoSummary> out;
     out.reserve(undo_list_.size());
-    for (const UndoEntry& e : undo_list_) out.push_back({e.version, e.actions.size()});
+    for (const UndoEntry& e : undo_list_)
+        out.push_back({e.version, e.actions.size(), e.name, e.data});
     return out;
 }
 
@@ -1700,7 +1703,7 @@ CommitResult Model::commit_pretransaction_locked(Transaction& txn) {
             CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
     }
 
-    return publish_now(std::move(remap));
+    return publish_now(std::move(remap), txn.name(), txn.data());
 }
 
 CommitResult Model::run_pre_transaction(Transaction& txn) {
@@ -1778,7 +1781,7 @@ CommitResult Model::commit_main_locked(Transaction& txn) {
         return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
     }
 
-    return publish_now(std::move(remap));
+    return publish_now(std::move(remap), txn.name(), txn.data());
 }
 
 CommitResult Model::try_commit(Transaction& txn) {

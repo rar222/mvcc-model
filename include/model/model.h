@@ -25,6 +25,7 @@
 // transactions concurrently. See CLAUDE.md invariant 8.
 
 #include <algorithm>
+#include <any>
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
@@ -1211,7 +1212,9 @@ public:
     /// you're also using for analysis, so you want the transaction's view to
     /// match it exactly). The Snapshot itself is untouched -- copied into the
     /// new Transaction's base(), same as Model::begin(Snapshot) does.
-    Transaction begin() const;
+    /// `name`/`data` are optional, caller-supplied labels -- see
+    /// Transaction::name()/data().
+    Transaction begin(std::string name = "", std::any data = {}) const;
 
     /// Untyped escape hatch -- for change events, which are heterogeneous
     /// (a Change::id could be any type). Generation-checked exactly like the
@@ -1531,12 +1534,15 @@ public:
     /// (create/update/remove/peek) touches only the Transaction's own local
     /// state -- never Model's shared state, never any lock -- so any number
     /// of threads can each build one fully in parallel with zero contention.
-    Transaction begin();
+    /// `name`/`data` are optional, caller-supplied labels -- see
+    /// Transaction::name()/data() -- copied onto this commit's UndoEntry/
+    /// UndoSummary (if any) once it publishes.
+    Transaction begin(std::string name = "", std::any data = {});
 
     /// Start a transaction based on an explicit, already-held Snapshot (e.g.
     /// one you're also using for analysis, so you want the transaction's view
     /// to match exactly).
-    Transaction begin(Snapshot base);
+    Transaction begin(Snapshot base, std::string name = "", std::any data = {});
 
     /// Attempt to publish a Transaction. This is the ONE serialization point:
     /// briefly locks the whole model while it (1) checks the transaction's
@@ -1967,14 +1973,23 @@ public:
         std::uint64_t version;
         std::vector<UndoAction> actions;
         std::unordered_set<Id, IdHash> touched;
+        std::string name;  ///< copied from the committing Transaction::name() (see publish_now())
+        std::any data;     ///< copied from the committing Transaction::data() (see publish_now())
     };
 
     /// Lightweight, copyable summary of one UndoEntry still in the list --
     /// what list_undo() returns, so browsing what's available doesn't force
-    /// copying every entry's (potentially many) snapshot clones.
+    /// copying every entry's (potentially many) snapshot clones. `data` is
+    /// the one exception to "lightweight": it's a copy of whatever the
+    /// committing Transaction's own data() held, which is only as cheap to
+    /// copy as the caller made it -- an empty std::any (the default) is
+    /// free, but a caller that passed something expensive pays for that
+    /// copy on every list_undo() call, not just once.
     struct UndoSummary {
         std::uint64_t version;
         std::size_t action_count;
+        std::string name;
+        std::any data;
     };
 
     /// Every undo entry still in the list, oldest first. See UndoEntry's
@@ -2202,7 +2217,12 @@ private:
     /// subscriber notify, retirees handed to the reaper, changelog append,
     /// scratch cleared. Always succeeds -- by the time it's called, nothing
     /// left to reject. Consumes changes_ (member scratch) into the result.
-    CommitResult publish_now(std::unordered_map<std::uint32_t, Id> remap);
+    /// `undo_name`/`undo_data` are copied onto this commit's UndoEntry, if
+    /// it gets one (see pending_undo_'s own comment) -- callers with no
+    /// Transaction to draw them from (commit_bulk(), which never produces
+    /// undo data at all) pass empty defaults.
+    CommitResult publish_now(std::unordered_map<std::uint32_t, Id> remap, std::string undo_name = "",
+                             std::any undo_data = {});
 
     /// check_and_apply() + publish_now(), with NO veto-hook seam -- used only
     /// by run_pre_transaction(), which must never invoke pre_commit_
@@ -2739,6 +2759,18 @@ public:
     /// the object it just built) without any extra API.
     std::uint64_t id() const noexcept { return id_; }
 
+    /// Caller-supplied label, set once at begin() and read-only from here on
+    /// -- empty unless the caller passed one. Purely descriptive (never
+    /// compared or dispatched on by the model itself); copied onto this
+    /// commit's UndoEntry/UndoSummary (if any), so a later list_undo() call
+    /// can show something more meaningful than a bare version number.
+    const std::string& name() const noexcept { return name_; }
+
+    /// Caller-supplied payload, set once at begin() and read-only from here
+    /// on -- empty (std::any{}) unless the caller passed one. Opaque to the
+    /// model; same copy-onto-UndoEntry/UndoSummary treatment as name().
+    const std::any& data() const noexcept { return data_; }
+
     /// The pinned Snapshot this transaction reads through (peek/update clone
     /// from here). Also usable directly, e.g. to look at pre-transaction
     /// state -- it's an ordinary Snapshot.
@@ -3062,10 +3094,12 @@ private:
     /// via m->next_txn_id_ (a plain atomic -- no lock taken), so id() is
     /// stable and unique from construction, before try_commit() is ever
     /// called.
-    Transaction(Model* m, Snapshot base)
+    Transaction(Model* m, Snapshot base, std::string name = "", std::any data = {})
         : model_(m),
           base_(std::move(base)),
-          id_(m->next_txn_id_.fetch_add(1, std::memory_order_relaxed)) {}
+          id_(m->next_txn_id_.fetch_add(1, std::memory_order_relaxed)),
+          name_(std::move(name)),
+          data_(std::move(data)) {}
 
     /// Does any OTHER pending object (a live local create, or an update
     /// clone) hold a Ref<>/Opt<> whose target is `local`? Purely
@@ -3094,6 +3128,8 @@ private:
     std::uint64_t id_ = 0;  ///< see id(); minted once, in the constructor, from
                             ///< model_'s next_txn_id_ -- moves along with the rest of this
                             ///< object via the defaulted move ctor/assignment
+    std::string name_;  ///< see name()
+    std::any data_;     ///< see data()
 
     std::vector<std::unique_ptr<ObjectBase>>
         local_created_;  ///< index == local id's low bits;

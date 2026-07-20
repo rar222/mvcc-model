@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <any>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -29,6 +30,22 @@ TEST(begin_returns_a_transaction_bound_to_the_current_snapshot) {
     Transaction txn = m.begin();
     CHECK_EQ(txn.base_version(), s.version());
     CHECK_EQ(txn.base().version(), m.current_version());
+}
+
+// name()/data() default to empty/nothing when begin() is called with no
+// arguments, and are read back exactly as passed otherwise -- purely
+// descriptive labels, never compared or dispatched on by the model itself.
+TEST(transaction_name_and_data_default_to_empty_and_round_trip_when_set) {
+    Model m;
+
+    Transaction plain = m.begin();
+    CHECK(plain.name().empty());
+    CHECK(!plain.data().has_value());
+
+    Transaction labeled = m.begin("import batch 7", std::any(std::int64_t{42}));
+    CHECK_EQ(labeled.name(), std::string("import batch 7"));
+    CHECK(labeled.data().has_value());
+    CHECK_EQ(std::any_cast<std::int64_t>(labeled.data()), std::int64_t{42});
 }
 
 // A same-transaction create can reference another same-transaction

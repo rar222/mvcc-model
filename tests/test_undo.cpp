@@ -8,6 +8,7 @@
 // Model::apply_undo -- same shape, same two-pass algorithm -- so this file's
 // tests double as a spec for what Stage 2 has to reproduce automatically.
 
+#include <any>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -349,4 +350,83 @@ TEST(apply_undo_reports_invalid_instead_of_resurrecting_a_dangling_reference) {
     CHECK(undo_res.status == CommitStatus::Invalid);  // resurrecting o would dangle
     CHECK(m.snapshot().find_by_key<&Order::computed_key>("ord:O1") == nullptr);  // nothing published
     CHECK_EQ(entry->actions.size(), std::size_t{1});  // the caller's copy survives, untouched
+}
+
+// UndoEntry/UndoSummary copy the committing Transaction's name()/data() --
+// both through list_undo() (the copy-only path) and take_undo() (the
+// move-out path).
+TEST(undo_entry_and_summary_copy_the_committing_transactions_name_and_data) {
+    Model m;
+    Transaction txn = m.begin("seed accounts", std::any(std::string("batch-7")));
+    auto a = std::make_unique<Account>();
+    a->name = "A1";
+    txn.create(std::move(a));
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{1});
+    CHECK_EQ(summaries.front().name, std::string("seed accounts"));
+    CHECK(summaries.front().data.has_value());
+    CHECK_EQ(std::any_cast<std::string>(summaries.front().data), std::string("batch-7"));
+
+    auto entry = m.take_undo(summaries.front().version);
+    CHECK(entry.has_value());
+    CHECK_EQ(entry->name, std::string("seed accounts"));
+    CHECK(entry->data.has_value());
+    CHECK_EQ(std::any_cast<std::string>(entry->data), std::string("batch-7"));
+}
+
+// A plain, unlabeled begin() (the common case) produces an UndoEntry/
+// UndoSummary with empty name and no data -- the feature is opt-in, not a
+// tax paid by every ordinary commit.
+TEST(undo_entry_and_summary_default_to_empty_name_and_no_data) {
+    Model m;
+    make_account(m, "A1");
+
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{1});
+    CHECK(summaries.front().name.empty());
+    CHECK(!summaries.front().data.has_value());
+}
+
+// apply_undo() is not special-cased in the capture pipeline: it just calls
+// try_commit() on an ordinary Transaction, so its OWN commit gets captured
+// exactly like any other -- meaning undoing something produces a fresh undo
+// entry of its own (an "undo of an undo" is a redo), and the chain can go
+// on indefinitely (create -> undo removes it -> undo-the-undo recreates it
+// with a NEW id -> ...).
+TEST(applying_an_undo_produces_a_new_undo_entry_of_its_own) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 7);
+
+    auto create_entry = m.take_undo(m.list_undo().front().version);
+    CHECK(create_entry.has_value());
+    CHECK_EQ(create_entry->actions.size(), std::size_t{1});
+    CHECK(create_entry->actions.front().kind == Model::UndoAction::Kind::Remove);
+
+    const CommitResult undo1 = m.apply_undo(*create_entry);
+    CHECK(undo1.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find(a) == nullptr);  // A1 removed
+
+    // Undoing the create produced its OWN entry -- a Recreate action, the
+    // inverse of the Remove that just ran.
+    const auto after_undo1 = m.list_undo();
+    CHECK_EQ(after_undo1.size(), std::size_t{1});
+    auto remove_entry = m.take_undo(after_undo1.front().version);
+    CHECK(remove_entry.has_value());
+    CHECK_EQ(remove_entry->actions.size(), std::size_t{1});
+    CHECK(remove_entry->actions.front().kind == Model::UndoAction::Kind::Recreate);
+
+    // Applying THAT entry (undo-of-the-undo, i.e. redo) resurrects A1 --
+    // with a new id, per invariant 5 -- and produces yet another entry.
+    const CommitResult undo2 = m.apply_undo(*remove_entry);
+    CHECK(undo2.status == CommitStatus::Committed);
+    const Account* revived = m.snapshot().find_by_key<&Account::name>("A1");
+    CHECK(revived != nullptr);
+    CHECK_EQ(revived->balance, std::int64_t{7});
+    CHECK(revived->id != a.raw());
+
+    const auto after_undo2 = m.list_undo();
+    CHECK_EQ(after_undo2.size(), std::size_t{1});  // the chain keeps going
 }
