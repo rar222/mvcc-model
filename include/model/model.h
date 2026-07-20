@@ -2668,11 +2668,23 @@ public:
     /// by this same batch, or is out of range.
     template <class T>
     T* update(Ref<T> r) {
-        return static_cast<T*>(update_impl(r.raw()));
+        return static_cast<T*>(update_raw(r.raw()));
     }
     template <class T>
     T* update(Opt<T> r) {
-        return static_cast<T*>(update_impl(r.raw()));
+        return static_cast<T*>(update_raw(r.raw()));
+    }
+
+    /// Untyped counterpart of update<T> -- same reasoning as Transaction's
+    /// create_raw/update_raw/remove_raw. objects_'s index IS the local id's
+    /// low bits (see create()), so this is a direct bounds-checked lookup
+    /// -- no clone-on-first-touch bookkeeping like Transaction::update_raw(),
+    /// because every entry here is already a local, not-yet-installed
+    /// object owned outright by this batch.
+    ObjectBase* update_raw(Id id) {
+        if (!is_local(id)) return nullptr;
+        const std::uint32_t idx = id.index & ~kLocalIdBit;
+        return idx < objects_.size() ? objects_[idx].get() : nullptr;
     }
 
     /// How many objects are pending. Diagnostic; commit_bulk() doesn't need
@@ -2684,17 +2696,6 @@ private:
 
     /// Only Model::begin_bulk() constructs one.
     explicit BulkTransaction(Model* m) : model_(m) {}
-
-    /// Untyped body of update(): objects_'s index IS the local id's low
-    /// bits (see create()), so this is a direct bounds-checked lookup --
-    /// no clone-on-first-touch bookkeeping like Transaction::update_impl(),
-    /// because every entry here is already a local, not-yet-installed
-    /// object owned outright by this batch.
-    ObjectBase* update_impl(Id id) {
-        if (!is_local(id)) return nullptr;
-        const std::uint32_t idx = id.index & ~kLocalIdBit;
-        return idx < objects_.size() ? objects_[idx].get() : nullptr;
-    }
 
     Model* model_ = nullptr;  ///< asserted against cross-model misuse in commit_bulk()
     std::vector<std::unique_ptr<ObjectBase>> objects_;  ///< index == local id's low bits
@@ -2787,18 +2788,55 @@ public:
     /// (if it's a local id) was removed earlier in this same transaction.
     template <class T>
     T* update(Ref<T> r) {
-        return static_cast<T*>(update_impl(r.raw()));
+        return static_cast<T*>(update_raw(r.raw()));
     }
     template <class T>
     T* update(Opt<T> r) {
-        return static_cast<T*>(update_impl(r.raw()));
+        return static_cast<T*>(update_raw(r.raw()));
     }
 
     /// Untyped counterpart of update<T> -- same reasoning as create_raw.
     /// Used by Model::apply_undo, both for a just-recreated local object
     /// (remapping its own ref fields) and for restoring a still-real
-    /// object's pre-image (RestoreUpdate actions).
-    ObjectBase* update_raw(Id id) { return update_impl(id); }
+    /// object's pre-image (RestoreUpdate actions). Also update<T>'s own
+    /// body: local id -> the already-owned local_created_ entry (create()-
+    /// then-update() in the same txn, no new clone needed); real id already
+    /// touched this txn -> the existing clone; otherwise clone base()'s
+    /// value into local_updated_, remember the pre-edit baseline
+    /// (peek_before()) and record the pending change. Null for a masked
+    /// (remove()-intended) or nonexistent id. The clone happens AT MOST
+    /// ONCE per id per transaction -- repeated calls on the same id return
+    /// the SAME clone, so writes accumulate.
+    ObjectBase* update_raw(Id id) {
+        if (is_local(id)) {
+            const std::uint32_t idx = id.index & ~kLocalIdBit;
+            // Masked like peek_raw: a deferred-removed local can't be
+            // written to any more than a remove-intended real id can.
+            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+                local_remove_intents_.end())
+                return nullptr;
+            return idx < local_created_.size() ? local_created_[idx].get() : nullptr;
+        }
+        if (remove_intents_.count(id)) return nullptr;
+        // local_updated_ is keyed by bare slot index (a transaction only ever
+        // clones ONE generation of a given slot -- whichever was alive at
+        // base()), so a lookup here must also check the clone's OWN id
+        // matches the FULL id requested, generation included. Without this,
+        // a caller asking about a stale generation of an already-updated
+        // slot (e.g. a handle recycled since base()) would get back the
+        // WRONG object instead of a correct "not found".
+        if (auto it = local_updated_.find(id.index); it != local_updated_.end())
+            return (it->second->id == id) ? it->second.get() : nullptr;
+
+        const ObjectBase* base_obj = base_.find_raw(id);
+        if (!base_obj) return nullptr;
+        auto clone = std::unique_ptr<ObjectBase>(base_obj->clone());
+        update_baseline_.try_emplace(id.index, base_obj);
+        ObjectBase* raw = clone.get();
+        local_updated_.emplace(id.index, std::move(clone));
+        pending_changes_.push_back({id, ChangeKind::Updated, raw->tag()});
+        return raw;
+    }
 
     /// Records an INTENT to delete -- unlike the single-writer design's
     /// remove(), this does NOT resolve cascade fan-out now (that can only be
@@ -2828,17 +2866,50 @@ public:
     /// build bug and still rejects as Invalid at commit.)
     template <class T>
     void remove(Ref<T> r) {
-        remove_impl(r.raw());
+        remove_raw(r.raw());
     }
     template <class T>
     void remove(Opt<T> r) {
-        remove_impl(r.raw());
+        remove_raw(r.raw());
     }
 
     /// Untyped counterpart of remove<T> -- same reasoning as create_raw.
     /// (Model::remove_raw already exists with unrelated semantics -- the
-    /// cascade BFS, on a different class -- no collision.)
-    void remove_raw(Id id) { remove_impl(id); }
+    /// cascade BFS, on a different class -- no collision.) Also remove<T>'s
+    /// own body: for a real id, just records the intent (remove_intents_);
+    /// no cascade work happens here, see the class-level remove() doc for
+    /// why. For a LOCAL id, the choice is made here, once, based on what
+    /// the transaction holds RIGHT NOW:
+    ///   - unreferenced: cancel the create outright -- drop the owned
+    ///     object and scrub it from pending_changes() -- since nothing was
+    ///     ever published for anything to reference;
+    ///   - referenced by another pending object: DEFER (record the local
+    ///     index in local_remove_intents_) -- the create still installs at
+    ///     apply time and is then fed, via its freshly minted real id, to
+    ///     the exact same cascade BFS a committed remove gets. Its Created
+    ///     entry stays in pending_changes(), because it genuinely will be
+    ///     created (and then deleted) by the commit.
+    void remove_raw(Id id) {
+        if (is_local(id)) {
+            const std::uint32_t idx = id.index & ~kLocalIdBit;
+            if (idx >= local_created_.size() || !local_created_[idx])
+                return;  // never created here, or already cancelled: nothing to do
+            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+                local_remove_intents_.end())
+                return;  // already deferred: remove() is idempotent
+            if (locally_referenced(id)) {
+                local_remove_intents_.push_back(idx);
+                return;
+            }
+            local_created_[idx].reset();  // cancel locally
+            auto rm = [&](const Change& c) { return c.id == id; };
+            pending_changes_.erase(
+                std::remove_if(pending_changes_.begin(), pending_changes_.end(), rm),
+                pending_changes_.end());
+            return;
+        }
+        remove_intents_.insert(id);
+    }
 
     /// "Is `r` alive as far as THIS transaction can tell?" -- peek() != null,
     /// so it honors local creates, edits, and remove() intents, but NOT other
@@ -2871,11 +2942,46 @@ public:
     /// only tells you what this transaction can currently see.
     template <class T>
     const T* peek(Ref<T> r) const {
-        return peek_impl<T>(r.raw());
+        const ObjectBase* o = peek_raw(r.raw());
+        return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
     }
     template <class T>
     const T* peek(Opt<T> r) const {
-        return peek_impl<T>(r.raw());
+        const ObjectBase* o = peek_raw(r.raw());
+        return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
+    }
+
+    /// Untyped counterpart of peek<T>/peek_as<T> -- same reasoning as
+    /// create_raw/update_raw/remove_raw: resolves this transaction's
+    /// current local view of `id` -- this transaction's own pending edit
+    /// if there is one, else base()'s committed value, else null. Masked
+    /// (null) by a pending remove() intent regardless of what base() would
+    /// say. No tag check here -- that's what makes it reusable for a
+    /// caller that doesn't know (or wants to check itself) the concrete
+    /// type; peek<T>/peek_as<T> add the checked cast on top.
+    const ObjectBase* peek_raw(Id id) const {
+        if (is_local(id)) {
+            const std::uint32_t idx = id.index & ~kLocalIdBit;
+            // A deferred local remove masks its target exactly like a real
+            // remove intent does below -- "removed as far as this
+            // transaction can tell", even though the create still installs
+            // (and is then removed) at apply time.
+            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+                local_remove_intents_.end())
+                return nullptr;
+            return idx < local_created_.size() ? local_created_[idx].get() : nullptr;
+        }
+        if (remove_intents_.count(id)) return nullptr;
+        // local_updated_ is keyed by bare slot index (a transaction only ever
+        // clones ONE generation of a given slot -- whichever was alive at
+        // base()), so a lookup here must also check the clone's OWN id
+        // matches the FULL id requested, generation included. Without this,
+        // a caller asking about a stale generation of an already-updated
+        // slot (e.g. a handle recycled since base()) would get back the
+        // WRONG object instead of a correct "not found".
+        if (auto it = local_updated_.find(id.index); it != local_updated_.end())
+            return (it->second->id == id) ? it->second.get() : nullptr;
+        return base_.find_raw(id);
     }
 
     /// Safe typed read from an untyped Id -- e.g. a Change::id out of
@@ -2883,7 +2989,8 @@ public:
     /// (same as Snapshot::find<T>); null if dead/masked, or a type mismatch.
     template <class T>
     const T* peek_as(Id id) const {
-        return peek_impl<T>(id);
+        const ObjectBase* o = peek_raw(id);
+        return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
     }
 
     /// The pre-transaction value for an id update()'d this transaction (the
@@ -2940,7 +3047,7 @@ public:
     ///     another writer commits something that would change the
     ///     cascade's shape;
     ///   - DEFERRED LOCAL removes (a remove() of a still-referenced local
-    ///     create, see remove_impl) are not cascade-estimated at all: their
+    ///     create, see remove_raw) are not cascade-estimated at all: their
     ///     victim still appears as Created (accurate -- it will be), but
     ///     the same-commit Deleted for it, and any fan-out into other
     ///     pending objects, only shows up in CommitResult::changes.
@@ -2959,80 +3066,6 @@ private:
         : model_(m),
           base_(std::move(base)),
           id_(m->next_txn_id_.fetch_add(1, std::memory_order_relaxed)) {}
-
-    /// Untyped body of update()/update(): local id -> the already-owned
-    /// local_created_ entry (create()-then-update() in the same txn, no new
-    /// clone needed); real id already touched this txn -> the existing
-    /// clone; otherwise clone base()'s value into local_updated_, remember
-    /// the pre-edit baseline (peek_before()) and record the pending change.
-    /// Null for a masked (remove()-intended) or nonexistent id. The clone
-    /// happens AT MOST ONCE per id per transaction -- repeated update()
-    /// calls on the same id return the SAME clone, so writes accumulate.
-    ObjectBase* update_impl(Id id) {
-        if (is_local(id)) {
-            const std::uint32_t idx = id.index & ~kLocalIdBit;
-            // Masked like peek_impl: a deferred-removed local can't be
-            // written to any more than a remove-intended real id can.
-            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
-                local_remove_intents_.end())
-                return nullptr;
-            return idx < local_created_.size() ? local_created_[idx].get() : nullptr;
-        }
-        if (remove_intents_.count(id)) return nullptr;
-        // local_updated_ is keyed by bare slot index (a transaction only ever
-        // clones ONE generation of a given slot -- whichever was alive at
-        // base()), so a lookup here must also check the clone's OWN id
-        // matches the FULL id requested, generation included. Without this,
-        // a caller asking about a stale generation of an already-updated
-        // slot (e.g. a handle recycled since base()) would get back the
-        // WRONG object instead of a correct "not found".
-        if (auto it = local_updated_.find(id.index); it != local_updated_.end())
-            return (it->second->id == id) ? it->second.get() : nullptr;
-
-        const ObjectBase* base_obj = base_.find_raw(id);
-        if (!base_obj) return nullptr;
-        auto clone = std::unique_ptr<ObjectBase>(base_obj->clone());
-        update_baseline_.try_emplace(id.index, base_obj);
-        ObjectBase* raw = clone.get();
-        local_updated_.emplace(id.index, std::move(clone));
-        pending_changes_.push_back({id, ChangeKind::Updated, raw->tag()});
-        return raw;
-    }
-
-    /// Untyped body of remove()/remove(): for a real id, just records the
-    /// intent (remove_intents_); no cascade work happens here, see the
-    /// class-level remove() doc for why. For a LOCAL id, the choice is made
-    /// here, once, based on what the transaction holds RIGHT NOW:
-    ///   - unreferenced: cancel the create outright -- drop the owned
-    ///     object and scrub it from pending_changes() -- since nothing was
-    ///     ever published for anything to reference;
-    ///   - referenced by another pending object: DEFER (record the local
-    ///     index in local_remove_intents_) -- the create still installs at
-    ///     apply time and is then fed, via its freshly minted real id, to
-    ///     the exact same cascade BFS a committed remove gets. Its Created
-    ///     entry stays in pending_changes(), because it genuinely will be
-    ///     created (and then deleted) by the commit.
-    void remove_impl(Id id) {
-        if (is_local(id)) {
-            const std::uint32_t idx = id.index & ~kLocalIdBit;
-            if (idx >= local_created_.size() || !local_created_[idx])
-                return;  // never created here, or already cancelled: nothing to do
-            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
-                local_remove_intents_.end())
-                return;  // already deferred: remove() is idempotent
-            if (locally_referenced(id)) {
-                local_remove_intents_.push_back(idx);
-                return;
-            }
-            local_created_[idx].reset();  // cancel locally
-            auto rm = [&](const Change& c) { return c.id == id; };
-            pending_changes_.erase(
-                std::remove_if(pending_changes_.begin(), pending_changes_.end(), rm),
-                pending_changes_.end());
-            return;
-        }
-        remove_intents_.insert(id);
-    }
 
     /// Does any OTHER pending object (a live local create, or an update
     /// clone) hold a Ref<>/Opt<> whose target is `local`? Purely
@@ -3055,38 +3088,6 @@ private:
         return found;
     }
 
-    /// Untyped body of peek()/peek()/peek_as(): resolves `id` against this
-    /// transaction's local overlay first (a local create, or an already-
-    /// cloned update), falls through to base() only if neither applies, and
-    /// is masked to null by a pending remove() intent regardless of what
-    /// base() would say. The final tag check is what makes peek_as<T> safe
-    /// to call on an untyped Change::id without a separate cast.
-    template <class T>
-    const T* peek_impl(Id id) const {
-        const ObjectBase* o = nullptr;
-        if (is_local(id)) {
-            const std::uint32_t idx = id.index & ~kLocalIdBit;
-            // A deferred local remove masks its target exactly like a real
-            // remove intent does below -- "removed as far as this
-            // transaction can tell", even though the create still installs
-            // (and is then removed) at apply time.
-            if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
-                local_remove_intents_.end())
-                return nullptr;
-            o = idx < local_created_.size() ? local_created_[idx].get() : nullptr;
-        } else if (remove_intents_.count(id)) {
-            return nullptr;
-        } else if (auto it = local_updated_.find(id.index); it != local_updated_.end()) {
-            // Same generation check as update_impl -- see its comment. A
-            // stale generation of an already-updated slot is dead, not the
-            // (different-generation) object this txn happens to have cloned.
-            o = (it->second->id == id) ? it->second.get() : nullptr;
-        } else {
-            o = base_.find_raw(id);
-        }
-        return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
-    }
-
     Model* model_ = nullptr;  ///< where try_commit() applies this; asserted against
                               ///< cross-model misuse in try_commit()
     Snapshot base_;  ///< pins base_version_ in Model::live_, same as any reader's snapshot
@@ -3096,17 +3097,17 @@ private:
 
     std::vector<std::unique_ptr<ObjectBase>>
         local_created_;  ///< index == local id's low bits;
-                         ///< null entry == cancelled (see remove_impl)
+                         ///< null entry == cancelled (see remove_raw)
     std::unordered_map<std::uint32_t, std::unique_ptr<ObjectBase>>
         local_updated_;  ///< keyed by real slot index
     std::unordered_map<std::uint32_t, const ObjectBase*>
         update_baseline_;                            ///< points into base_'s Root,
                                                      ///< kept alive by base_ itself
-    std::unordered_set<Id, IdHash> remove_intents_;  ///< real ids only -- see remove_impl
+    std::unordered_set<Id, IdHash> remove_intents_;  ///< real ids only -- see remove_raw
     std::vector<std::uint32_t> local_remove_intents_;  ///< DEFERRED local removes (bare local
                                                        ///< indexes): creates that install at apply
                                                        ///< time and are then cascade-removed, see
-                                                       ///< remove_impl. Usually empty; linear
+                                                       ///< remove_raw. Usually empty; linear
                                                        ///< std::find is fine at this size.
     std::uint32_t next_local_id_ = 0;      ///< mints local ids; per-TRANSACTION, so the same
                                            ///< value recurs across transactions (see create())
