@@ -105,6 +105,20 @@ struct IdHash {
             return static_cast<std::size_t>(h ^ (h >> 32));
         }
     }
+
+    /// True exactly when operator() above takes its unfolded branch: the
+    /// "full 64-bit pack is a perfect hash of Id" claim in operator()'s own
+    /// comment holds ONLY there -- the 32-bit-size_t fold is NOT
+    /// collision-free. pmap::TrieCore (persistent_map.h) reads this opt-in
+    /// static member -- via pmap::detail::hash_is_perfect_v, the same
+    /// optional-static-member detection idiom this file's own
+    /// has_define_references<> uses -- to decide whether a Leaf keyed by
+    /// this Hash can skip collision-chain storage entirely. Declaring this
+    /// true when it isn't would silently corrupt Root::by_type and every
+    /// other IdHash-keyed persistent map on a 32-bit platform the moment two
+    /// Ids' folded hashes coincided; that's why it's conditional on the
+    /// exact same test operator() itself branches on, not a bare `true`.
+    static constexpr bool is_perfect = sizeof(std::size_t) >= sizeof(std::uint64_t);
 };
 
 /// The top bit of Id::index marks a LOCAL placeholder id, assigned by
@@ -717,6 +731,50 @@ public:
 ///         v.key<&Order::computed_key>(s.computed_key());  //
 ///         find_by_key<&Order::computed_key>("ord:O1")
 ///     }
+///
+/// A computed key CANNOT resolve a Ref<>/Opt<> field to reach another
+/// object's data (e.g. an Order key incorporating its Account's name).
+/// Two independent reasons, not one:
+///
+///   - Mechanically, there is nowhere to resolve THROUGH. computed_key() is
+///     a bare nullary const method -- member_value<V (C::*)() const> -- and
+///     Object<Derived>::each_field_key() calls it as `s.computed_key()`,
+///     `s` being only the object itself. No Snapshot or Model is threaded
+///     through define_keys()/FieldKeyReader::key()/each_field_key() at all.
+///     A Ref<T>/Opt<T> is deliberately just an 8-byte {index, gen} with no
+///     snapshot pointer (see Ref<T>'s own doc comment) -- resolving one
+///     needs a Snapshot, which computed_key() has no way to obtain.
+///
+///   - Structurally, even threading one in would be unsound. define_keys()
+///     only ever runs when the KEY-OWNING object itself is created or
+///     updated (add_field_keys/reconcile_field_keys, called from
+///     apply_create/apply_update) -- whatever string computed_key() returns
+///     is baked into Root::by_field ONCE, at that instant, and never
+///     recomputed later. If the key depended on a REFERENCED object's
+///     field, updating that OTHER object without touching the referrer
+///     would leave the referrer's indexed key silently stale: find_by_key
+///     would miss it under its new value and still wrongly match it under
+///     the old one. Nothing in this design tracks "key K depends on field F
+///     of some other object, re-derive K when F changes" -- referrers_/
+///     by_cached_reference solve a narrower, one-hop problem (who points at
+///     X, for cascade delete/null AT X's OWN commit), not "recompute a
+///     derived value elsewhere whenever any upstream field changes." That
+///     is a materialized-view-with-invalidation problem, a different and
+///     much bigger feature than "each type defines its own keys" -- and
+///     the same class of before/after timing bug invariant 9 (CLAUDE.md)
+///     already goes out of its way to avoid, reintroduced in a new,
+///     self-inflicted shape.
+///
+/// What to do instead:
+///   - Denormalize the field you need onto the referencing object at
+///     create()/update() time (copy Account::name onto Order), so
+///     computed_key() only ever reads `*this` -- the same pattern any
+///     scan/cached field already uses.
+///   - Or do a two-step lookup at QUERY time instead of baking the join
+///     into the index: `snapshot.resolve(order.account).name`, then a
+///     separate find_by_key/find on whatever that's actually looking for --
+///     using Snapshot, which does have resolve access, just at read time
+///     rather than baked into the write-time index.
 ///
 /// Each define_keys() field is assumed unique within its type; a duplicate
 /// value silently overwrites the earlier entry. For "give me every match,

@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -78,6 +79,27 @@ struct IdentityKeyOf {
     const K& operator()(const K& e) const noexcept { return e; }
 };
 
+/// Detects an opt-in `static constexpr bool is_perfect = true;` on a Hash
+/// functor -- the same optional-static-member detection idiom model.h's
+/// has_define_references<> etc. use, so a Hash type that never declares it
+/// (StringHash, or any user-supplied Hash) defaults to false via SFINAE
+/// rather than a hard error. `is_perfect` is a promise from the Hash's
+/// author: DISTINCT keys always produce DISTINCT 64-bit hash values --
+/// model::IdHash makes exactly this claim in its own doc comment (Id's
+/// (gen,index) pair packed losslessly into 64 bits). TrieCore uses the
+/// promise to drop collision-chain storage entirely for that Hash's Leaf
+/// shape (see hash_is_perfect_v below and Leaf's own comment) -- getting
+/// this wrong for a Hash that ISN'T actually collision-free silently
+/// corrupts the trie (see chain_copy's assert), so only declare it where
+/// the guarantee is real, not just "very likely."
+template <class Hash, class = void>
+struct hash_is_perfect : std::false_type {};
+template <class Hash>
+struct hash_is_perfect<Hash, std::void_t<decltype(Hash::is_perfect)>>
+    : std::bool_constant<Hash::is_perfect> {};
+template <class Hash>
+inline constexpr bool hash_is_perfect_v = hash_is_perfect<Hash>::value;
+
 /// The trie itself, parameterized on what a leaf actually stores (Entry) and
 /// how to get a K back out of one (KeyOf). PersistentMap and PersistentSet
 /// below are both ~30-line forwarding wrappers over this.
@@ -91,9 +113,19 @@ class TrieCore {
     // benchmark, that second allocation was a double-digit share of the
     // whole per-entry footprint.
     //
+    // No stored `hash` field: every place that needs it (set_in's collision
+    // check, the push-down split) has the entry's own key in hand, so
+    // entry_hash() below recomputes it via Hash{} -- a few instructions for
+    // IdHash, one rehash for StringHash, and only ever on the O(log32 n)
+    // path of an insert/erase, never on a hot read (get_in/leaf_get compare
+    // by KEY, not by hash, and never touch this field at all). Caching a
+    // value this cheap to rederive just to save the recompute would be
+    // paying 8 bytes on EVERY leaf in the trie for a savings that doesn't
+    // exist on the paths that matter -- do not add it back.
+    //
     // `next` is a unique_ptr, NOT a shared_ptr, on purpose: a shared_ptr
-    // member is 16 bytes and would push the (hash, entry, next) leaf into
-    // the next glibc size class for every entry in the trie, all to enable
+    // member is 16 bytes and would push the (entry, next) leaf into the
+    // next glibc size class for every entry in the trie, all to enable
     // tail-sharing that only a length->=2 chain could ever use. Instead,
     // tails are exclusively OWNED by their head, and every chain edit
     // deep-copies the surviving links (see chain_copy) -- do not "optimize"
@@ -107,12 +139,33 @@ class TrieCore {
     // than the one link that is being edited anyway. Heads stay shared_ptr
     // (in Node::leaves): heads ARE genuinely shared, across every node
     // clone and push-down that path-copying produces.
+    //
+    // For a Hash that DECLARES itself collision-free (hash_is_perfect_v --
+    // e.g. model::IdHash), "impossible" above is exact, not just likely: a
+    // chain longer than one link can never legitimately occur, so there is
+    // nothing to link to in the first place. NoChain is that case's `next`:
+    // zero-sized (via [[no_unique_address]]), and its get() always reports
+    // "no tail" -- which is EXACTLY the value a real, empty
+    // unique_ptr<const Leaf> would also report, so every generic walker
+    // below (leaf_get, each_in, chain_copy's base case, ...) needs no
+    // if-constexpr fork to handle both Leaf shapes; only the handful of
+    // places that would otherwise WRITE a second link (chain_set/
+    // chain_erase) need to know the difference, and they fail loudly
+    // (assert) rather than silently drop data if that promise ever turns
+    // out to be false at runtime.
+    struct Leaf;  // forward declaration: NoChain::get()'s return type needs the name,
+                  // not a complete type (it never dereferences it)
+
+    struct NoChain {
+        const Leaf* get() const noexcept { return nullptr; }
+    };
+    static constexpr bool kPerfectHash = hash_is_perfect_v<Hash>;
+    using ChainLink = std::conditional_t<kPerfectHash, NoChain, std::unique_ptr<const Leaf>>;
+
     struct Leaf {
-        Leaf(std::uint64_t h, Entry e, std::unique_ptr<const Leaf> n)
-            : hash(h), entry(std::move(e)), next(std::move(n)) {}
-        std::uint64_t hash;
+        Leaf(Entry e, ChainLink n) : entry(std::move(e)), next(std::move(n)) {}
         Entry entry;
-        std::unique_ptr<const Leaf> next;  ///< collision chain; almost always null
+        [[no_unique_address]] ChainLink next;  ///< collision chain; empty under a perfect Hash
     };
 
     struct Node {
@@ -127,6 +180,10 @@ class TrieCore {
     static std::uint64_t hash_key(const K& k) noexcept {
         return static_cast<std::uint64_t>(Hash{}(k));
     }
+
+    /// The hash a Leaf's entry WOULD have stored, recomputed from its key --
+    /// see Leaf's own comment for why nothing caches this.
+    static std::uint64_t entry_hash(const Entry& e) noexcept { return hash_key(KeyOf{}(e)); }
 
     static std::uint32_t slice(std::uint64_t hash, int shift) noexcept {
         return static_cast<std::uint32_t>((hash >> shift) & 0x1f);  // 5 bits
@@ -162,24 +219,37 @@ class TrieCore {
     // Deep-copies a tail chain. Every edited chain copies its surviving
     // links through this rather than sharing them -- see Leaf::next's
     // comment for why sharing is not an option (and why copying is free).
-    static std::unique_ptr<const Leaf> chain_copy(const Leaf* l) {
-        if (!l) return nullptr;
-        return std::make_unique<Leaf>(l->hash, l->entry, chain_copy(l->next.get()));
+    //
+    // Under a perfect Hash there IS no tail to copy -- `l` is structurally
+    // always null here (every caller passes `something->next.get()`, and
+    // NoChain::get() always returns null) -- so this returns an empty
+    // ChainLink unconditionally. The assert is the one place that promise
+    // gets checked: if `l` is somehow non-null anyway, hash_is_perfect_v was
+    // declared for a Hash that collides in practice, and silently dropping
+    // `l`'s entry here would corrupt the trie -- fail loudly instead of
+    // doing that quietly (see CLAUDE.md's "prefer failing loudly").
+    static ChainLink chain_copy(const Leaf* l) {
+        if constexpr (kPerfectHash) {
+            assert(!l && "Hash declared is_perfect but produced a real collision");
+            return ChainLink{};
+        } else {
+            if (!l) return nullptr;
+            return std::make_unique<Leaf>(l->entry, chain_copy(l->next.get()));
+        }
     }
 
     // Tail-link half of chain_set: `entry` replaces the link whose key
     // matches, or lands in a fresh link at the end (reported via `added`).
-    static std::unique_ptr<const Leaf> chain_set_links(const Leaf* l, std::uint64_t hash,
-                                                       const K& key, const Entry& entry,
-                                                       bool& added) {
+    static std::unique_ptr<const Leaf> chain_set_links(const Leaf* l, const K& key,
+                                                       const Entry& entry, bool& added) {
         if (!l) {
             added = true;
-            return std::make_unique<Leaf>(hash, entry, nullptr);
+            return std::make_unique<Leaf>(entry, nullptr);
         }
         if (KeyOf{}(l->entry) == key)
-            return std::make_unique<Leaf>(l->hash, entry, chain_copy(l->next.get()));
-        return std::make_unique<Leaf>(l->hash, l->entry,
-                                      chain_set_links(l->next.get(), hash, key, entry, added));
+            return std::make_unique<Leaf>(entry, chain_copy(l->next.get()));
+        return std::make_unique<Leaf>(l->entry,
+                                      chain_set_links(l->next.get(), key, entry, added));
     }
 
     // Returns `lf`'s chain, rebuilt, with `entry` replacing the link whose
@@ -187,17 +257,29 @@ class TrieCore {
     // `added`). The head is built with make_shared (Node holds heads by
     // shared_ptr, and the fused control block keeps it one allocation);
     // tail links go through the unique_ptr helpers above.
-    static std::shared_ptr<const Leaf> chain_set(const Leaf* lf, std::uint64_t hash,
-                                                 const K& key, const Entry& entry,
-                                                 bool& added) {
-        if (!lf) {
-            added = true;
-            return std::make_shared<Leaf>(hash, entry, nullptr);
+    //
+    // Only ever called (see set_in) when lf_hash == hash. Under a perfect
+    // Hash that equality IMPLIES KeyOf{}(lf->entry) == key -- distinct keys
+    // can't share a hash -- so this is always a replace of the one entry
+    // this slot can ever hold, never an append to a chain that (by
+    // construction) never exists.
+    static std::shared_ptr<const Leaf> chain_set(const Leaf* lf, const K& key,
+                                                 const Entry& entry, bool& added) {
+        if constexpr (kPerfectHash) {
+            assert(lf && KeyOf{}(lf->entry) == key &&
+                  "Hash declared is_perfect but produced a real collision");
+            added = false;
+            return std::make_shared<Leaf>(entry, NoChain{});
+        } else {
+            if (!lf) {
+                added = true;
+                return std::make_shared<Leaf>(entry, nullptr);
+            }
+            if (KeyOf{}(lf->entry) == key)
+                return std::make_shared<Leaf>(entry, chain_copy(lf->next.get()));
+            return std::make_shared<Leaf>(lf->entry,
+                                          chain_set_links(lf->next.get(), key, entry, added));
         }
-        if (KeyOf{}(lf->entry) == key)
-            return std::make_shared<Leaf>(lf->hash, entry, chain_copy(lf->next.get()));
-        return std::make_shared<Leaf>(lf->hash, lf->entry,
-                                      chain_set_links(lf->next.get(), hash, key, entry, added));
     }
 
     // Tail-link half of chain_erase. Precondition (caller checks via
@@ -207,20 +289,30 @@ class TrieCore {
     static std::unique_ptr<const Leaf> chain_erase_links(const Leaf* l, const K& key) {
         assert(l && "caller verified the key is present in this chain");
         if (KeyOf{}(l->entry) == key) return chain_copy(l->next.get());
-        return std::make_unique<Leaf>(l->hash, l->entry, chain_erase_links(l->next.get(), key));
+        return std::make_unique<Leaf>(l->entry, chain_erase_links(l->next.get(), key));
     }
 
     // Returns `lf`'s chain, rebuilt without `key`'s link. Same presence
     // precondition as chain_erase_links. A null result means the chain
     // emptied -- the caller drops the slot.
+    //
+    // Under a perfect Hash, `lf` (found via the same hash slice as `key`)
+    // IS the entry for `key` -- same reasoning as chain_set -- so erasing
+    // it always empties the slot; there is no tail that could survive.
     static std::shared_ptr<const Leaf> chain_erase(const Leaf* lf, const K& key) {
         assert(lf && "caller verified the key is present in this chain");
-        if (KeyOf{}(lf->entry) == key) {
-            const Leaf* t = lf->next.get();
-            if (!t) return nullptr;  // the chain held only this key
-            return std::make_shared<Leaf>(t->hash, t->entry, chain_copy(t->next.get()));
+        if constexpr (kPerfectHash) {
+            assert(KeyOf{}(lf->entry) == key &&
+                  "Hash declared is_perfect but produced a real collision");
+            return nullptr;
+        } else {
+            if (KeyOf{}(lf->entry) == key) {
+                const Leaf* t = lf->next.get();
+                if (!t) return nullptr;  // the chain held only this key
+                return std::make_shared<Leaf>(t->entry, chain_copy(t->next.get()));
+            }
+            return std::make_shared<Leaf>(lf->entry, chain_erase_links(lf->next.get(), key));
         }
-        return std::make_shared<Leaf>(lf->hash, lf->entry, chain_erase_links(lf->next.get(), key));
     }
 
     // ---- set ----
@@ -236,7 +328,10 @@ class TrieCore {
             // Empty slot: insert a fresh single-entry leaf.
             auto nn = clone_node(n);
             const std::uint32_t pos = popcount_below(nn->bitmap, idx);
-            auto lf = std::make_shared<Leaf>(hash, entry, nullptr);
+            // ChainLink{}, not nullptr: this code path is common to both
+            // Leaf shapes (unlike chain_set/chain_erase, it never forks on
+            // kPerfectHash), and nullptr has no conversion to NoChain.
+            auto lf = std::make_shared<Leaf>(entry, ChainLink{});
             nn->bitmap |= b;
             nn->children.insert(nn->children.begin() + pos, nullptr);
             nn->leaves.insert(nn->leaves.begin() + pos, lf);
@@ -253,12 +348,15 @@ class TrieCore {
             return nn;
         }
 
-        // Slot holds a leaf.
+        // Slot holds a leaf. Its hash isn't stored -- rederive it from its
+        // own entry (see Leaf's comment); this recompute happens at most
+        // once per level of an O(log32 n) insert, never on a read path.
         const Leaf* lf = n->leaves[pos].get();
-        if (lf->hash == hash) {
+        const std::uint64_t lf_hash = entry_hash(lf->entry);
+        if (lf_hash == hash) {
             // Same hash: replace-or-append within the chain (true collision or
             // same key).
-            nn->leaves[pos] = chain_set(lf, hash, key, entry, added);
+            nn->leaves[pos] = chain_set(lf, key, entry, added);
             return nn;
         }
 
@@ -267,12 +365,12 @@ class TrieCore {
         if (shift + 5 >= 64) {
             // Ran out of hash bits (astronomically unlikely with distinct hashes,
             // but handle it): merge into one collision chain.
-            nn->leaves[pos] = std::make_shared<Leaf>(hash, entry, chain_copy(lf));
+            nn->leaves[pos] = std::make_shared<Leaf>(entry, chain_copy(lf));
             added = true;
             return nn;
         }
         auto sub = std::make_shared<Node>();
-        const std::uint32_t exist_idx = slice(lf->hash, shift + 5);
+        const std::uint32_t exist_idx = slice(lf_hash, shift + 5);
         sub->bitmap = bit(exist_idx);
         sub->children.push_back(nullptr);
         sub->leaves.push_back(n->leaves[pos]);
