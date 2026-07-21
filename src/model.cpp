@@ -2024,6 +2024,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     changelog_.clear();
     last_write_version_.clear();
     last_write_id_.clear();
+    undo_list_.clear();
 
     // Pass 3: install. next_slot_ is 0 and free_slots_ is empty (just
     // cleared), so real ids are just 0..N-1 in order -- what alloc_slot()
