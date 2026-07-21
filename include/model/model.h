@@ -2090,11 +2090,47 @@ public:
     /// undo_list_, for why the broad reading was chosen over a narrower
     /// one that would only watch RestoreUpdate targets).
     struct UndoEntry {
+        /// The version this commit PUBLISHED as -- `r->version` at the
+        /// point it was handed to readers (model.cpp's try_commit()), the
+        /// same numbering space as Snapshot::version(), changelog_ entries,
+        /// and diagnostics().retained_commit_history. This is the key
+        /// take_undo() looks up by, and it's deliberately NOT
+        /// Transaction::id(): id() is minted at begin(), in attempt-
+        /// construction order, while `version` is minted at publish, in
+        /// commit order -- under multi-writer racing those orders diverge
+        /// (a transaction that begins first can lose a race, retry, and
+        /// publish after one that began later). Using `version` is what
+        /// lets a caller compare an undo entry against a Snapshot they're
+        /// holding ("is this newer or older than what I'm looking at?");
+        /// id() carries no such relationship to publish order and would
+        /// make the field a bare opaque token instead.
         std::uint64_t version;
+
+        /// This commit's inverse, one UndoAction per Created/Updated/
+        /// Deleted change. apply_undo() doesn't care what order these run
+        /// in (it pre-mints every Recreate's new id in its own first pass
+        /// before remapping anything) -- so no ordering is promised here.
         std::vector<UndoAction> actions;
+
+        /// Every id this commit's OWN changes_ mentioned (Created ∪
+        /// Updated ∪ Deleted) -- see the struct comment above for why this
+        /// is broader than just the ids apply_undo() would act on. A later
+        /// commit that touches ANY id in this set invalidates the whole
+        /// entry (the loop in try_commit() that erases conflicting undo_list_
+        /// entries), not just the actions that reference it.
         std::unordered_set<Id, IdHash> touched;
+
         std::string name;  ///< copied from the committing Transaction::name() (see publish_now())
         std::any data;     ///< copied from the committing Transaction::data() (see publish_now())
+
+        /// The committing Transaction::id() -- purely informational, NOT a
+        /// lookup key (take_undo() still keys on `version`, for the reasons
+        /// in that member's comment). This is what lets a caller correlate
+        /// an entry back to the specific attempt that produced it, e.g.
+        /// matching it against PostCommitFn logging keyed by id() -- 0 for
+        /// paths with no Transaction to draw an id from (commit_bulk_without_undo()),
+        /// though those never produce undo data in the first place.
+        std::uint64_t txn_id = 0;
     };
 
     /// Lightweight, copyable summary of one UndoEntry still in the list --
@@ -2106,10 +2142,25 @@ public:
     /// free, but a caller that passed something expensive pays for that
     /// copy on every list_undo() call, not just once.
     struct UndoSummary {
+        /// Copied verbatim from UndoEntry::version -- see that member's
+        /// comment for why it's the commit's PUBLISHED version (the same
+        /// number CommitResult::snapshot.version() returned for this
+        /// commit), not Transaction::id(). Pass this straight to
+        /// take_undo() to retrieve the full entry.
         std::uint64_t version;
+
+        /// UndoEntry::actions.size(), so a caller can gauge an entry's
+        /// size (e.g. for display, or to skip take_undo()-ing something
+        /// huge) without copying the vector of UndoActions -- each of
+        /// which owns a full object clone -- just to count them.
         std::size_t action_count;
-        std::string name;
-        std::any data;
+
+        std::string name;  ///< copied from UndoEntry::name; see that member's comment
+        std::any data;     ///< copied from UndoEntry::data; see that member's comment
+
+        /// Copied verbatim from UndoEntry::txn_id -- see that member's
+        /// comment. Informational only; take_undo() still keys on `version`.
+        std::uint64_t txn_id = 0;
     };
 
     /// Every undo entry still in the list, oldest first. See UndoEntry's
@@ -2303,9 +2354,10 @@ private:
     ObjectBase* clone_for_cascade_null(Id id, bool keep_undo = true);
 
     /// The conflict check: every slot this transaction updated or intends to
-    /// remove, tested against every changelog entry newer than its base.
-    /// Read-only; runs before anything is applied, so a Conflict here costs
-    /// no rollback. Creates can't conflict (fresh slots) and aren't checked.
+    /// remove, tested against last_write_version_ (was that slot touched by
+    /// ANY commit after this transaction's base?). Read-only; runs before
+    /// anything is applied, so a Conflict here costs no rollback. Creates
+    /// can't conflict (fresh slots) and aren't checked.
     std::vector<Id> check_id_overlap(const Transaction& txn) const;
 
     /// Drop changelog entries at or below the live watermark -- no open
@@ -2346,16 +2398,17 @@ private:
     /// subscriber notify, retirees handed to the reaper, changelog append,
     /// scratch cleared. Always succeeds -- by the time it's called, nothing
     /// left to reject. Consumes changes_ (member scratch) into the result.
-    /// `undo_name`/`undo_data` are copied onto this commit's UndoEntry, if
-    /// it gets one (see pending_undo_'s own comment) -- callers with no
-    /// Transaction to draw them from (commit_bulk_without_undo(), which never produces
-    /// undo data at all) pass empty defaults. `keep_undo` gates only
-    /// whether THIS commit gets added as a new entry -- existing undo_list_
-    /// entries this commit conflicts with are pruned regardless (see
-    /// try_commit_without_undo()'s own doc comment for why that split is
-    /// deliberate).
+    /// `undo_name`/`undo_data`/`undo_txn_id` are copied onto this commit's
+    /// UndoEntry, if it gets one (see pending_undo_'s own comment) --
+    /// callers with no Transaction to draw them from (commit_bulk_without_undo(),
+    /// which never produces undo data at all) pass empty/zero defaults.
+    /// `keep_undo` gates only whether THIS commit gets added as a new entry
+    /// -- existing undo_list_ entries this commit conflicts with are pruned
+    /// regardless (see try_commit_without_undo()'s own doc comment for why
+    /// that split is deliberate).
     CommitResult publish_now(std::unordered_map<std::uint32_t, Id> remap, std::string undo_name = "",
-                             std::any undo_data = {}, bool keep_undo = true);
+                             std::any undo_data = {}, bool keep_undo = true,
+                             std::uint64_t undo_txn_id = 0);
 
     /// check_and_apply() + publish_now(), with NO veto-hook seam -- used only
     /// by run_pre_transaction()/run_pre_transaction_without_undo(), which
@@ -2529,6 +2582,26 @@ private:
     PreCommitFn pre_commit_;  ///< empty = no hook; swapped only under commit_mu_ (set_pre_commit)
     std::deque<ChangelogEntry>
         changelog_;  ///< for try_commit()'s conflict check; see prune_changelog
+
+    /// Dense, slot-indexed conflict index: last_write_version_[slot] is the
+    /// version() of the most recent commit that created/updated/removed/
+    /// cascade-nulled that slot (0 if never touched), last_write_id_[slot]
+    /// the Id (generation included) of that write. check_id_overlap() uses
+    /// this instead of scanning changelog_, so its cost is O(this
+    /// transaction's own write set) rather than O(every change committed
+    /// by every writer since this transaction's base) -- the latter grows
+    /// with contention itself (more concurrent writers => a transaction's
+    /// base falls further behind by the time it reaches try_commit()),
+    /// which is exactly backwards for a design whose whole point is many
+    /// writer threads. Grown lazily in publish_now() (indices only ever
+    /// need to reach the highest slot touched so far); never shrunk, since
+    /// a recycled slot's old entry is harmless -- see check_id_overlap's
+    /// version comparison, which only cares whether it exceeds a specific
+    /// txn's base_version(). Writer-private and NOT part of Root: unlike
+    /// spine_/by_type_/etc. it is never handed to a reader, so it costs
+    /// nothing per-commit to "publish" (there is nothing to copy).
+    std::vector<std::uint64_t> last_write_version_;
+    std::vector<Id> last_write_id_;
 
     /// One entry per successful commit that had any undo data (see
     /// UndoEntry), oldest first. Unlike changelog_ (pruned by the
@@ -2930,7 +3003,10 @@ public:
     /// PreTransactionsFn gets its OWN, different id -- there is no need for
     /// a separate "parent id": the hook already has both ids in scope
     /// (the main txn's, from its own parameter; the pre-transaction's, from
-    /// the object it just built) without any extra API.
+    /// the object it just built) without any extra API. If this transaction
+    /// commits and produces undo data, this id is also copied onto
+    /// UndoEntry::txn_id/UndoSummary::txn_id -- informational there too
+    /// (take_undo() still keys on the commit's published version, not this).
     std::uint64_t id() const noexcept { return id_; }
 
     /// Caller-supplied label, set once at begin() and read-only from here on

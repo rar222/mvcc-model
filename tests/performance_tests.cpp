@@ -61,6 +61,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "model/model.h"
@@ -580,6 +581,114 @@ PERF_TEST(single_field_commit_latency_stays_bounded_as_total_model_size_grows) {
                 "single-field commit", sizes.front(), sizes.back(), ms_per_commit.front(),
                 ms_per_commit.back(), ms_per_commit.front() * 20.0);
     if (kAssertTimings) CHECK(ms_per_commit.back() <= ms_per_commit.front() * 20.0);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent throughput: does parallel Transaction *building* actually buy
+// anything, given commit_mu_ fully serializes every try_commit()'s apply
+// step (CLAUDE.md invariant 7)?
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// kThreads disjoint groups of kObjectsPerThread Accounts each, seeded in one
+// batched commit. Each thread only ever touches its own group, so this
+// isolates parallel building/serialized-apply overlap from conflict-retry
+// overhead -- the same reason commit_bench.cpp's throughput sweep gives
+// each thread its own Account.
+constexpr int kThreads = 4;
+constexpr int kObjectsPerThread = 100;
+
+void seed_private_groups(Model& m, std::vector<std::vector<Ref<Account>>>& groups) {
+    groups.assign(kThreads, {});
+    Transaction txn = m.begin();
+    std::vector<std::vector<Ref<Account>>> local(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        for (int i = 0; i < kObjectsPerThread; ++i) {
+            auto a = std::make_unique<Account>();
+            a->name = "T" + std::to_string(t) + "_" + std::to_string(i);
+            local[static_cast<std::size_t>(t)].push_back(txn.create(std::move(a)));
+        }
+    }
+    const CommitResult res = m.try_commit(txn);
+    for (int t = 0; t < kThreads; ++t)
+        for (auto& r : local[static_cast<std::size_t>(t)])
+            groups[static_cast<std::size_t>(t)].push_back(res.to_real(r));
+}
+
+}  // namespace
+
+// 4 threads, each repeatedly building-and-committing a transaction that
+// updates all 100 of ITS OWN objects (never another thread's), must finish
+// the same total work -- kThreads * kIters transactions, each touching
+// kObjectsPerThread objects -- faster than running the identical sequence
+// of transactions one after another on a single thread. This isn't a
+// claim that try_commit() itself parallelizes: commit_mu_ still serializes
+// every one of the 4 applies (see commit_bench.cpp's sub-linear
+// throughput-vs-threads sweep, and CLAUDE.md's "Known scope boundaries").
+// What DOES parallelize is Transaction building -- txn.update() clones an
+// object into the transaction's local overlay without touching commit_mu_
+// at all -- so while one thread holds commit_mu_ applying, the other three
+// can be off cloning and mutating their own next transaction instead of
+// waiting idle, which the fully-sequential run can never do.
+PERF_TEST(
+    four_threads_updating_private_objects_concurrently_beats_running_the_same_transactions_sequentially) {
+    const int kIters = scaled(300);
+
+    Model concurrent_model;
+    std::vector<std::vector<Ref<Account>>> concurrent_groups;
+    seed_private_groups(concurrent_model, concurrent_groups);
+
+    const double concurrent_ms = best_of(3, [&] {
+        return time_ms([&] {
+            std::vector<std::thread> pool;
+            for (int t = 0; t < kThreads; ++t) {
+                pool.emplace_back([&, t] {
+                    const auto& objs = concurrent_groups[static_cast<std::size_t>(t)];
+                    for (int it = 0; it < kIters; ++it) {
+                        Transaction txn = concurrent_model.begin();
+                        for (const auto& r : objs)
+                            if (Account* a = txn.update(r)) a->balance = it;
+                        concurrent_model.try_commit(txn);
+                    }
+                });
+            }
+            for (auto& th : pool) th.join();
+        });
+    });
+
+    Model sequential_model;
+    std::vector<std::vector<Ref<Account>>> sequential_groups;
+    seed_private_groups(sequential_model, sequential_groups);
+
+    const double sequential_ms = best_of(3, [&] {
+        return time_ms([&] {
+            for (int t = 0; t < kThreads; ++t) {
+                const auto& objs = sequential_groups[static_cast<std::size_t>(t)];
+                for (int it = 0; it < kIters; ++it) {
+                    Transaction txn = sequential_model.begin();
+                    for (const auto& r : objs)
+                        if (Account* a = txn.update(r)) a->balance = it;
+                    sequential_model.try_commit(txn);
+                }
+            }
+        });
+    });
+
+    const double speedup = sequential_ms / concurrent_ms;
+    std::printf(
+        "  %d threads x %d iters x %d objs/txn:  concurrent=%.2f ms   sequential=%.2f ms   "
+        "speedup=%.2fx\n",
+        kThreads, kIters, kObjectsPerThread, concurrent_ms, sequential_ms, speedup);
+
+    if (!kAssertTimings) return;  // see kAssertTimings
+    // Not asserting anywhere near kThreads-fold: apply is fully serialized,
+    // so the ceiling on speedup is nowhere close to 4x. The floor asserted
+    // here is deliberately modest -- it only needs to catch a regression
+    // that makes concurrent building stop overlapping with serialized
+    // apply at all (e.g. a lock accidentally widened to cover building
+    // too), not chase a specific ratio.
+    CHECK(speedup > 1.15);
 }
 
 // ---------------------------------------------------------------------------

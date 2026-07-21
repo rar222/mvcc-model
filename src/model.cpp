@@ -1346,17 +1346,13 @@ std::vector<Id> Model::check_id_overlap(const Transaction& txn) const {
     std::vector<Id> conflicts;
     if (written_slots.empty()) return conflicts;  // nothing to conflict-check (a create-only txn)
 
-    // Scan every changelog entry published strictly after this transaction's
-    // OWN base version -- i.e. everything it could not have seen when it was
-    // built. Any Change in there whose slot this transaction also wants to
-    // touch is a genuine race: someone else committed against the same
-    // object first. `conflicts` collects the SPECIFIC ids that collided, for
+    // O(this transaction's own write set), not O(everything committed by
+    // everyone since its base) -- see last_write_version_'s own comment.
+    // `conflicts` collects the SPECIFIC ids that collided, for
     // ConflictInfo::ids -- not just a yes/no.
-    for (const auto& entry : changelog_) {
-        if (entry.version <= txn.base_version()) continue;  // txn's base already reflects this
-        for (const Change& c : entry.changes) {
-            if (written_slots.count(c.id.index)) conflicts.push_back(c.id);
-        }
+    for (std::uint32_t slot : written_slots) {
+        if (slot < last_write_version_.size() && last_write_version_[slot] > txn.base_version())
+            conflicts.push_back(last_write_id_[slot]);
     }
     return conflicts;
 }
@@ -1544,7 +1540,7 @@ std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
 }
 
 CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std::string undo_name,
-                                std::any undo_data, bool keep_undo) {
+                                std::any undo_data, bool keep_undo, std::uint64_t undo_txn_id) {
     ++version_;  // the version this attempt is about to publish -- commit_mu_-protected, so no
                  // other thread can be racing this increment
 
@@ -1600,6 +1596,21 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     changelog_.push_back({r->version, changes_});
     prune_changelog();
 
+    // Feed check_id_overlap()'s slot-indexed conflict index -- see
+    // last_write_version_'s own comment. Grown lazily to the highest slot
+    // any commit has touched so far; a slot never touched keeps its
+    // default (0), which can never exceed any real base_version() (version
+    // numbering starts at 1), so an unresized tail slot correctly reads as
+    // "never touched" without needing to be pre-sized to spine_'s extent.
+    for (const Change& c : changes_) {
+        if (c.id.index >= last_write_version_.size()) {
+            last_write_version_.resize(c.id.index + 1, 0);
+            last_write_id_.resize(c.id.index + 1, Id{});
+        }
+        last_write_version_[c.id.index] = r->version;
+        last_write_id_[c.id.index] = c.id;
+    }
+
     // Undo list: this commit's own touched ids invalidate any existing
     // entry that overlaps them (see undo_list_'s own comment for what
     // "conflicts" means here), whether or not this commit produced undo
@@ -1622,7 +1633,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
 
         if (keep_undo && !pending_undo_.empty())
             undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched),
-                                  std::move(undo_name), std::move(undo_data)});
+                                  std::move(undo_name), std::move(undo_data), undo_txn_id});
     }
     pending_undo_.clear();
 
@@ -1646,7 +1657,7 @@ std::vector<Model::UndoSummary> Model::list_undo() const {
     std::vector<UndoSummary> out;
     out.reserve(undo_list_.size());
     for (const UndoEntry& e : undo_list_)
-        out.push_back({e.version, e.actions.size(), e.name, e.data});
+        out.push_back({e.version, e.actions.size(), e.name, e.data, e.txn_id});
     return out;
 }
 
@@ -1720,7 +1731,7 @@ CommitResult Model::commit_pretransaction_locked(Transaction& txn, bool keep_und
             CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
     }
 
-    return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo);
+    return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo, txn.id());
 }
 
 CommitResult Model::run_pre_transaction_core(Transaction& txn, bool keep_undo) {
@@ -1808,7 +1819,7 @@ CommitResult Model::commit_main_locked(Transaction& txn, bool keep_undo) {
         return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
     }
 
-    return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo);
+    return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo, txn.id());
 }
 
 // One counter per CommitStatus (see the Diagnostics::commits_* doc
@@ -2005,6 +2016,8 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     next_slot_ = 0;
     exhausted_slots_ = 0;
     changelog_.clear();
+    last_write_version_.clear();
+    last_write_id_.clear();
 
     // Pass 3: install. next_slot_ is 0 and free_slots_ is empty (just
     // cleared), so real ids are just 0..N-1 in order -- what alloc_slot()
