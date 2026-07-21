@@ -455,6 +455,16 @@ class TrieCore {
     }
 
     // ---- erase ----
+    // NOTE: when a subtree under a Node slot shrinks to a single child, that
+    // child is kept as a one-entry Node one level down rather than being
+    // collapsed back into a Leaf occupying the parent's slot directly (unlike
+    // some HAMT implementations, which do path-collapse on erase). This is
+    // simpler and still correct -- get_in/each_in walk through a one-child
+    // Node exactly like any other -- but a key set that inserts and erases
+    // heavily around the same hash prefixes can leave the trie permanently
+    // one level deeper than the live entry count alone would need. Not a
+    // correctness issue, just a depth (and therefore path-copy cost) that
+    // never shrinks back down on its own.
     static std::shared_ptr<const Node> erase_in(const Node* n, std::uint64_t hash,
                                                 int shift, const K& key,
                                                 bool& removed) {
