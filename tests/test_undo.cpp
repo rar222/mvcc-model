@@ -304,6 +304,90 @@ TEST(undo_list_captures_a_real_cascade_and_apply_undo_reconnects_it) {
     CHECK(post.find(surv)->parent == Opt<Order>(Ref<Order>(new_mid1->id)));
 }
 
+// A single commit can touch the same id more than once (see Change's own
+// doc comment): a same-transaction create-then-cascade-delete shows up as
+// BOTH a Created and a Deleted entry in CommitResult::changes (see
+// test_cascade.cpp's removing_a_referenced_local_create_cascades_at_commit_
+// like_a_committed_remove, which asserts exactly that -- it's a deliberate
+// audit trail, not a bug). UndoEntry::actions has a DIFFERENT job, though:
+// it must be a set of independently-replayable inverses, and apply_undo()
+// makes no promise about what order they run in. When a real id gets
+// pushed twice (once per touch), replaying BOTH actions can resurrect
+// something that was never actually visible to any reader.
+TEST(apply_undo_of_a_same_transaction_create_then_cascade_delete_does_not_resurrect_it) {
+    Model m;
+    const Ref<Account> acct = make_account(m, "A1");
+    m.clear_undo_list();  // only interested in the create+cascade commit's own entry below
+
+    Transaction txn = m.begin();
+    const Ref<Order> victim = txn.create(std::make_unique<Order>());
+    txn.update(victim)->code = "VICTIM";
+    txn.update(victim)->account = acct;
+    auto o = std::make_unique<Order>();
+    o->code = "SURVIVOR";
+    o->account = acct;
+    o->parent = victim;  // Opt<>: nulled by the cascade, victim never installs visibly
+    txn.create(std::move(o));
+    txn.remove(victim);  // deferred: victim installs then is cascade-removed, same commit
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find_by_key<&Order::computed_key>("ord:VICTIM") == nullptr);
+
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{1});
+    auto entry = m.take_undo(summaries.front().version);
+    CHECK(entry.has_value());
+
+    const CommitResult undo_res = m.apply_undo(*entry);
+    CHECK(undo_res.status == CommitStatus::Committed);
+
+    // The commit's net, externally-observable effect was "SURVIVOR exists,
+    // VICTIM never did" -- undoing it should restore exactly the
+    // pre-commit state (just the Account), never bring VICTIM into
+    // existence, since nothing before this commit ever had it either.
+    Snapshot post = m.snapshot();
+    CHECK(post.find_by_key<&Order::computed_key>("ord:VICTIM") == nullptr);
+}
+
+// Same idea, for the RestoreUpdate+Recreate pairing instead of Remove+
+// Recreate: an object explicitly update()'d, then cascade-deleted via a
+// non-nullable ref, in the SAME transaction. Its Recreate action captures
+// the value right before deletion (already reflecting this transaction's
+// own update), not the true pre-transaction baseline -- so undo must not
+// just replay both actions and let whichever runs last win.
+TEST(apply_undo_of_a_same_transaction_update_then_cascade_delete_restores_the_true_baseline) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Order> o = make_order(m, "O1", a1);
+    m.clear_undo_list();  // only interested in the removal's own entry below
+
+    Transaction txn = m.begin();
+    txn.update(o)->account = a2;  // repoint o's non-nullable Ref<> to a2
+    txn.remove(a2);               // same transaction removes a2, cascading o (non-nullable)
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().find(o) == nullptr);
+    CHECK(m.snapshot().find(a2) == nullptr);
+
+    const auto summaries = m.list_undo();
+    CHECK_EQ(summaries.size(), std::size_t{1});
+    auto entry = m.take_undo(summaries.front().version);
+    CHECK(entry.has_value());
+
+    const CommitResult undo_res = m.apply_undo(*entry);
+    CHECK(undo_res.status == CommitStatus::Committed);
+
+    Snapshot post = m.snapshot();
+    const Order* revived = post.find_by_key<&Order::computed_key>("ord:O1");
+    CHECK(revived != nullptr);
+    // The true pre-transaction baseline pointed at a1, never a2 -- undo must
+    // not resurrect o still pointing at the (also-resurrected) a2.
+    CHECK(revived != nullptr && revived->account == a1);
+}
+
 // Try to break the conflict-invalidation rule: a later commit touching an
 // id an EARLIER undo entry depends on must drop that entry from the list --
 // otherwise take_undo()/apply_undo() could silently apply a stale

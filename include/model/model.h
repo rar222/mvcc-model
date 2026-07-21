@@ -1369,8 +1369,22 @@ private:
 /// What happened to one Id in one committed transaction. Updated covers any
 /// reinstall of the object -- a field write via Transaction::update() AND a
 /// cascade-nulled Opt<> field -- so subscribers cannot tell those apart
-/// (they see the final value either way). A given Id (generation included)
-/// appears at most once per changeset.
+/// (they see the final value either way).
+///
+/// A given Id (generation included) USUALLY appears at most once per
+/// changeset, but not always: a same-transaction create-then-cascade-delete
+/// (a deferred local remove, see Transaction::remove_raw) or update()-then-
+/// cascade-delete shows up as two separate entries -- e.g. Created then
+/// Deleted -- one per event that actually happened during apply, even though
+/// the net externally-visible effect is "never existed"/"back to how it
+/// looked before this transaction." This is a deliberate audit trail (see
+/// the cascade tests asserting both a Created and a Deleted entry for one
+/// id), not something a subscriber needs to dedupe by hand -- just don't
+/// assume a single lookup by Id tells you everything this changeset did to
+/// it. Model::UndoEntry::actions is NOT built this way: it collapses to at
+/// most one action per id (see Model::collapse_undo_actions()), since a
+/// naive replay of every action would resurrect something that was never
+/// visible or restore the wrong intermediate value.
 enum class ChangeKind : std::uint8_t { Created, Updated, Deleted };
 
 /// Changesets span every type in the model, so they carry the untyped Id --
@@ -2107,10 +2121,16 @@ public:
         /// make the field a bare opaque token instead.
         std::uint64_t version;
 
-        /// This commit's inverse, one UndoAction per Created/Updated/
-        /// Deleted change. apply_undo() doesn't care what order these run
-        /// in (it pre-mints every Recreate's new id in its own first pass
-        /// before remapping anything) -- so no ordering is promised here.
+        /// This commit's inverse: at most ONE UndoAction per id it touched --
+        /// collapsed (see Model::collapse_undo_actions()) to the NET effect
+        /// even when that id's own resolved changeset shows up more than
+        /// once (a same-transaction create-then-cascade-delete, or an
+        /// update()/cascade-null followed by a cascade delete of the same
+        /// object -- see Change's own doc comment for why changes_ itself is
+        /// allowed to report an id twice; actions never is). apply_undo()
+        /// doesn't care what order these run in (it pre-mints every
+        /// Recreate's new id in its own first pass before remapping
+        /// anything) -- so no ordering is promised here.
         std::vector<UndoAction> actions;
 
         /// Every id this commit's OWN changes_ mentioned (Created ∪
@@ -2396,11 +2416,38 @@ private:
     // as the main transaction, with nothing bespoke to keep in sync.
 
     /// The creates-then-updates-then-removes apply loop (see try_commit()'s
-    /// phase-order comment for why that order matters). Returns nullopt on
+    /// phase-order comment for why that order matters), finishing with
+    /// collapse_undo_actions() (when keep_undo) so pending_undo_ has at most
+    /// one action per id before the caller ever sees it. Returns nullopt on
     /// success; the caller must then check changes_ and eventually publish
     /// or, on failure, pass the returned error to classify_apply_failure().
     std::optional<IntegrityError> apply_transaction_contents(
         Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo = true);
+
+    /// Collapses pending_undo_ so a given id has AT MOST ONE UndoAction, even
+    /// though changes_ (left untouched -- see Change's own doc comment) may
+    /// report that same id more than once. Multiple pending_undo_ entries for
+    /// one id arise from ordinary sequences within a single transaction: a
+    /// fresh create() immediately cascade-touched by removing something it
+    /// points at (Remove, then RestoreUpdate or Recreate), an update()/
+    /// cascade-null followed by a cascade DELETE of that same object
+    /// (RestoreUpdate, then Recreate), or several cascade-nulls of different
+    /// fields on one referrer (RestoreUpdate, RestoreUpdate, ...). Naively
+    /// replaying every action apply_undo() would otherwise resurrect
+    /// something that was never actually visible (a Recreate outliving an
+    /// earlier Remove) or restore an intermediate, WRONG value (a later
+    /// action capturing this same transaction's own earlier edit instead of
+    /// the true pre-transaction baseline) -- apply_undo() makes no promise
+    /// about the order actions run in, so leaving duplicates in is not safe
+    /// even though they'd often cancel out by luck. Called once, from the
+    /// tail of apply_transaction_contents() (guarded by keep_undo there, the
+    /// same way every push into pending_undo_ already is), right after the
+    /// create/update/remove loop and before that function returns success --
+    /// never mid-apply and never on a failed attempt, so it has no
+    /// interaction with the log()-based rollback mechanism at all. Reads
+    /// changes_ (unmodified) only to recover, per id, which UndoAction was
+    /// pushed first -- see the "index-parallel" assert in the .cpp.
+    void collapse_undo_actions();
 
     /// Unwinds the failed apply attempt (rollback_apply()) and turns the
     /// IntegrityError into the right CommitResult: Conflict(RefIntegrity) if

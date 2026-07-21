@@ -1501,6 +1501,14 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
         }
         for (Id rid : txn.remove_intents_) remove_raw(rid, keep_undo);
     }
+    // Collapse pending_undo_ to at most one action per id -- see
+    // collapse_undo_actions()'s own doc comment. Guarded by keep_undo, same
+    // as every push into pending_undo_ above (apply_create/apply_update/
+    // clone_for_cascade_null/remove_raw): when keep_undo is false the vector
+    // never had anything in it to collapse, so this would be a no-op anyway,
+    // but gating explicitly keeps that fact grep-able here rather than
+    // relying on collapse_undo_actions() noticing the vector is empty.
+    if (!err && keep_undo) collapse_undo_actions();
     return err;
 }
 
@@ -1520,6 +1528,83 @@ CommitResult Model::classify_apply_failure(IntegrityError err, const Transaction
                             std::nullopt};
     }
     return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, std::move(err)};
+}
+
+void Model::collapse_undo_actions() {
+    if (pending_undo_.size() < 2) return;  // nothing to collapse
+
+    // pending_undo_ is index-parallel to changes_: every push site (apply_
+    // create/apply_update/clone_for_cascade_null/remove_raw) adds exactly
+    // one of each, same id, same order -- see those functions' own
+    // pending_undo_.push_back calls, each immediately alongside a
+    // changes_.push_back for the same id. changes_ itself is read here but
+    // never modified -- see Change's own doc comment for why an id showing
+    // up twice there is fine (a deliberate audit trail), unlike here.
+    assert(pending_undo_.size() == changes_.size() &&
+          "pending_undo_ must be index-parallel with changes_ when non-empty");
+
+    std::unordered_map<Id, std::size_t, IdHash> slot_of;  // Id -> its index in `out`
+    std::vector<UndoAction> out;
+    std::vector<bool> cancelled;
+    out.reserve(pending_undo_.size());
+    cancelled.reserve(pending_undo_.size());
+
+    for (std::size_t i = 0; i < changes_.size(); ++i) {
+        const Id id = changes_[i].id;
+        auto it = slot_of.find(id);
+        if (it == slot_of.end()) {
+            slot_of.emplace(id, out.size());
+            out.push_back(std::move(pending_undo_[i]));
+            cancelled.push_back(false);
+            continue;
+        }
+        const std::size_t slot = it->second;
+        switch (changes_[i].kind) {
+            case ChangeKind::Created:
+                break;  // structurally never anything but the first entry for an id
+            case ChangeKind::Updated:
+                // A second (or later) Updated for this id -- e.g. two
+                // cascade-nulls of different fields on the same referrer, or
+                // a cascade-null of an object also create()'d this same
+                // transaction. out[slot] already holds the FIRST action
+                // pushed for this id (a Remove if it originated as a
+                // create() this transaction, else a RestoreUpdate holding
+                // the TRUE pre-transaction baseline) -- keep it as-is. A
+                // later capture would only reflect this same transaction's
+                // own earlier edit to this id, not what existed before the
+                // transaction started, so it must not overwrite what's kept.
+                break;
+            case ChangeKind::Deleted:
+                if (out[slot].kind == UndoAction::Kind::Remove) {
+                    // This id originated as a create() THIS transaction and
+                    // is now being cascade-deleted, also this transaction:
+                    // nothing was ever visible to a reader. Cancel the
+                    // pairing entirely -- resurrecting it on undo would
+                    // bring into existence something that never did.
+                    cancelled[slot] = true;
+                } else {
+                    // out[slot] is a RestoreUpdate holding the true
+                    // pre-transaction baseline (from the FIRST edit to this
+                    // id this transaction). Promote it to a Recreate of
+                    // that SAME baseline -- not pending_undo_[i]'s own
+                    // Recreate, which captured the value right before
+                    // deletion and so already reflects this transaction's
+                    // own prior edits. The id is unchanged from Updated
+                    // through to Deleted (a slot keeps its generation until
+                    // the delete actually zeros it), so `id` is correct for
+                    // the promoted Recreate action too.
+                    out[slot].kind = UndoAction::Kind::Recreate;
+                    out[slot].id = id;
+                }
+                break;
+        }
+    }
+
+    pending_undo_.clear();
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        if (cancelled[i]) continue;
+        pending_undo_.push_back(std::move(out[i]));
+    }
 }
 
 std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
