@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2188,6 +2189,27 @@ public:
     /// bound it" tradeoff Subscription's queue depth already makes).
     void clear_undo_list();
 
+    /// Caps how many entries undo_list_ is allowed to hold. Enforced lazily,
+    /// only at the moment a new entry would be appended (publish_now()): if
+    /// the list is already at (or over, having been shrunk since the last
+    /// add) the cap, the OLDEST entries are dropped first -- same "oldest
+    /// first" ordering list_undo() documents -- until there is room for the
+    /// one about to be added. Does not retroactively prune when THIS call
+    /// lowers the cap; a list already over the new limit only shrinks the
+    /// next time a commit would add to it. n == 0 means "keep no undo
+    /// history at all": a commit that would otherwise gain an UndoEntry
+    /// skips adding one entirely (pending_undo_ is still collected during
+    /// apply when the caller asked for it via try_commit() vs.
+    /// try_commit_without_undo() -- this is a separate, later cap on
+    /// RETENTION, not a way to skip collecting undo data mid-apply).
+    /// Default is unbounded (matching every version of this Model before
+    /// this method existed). Takes commit_mu_, same locking contract as
+    /// set_pre_commit/set_pre_transactions/set_post_commit.
+    void set_max_undo_list_size(std::size_t n) {
+        std::lock_guard lk(commit_mu_);
+        max_undo_list_size_ = n;
+    }
+
     /// Builds a fresh Transaction from `entry` and commits it: mints a new
     /// local id for every Recreate action first (mirrors the pre-mint
     /// pass, so victim-to-victim edges among resurrected objects remap
@@ -2616,8 +2638,16 @@ private:
     /// only watch RestoreUpdate targets. Otherwise unbounded: nothing
     /// caps its size automatically, matching this project's existing "give
     /// the primitive, let the caller bound it" pattern (Subscription's
-    /// queue depth) -- see clear_undo_list().
+    /// queue depth) -- see clear_undo_list() and set_max_undo_list_size().
     std::vector<UndoEntry> undo_list_;
+
+    /// Cap enforced by set_max_undo_list_size(); default (max()) means
+    /// unbounded, preserving the historical behavior for anyone who never
+    /// calls the setter. Read and enforced only in publish_now(), at the
+    /// point a new entry would be appended -- see that setter's own
+    /// comment for why this is lazy (checked on add) rather than applied
+    /// retroactively when the cap changes.
+    std::size_t max_undo_list_size_ = std::numeric_limits<std::size_t>::max();
 
     PreTransactionsFn pre_transactions_;  ///< empty = no hook; swapped only under commit_mu_
                                           ///< (set_pre_transactions)

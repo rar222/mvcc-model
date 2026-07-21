@@ -59,6 +59,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -616,6 +617,66 @@ void seed_private_groups(Model& m, std::vector<std::vector<Ref<Account>>>& group
             groups[static_cast<std::size_t>(t)].push_back(res.to_real(r));
 }
 
+// Unlike seed_private_groups/four_threads_updating_private_objects_..._
+// sequentially above, EVERY iteration creates a brand-new batch of
+// `batch_size` objects (globally-unique names, never reused) and then
+// updates that same fresh batch -- two commits, not one. The point isn't
+// the create/update mechanics; it's the ids: because every iteration's
+// batch is disjoint from every other iteration's (this thread's own past
+// ones AND every other thread's), publish_now()'s conflict-prune scan
+// (which drops an existing undo_list_ entry only when a LATER commit
+// touches an overlapping id) never fires ACROSS iterations. Within one
+// iteration it fires exactly once -- the update's touched set is the same
+// as its own create's, so the create's own entry is invalidated the moment
+// the update lands, leaving one surviving UndoEntry per iteration. So an
+// UNCAPPED run's undo_list_ grows by one entry every iteration, with
+// nothing ever pruning it back down -- unlike the reused-object workload
+// above, where the list stays near kThreads entries regardless of any cap.
+// That's what makes a cap actually bind here: by the last iteration,
+// kThreads * kIters surviving entries is comfortably past both the 1000
+// and 100 caps tested below, so the conflict-prune scan's O(list size)
+// cost is genuinely smaller under a cap than without one. `batch_size` is
+// deliberately small (not kObjectsPerThread=100): the effect under test is
+// driven by the NUMBER of undo_list_ entries, not their size, so a small
+// batch reaches the same entry counts for a fraction of the clone/commit
+// cost -- keeping kIters large enough to clear the 1000 cap affordable.
+double bench_concurrent_create_and_update_with_undo_cap(std::size_t max_undo_list_size, int kIters,
+                                                        int batch_size, int trials) {
+    return best_of(trials, [&] {
+        Model m;
+        m.set_max_undo_list_size(max_undo_list_size);
+        return time_ms([&] {
+            std::vector<std::thread> pool;
+            for (int t = 0; t < kThreads; ++t) {
+                pool.emplace_back([&, t] {
+                    for (int it = 0; it < kIters; ++it) {
+                        std::vector<Ref<Account>> batch;
+                        {
+                            Transaction txn = m.begin();
+                            std::vector<Ref<Account>> local;
+                            for (int i = 0; i < batch_size; ++i) {
+                                auto a = std::make_unique<Account>();
+                                a->name = "T" + std::to_string(t) + "_" + std::to_string(it) + "_" +
+                                          std::to_string(i);
+                                local.push_back(txn.create(std::move(a)));
+                            }
+                            const CommitResult res = m.try_commit(txn);
+                            for (auto& r : local) batch.push_back(res.to_real(r));
+                        }
+                        {
+                            Transaction txn = m.begin();
+                            for (const auto& r : batch)
+                                if (Account* a = txn.update(r)) a->balance = it;
+                            m.try_commit(txn);
+                        }
+                    }
+                });
+            }
+            for (auto& th : pool) th.join();
+        });
+    });
+}
+
 }  // namespace
 
 // 4 threads, each repeatedly building-and-committing a transaction that
@@ -689,6 +750,83 @@ PERF_TEST(
     // apply at all (e.g. a lock accidentally widened to cover building
     // too), not chase a specific ratio.
     CHECK(speedup > 1.15);
+}
+
+// Three variants of the SAME kThreads x kIters concurrent shape as the test
+// just above (see bench_concurrent_create_and_update_with_undo_cap's own
+// comment for why this workload creates-then-updates a fresh batch every
+// iteration, rather than reusing kObjectsPerThread objects the way the
+// test above does), with the ONLY difference being Model::set_max_undo_
+// list_size(), swept at maximum (the historical, uncapped default), 1000,
+// and 100 -- each compares its capped run against a fresh uncapped run and
+// reports the speedup. kIters * kThreads (1200) comfortably clears both
+// caps, so undo_list_ genuinely exceeds them in the uncapped run and both
+// caps do real pruning work, not a no-op.
+//
+// publish_now()'s undo-list maintenance can only do LESS work under a cap
+// than without one, never more, so a capped run is never EXPECTED to be
+// slower than uncapped: the floor below asserts exactly that (speedup >=
+// 1.0, no ceiling -- this isn't a claim about how MUCH faster, just that
+// bounding retention never costs anything).
+PERF_TEST(
+    four_threads_updating_private_objects_with_undo_list_capped_at_1000_is_never_slower_than_uncapped) {
+    // kThreads * kIters needs to clear kCap by a wide margin, not just cross
+    // it -- at 1200 (kIters=300, the other two tests' iteration count) the
+    // uncapped list is only 20% over the cap, so the pruning work saved is a
+    // small fraction of total commit cost and gets lost in machine noise
+    // (measured flipping below 1.0x across repeat runs at that size). 900
+    // gives kThreads * kIters = 3600, 3.6x the cap, a comfortably larger
+    // fraction of steady-state list scans to save.
+    const int kIters = scaled(900);
+    constexpr int kBatchSize = 10;
+    constexpr int kTrials = 5;
+    constexpr std::size_t kCap = 1000;
+    const double uncapped_ms = bench_concurrent_create_and_update_with_undo_cap(
+        std::numeric_limits<std::size_t>::max(), kIters, kBatchSize, kTrials);
+    const double capped_ms =
+        bench_concurrent_create_and_update_with_undo_cap(kCap, kIters, kBatchSize, kTrials);
+    const double speedup = uncapped_ms / capped_ms;
+    std::printf(
+        "  undo list cap=%4zu vs maximum:  uncapped=%7.2f ms   capped=%7.2f ms   speedup=%.2fx\n",
+        kCap, uncapped_ms, capped_ms, speedup);
+    if (!kAssertTimings) return;  // see kAssertTimings
+    CHECK(speedup >= 1.0);
+}
+
+PERF_TEST(
+    four_threads_updating_private_objects_with_undo_list_capped_at_100_is_never_slower_than_uncapped) {
+    const int kIters = scaled(300);
+    constexpr int kBatchSize = 10;
+    constexpr int kTrials = 3;
+    constexpr std::size_t kCap = 100;
+    const double uncapped_ms = bench_concurrent_create_and_update_with_undo_cap(
+        std::numeric_limits<std::size_t>::max(), kIters, kBatchSize, kTrials);
+    const double capped_ms =
+        bench_concurrent_create_and_update_with_undo_cap(kCap, kIters, kBatchSize, kTrials);
+    const double speedup = uncapped_ms / capped_ms;
+    std::printf(
+        "  undo list cap=%4zu vs maximum:  uncapped=%7.2f ms   capped=%7.2f ms   speedup=%.2fx\n",
+        kCap, uncapped_ms, capped_ms, speedup);
+    if (!kAssertTimings) return;  // see kAssertTimings
+    CHECK(speedup >= 1.0);
+}
+
+PERF_TEST(
+    four_threads_updating_private_objects_with_undo_list_capped_at_0_is_never_slower_than_uncapped) {
+    const int kIters = scaled(300);
+    constexpr int kBatchSize = 10;
+    constexpr int kTrials = 3;
+    constexpr std::size_t kCap = 0;
+    const double uncapped_ms = bench_concurrent_create_and_update_with_undo_cap(
+        std::numeric_limits<std::size_t>::max(), kIters, kBatchSize, kTrials);
+    const double capped_ms =
+        bench_concurrent_create_and_update_with_undo_cap(kCap, kIters, kBatchSize, kTrials);
+    const double speedup = uncapped_ms / capped_ms;
+    std::printf(
+        "  undo list cap=%4zu vs maximum:  uncapped=%7.2f ms   capped=%7.2f ms   speedup=%.2fx\n",
+        kCap, uncapped_ms, capped_ms, speedup);
+    if (!kAssertTimings) return;  // see kAssertTimings
+    CHECK(speedup >= 1.0);
 }
 
 // ---------------------------------------------------------------------------

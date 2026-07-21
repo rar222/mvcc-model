@@ -334,6 +334,69 @@ TEST(clear_undo_list_empties_the_list) {
     CHECK(m.list_undo().empty());
 }
 
+// set_max_undo_list_size() bounds undo_list_ going forward: once the cap is
+// in effect, a commit that would push the list over it instead drops the
+// OLDEST entries first (list_undo()'s own documented ordering) to make
+// room, so the list never exceeds the cap after an add.
+TEST(set_max_undo_list_size_prunes_oldest_entries_to_make_room) {
+    Model m;
+    m.set_max_undo_list_size(2);
+
+    const Ref<Account> a1 = make_account(m, "A1");  // each is its own commit, own UndoEntry,
+    const Ref<Account> a2 = make_account(m, "A2");  // and none touch a shared id -- so only the
+    const Ref<Account> a3 = make_account(m, "A3");  // size cap (not conflict-pruning) is at play
+    (void)a1;
+    (void)a2;
+    (void)a3;
+
+    const auto entries = m.list_undo();
+    CHECK_EQ(entries.size(), std::size_t{2});
+    // Oldest (A1's) is gone; the two most recent survive, oldest-of-the-
+    // survivors first.
+    CHECK(entries.front().version < entries.back().version);
+}
+
+// n == 0 means "keep no undo history at all" -- commits still succeed
+// normally (this is a RETENTION cap, not a way to skip collecting undo data
+// mid-apply), they just never gain an entry in undo_list_.
+TEST(set_max_undo_list_size_of_zero_never_adds_to_the_list) {
+    Model m;
+    m.set_max_undo_list_size(0);
+
+    CommitResult r1 = [&] {
+        Transaction txn = m.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "A1";
+        txn.create(std::move(a));
+        return m.try_commit(txn);
+    }();
+    CHECK(r1.status == CommitStatus::Committed);  // the commit itself is unaffected
+    CHECK(m.list_undo().empty());
+
+    make_account(m, "A2");
+    CHECK(m.list_undo().empty());
+}
+
+// Lowering the cap does not retroactively prune what's already in the
+// list -- set_max_undo_list_size() only takes effect the next time a
+// commit would ADD an entry (see its own doc comment for why). At that
+// point, the prune-to-make-room loop can drop more than one entry at once
+// to get back under a cap that was lowered by more than one step.
+TEST(lowering_max_undo_list_size_only_takes_effect_on_the_next_add) {
+    Model m;
+    make_account(m, "A1");
+    make_account(m, "A2");
+    make_account(m, "A3");
+    CHECK_EQ(m.list_undo().size(), std::size_t{3});
+
+    m.set_max_undo_list_size(1);
+    CHECK_EQ(m.list_undo().size(), std::size_t{3});  // not retroactive
+
+    make_account(m, "A4");  // the next add enforces the (now-lower) cap
+    const auto entries = m.list_undo();
+    CHECK_EQ(entries.size(), std::size_t{1});
+}
+
 // apply_undo is not a special-cased path: it just builds a Transaction and
 // calls try_commit(), so a stale entry -- one whose reconstruction would now
 // dangle -- reports Invalid exactly like any other build-time integrity

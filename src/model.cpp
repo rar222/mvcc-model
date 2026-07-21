@@ -1631,9 +1631,15 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
             it = conflicts ? undo_list_.erase(it) : std::next(it);
         }
 
-        if (keep_undo && !pending_undo_.empty())
+        // max_undo_list_size_ == 0: don't even bother adding -- see
+        // set_max_undo_list_size()'s own comment. Otherwise, make room
+        // first (oldest entries first, same ordering list_undo() promises)
+        // so this add never leaves the list over the configured cap.
+        if (keep_undo && max_undo_list_size_ != 0 && !pending_undo_.empty()) {
+            while (undo_list_.size() >= max_undo_list_size_) undo_list_.erase(undo_list_.begin());
             undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched),
                                   std::move(undo_name), std::move(undo_data), undo_txn_id});
+        }
     }
     pending_undo_.clear();
 
