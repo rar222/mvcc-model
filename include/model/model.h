@@ -497,7 +497,11 @@ struct RefIndexReader {
 /// Callback shape for enumerating a type's declared lookup fields (see
 /// ObjectBase::each_field_key / each_cached_field / each_scan_field): the
 /// field's identity tag plus its value in canonical string form
-/// (to_field_key). One shape serves all three lookup families.
+/// (to_field_key). One shape serves all three lookup families -- and, being
+/// one shape rather than one per field type, is what lets a single
+/// heterogeneous vector of (field, key) pairs represent a type's whole
+/// define_keys() set (see collect_update_baseline_field_keys()) with no
+/// variant.
 using FieldKeyFn = std::function<void(const void* field, std::string key)>;
 
 /// Canonical string form of a define_keys()-indexed field's value: a
@@ -506,7 +510,11 @@ using FieldKeyFn = std::function<void(const void* field, std::string key)>;
 /// (reading it) so the two can never drift apart on what a value maps to --
 /// which is also what makes find_by_key type safe: it takes the field's own
 /// value type, not a bare std::string, so a caller can't pass a key of the
-/// wrong shape for that field in the first place.
+/// wrong shape for that field in the first place. Same reason
+/// collect_update_baseline_field_keys() stores baseline values in this form
+/// rather than the field's native type: it lets old-vs-new be a plain ==
+/// regardless of the field's declared type, and lets that baseline live in
+/// the same string-keyed shape as by_field_ itself.
 template <class V>
 std::string to_field_key(const V& v) {
     if constexpr (std::is_same_v<V, std::string>) {
@@ -2452,7 +2460,17 @@ private:
     ///                                      (before this transaction's own
     ///                                      edit) -- what by_field_ indexed
     ///                                      this object under prior to the
-    ///                                      update.
+    ///                                      update. Canonical string, not
+    ///                                      the field's native type, for
+    ///                                      two reasons: it lets one
+    ///                                      vector hold define_keys()
+    ///                                      fields of different types
+    ///                                      (std::string, int, ...) with
+    ///                                      no variant, and it lets
+    ///                                      validate_field_key_uniqueness()
+    ///                                      tell old from new with a
+    ///                                      plain == against the new
+    ///                                      key's own to_field_key() form.
     std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>
     collect_update_baseline_field_keys(const Transaction& txn) const;
 
