@@ -1915,28 +1915,59 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     // data of its own; then append this commit's own entry, if it has any
     // (a commit_bulk_without_undo()-style wipe, or an attempt with only
     // no-op-since-cancelled local creates, has none).
-    {
+    //
+    // Skipping this outright when max_undo_list_size_ == 0 is safe -- not
+    // just an optimistic guess -- because set_max_undo_list_size(0) clears
+    // undo_list_/undo_touch_index_ IMMEDIATELY (see its own doc comment),
+    // and nothing can add to either while the cap stays 0 (keep_undo is
+    // folded against the cap before apply even runs, in
+    // apply_transaction_contents). So "cap is 0" and "undo_list_ is
+    // (provably, permanently, until the cap changes) empty" are the same
+    // fact here -- there is nothing this block could possibly find to
+    // prune or append.
+    if (max_undo_list_size_ != 0) {
         std::unordered_set<Id, IdHash> touched;
         for (const Change& c : changes_) touched.insert(c.id);
 
-        for (auto it = undo_list_.begin(); it != undo_list_.end();) {
-            bool conflicts = false;
-            for (Id id : touched)
-                if (it->touched.count(id)) {
-                    conflicts = true;
-                    break;
-                }
-            it = conflicts ? undo_list_.erase(it) : std::next(it);
+        // Conflicting entries, via undo_touch_index_ -- O(|touched|) expected
+        // lookups instead of an O(|undo_list_|) scan of every retained
+        // entry regardless of whether it could possibly conflict. Collected
+        // into `to_erase` first (deduped by list-node address: more than
+        // one id in `touched` can resolve to the SAME entry) rather than
+        // erased inline, since untrack_undo_entry() below reads an entry's
+        // OWN touched set -- which may contain ids not in `touched` at all
+        // -- to unindex it, and doing that while also iterating `touched`
+        // itself would be iterating one container while mutating another
+        // it doesn't own.
+        std::vector<std::list<UndoEntry>::iterator> to_erase;
+        {
+            std::unordered_set<const UndoEntry*> seen;
+            for (Id id : touched) {
+                auto it = undo_touch_index_.find(id);
+                if (it == undo_touch_index_.end()) continue;
+                if (seen.insert(&*it->second).second) to_erase.push_back(it->second);
+            }
+        }
+        for (auto& it : to_erase) {
+            untrack_undo_entry(*it);  // drop every OTHER id this entry indexed under, first
+            undo_list_.erase(it);
         }
 
-        // max_undo_list_size_ == 0: don't even bother adding -- see
-        // set_max_undo_list_size()'s own comment. Otherwise, make room
-        // first (oldest entries first, same ordering list_undo() promises)
-        // so this add never leaves the list over the configured cap.
-        if (keep_undo && max_undo_list_size_ != 0 && !pending_undo_.empty()) {
-            while (undo_list_.size() >= max_undo_list_size_) undo_list_.erase(undo_list_.begin());
+        // Already inside `max_undo_list_size_ != 0` -- make room first
+        // (oldest entries first, same ordering list_undo() promises) so
+        // this add never leaves the list over the configured cap.
+        if (keep_undo && !pending_undo_.empty()) {
+            while (undo_list_.size() >= max_undo_list_size_) {
+                untrack_undo_entry(undo_list_.front());
+                undo_list_.erase(undo_list_.begin());
+            }
             undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched),
                                   std::move(undo_name), std::move(undo_data), undo_txn_id});
+            // Index the just-added entry under every id it touches, so a
+            // LATER commit's conflict check (the lookup above) can find it
+            // in O(1) instead of scanning for it.
+            const auto new_it = std::prev(undo_list_.end());
+            for (Id id : new_it->touched) undo_touch_index_[id] = new_it;
         }
     }
     pending_undo_.clear();
@@ -1960,6 +1991,10 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
 // Undo list
 // ---------------------------------------------------------------------------
 
+void Model::untrack_undo_entry(const UndoEntry& e) {
+    for (Id id : e.touched) undo_touch_index_.erase(id);
+}
+
 std::vector<Model::UndoSummary> Model::list_undo() const {
     std::lock_guard lk(commit_mu_);
     std::vector<UndoSummary> out;
@@ -1973,6 +2008,7 @@ std::optional<Model::UndoEntry> Model::take_undo(std::uint64_t version) {
     std::lock_guard lk(commit_mu_);
     for (auto it = undo_list_.begin(); it != undo_list_.end(); ++it) {
         if (it->version != version) continue;
+        untrack_undo_entry(*it);
         UndoEntry taken = std::move(*it);
         undo_list_.erase(it);
         return taken;
@@ -1983,6 +2019,7 @@ std::optional<Model::UndoEntry> Model::take_undo(std::uint64_t version) {
 void Model::clear_undo_list() {
     std::lock_guard lk(commit_mu_);
     undo_list_.clear();
+    undo_touch_index_.clear();  // every entry it indexed is gone too
 }
 
 CommitResult Model::apply_undo(const UndoEntry& entry) {
@@ -2336,6 +2373,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     last_write_version_.clear();
     last_write_id_.clear();
     undo_list_.clear();
+    undo_touch_index_.clear();  // every entry it indexed is gone too
 
     // Pass 3: install. next_slot_ is 0 and free_slots_ is empty (just
     // cleared), so real ids are just 0..N-1 in order -- what alloc_slot()

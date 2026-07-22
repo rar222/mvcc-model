@@ -489,6 +489,25 @@ TEST(set_max_undo_list_size_of_zero_never_adds_to_the_list) {
     CHECK(m.list_undo().empty());
 }
 
+// Unlike lowering to a POSITIVE cap (see lowering_max_undo_list_size_only_
+// takes_effect_on_the_next_add below, which is lazy -- it only takes effect
+// on the next add), lowering to 0 specifically prunes undo_list_
+// IMMEDIATELY. See set_max_undo_list_size()'s own doc comment for why: it's
+// what lets publish_now() skip its entire conflict-prune step outright
+// whenever the cap is 0, by making "cap is 0" and "undo_list_ is empty" the
+// same fact on the spot, rather than something a later commit would
+// eventually have to discover and enforce on its own.
+TEST(set_max_undo_list_size_of_zero_immediately_clears_existing_entries) {
+    Model m;
+    make_account(m, "A1");
+    make_account(m, "A2");
+    make_account(m, "A3");
+    CHECK_EQ(m.list_undo().size(), std::size_t{3});
+
+    m.set_max_undo_list_size(0);
+    CHECK(m.list_undo().empty());  // immediate, not deferred to the next commit
+}
+
 // A 0 cap doesn't just skip RETENTION -- it skips the per-object pre-image
 // clone during apply too (apply_update's baseline->clone(), remove_raw's
 // victim->clone(), clone_for_cascade_null's cur->clone()):

@@ -33,6 +33,7 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2246,21 +2247,39 @@ public:
     /// add) the cap, the OLDEST entries are dropped first -- same "oldest
     /// first" ordering list_undo() documents -- until there is room for the
     /// one about to be added. Does not retroactively prune when THIS call
-    /// lowers the cap; a list already over the new limit only shrinks the
-    /// next time a commit would add to it. n == 0 means "keep no undo
-    /// history at all": apply_transaction_contents() folds this cap into
-    /// keep_undo before its apply loop starts, so a 0 cap also skips
-    /// collecting pending_undo_ mid-apply -- no per-object clone
-    /// (apply_update/remove_raw/clone_for_cascade_null) for a commit whose
-    /// undo data publish_now() would just discard anyway. This is read
-    /// under commit_mu_ (already held at that point), same as every other
-    /// commit_mu_-protected member. Default is unbounded (matching every
-    /// version of this Model before
+    /// LOWERS a positive cap; a list already over the new limit only
+    /// shrinks the next time a commit would add to it.
+    ///
+    /// n == 0 is the one exception, and it IS immediate, not lazy: it means
+    /// "keep no undo history at all," enforced right here by clearing
+    /// undo_list_ (and undo_touch_index_ along with it) on the spot, not
+    /// just going forward. This isn't just tidiness -- it turns "the cap is
+    /// 0" and "undo_list_ is empty" into the SAME fact for as long as the
+    /// cap stays 0 (nothing else can ever add to undo_list_ while
+    /// max_undo_list_size_ == 0 -- apply_transaction_contents() folds this
+    /// cap into keep_undo before publish_now() is ever reached, so
+    /// pending_undo_ stays empty too), which is what lets publish_now()
+    /// skip its entire prune-and-append step outright when the cap is 0,
+    /// instead of running the conflict-prune check (see undo_touch_index_)
+    /// on every single commit for a list that's provably always empty
+    /// anyway. A 0 cap also skips the per-object pre-image clone during
+    /// apply (apply_update's baseline->clone(), remove_raw's
+    /// victim->clone(), clone_for_cascade_null's cur->clone()) -- no
+    /// per-object clone for a commit whose undo data would just be
+    /// discarded.
+    ///
+    /// Read (and, for n == 0, mutated) under commit_mu_ (already held at
+    /// that point), same as every other commit_mu_-protected member.
+    /// Default is unbounded (matching every version of this Model before
     /// this method existed). Takes commit_mu_, same locking contract as
     /// set_pre_commit/set_pre_transactions/set_post_commit.
     void set_max_undo_list_size(std::size_t n) {
         std::lock_guard lk(commit_mu_);
         max_undo_list_size_ = n;
+        if (n == 0) {
+            undo_list_.clear();
+            undo_touch_index_.clear();
+        }
     }
 
     /// Builds a fresh Transaction from `entry` and commits it: mints a new
@@ -2876,7 +2895,48 @@ private:
     /// caps its size automatically, matching this project's existing "give
     /// the primitive, let the caller bound it" pattern (Subscription's
     /// queue depth) -- see clear_undo_list() and set_max_undo_list_size().
-    std::vector<UndoEntry> undo_list_;
+    ///
+    /// A std::list, not a std::vector: undo_touch_index_ below stores
+    /// iterators into this container across arbitrary later insertions and
+    /// erasures elsewhere in it, which only a node-based container can
+    /// promise stay valid for (a vector's iterators are invalidated by any
+    /// insert/erase that isn't at the very end). size() is still O(1) (C++11
+    /// guarantee), so the cap check in publish_now() is unaffected; nothing
+    /// here ever needs random access, only forward iteration and erase-by-
+    /// iterator, both of which a list gives in O(1).
+    std::list<UndoEntry> undo_list_;
+
+    /// Reverse index for the conflict-prune step in publish_now(): every id
+    /// CURRENTLY touched by some entry still in undo_list_ maps to THAT
+    /// entry's iterator. Lets a commit that touched ids {a, b, c} find
+    /// exactly which retained entries conflict in O(|{a,b,c}|) expected
+    /// time -- one hash lookup per id THIS commit touched -- instead of the
+    /// O(|undo_list_|) scan-every-entry approach that used to run on every
+    /// single commit regardless of how much (or how little) history was
+    /// actually affected.
+    ///
+    /// At most ONE entry can be indexed under a given id at any moment: any
+    /// commit that touches id X always prunes whichever entry currently
+    /// touches X (via this very index) before it can possibly add a new
+    /// entry of its own -- so a later entry claiming X necessarily replaces
+    /// the only earlier one that could have claimed it, never coexists with
+    /// it. That's what keeps this a plain Id -> iterator map rather than a
+    /// multimap.
+    ///
+    /// Kept in exact lockstep with undo_list_ by every mutation site
+    /// (publish_now()'s prune-and-append, take_undo(), clear_undo_list()) --
+    /// see untrack_undo_entry(), the one place entries are ever removed from
+    /// this index, so "an entry left undo_list_" and "its ids left this
+    /// index" can never drift apart.
+    std::unordered_map<Id, std::list<UndoEntry>::iterator, IdHash> undo_touch_index_;
+
+    /// Removes every id in `e.touched` from undo_touch_index_ -- called
+    /// immediately before `e` itself is erased from undo_list_ (publish_now,
+    /// take_undo, clear_undo_list), never after: an id left indexed while
+    /// pointing at an already-erased list node is a dangling iterator the
+    /// next lookup would dereference. Doesn't touch undo_list_ itself; the
+    /// caller does that part.
+    void untrack_undo_entry(const UndoEntry& e);
 
     /// Cap enforced by set_max_undo_list_size(); default (max()) means
     /// unbounded, preserving the historical behavior for anyone who never
