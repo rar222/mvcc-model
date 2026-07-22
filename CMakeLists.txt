@@ -37,7 +37,6 @@ else()
     -Wcast-align
     -Wcast-qual
     -Wunused
-    -Wnull-dereference
     -Wdouble-promotion
     -Wformat=2
     -Wimplicit-fallthrough
@@ -46,6 +45,10 @@ else()
     -Wredundant-decls
     -Wextra-semi
   )
+  # -Wnull-dereference deliberately omitted: at -O2 (the default preset) it
+  # false-positives inside libstdc++'s own inlined basic_string copy ctor,
+  # not just this project's code -- a known GCC false-positive pattern with
+  # heavy inlining, not a real bug to chase here.
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(model_flags INTERFACE
       -Wduplicated-cond

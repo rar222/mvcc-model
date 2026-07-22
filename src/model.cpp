@@ -665,12 +665,17 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
     // erased here but never restored means a later remove() of the old target
     // publishes a dangling Ref.
     const Id id = after->id;
-    std::unordered_map<const void*, Id> old_targets;
-    before->each_ref(
-        [&](const void* field, const char*, Id target, bool) { old_targets[field] = target; });
+    // Objects have a handful of Ref<>/Opt<> fields at most, so a linear-scan
+    // vector beats an unordered_map here: one heap allocation for the whole
+    // vector instead of one hash-table node allocation per field.
+    std::vector<std::pair<const void*, Id>> old_targets;
+    before->each_ref([&](const void* field, const char*, Id target, bool) {
+        old_targets.emplace_back(field, target);
+    });
 
     after->each_ref([&](const void* field, const char*, Id new_target, bool nullable) {
-        const auto it = old_targets.find(field);
+        const auto it = std::find_if(old_targets.begin(), old_targets.end(),
+                                     [&](const auto& p) { return p.first == field; });
         const Id old_target = (it != old_targets.end()) ? it->second : Id{};
         if (new_target == old_target) return;
 
@@ -743,13 +748,15 @@ void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* aft
     // old_keys: this object's OWN key per field, as it was before the
     // update -- one snapshot of each_field_key() taken up front, so the
     // `after` pass below can diff against it field by field without a
-    // second traversal of `before`.
-    std::unordered_map<const void*, std::string> old_keys;
+    // second traversal of `before`. A linear-scan vector, not an
+    // unordered_map -- see reconcile_out_refs()'s comment for why.
+    std::vector<std::pair<const void*, std::string>> old_keys;
     before->each_field_key(
-        [&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
+        [&](const void* field, std::string key) { old_keys.emplace_back(field, std::move(key)); });
 
     after->each_field_key([&](const void* field, std::string new_key) {
-        const auto it = old_keys.find(field);
+        const auto it = std::find_if(old_keys.begin(), old_keys.end(),
+                                     [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
         // Same undo pattern as add_field_keys/drop_field_keys: capture the
@@ -824,13 +831,15 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
     const Id id = after->id;
     // old_keys: this object's own cached-field value per field, as it was
     // BEFORE the update -- snapshotted up front so the `after` pass can diff
-    // against it one field at a time.
-    std::unordered_map<const void*, std::string> old_keys;
+    // against it one field at a time. A linear-scan vector, not an
+    // unordered_map -- see reconcile_out_refs()'s comment for why.
+    std::vector<std::pair<const void*, std::string>> old_keys;
     before->each_cached_field(
-        [&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
+        [&](const void* field, std::string key) { old_keys.emplace_back(field, std::move(key)); });
 
     after->each_cached_field([&](const void* field, std::string new_key) {
-        const auto it = old_keys.find(field);
+        const auto it = std::find_if(old_keys.begin(), old_keys.end(),
+                                     [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
         // prev: the OUTER map's state before any edit -- what the undo log
@@ -901,12 +910,16 @@ void Model::drop_cached_references(const ObjectBase* o) {
 
 void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBase* after) {
     const Id id = after->id;
-    std::unordered_map<const void*, Id> old_targets;
-    before->each_cached_reference(
-        [&](const void* field, const char*, Id target, bool) { old_targets[field] = target; });
+    // A linear-scan vector, not an unordered_map -- see
+    // reconcile_out_refs()'s comment for why.
+    std::vector<std::pair<const void*, Id>> old_targets;
+    before->each_cached_reference([&](const void* field, const char*, Id target, bool) {
+        old_targets.emplace_back(field, target);
+    });
 
     after->each_cached_reference([&](const void* field, const char*, Id new_target, bool) {
-        const auto it = old_targets.find(field);
+        const auto it = std::find_if(old_targets.begin(), old_targets.end(),
+                                     [&](const auto& p) { return p.first == field; });
         const Id old_target = (it != old_targets.end()) ? it->second : Id{};
         if (new_target == old_target) return;  // unchanged (incl. both still null)
 
@@ -1517,11 +1530,12 @@ std::vector<Change> Transaction::estimate_changes_with_cascades() const {
     while (!work.empty()) {
         const Id x = work.back();
         work.pop_back();
-        if (!base_.find_raw(x)) continue;  // already dead even at base() -- nothing to estimate
+        const ObjectBase* obj = base_.find_raw(x);
+        if (!obj) continue;  // already dead even at base() -- nothing to estimate
         if (!visited.insert(x.index).second)
             continue;  // cycles terminate here, same as remove_raw()
 
-        out.push_back({x, ChangeKind::Deleted, base_.find_raw(x)->tag()});
+        out.push_back({x, ChangeKind::Deleted, obj->tag()});
 
         base_.for_each_referrer_any(x, [&](Id from, const void*, bool nullable, TypeTag from_tag) {
             if (!base_.find_raw(from)) return;  // already accounted for, or already dead
@@ -1548,6 +1562,19 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // hold commit_mu_ already, so max_undo_list_size_ is safe to read here.
     keep_undo = keep_undo && max_undo_list_size_ != 0;
 
+    // Size hint for every container the apply loop below grows one entry (or
+    // more, for changes_/pending_undo_/undo_) at a time -- creates+updates is
+    // a lower bound (cascade deletes add more, unpredictably), but reserving
+    // even that much upfront avoids the geometric-growth reallocations a
+    // large transaction would otherwise pay on remap/pending/changes_/
+    // pending_undo_/undo_ every time. Only changes remap/pending/changes_/
+    // pending_undo_/undo_'s CAPACITY, never their contents.
+    const std::size_t apply_size_hint = txn.local_created_.size() + txn.local_updated_.size();
+    remap.reserve(remap.size() + apply_size_hint);
+    changes_.reserve(changes_.size() + apply_size_hint);
+    if (keep_undo) pending_undo_.reserve(pending_undo_.size() + apply_size_hint);
+    undo_.reserve(undo_.size() + apply_size_hint);
+
     // Whole-transaction key-uniqueness check, before ANYTHING mutates (not
     // even the pre-mint pass below) -- see validate_field_key_uniqueness()'s
     // own doc comment for why this can't be folded into the per-object
@@ -1570,6 +1597,7 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // either installs later this same attempt or the whole attempt rolls
     // back, so integrity holds either way.
     std::unordered_set<Id, IdHash> pending;
+    pending.reserve(txn.local_created_.size());
     for (auto& obj : txn.local_created_) {
         if (!obj) continue;
         const std::uint32_t slot = alloc_slot();
