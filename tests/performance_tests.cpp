@@ -1123,6 +1123,246 @@ PERF_TEST(read_lookup_time_is_insensitive_to_object_payload_size) {
 }
 
 // ---------------------------------------------------------------------------
+// String key length and key uniqueness -- a FOURTH axis: how big a string
+// key is, and whether it's shared by other objects, independent of object
+// COUNT (the axis every sweep above holds fixed) and PAYLOAD (the axis the
+// Blob tests above vary). Every find_by_* family hashes and/or compares the
+// PROBE string, so a longer key is real per-call work even for an O(log n)
+// indexed lookup -- and a key SHARED BY MANY OBJECTS (only possible for the
+// multi-match families; a define_keys() field's values must stay unique,
+// see Model::validate_field_key_uniqueness) adds an O(#matches) term on top
+// of whatever the index itself costs. This section isolates both effects.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Same "no ref fields" rationale as Blob: isolates key length/uniqueness
+// from clone/copy cost. Two fields, sharing one length knob (StringKeyCase),
+// let one seeding pass exercise both models at once:
+//   unique_key -- globally distinct per object; also declared in
+//                 define_keys(), so find_by_key is available on it (a
+//                 define_keys() field's values MUST be unique -- a
+//                 duplicate is a rejected commit, not test data, so this is
+//                 the only field here that can back that lookup).
+//   dup_key    -- shared by dup_fanout-many objects; deliberately NOT in
+//                 define_keys(), the same reason Order::qty above isn't --
+//                 this is the "clashing" case, exercised only through the
+//                 multi-match families (find_by_scan_field /
+//                 find_by_cached_field).
+class StrKeyed final : public model::Object<StrKeyed> {
+public:
+    std::string unique_key;
+    std::string dup_key;
+
+    template <class Self>
+    static void define_keys(Self& s, const model::FieldKeyReader& v) {
+        v.key<&StrKeyed::unique_key>(s.unique_key, "unique_key");
+    }
+
+    template <class Self>
+    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&StrKeyed::unique_key>(s.unique_key, "unique_key");
+        v.key<&StrKeyed::dup_key>(s.dup_key, "dup_key");
+    }
+
+    template <class Self>
+    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&StrKeyed::unique_key>(s.unique_key, "unique_key");
+        v.key<&StrKeyed::dup_key>(s.dup_key, "dup_key");
+    }
+};
+
+struct StringKeyCase {
+    const char* label;
+    std::size_t len;  // total byte length of every key at this case
+};
+
+const std::vector<StringKeyCase>& string_key_cases() {
+    static const std::vector<StringKeyCase> cases = {
+        {"small (8B)", 8},
+        {"medium (64B)", 64},
+        {"large (512B)", 512},
+    };
+    return cases;
+}
+
+// Pads `distinguishing` out to `len` bytes with a COMMON LEADING filler,
+// not a trailing one -- so every key at a given length shares a long
+// identical prefix and differs only in its last few bytes. That is the
+// worst realistic case for the leaf-level std::string equality check in
+// TrieCore::leaf_get: a mismatch between two SHARED-PREFIX keys isn't found
+// until near the very end of the compare, which is what actually makes
+// `len` show up as real per-call cost instead of being hidden behind an
+// early first-byte mismatch. FNV-1a hashing (StringHash) processes every
+// byte regardless of where a key's distinguishing part sits, so this
+// construction is specifically about the COMPARE cost, not the hash cost.
+std::string padded_key(const std::string& distinguishing, std::size_t len) {
+    if (distinguishing.size() >= len) return distinguishing.substr(distinguishing.size() - len);
+    return std::string(len - distinguishing.size(), 'x') + distinguishing;
+}
+
+// `dup_fanout` distinct dup_key values, round-robinned across `count`
+// objects, so a probe against dup_key matches roughly count/dup_fanout
+// objects -- the same "hold match count roughly constant" knob seed_orders()
+// already uses (via qty_mod) for Order::qty.
+void seed_str_keyed(Model& m, const StringKeyCase& c, int count, int dup_fanout,
+                    std::vector<Ref<StrKeyed>>& out) {
+    constexpr int kBatch = 2000;
+    out.clear();
+    out.reserve(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; i += kBatch) {
+        Transaction txn = m.begin();
+        std::vector<Ref<StrKeyed>> local;
+        for (int j = i; j < std::min(count, i + kBatch); ++j) {
+            auto o = std::make_unique<StrKeyed>();
+            o->unique_key = padded_key(std::to_string(j), c.len);
+            o->dup_key = padded_key(std::to_string(j % dup_fanout), c.len);
+            local.push_back(txn.create(std::move(o)));
+        }
+        CommitResult res = m.try_commit(txn);
+        for (auto& r : local) out.push_back(res.to_real(r));
+    }
+}
+
+}  // namespace
+
+// find_by_key and find_by_cached_field are both O(log n) index descents --
+// the population itself doesn't move across this sweep, only the KEY
+// LENGTH does (via padded_key's shared-prefix construction), so any growth
+// here is purely the hashing/comparison cost of a longer string, not a
+// bigger trie. Contrast cached_unique_us against cached_dup_us, measured in
+// the SAME loop: same key length, same index depth, but every dup_key probe
+// now returns ~count/dup_fanout matches instead of one -- isolating the
+// O(#matches) term from the O(string length) term the unique_key column
+// already isolates from population.
+PERF_TEST(indexed_lookup_time_vs_string_key_length_unique_vs_clashing) {
+    const int kCount = scaled(20000);
+    const int kDupFanout = 100;  // ~200 matches per dup_key probe at kCount
+    std::vector<double> key_us, cached_unique_us, cached_dup_us;
+    for (const StringKeyCase& c : string_key_cases()) {
+        Model m;
+        std::vector<Ref<StrKeyed>> items;
+        seed_str_keyed(m, c, kCount, kDupFanout, items);
+        Snapshot s = m.snapshot();
+
+        const std::string unique_probe = padded_key(std::to_string(kCount / 2), c.len);
+        const std::string dup_probe = padded_key(std::to_string((kCount / 2) % kDupFanout), c.len);
+
+        constexpr int kReps = 5000;
+        key_us.push_back(best_of(15, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < kReps; ++i)
+                           (void)s.find_by_key<&StrKeyed::unique_key>(unique_probe);
+                   }) *
+                   1000.0 / kReps;
+        }));
+        cached_unique_us.push_back(best_of(15, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < kReps; ++i)
+                           (void)s.find_by_cached_field<&StrKeyed::unique_key>(unique_probe);
+                   }) *
+                   1000.0 / kReps;
+        }));
+        cached_dup_us.push_back(best_of(15, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < kReps; ++i)
+                           (void)s.find_by_cached_field<&StrKeyed::dup_key>(dup_probe);
+                   }) *
+                   1000.0 / kReps;
+        }));
+
+        std::printf(
+            "  key=%-14s find_by_key(unique)=%8.4f us   find_by_cached_field(unique)=%8.4f us   "
+            "find_by_cached_field(clashing, ~%d matches)=%8.4f us\n",
+            c.label, key_us.back(), cached_unique_us.back(), kCount / kDupFanout, cached_dup_us.back());
+    }
+    // All three are O(log n) index descents at a FIXED population -- key
+    // length is real work (hashing + a near-full-length compare, see
+    // padded_key) but small relative to the fixed per-call overhead, so this
+    // stays a bounded-ratio check (see the Blob payload tests above) rather
+    // than a check_scaling band: growing an 8B key to a 512B one is not the
+    // same KIND of growth check_scaling's GrowthOrder enum models (that
+    // machinery is about POPULATION growth).
+    if (kAssertTimings) {
+        CHECK(key_us.back() < key_us.front() * 8.0 + 5.0);
+        CHECK(cached_unique_us.back() < cached_unique_us.front() * 8.0 + 5.0);
+        CHECK(cached_dup_us.back() < cached_dup_us.front() * 8.0 + 5.0);
+        // The O(#matches) term: at every key length, returning ~200 matches
+        // must cost more than returning the single match unique_key always
+        // does -- a robust ordinal fact (more work should not run faster),
+        // not a fragile absolute-timing one.
+        for (std::size_t i = 0; i < cached_dup_us.size(); ++i) {
+            CHECK(cached_dup_us[i] > cached_unique_us[i]);
+        }
+    }
+}
+
+// find_by_scan_field walks every live object regardless of how many of them
+// match, so -- unlike find_by_cached_field above -- it should cost the SAME
+// whether the probed value is unique_key (one match) or dup_key (~200
+// matches): the index-vs-scan distinction is exactly what makes clashing
+// values expensive for one family and irrelevant to the other. Key LENGTH,
+// though, is real per-object cost here too (every one of `count` objects
+// gets its own full string compare, not just the O(log n) handful an index
+// descent touches) -- so this is the scan-side counterpart of the test
+// above, over the same string_key_cases().
+PERF_TEST(scan_field_time_vs_string_key_length_is_insensitive_to_key_uniqueness) {
+    const int kCount = scaled(20000);
+    const int kDupFanout = 100;
+    std::vector<double> scan_unique_us, scan_dup_us;
+    const int scan_reps = std::max(5, 200000 / kCount);
+    for (const StringKeyCase& c : string_key_cases()) {
+        Model m;
+        std::vector<Ref<StrKeyed>> items;
+        seed_str_keyed(m, c, kCount, kDupFanout, items);
+        Snapshot s = m.snapshot();
+
+        const std::string unique_probe = padded_key(std::to_string(kCount / 2), c.len);
+        const std::string dup_probe = padded_key(std::to_string((kCount / 2) % kDupFanout), c.len);
+
+        scan_unique_us.push_back(best_of(5, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < scan_reps; ++i)
+                           (void)s.find_by_scan_field<&StrKeyed::unique_key>(unique_probe);
+                   }) *
+                   1000.0 / scan_reps;
+        }));
+        scan_dup_us.push_back(best_of(5, [&] {
+            return time_ms([&] {
+                       for (int i = 0; i < scan_reps; ++i)
+                           (void)s.find_by_scan_field<&StrKeyed::dup_key>(dup_probe);
+                   }) *
+                   1000.0 / scan_reps;
+        }));
+
+        std::printf(
+            "  key=%-14s find_by_scan_field(unique)=%9.2f us   find_by_scan_field(clashing)=%9.2f "
+            "us\n",
+            c.label, scan_unique_us.back(), scan_dup_us.back());
+    }
+    if (kAssertTimings) {
+        // Unique vs. clashing: both scan the SAME `count` objects, so the
+        // two columns must land close together -- a scan can't tell a rare
+        // value from a common one before it's checked every object. Under
+        // quiet conditions the measured ratio sits at 0.85x-1.15x, but on a
+        // loaded machine a single sample was observed as low as 0.33x (both
+        // sides are only a few ms, so a scheduler preemption mid-measurement
+        // swings the ratio far more than any real per-object cost does) --
+        // the 0.2-4.0 band is wide enough to absorb that without masking the
+        // failure mode this actually guards against (a scan silently
+        // becoming match-count-sensitive, e.g. from an accidental
+        // short-circuit or an index sneaking in that only helps one field).
+        for (std::size_t i = 0; i < scan_unique_us.size(); ++i) {
+            const double ratio = scan_dup_us[i] / scan_unique_us[i];
+            CHECK(ratio > 0.2 && ratio < 4.0);
+        }
+        // Key length: still a bounded, not asserted-flat, ratio -- see the
+        // indexed test above for why.
+        CHECK(scan_unique_us.back() < scan_unique_us.front() * 8.0 + 50.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Memory claim: the cached-reference index costs SOME extra memory, but
 // not a runaway amount -- same fork()+VmHWM technique as
 // examples/cached_reference_bench.cpp (see that file for the full,
