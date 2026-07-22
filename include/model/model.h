@@ -2335,6 +2335,39 @@ private:
     /// same entry to reconcile_field_keys(), see its `old_keys_hint`
     /// parameter) can read it without either one walking a given baseline's
     /// each_field_key() more than this one time.
+    ///
+    /// The return type, outside in:
+    ///   std::unordered_map<K, V> -- one entry per updated object; K/V below.
+    ///     K = std::uint32_t                the updated object's SLOT index
+    ///                                      (Id::index with the generation
+    ///                                      stripped) -- the exact key
+    ///                                      txn.local_updated_ itself uses,
+    ///                                      so a caller already iterating
+    ///                                      that map (apply_transaction_
+    ///                                      contents's update loop) can look
+    ///                                      an entry up with no translation.
+    ///     V = std::vector<std::pair<F, S>> that object's baseline
+    ///                                      define_keys() fields, ONE PAIR
+    ///                                      PER DECLARED FIELD -- a
+    ///                                      linear-scan vector, not a nested
+    ///                                      map, because a type has a
+    ///                                      handful of define_keys() fields
+    ///                                      at most (same tradeoff as
+    ///                                      reconcile_out_refs()'s own
+    ///                                      old_targets vector).
+    ///       F = const void*                the field's identity --
+    ///                                      field_tag<Field>(), exactly what
+    ///                                      each_field_key()/FieldKeyReader::
+    ///                                      key() hand out; an opaque
+    ///                                      address, compared, never
+    ///                                      dereferenced.
+    ///       S = std::string                that field's value, in
+    ///                                      to_field_key()'s canonical
+    ///                                      string form, AS OF THE BASELINE
+    ///                                      (before this transaction's own
+    ///                                      edit) -- what by_field_ indexed
+    ///                                      this object under prior to the
+    ///                                      update.
     std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>
     collect_update_baseline_field_keys(const Transaction& txn) const;
 
