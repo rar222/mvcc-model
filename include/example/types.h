@@ -7,7 +7,8 @@
 // don't declare is invisible to that family's lookup):
 //   define_references()     optional: list every reference field ONCE, tagged by its own address
 //   define_keys()           optional: zero or more fields (or computed methods) for fast
-//                           UNIQUE lookup (find_by_key; a duplicate value overwrites)
+//                           UNIQUE lookup (find_by_key; a create/update that would duplicate
+//                           another live object's value is rejected, CommitStatus::Invalid)
 //   define_scan_fields()    optional: zero or more fields for UNINDEXED multi-match lookup
 //                           (find_by_scan_field; O(#objects) scan per query, zero write-side
 //                           cost -- for fields queried rarely)
@@ -64,9 +65,12 @@ public:
         v.key<&Account::name>(s.name, "name");
     }
 
-    /// name is ALSO a scan field: find_by_key gives the unique-index winner,
-    /// find_by_scan_field gives every account sharing the name. The same
-    /// field can live in more than one lookup family.
+    /// name is ALSO a scan field, so the same field can live in more than
+    /// one lookup family -- but since it's ALSO a define_keys() field, no
+    /// two live Accounts can actually share a name (a duplicate is rejected
+    /// at commit time), so find_by_scan_field on it can only ever return
+    /// zero or one match in practice. See Order::qty for a scan field where
+    /// genuine multi-match duplicates are legal.
     template <class Self>
     static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
         v.key<&Account::name>(s.name, "name");

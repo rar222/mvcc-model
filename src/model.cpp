@@ -515,6 +515,88 @@ std::optional<Model::IntegrityError> Model::validate(
     return err;
 }
 
+std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
+    const Transaction& txn) const {
+    // Per define_keys() field: every (key -> claiming object) this
+    // transaction's creates/updates will install, plus the set of keys some
+    // update in this same transaction is moving OFF of. `claims` uses the
+    // object's own address purely as an identity token (to tell "the same
+    // object claimed this key twice, harmlessly" -- impossible, each_field_key
+    // reports one value per field -- from "two DIFFERENT objects want it").
+    struct FieldPlan {
+        std::unordered_map<std::string, const void*> claims;
+        std::unordered_set<std::string> vacated;
+    };
+    std::unordered_map<const void*, FieldPlan> plans;
+
+    for (const auto& obj : txn.local_created_) {
+        if (!obj) continue;  // cancelled locally (see remove_raw): nothing to claim
+        std::optional<IntegrityError> err;
+        obj->each_field_key([&](const void* field, std::string key) {
+            if (err) return;  // keep the FIRST violation, same convention as validate()
+            auto& plan = plans[field];
+            const void* self = obj.get();
+            auto [it, inserted] = plan.claims.try_emplace(key, self);
+            if (!inserted && it->second != self)
+                err = IntegrityError{"duplicate key '" + it->first +
+                                     "' claimed by more than one object within the same transaction",
+                                     Id{}};
+        });
+        if (err) return err;
+    }
+
+    for (const auto& [slot, clone] : txn.local_updated_) {
+        (void)slot;
+        // peek_raw(), not txn.update_baseline_: this runs from inside
+        // apply_transaction_contents, the same "latest, not base" moment
+        // apply_update() itself reads baseline from -- see validate()'s
+        // comment. try_commit()'s conflict check already guarantees the two
+        // agree for every id in local_updated_ (nothing else could have
+        // touched it since txn.base()).
+        const ObjectBase* baseline = peek_raw(clone->id);
+        std::unordered_map<const void*, std::string> old_keys;
+        baseline->each_field_key(
+            [&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
+
+        std::optional<IntegrityError> err;
+        clone->each_field_key([&](const void* field, std::string new_key) {
+            if (err) return;
+            const auto oldit = old_keys.find(field);
+            if (oldit != old_keys.end() && oldit->second == new_key) return;  // unchanged
+
+            auto& plan = plans[field];
+            if (oldit != old_keys.end()) plan.vacated.insert(oldit->second);
+            const void* self = clone.get();
+            auto [it, inserted] = plan.claims.try_emplace(new_key, self);
+            if (!inserted && it->second != self)
+                err = IntegrityError{"duplicate key '" + it->first +
+                                     "' claimed by more than one object within the same transaction",
+                                     Id{}};
+        });
+        if (err) return err;
+    }
+
+    // Finally, check every claim against the CURRENTLY COMMITTED holder (if
+    // any) -- unless that holder is itself vacating this same key in this
+    // same transaction, in which case it's not a blocker regardless of which
+    // of the two ends up applying first (see reconcile_field_keys()'s own
+    // conditional erase for the mutation-order half of this).
+    for (const auto& [field, plan] : plans) {
+        const auto fit = by_field_.find(field);
+        if (fit == by_field_.end()) continue;  // this field has no committed entries at all
+        for (const auto& [key, owner] : plan.claims) {
+            (void)owner;
+            if (plan.vacated.count(key)) continue;
+            if (const Id* holder = fit->second.get(key))
+                return IntegrityError{"key '" + key + "' is already in use by object " +
+                                          std::to_string(holder->index) + ":" +
+                                          std::to_string(holder->gen),
+                                      Id{}};
+        }
+    }
+    return std::nullopt;
+}
+
 // referrers_ maintenance: the writer-private reverse index that drives
 // cascade delete (invariant 8). Keyed by TARGET slot index (bare, not a full
 // Id -- only the live generation of a slot can ever be the target of a
@@ -676,7 +758,19 @@ void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* aft
         // by_field_ permanently indexing values that never committed.
         auto& sub = by_field_[field];
         auto prev = sub;
-        if (it != old_keys.end()) sub = sub.erase(it->second);
+        // Only erase the OLD key if we still hold it. local_updated_ is an
+        // unordered_map -- apply order across objects in one transaction is
+        // arbitrary -- so a same-transaction swap (this object vacates K
+        // while some OTHER object in the same transaction claims K) may
+        // already have overwritten this entry with that other object's id
+        // by the time this runs. validate_field_key_uniqueness() has already
+        // proven the transaction's FINAL state is collision-free; erasing
+        // unconditionally here would still wipe out that other object's
+        // legitimate, already-applied claim.
+        if (it != old_keys.end()) {
+            const Id* cur = sub.get(it->second);
+            if (cur && *cur == id) sub = sub.erase(it->second);
+        }
         sub = sub.set(new_key, id);
         log([this, field, prev = std::move(prev)]() mutable {
             by_field_[field] = std::move(prev);
@@ -1443,6 +1537,12 @@ std::vector<Change> Transaction::estimate_changes_with_cascades() const {
 
 std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo) {
+    // Whole-transaction key-uniqueness check, before ANYTHING mutates (not
+    // even the pre-mint pass below) -- see validate_field_key_uniqueness()'s
+    // own doc comment for why this can't be folded into the per-object
+    // create/update loop the way validate() (Ref<> integrity) is.
+    if (auto err = validate_field_key_uniqueness(txn)) return err;
+
     // Pre-mint pass: every live create gets its real id BEFORE anything is
     // applied, so the remap table is complete when the first remap_refs()
     // runs -- which is what lets creates in one transaction reference each
@@ -2006,10 +2106,15 @@ void Model::add_out_refs_no_log(const ObjectBase* o) {
 // prior state. Reads the outer map through a reference (`auto&`, not
 // add_field_keys()'s `auto prev = ...` copy) since there is no "prev" to
 // hold onto -- one fewer PersistentMap handle copy per field per object.
-// Collisions are still the caller's problem, not detected here, same as
-// add_field_keys(): define_keys()'s contract is that each object's key
-// value is unique, and a bulk load that violates it silently overwrites the
-// earlier entry exactly as an ordinary Transaction would.
+// Collisions are still the caller's problem, not detected here -- UNLIKE the
+// ordinary Transaction path (see validate_field_key_uniqueness()), which
+// now rejects a duplicate key as CommitStatus::Invalid instead of
+// overwriting it. commit_bulk_without_undo() has no undo log to unwind a
+// rejected batch against, so extending the same check here would mean a
+// second full validation pass over the whole batch upfront, same idea as
+// Pass 1's ref-integrity check just above -- not done today, so a bulk load
+// that violates define_keys()'s uniqueness contract still silently
+// overwrites the earlier entry.
 void Model::add_field_keys_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {

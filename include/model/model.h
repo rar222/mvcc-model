@@ -777,16 +777,21 @@ public:
 ///     using Snapshot, which does have resolve access, just at read time
 ///     rather than baked into the write-time index.
 ///
-/// Each define_keys() field is assumed unique within its type; a duplicate
-/// value silently overwrites the earlier entry. For "give me every match,
-/// not just one," there are two MULTI-match families, declared with the same
-/// visitor shape and named the same way -- each define_X drives find_by_X
-/// and view_by_X, and in every family a field you did NOT declare is
-/// invisible to its lookup (empty result, same as find_by_key on a field
-/// define_keys() never mentioned):
+/// Each define_keys() field is assumed unique within its type; a create or
+/// update that would duplicate another live object's value is rejected as
+/// CommitStatus::Invalid instead of silently overwriting it (see
+/// Model::validate_field_key_uniqueness) -- EXCEPT commit_bulk_without_undo(),
+/// which has no undo log to unwind a rejected batch against and keeps the
+/// old silent-overwrite behavior; see its own doc comment. For "give me
+/// every match, not just one," there are two MULTI-match families, declared
+/// with the same visitor shape and named the same way -- each define_X
+/// drives find_by_X and view_by_X, and in every family a field you did NOT
+/// declare is invisible to its lookup (empty result, same as find_by_key on
+/// a field define_keys() never mentioned):
 ///
 ///   define_keys()          -> find_by_key         / view_by_key
-///       unique, indexed: O(log n); later write wins on duplicates.
+///       unique, indexed: O(log n); a duplicate value is rejected, not
+///       overwritten.
 ///   define_scan_fields()   -> find_by_scan_field  / view_by_scan_field
 ///       every match, UNINDEXED: O(#T objects) per query, but zero
 ///       write-side cost -- nothing is maintained per commit. For fields
@@ -1724,6 +1729,16 @@ public:
     /// section comment above for the precondition this REQUIRES -- calling
     /// this while any other thread holds a Snapshot of this Model is
     /// undefined behavior, not a checked error.
+    ///
+    /// UNLIKE an ordinary Transaction (see define_keys()'s own doc comment
+    /// and Model::validate_field_key_uniqueness), a define_keys() value
+    /// duplicated within this batch is NOT rejected here -- only Ref<>/Opt<>
+    /// integrity is validated upfront. Extending that check to this path
+    /// would mean a second whole-batch validation pass, the same idea as
+    /// the ref-integrity one above; not done today, so a batch that
+    /// violates define_keys()'s uniqueness contract still silently
+    /// overwrites the earlier entry (see add_field_keys_no_log()'s own
+    /// comment in the .cpp).
     CommitResult commit_bulk_without_undo(BulkTransaction& txn);
 
     /// Install (or clear, with {}) the pre-commit hook. See PreCommitFn.
@@ -2288,6 +2303,29 @@ private:
     std::optional<IntegrityError> validate(const ObjectBase* o,
                                            const std::unordered_set<Id, IdHash>* pending
                                            = nullptr) const;
+
+    /// Read-only, whole-transaction pass over every define_keys() field this
+    /// transaction's creates/updates touch, run once at the very start of
+    /// apply_transaction_contents -- BEFORE anything mutates -- so a failure
+    /// here needs no rollback. Two things a per-object, apply-order check
+    /// cannot get right on its own (txn.local_updated_ is an unordered_map;
+    /// apply order is not call order):
+    ///   - A key claimed by two different objects in the SAME transaction
+    ///     (two creates, or a create and an update) is always rejected.
+    ///   - A key an update is VACATING this same transaction never blocks
+    ///     another object's claim on it, no matter which one applies first
+    ///     -- this is what makes "A moves off key K, B moves onto K, same
+    ///     transaction" a legal swap. reconcile_field_keys()'s own
+    ///     conditional erase (only erase the old key if this object still
+    ///     holds it) is what keeps the actual mutation order-safe once this
+    ///     check has already proven the final state collision-free.
+    /// A collision against another object's CURRENTLY COMMITTED key is
+    /// always CommitStatus::Invalid, never Conflict: unlike Ref<> integrity,
+    /// key uniqueness isn't part of this design's object-write-set OCC (see
+    /// CLAUDE.md) -- there is no "existed at base" test that distinguishes a
+    /// real race from a caller who should have checked find_by_key() first,
+    /// so this doesn't attempt one.
+    std::optional<IntegrityError> validate_field_key_uniqueness(const Transaction& txn) const;
 
     // Reverse-index (referrers_) maintenance: add/drop an object's whole
     // outgoing edge set (create/delete), or diff before->after (update).

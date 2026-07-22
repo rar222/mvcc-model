@@ -357,8 +357,17 @@ void seed_accounts(Model& m, int n, std::vector<Ref<Account>>& out) {
 // scale qty_mod with n_orders to keep matches roughly constant across a
 // size sweep -- the same reason examples/cached_reference_bench.cpp scales
 // its bucket count with population (bucket_count_for).
+// `code_prefix` keeps Order::computed_key() (a define_keys() field, so a
+// duplicate is now a rejected commit -- see Model::validate_field_key_
+// uniqueness) unique across MULTIPLE seed_orders() calls into the same
+// Model: every caller that seeds more than one batch (seed_hub_with_fanout's
+// background + hub batches; the per-hub loop in the cascade-size test below)
+// must pass a distinct prefix per batch, or the second batch's codes collide
+// with the first's and those creates are silently rejected, undercounting
+// the model.
 void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orders,
-                 std::vector<Ref<Order>>& out, int qty_mod = 50) {
+                 std::vector<Ref<Order>>& out, int qty_mod = 50,
+                 const std::string& code_prefix = "") {
     constexpr int kBatch = 2000;
     out.clear();
     out.reserve(static_cast<std::size_t>(n_orders));
@@ -367,7 +376,7 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
         std::vector<Ref<Order>> local;
         for (int j = i; j < std::min(n_orders, i + kBatch); ++j) {
             auto o = std::make_unique<Order>();
-            o->code = "O" + std::to_string(j);
+            o->code = code_prefix + "O" + std::to_string(j);
             o->account = accounts[static_cast<std::size_t>(j) % accounts.size()];
             o->qty = j % qty_mod;
             local.push_back(txn.create(std::move(o)));
@@ -856,11 +865,11 @@ void seed_hub_with_fanout(Model& m, int fanout, int background, Ref<Account>& hu
     std::vector<Ref<Account>> bg_accounts;
     seed_accounts(m, background, bg_accounts);
     std::vector<Ref<Order>> bg_orders;
-    seed_orders(m, bg_accounts, background, bg_orders);
+    seed_orders(m, bg_accounts, background, bg_orders, 50, "BG_");
 
     hub = make_one_account(m, "HUB");
     const std::vector<Ref<Account>> hub_only{hub};
-    seed_orders(m, hub_only, fanout, hub_orders);
+    seed_orders(m, hub_only, fanout, hub_orders, 50, "HUB_");
 }
 
 }  // namespace
@@ -957,7 +966,8 @@ PERF_TEST(worst_case_removing_a_hub_scales_with_the_size_of_its_cascade) {
         for (int t = 0; t < kTrials; ++t) {
             const Ref<Account> hub = make_one_account(m, "HUB" + std::to_string(t));
             std::vector<Ref<Order>> orders;
-            seed_orders(m, std::vector<Ref<Account>>{hub}, fanout, orders);
+            seed_orders(m, std::vector<Ref<Account>>{hub}, fanout, orders, 50,
+                       "H" + std::to_string(t) + "_");
             hubs.push_back(hub);
         }
         const std::size_t before = m.snapshot().size();

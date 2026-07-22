@@ -60,10 +60,9 @@ TEST(view_of_a_stale_handle_is_empty) {
 // define_keys field, and is empty for a field never declared scan.
 TEST(find_by_scan_field_returns_every_match_and_only_for_declared_fields) {
     Model m;
-    const Ref<Account> a =
-        make_account(m, "DUP", 1);  // Account::name: define_keys AND define_scan_fields
-    const Ref<Account> b =
-        make_account(m, "DUP", 2);  // duplicate name: the unique index keeps only this one
+    const Ref<Account> a = make_account(m, "A1", 1);  // Account::name: define_keys AND
+                                                      // define_scan_fields (see Account's
+                                                      // own doc comment)
     make_account(m, "OTHER", 3);
     make_order(m, "O1", a, {}, 5);
     make_order(m, "O2", a, {}, 5);
@@ -71,18 +70,19 @@ TEST(find_by_scan_field_returns_every_match_and_only_for_declared_fields) {
 
     Snapshot s = m.snapshot();
 
-    // The unique-key index sees one winner for a duplicate value...
-    CHECK(s.find_by_key<&Account::name>("DUP") == s.find(b));
-    // ...the scan family sees every object, on the same field.
-    auto dups = s.view_by_scan_field<&Account::name>("DUP");
-    CHECK_EQ(dups.size(), std::size_t{2});
-    std::int64_t balances = 0;
-    for (const auto& v : dups) balances += v->balance;
-    CHECK_EQ(balances, std::int64_t{3});  // 1 + 2: both objects, not the winner twice
+    // A field can live in more than one lookup family at once: with no
+    // duplicate value in play (define_keys() now rejects one -- see
+    // field_index_duplicate_value_is_rejected in test_lookup.cpp), the
+    // unique-key and scan families simply agree on the same single object.
+    CHECK(s.find_by_key<&Account::name>("A1") == s.find(a));
+    auto by_name = s.view_by_scan_field<&Account::name>("A1");
+    CHECK_EQ(by_name.size(), std::size_t{1});
+    CHECK_EQ(by_name[0]->id, a.raw());
     CHECK(s.find_by_scan_field<&Account::name>("NOBODY").empty());
 
-    // The find form, on a field define_keys() never mentioned, and the Views
-    // traverse like any other.
+    // The scan family's real multi-match story: Order::qty is a PURE scan
+    // field (never define_keys()'d, so genuine duplicates are legal), and
+    // two orders legitimately share a value.
     CHECK_EQ(s.find_by_scan_field<&Order::qty>(5).size(), std::size_t{2});
     auto q5 = s.view_by_scan_field<&Order::qty>(5);
     CHECK_EQ(q5.size(), std::size_t{2});

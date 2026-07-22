@@ -187,16 +187,87 @@ TEST(field_index_is_cleaned_up_on_removal) {
     CHECK(s.find_by_key<&Gadget::serial>(111) == nullptr);
 }
 
-// Two objects sharing the same indexed value: find_by_key resolves to
-// whichever was written last, matching the documented contract.
-TEST(field_index_duplicate_value_is_last_write_wins) {
+// Two objects sharing the same indexed value: the second create is rejected
+// as CommitStatus::Invalid rather than silently overwriting the first one's
+// index entry.
+TEST(field_index_duplicate_value_is_rejected) {
     Model m;
     const Ref<Gadget> g1 = make_gadget(m, "Same", 1);
-    const Ref<Gadget> g2 = make_gadget(m, "Same", 2);
+
+    Transaction txn = m.begin();
+    auto g2 = std::make_unique<Gadget>();
+    g2->label = "Same";
+    g2->serial = 2;
+    txn.create(std::move(g2));
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Invalid);
+    CHECK(res.error.has_value());
+    CHECK(!res.error->bad_target);  // key collisions have no single target to classify against base
 
     Snapshot s = m.snapshot();
-    CHECK_EQ(s.find_by_key<&Gadget::label>("Same")->id, g2.raw());  // later write wins
-    (void)g1;
+    CHECK_EQ(s.find_by_key<&Gadget::label>("Same")->id, g1.raw());  // first write still stands
+    CHECK(s.find_by_key<&Gadget::serial>(2) == nullptr);            // rejected create never installed
+}
+
+// The SAME key, reused after the original holder is deleted, is fine: a
+// duplicate is only ever a live collision, never "this value was ever used
+// before."
+TEST(a_deleted_keys_value_can_be_reclaimed_by_a_different_record) {
+    Model m;
+    const Ref<Gadget> g1 = make_gadget(m, "Same", 1);
+    remove_and_commit(m, g1);
+    const Ref<Gadget> g2 = make_gadget(m, "Same", 2);  // different record, same label
+
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.find_by_key<&Gadget::label>("Same")->id, g2.raw());
+    CHECK(s.find(g1) == nullptr);
+}
+
+// Two creates claiming the same key WITHIN one transaction are rejected too
+// -- there's no "current holder" to check against, since both claims are
+// equally new, but it's still two different objects wanting one value.
+TEST(field_index_duplicate_value_within_one_transaction_is_rejected) {
+    Model m;
+    Transaction txn = m.begin();
+    auto g1 = std::make_unique<Gadget>();
+    g1->label = "Same";
+    g1->serial = 1;
+    txn.create(std::move(g1));
+    auto g2 = std::make_unique<Gadget>();
+    g2->label = "Same";
+    g2->serial = 2;
+    txn.create(std::move(g2));
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Invalid);
+    CHECK(res.error.has_value());
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_by_key<&Gadget::label>("Same") == nullptr);  // neither create ever installed
+}
+
+// A same-transaction "swap": g_a moves OFF its original key onto a new one,
+// while g_b moves ONTO that now-vacated key, in the same Transaction. This
+// must succeed regardless of which of the two updates the model happens to
+// apply first internally (Transaction::local_updated_ has no defined
+// iteration order) -- see Model::validate_field_key_uniqueness and
+// Model::reconcile_field_keys's conditional erase.
+TEST(a_key_vacated_and_reclaimed_in_the_same_transaction_is_not_a_collision) {
+    Model m;
+    const Ref<Gadget> g_a = make_gadget(m, "KeyA", 1);
+    const Ref<Gadget> g_b = make_gadget(m, "KeyB", 2);
+
+    Transaction txn = m.begin();
+    txn.update(g_a)->label = "KeyA-moved";
+    txn.update(g_b)->label = "KeyA";  // takes over g_a's original label
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_by_key<&Gadget::label>("KeyA") != nullptr);
+    CHECK_EQ(s.find_by_key<&Gadget::label>("KeyA")->id, g_b.raw());
+    CHECK_EQ(s.find_by_key<&Gadget::label>("KeyA-moved")->id, g_a.raw());
+    CHECK(s.find_by_key<&Gadget::label>("KeyB") == nullptr);  // g_b vacated it
 }
 
 // A two-hop cascade: deleting an Account kills an Order (Ref<>), which
