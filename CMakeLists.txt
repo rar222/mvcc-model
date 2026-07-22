@@ -94,6 +94,15 @@ add_executable(cached_reference_bench examples/cached_reference_bench.cpp)
 target_link_libraries(cached_reference_bench PRIVATE model)
 target_precompile_headers(cached_reference_bench REUSE_FROM model)
 
+# 1,000,000 creates as one single-threaded Transaction vs. as 4 threads each
+# building+committing their own 250,000-create Transaction -- the single
+# transaction wins, because apply is serialized behind commit_mu_ (invariant
+# 7) and build (the genuinely parallel part) is cheap next to apply. See the
+# file's own header comment for the measured numbers and the full reasoning.
+add_executable(single_vs_multi_txn_bench examples/single_vs_multi_txn_bench.cpp)
+target_link_libraries(single_vs_multi_txn_bench PRIVATE model)
+target_precompile_headers(single_vs_multi_txn_bench REUSE_FROM model)
+
 # --- tests ------------------------------------------------------------------
 
 enable_testing()
