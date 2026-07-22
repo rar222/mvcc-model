@@ -516,10 +516,33 @@ std::optional<Model::IntegrityError> Model::validate(
     return err;
 }
 
+std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>
+Model::collect_update_baseline_field_keys(const Transaction& txn) const {
+    std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>> out;
+    out.reserve(txn.local_updated_.size());
+    for (const auto& [slot, clone] : txn.local_updated_) {
+        // peek_raw(), not txn.update_baseline_: this runs from inside
+        // apply_transaction_contents, the same "latest, not base" moment
+        // apply_update() itself reads baseline from -- see validate()'s
+        // comment. try_commit()'s conflict check already guarantees the two
+        // agree for every id in local_updated_ (nothing else could have
+        // touched it since txn.base()).
+        const ObjectBase* baseline = peek_raw(clone->id);
+        // A linear-scan vector, not an unordered_map -- see
+        // reconcile_out_refs()'s comment for why (a handful of fields at
+        // most).
+        std::vector<std::pair<const void*, std::string>> old_keys;
+        baseline->each_field_key(
+            [&](const void* field, std::string key) { old_keys.emplace_back(field, std::move(key)); });
+        out.emplace(slot, std::move(old_keys));
+    }
+    return out;
+}
+
 std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
     const Transaction& txn,
-    std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>&
-        old_keys_out) const {
+    const std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>&
+        old_keys) const {
     // Per define_keys() field: every (key -> claiming object) this
     // transaction's creates/updates will install, plus the set of keys some
     // update in this same transaction is moving OFF of. `claims` uses the
@@ -549,32 +572,25 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
     }
 
     for (const auto& [slot, clone] : txn.local_updated_) {
-        // peek_raw(), not txn.update_baseline_: this runs from inside
-        // apply_transaction_contents, the same "latest, not base" moment
-        // apply_update() itself reads baseline from -- see validate()'s
-        // comment. try_commit()'s conflict check already guarantees the two
-        // agree for every id in local_updated_ (nothing else could have
-        // touched it since txn.base()).
-        const ObjectBase* baseline = peek_raw(clone->id);
-        // A linear-scan vector, not an unordered_map -- see
-        // reconcile_out_refs()'s comment for why (a handful of fields at
-        // most). Moved into old_keys_out below so apply_update()'s later
-        // call to reconcile_field_keys() can reuse it instead of walking
-        // baseline->each_field_key() a second time -- see old_keys_out's own
+        // old_keys[slot] was already collected by
+        // collect_update_baseline_field_keys() -- one entry per id in
+        // local_updated_, unconditionally -- so this reads it rather than
+        // walking baseline->each_field_key() itself; see this function's own
         // doc comment in model.h.
-        std::vector<std::pair<const void*, std::string>> old_keys;
-        baseline->each_field_key(
-            [&](const void* field, std::string key) { old_keys.emplace_back(field, std::move(key)); });
+        const auto old_keys_it = old_keys.find(slot);
+        assert(old_keys_it != old_keys.end() &&
+              "collect_update_baseline_field_keys() covers every id in local_updated_");
+        const std::vector<std::pair<const void*, std::string>>& obj_old_keys = old_keys_it->second;
 
         std::optional<IntegrityError> err;
         clone->each_field_key([&](const void* field, std::string new_key) {
             if (err) return;
-            const auto oldit = std::find_if(old_keys.begin(), old_keys.end(),
+            const auto oldit = std::find_if(obj_old_keys.begin(), obj_old_keys.end(),
                                             [&](const auto& p) { return p.first == field; });
-            if (oldit != old_keys.end() && oldit->second == new_key) return;  // unchanged
+            if (oldit != obj_old_keys.end() && oldit->second == new_key) return;  // unchanged
 
             auto& plan = plans[field];
-            if (oldit != old_keys.end()) plan.vacated.insert(oldit->second);
+            if (oldit != obj_old_keys.end()) plan.vacated.insert(oldit->second);
             const void* self = clone.get();
             auto [it, inserted] = plan.claims.try_emplace(new_key, self);
             if (!inserted && it->second != self)
@@ -582,7 +598,6 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
                                      "' claimed by more than one object within the same transaction",
                                      Id{}};
         });
-        old_keys_out.emplace(slot, std::move(old_keys));
         if (err) return err;
     }
 
@@ -1349,20 +1364,20 @@ ObjectBase* Model::clone_for_cascade_null(Id id, bool keep_undo) {
     return copy;
 }
 
-std::vector<Id> Model::remove_raw(const std::vector<Id>& seeds, bool keep_undo) {
+std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
     // Breadth-first cascade delete, resolved here (at apply time, under
-    // commit_mu_) and never eagerly (invariant 8). `work` is the BFS
-    // frontier -- ids still waiting to be visited, seeded with EVERY
-    // Transaction::remove() intent this attempt resolves (see this
-    // function's own doc comment in model.h for why one shared BFS replaces
-    // one call per intent); `visited` is the set of slot indices already
-    // processed, which both terminates cycles (a self- or
+    // commit_mu_) and never eagerly (invariant 8). `work` -- taken by value,
+    // so the caller's vector becomes this BFS's own frontier with no extra
+    // copy when passed as an rvalue (see model.h's doc comment) -- is seeded
+    // with EVERY Transaction::remove() intent this attempt resolves (see
+    // this function's own doc comment in model.h for why one shared BFS
+    // replaces one call per intent); `visited` is the set of slot indices
+    // already processed, which both terminates cycles (a self- or
     // mutually-referential graph would otherwise loop forever) and prevents
     // processing the same victim twice -- including a victim reachable from
     // more than one seed's cascade. `killed` accumulates every id actually
     // deleted, in visitation order, for the caller (try_commit()) to report.
     std::vector<Id> killed;
-    std::vector<Id> work(seeds);
     std::unordered_set<std::uint32_t> visited;
 
     while (!work.empty()) {
@@ -1604,16 +1619,18 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     if (keep_undo) pending_undo_.reserve(pending_undo_.size() + apply_size_hint);
     undo_.reserve(undo_.size() + apply_size_hint);
 
+    // old_field_keys: per-update baseline define_keys() fields -- collected
+    // once, up front, and handed to BOTH validate_field_key_uniqueness()
+    // (below) and apply_update() (later in this same function) so neither
+    // has to walk a given baseline's each_field_key() itself; see
+    // collect_update_baseline_field_keys()'s own doc comment.
+    const std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>
+        old_field_keys = collect_update_baseline_field_keys(txn);
+
     // Whole-transaction key-uniqueness check, before ANYTHING mutates (not
     // even the pre-mint pass below) -- see validate_field_key_uniqueness()'s
     // own doc comment for why this can't be folded into the per-object
     // create/update loop the way validate() (Ref<> integrity) is.
-    // old_field_keys: per-update baseline define_keys() fields, computed by
-    // this same pass -- handed to apply_update() below so it doesn't have to
-    // re-walk each baseline's each_field_key() a second time; see
-    // validate_field_key_uniqueness()'s own old_keys_out doc comment.
-    std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>
-        old_field_keys;
     if (auto err = validate_field_key_uniqueness(txn, old_field_keys)) return err;
 
     // Pre-mint pass: every live create gets its real id BEFORE anything is
@@ -1660,7 +1677,7 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
             // No `pending` needed here: every create installed before the
             // first update applies, so peek() resolves them directly.
             // old_field_keys[slot] was populated for every id in
-            // local_updated_ by validate_field_key_uniqueness() above --
+            // local_updated_ by collect_update_baseline_field_keys() above --
             // see apply_update()'s own old_field_keys_hint doc comment.
             if (!clone) continue;
             const auto hint_it = old_field_keys.find(slot);
@@ -1683,7 +1700,11 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
             if (it != remap.end()) remove_seeds.push_back(it->second);
         }
         for (Id rid : txn.remove_intents_) remove_seeds.push_back(rid);
-        if (!remove_seeds.empty()) remove_raw(remove_seeds, keep_undo);
+        // std::move: remove_raw takes its `work` list by value and uses it
+        // AS the BFS frontier directly -- see its own doc comment. Without
+        // the move this would copy the vector a second time (having already
+        // built it once above) for no reason, right before its only use.
+        if (!remove_seeds.empty()) remove_raw(std::move(remove_seeds), keep_undo);
     }
     // Collapse pending_undo_ to at most one action per id -- see
     // collapse_undo_actions()'s own doc comment. Guarded by keep_undo, same

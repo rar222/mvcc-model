@@ -136,6 +136,14 @@ add_executable(large_txn_bench examples/large_txn_bench.cpp)
 target_link_libraries(large_txn_bench PRIVATE model)
 target_precompile_headers(large_txn_bench REUSE_FROM model)
 
+# Per-commit latency of many SMALL (one-object) transactions -- the
+# target-scale workload per CLAUDE.md -- to check whether apply_transaction_
+# contents()'s large-transaction optimizations (large_txn_bench.cpp) cost
+# anything when there's nothing to dedupe (N=1 object per commit).
+add_executable(small_txn_bench examples/small_txn_bench.cpp)
+target_link_libraries(small_txn_bench PRIVATE model)
+target_precompile_headers(small_txn_bench REUSE_FROM model)
+
 # --- tests ------------------------------------------------------------------
 
 enable_testing()

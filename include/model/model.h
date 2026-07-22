@@ -2325,6 +2325,19 @@ private:
                                            const std::unordered_set<Id, IdHash>* pending
                                            = nullptr) const;
 
+    /// One entry per id in txn.local_updated_ (every entry is a real,
+    /// non-null clone, so this is unconditional): that object's baseline
+    /// define_keys() fields, via baseline->each_field_key(), keyed by slot
+    /// index. Pure data collection, no validation -- run once, up front, by
+    /// apply_transaction_contents, so BOTH validate_field_key_uniqueness()
+    /// (which needs the pre-update value to tell "unchanged"/"vacated" from
+    /// a genuine new claim) and, later, apply_update() (which forwards the
+    /// same entry to reconcile_field_keys(), see its `old_keys_hint`
+    /// parameter) can read it without either one walking a given baseline's
+    /// each_field_key() more than this one time.
+    std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>
+    collect_update_baseline_field_keys(const Transaction& txn) const;
+
     /// Read-only, whole-transaction pass over every define_keys() field this
     /// transaction's creates/updates touch, run once at the very start of
     /// apply_transaction_contents -- BEFORE anything mutates -- so a failure
@@ -2347,21 +2360,16 @@ private:
     /// real race from a caller who should have checked find_by_key() first,
     /// so this doesn't attempt one.
     ///
-    /// `old_keys_out`, keyed by slot index, is populated with exactly the
-    /// per-update `old_keys` list this pass already builds internally (each
-    /// updated object's baseline define_keys() fields, via
-    /// baseline->each_field_key()) -- one entry per id in
-    /// txn.local_updated_, unconditionally (every local_updated_ entry is a
-    /// real, non-null clone). apply_transaction_contents's later apply loop
-    /// hands the matching entry to apply_update (which forwards it to
-    /// reconcile_field_keys) so that object's baseline isn't walked via
-    /// each_field_key() a second time -- see reconcile_field_keys's own
-    /// `old_keys_hint` parameter for why a second traversal would otherwise
-    /// be needed.
+    /// `old_keys` is collect_update_baseline_field_keys()'s own output,
+    /// passed in rather than recomputed -- keyed by slot, one entry per id
+    /// in txn.local_updated_. This function only READS it (to tell
+    /// "unchanged"/"vacated" from a new claim); it does not itself walk any
+    /// baseline's each_field_key() -- that traversal belongs entirely to the
+    /// collection step, so this function is pure validation, nothing more.
     std::optional<IntegrityError> validate_field_key_uniqueness(
         const Transaction& txn,
-        std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>&
-            old_keys_out) const;
+        const std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>&
+            old_keys) const;
 
     // Reverse-index (referrers_) maintenance: add/drop an object's whole
     // outgoing edge set (create/delete), or diff before->after (update).
@@ -2490,24 +2498,28 @@ private:
                                                bool keep_undo = true);
     /// `old_field_keys_hint`, when non-null, is the target's baseline
     /// define_keys() field/value list, ALREADY computed by
-    /// validate_field_key_uniqueness() (see its own `old_keys_out` doc
-    /// comment) -- forwarded straight through to reconcile_field_keys() so
-    /// this update doesn't walk baseline->each_field_key() a second time.
-    /// nullptr for any caller (there are none today besides
-    /// apply_transaction_contents's own update loop) that hasn't already
-    /// computed it.
+    /// collect_update_baseline_field_keys() (see its own doc comment) --
+    /// forwarded straight through to reconcile_field_keys() so this update
+    /// doesn't walk baseline->each_field_key() a second time. nullptr for
+    /// any caller (there are none today besides apply_transaction_contents's
+    /// own update loop) that hasn't already computed it.
     std::optional<IntegrityError> apply_update(
         std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap,
         const std::vector<std::pair<const void*, std::string>>* old_field_keys_hint = nullptr,
         bool keep_undo = true);
-    /// Cascade BFS, called from try_commit()'s apply phase. `seeds` is
-    /// EVERY remove() intent this transaction resolves (deferred local
-    /// removes AND real remove_intents_), fed to the SAME BFS in one call
-    /// -- one shared `work` list and `visited` set -- instead of one
-    /// remove_raw() call per intent. Correctness is unaffected: each id is
-    /// still visited (and its cascade resolved) exactly once regardless of
-    /// which seed's fan-out reaches it first, exactly as if a later intent's
-    /// BFS had found it already-gone via peek_raw() -- the only thing this
+    /// Cascade BFS, called from try_commit()'s apply phase. `work` is EVERY
+    /// remove() intent this transaction resolves (deferred local removes AND
+    /// real remove_intents_), taken BY VALUE and used directly as the BFS's
+    /// own frontier (the caller's vector becomes this one -- see the .cpp:
+    /// there is no separate internal copy) -- fed to the SAME BFS in one
+    /// call, one shared `visited` set, instead of one remove_raw() call per
+    /// intent. Pass an rvalue (the call site does) and the caller's buffer is
+    /// moved into `work` with zero allocation; passing an lvalue still
+    /// compiles but copies, same as any other pass-by-value parameter.
+    /// Correctness is unaffected by the batching: each id is still visited
+    /// (and its cascade resolved) exactly once regardless of which seed's
+    /// fan-out reaches it first, exactly as if a later intent's BFS had
+    /// found it already-gone via peek_raw() -- the only thing batching
     /// changes is that finding avoids a second, separate BFS setup (a fresh
     /// `work`/`visited` allocation and a redundant referrers_ lookup) to
     /// discover it. The RELATIVE order of resulting Change/UndoAction
@@ -2516,7 +2528,7 @@ private:
     /// relative to creates/updates (this always runs after both; see
     /// apply_transaction_contents) and the per-id order within one id's own
     /// cascade (still guaranteed by `visited`) are load-bearing.
-    std::vector<Id> remove_raw(const std::vector<Id>& seeds, bool keep_undo = true);
+    std::vector<Id> remove_raw(std::vector<Id> work, bool keep_undo = true);
     // remove_raw's helper for a NULLABLE referrer: clone + install, so the
     // caller can null_ref() the field that pointed at the victim, then
     // reconcile immediately. See the .cpp for why reconciliation must happen
