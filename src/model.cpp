@@ -1237,8 +1237,22 @@ std::optional<Model::IntegrityError> Model::apply_create(
     // Every object gets an (internal, Id-keyed) entry in its type's
     // enumeration index, unconditionally -- this is what for_each<T>() scans.
     const TypeTag tag = raw->tag();
+    // emplace, not operator[], and BEFORE log_by_type_once(): the FIRST time
+    // this tag is seen, seed it with node_pool_ so every Node/Leaf this (and
+    // every later) insert()/erase() on it allocates from the pool instead of
+    // plain new/delete -- see node_pool_'s own comment in model.h. This MUST
+    // run before log_by_type_once(), which itself reads by_type_[tag] via
+    // operator[] to capture the pre-attempt value for rollback -- doing that
+    // first would default-construct an UNPOOLED (mem_ == nullptr) entry
+    // first, and try_emplace() then silently keeps that already-present,
+    // unpooled value instead of seeding the pool at all (a real bug this
+    // ordering fixes: measured, before the fix, as zero pool allocations
+    // ever happening). A tag already present (either from an earlier
+    // create(), or from log_by_type_once() below) is left untouched by
+    // try_emplace() either way -- its existing, already-seeded value carries
+    // forward via insert()'s own copy of mem_ regardless.
+    auto& sub = by_type_.try_emplace(tag, pmap::PersistentSet<Id, IdHash>(&node_pool_)).first->second;
     log_by_type_once(tag);
-    auto& sub = by_type_[tag];
     sub = sub.insert(id);
 
     add_out_refs(raw);
@@ -2425,7 +2439,12 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
         raw->id = id;
 
         set_slot_no_log(id.index, raw, id.gen);
-        auto& sub = by_type_[raw->tag()];
+        // try_emplace, not operator[]: see apply_create's identical seeding
+        // for why (this path has no log_by_type_once ordering hazard --
+        // commit_bulk_without_undo never logs -- but still needs to seed
+        // the pool on first touch rather than default-constructing unpooled).
+        auto& sub =
+            by_type_.try_emplace(raw->tag(), pmap::PersistentSet<Id, IdHash>(&node_pool_)).first->second;
         sub = sub.insert(id);
         add_out_refs_no_log(raw);
         add_field_keys_no_log(raw);

@@ -37,6 +37,7 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <memory_resource>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -263,12 +264,52 @@ class TrieCore {
     std::shared_ptr<const Node> root_;
     std::size_t size_ = 0;
 
-    explicit TrieCore(std::shared_ptr<const Node> r, std::size_t n)
-        : root_(std::move(r)), size_(n) {}
+    /// EXPERIMENTAL: where this instance's Node/Leaf HEAD allocations come
+    /// from (the shared_ptr ones stored in Node::slots -- never the
+    /// unique_ptr tail links, which stay on plain new; see chain_copy/
+    /// chain_set_links/chain_erase_links). nullptr (the default, and every
+    /// existing caller's behavior -- persistent_map_tests.cpp included) means
+    /// "use ordinary make_shared", exactly as before this was added.
+    ///
+    /// Profiling one_million_random_basic_records_in_a_single_transaction_
+    /// without_undo (examples/basic_record_bench.cpp) found cloning
+    /// by_type_'s Node chain -- make_shared<Node>/make_shared<Leaf> plus the
+    /// shared_ptr<const void> vector copy/dispose that comes with it -- to
+    /// be the single largest cost of a commit, ahead of the model's own
+    /// apply logic: ~27% of instructions, and a LARGER share of last-level
+    /// cache misses once measured with cache simulation (callgrind
+    /// --cache-sim=yes), since a fresh malloc'd Node/Leaf is by definition
+    /// cold memory.
+    ///
+    /// Deliberately a raw, non-owning pointer, NOT a shared_ptr: unlike
+    /// std::allocate_shared's own control block (which copies whatever
+    /// allocator it's given, and would silently keep a bare
+    /// memory_resource* alive-by-reference nowhere), the LIFETIME
+    /// obligation here is pushed onto the caller who supplies the pointer
+    /// -- see Model::node_pool_'s own comment for how Model discharges it
+    /// (by construction order, not refcounting). set_entry()/erase_key()
+    /// carry `mem_` forward from `*this` into every derived TrieCore, so
+    /// once a lineage is seeded with a resource (Model does this the FIRST
+    /// time a given type/field's index is touched -- see e.g. apply_create's
+    /// by_type_[tag] seeding in model.cpp), every later insert/erase for
+    /// that SAME lineage keeps using it automatically. Constant for the
+    /// whole of any one set_entry()/erase_key() call (and everything it
+    /// recurses into), which is what lets clone_node/make_leaf/set_in/
+    /// erase_in/chain_set/chain_erase below read it straight off `this`
+    /// instead of threading it through as an extra parameter on every
+    /// recursive call.
+    std::pmr::memory_resource* mem_ = nullptr;
+
+    explicit TrieCore(std::shared_ptr<const Node> r, std::size_t n, std::pmr::memory_resource* mem)
+        : root_(std::move(r)), size_(n), mem_(mem) {}
 
     // Return a new node equal to `n` but with slot `pos` replaced/inserted.
-    static std::shared_ptr<Node> clone_node(const Node* n) {
-        auto c = std::make_shared<Node>();
+    // mem_ == nullptr => plain make_shared (today's behavior, and every
+    // existing caller's); otherwise routed through that resource via
+    // allocate_shared.
+    std::shared_ptr<Node> clone_node(const Node* n) const {
+        auto c = mem_ ? std::allocate_shared<Node>(std::pmr::polymorphic_allocator<Node>(mem_))
+                     : std::make_shared<Node>();
         if (n) {
             c->bitmap = n->bitmap;
             c->is_leaf = n->is_leaf;
@@ -337,22 +378,26 @@ class TrieCore {
     // can't share a hash -- so this is always a replace of the one entry
     // this slot can ever hold, never an append to a chain that (by
     // construction) never exists.
-    static std::shared_ptr<const Leaf> chain_set(const Leaf* lf, const K& key,
-                                                 const Entry& entry, bool& added) {
+    std::shared_ptr<Leaf> make_leaf(Entry e, ChainLink n) const {
+        if (mem_) return std::allocate_shared<Leaf>(std::pmr::polymorphic_allocator<Leaf>(mem_),
+                                                    std::move(e), std::move(n));
+        return std::make_shared<Leaf>(std::move(e), std::move(n));
+    }
+
+    std::shared_ptr<const Leaf> chain_set(const Leaf* lf, const K& key, const Entry& entry,
+                                          bool& added) const {
         if constexpr (kPerfectHash) {
             assert(lf && KeyOf{}(lf->entry) == key &&
                   "Hash declared is_perfect but produced a real collision");
             added = false;
-            return std::make_shared<Leaf>(entry, NoChain{});
+            return make_leaf(entry, NoChain{});
         } else {
             if (!lf) {
                 added = true;
-                return std::make_shared<Leaf>(entry, nullptr);
+                return make_leaf(entry, nullptr);
             }
-            if (KeyOf{}(lf->entry) == key)
-                return std::make_shared<Leaf>(entry, chain_copy(lf->next.get()));
-            return std::make_shared<Leaf>(lf->entry,
-                                          chain_set_links(lf->next.get(), key, entry, added));
+            if (KeyOf{}(lf->entry) == key) return make_leaf(entry, chain_copy(lf->next.get()));
+            return make_leaf(lf->entry, chain_set_links(lf->next.get(), key, entry, added));
         }
     }
 
@@ -373,7 +418,7 @@ class TrieCore {
     // Under a perfect Hash, `lf` (found via the same hash slice as `key`)
     // IS the entry for `key` -- same reasoning as chain_set -- so erasing
     // it always empties the slot; there is no tail that could survive.
-    static std::shared_ptr<const Leaf> chain_erase(const Leaf* lf, const K& key) {
+    std::shared_ptr<const Leaf> chain_erase(const Leaf* lf, const K& key) const {
         assert(lf && "caller verified the key is present in this chain");
         if constexpr (kPerfectHash) {
             assert(KeyOf{}(lf->entry) == key &&
@@ -383,18 +428,17 @@ class TrieCore {
             if (KeyOf{}(lf->entry) == key) {
                 const Leaf* t = lf->next.get();
                 if (!t) return nullptr;  // the chain held only this key
-                return std::make_shared<Leaf>(t->entry, chain_copy(t->next.get()));
+                return make_leaf(t->entry, chain_copy(t->next.get()));
             }
-            return std::make_shared<Leaf>(lf->entry, chain_erase_links(lf->next.get(), key));
+            return make_leaf(lf->entry, chain_erase_links(lf->next.get(), key));
         }
     }
 
     // ---- set ----
     // Returns the new subtree root for the node at `shift`, and reports whether
     // the key was newly inserted (vs replaced) via `added`.
-    static std::shared_ptr<const Node> set_in(const Node* n, std::uint64_t hash,
-                                              int shift, const K& key,
-                                              const Entry& entry, bool& added) {
+    std::shared_ptr<const Node> set_in(const Node* n, std::uint64_t hash, int shift, const K& key,
+                                       const Entry& entry, bool& added) const {
         const std::uint32_t idx = slice(hash, shift);
         const std::uint32_t b = bit(idx);
 
@@ -405,7 +449,7 @@ class TrieCore {
             // ChainLink{}, not nullptr: this code path is common to both
             // Leaf shapes (unlike chain_set/chain_erase, it never forks on
             // kPerfectHash), and nullptr has no conversion to NoChain.
-            auto lf = std::make_shared<Leaf>(entry, ChainLink{});
+            auto lf = make_leaf(entry, ChainLink{});
             nn->bitmap |= b;
             nn->is_leaf |= b;
             nn->slots.insert(nn->slots.begin() + pos, std::move(lf));
@@ -439,11 +483,11 @@ class TrieCore {
         if (shift + 5 >= 64) {
             // Ran out of hash bits (astronomically unlikely with distinct hashes,
             // but handle it): merge into one collision chain.
-            nn->slots[pos] = std::make_shared<Leaf>(entry, chain_copy(lf));
+            nn->slots[pos] = make_leaf(entry, chain_copy(lf));
             added = true;
             return nn;
         }
-        auto sub = std::make_shared<Node>();
+        auto sub = clone_node(nullptr);
         const std::uint32_t exist_idx = slice(lf_hash, shift + 5);
         sub->bitmap = bit(exist_idx);
         sub->is_leaf = bit(exist_idx);
@@ -465,9 +509,8 @@ class TrieCore {
     // one level deeper than the live entry count alone would need. Not a
     // correctness issue, just a depth (and therefore path-copy cost) that
     // never shrinks back down on its own.
-    static std::shared_ptr<const Node> erase_in(const Node* n, std::uint64_t hash,
-                                                int shift, const K& key,
-                                                bool& removed) {
+    std::shared_ptr<const Node> erase_in(const Node* n, std::uint64_t hash, int shift, const K& key,
+                                         bool& removed) const {
         if (!n) return nullptr;
         const std::uint32_t idx = slice(hash, shift);
         const std::uint32_t b = bit(idx);
@@ -506,7 +549,7 @@ class TrieCore {
         return nn;
     }
 
-    static std::shared_ptr<const Node> copy_shared(const Node* n) {
+    std::shared_ptr<const Node> copy_shared(const Node* n) const {
         // The node is unchanged; reuse it. We only have a raw pointer here, so we
         // must reconstruct a shared_ptr owner -- but every caller already holds
         // one, so instead of copying we clone. (Called only on the not-present
@@ -554,6 +597,14 @@ class TrieCore {
 public:
     TrieCore() = default;
 
+    /// Binds this (empty) core to `mem` for every Node/Leaf it or any core
+    /// derived from it (via set_entry/erase_key, which carry mem_ forward)
+    /// ever allocates. See mem_'s own comment for the lifetime obligation
+    /// this places on the caller -- `mem` must outlive every Node/Leaf ever
+    /// allocated through it, which is why Model seeds this only with a
+    /// resource whose lifetime is tied to the Model itself.
+    explicit TrieCore(std::pmr::memory_resource* mem) : mem_(mem) {}
+
     std::size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
 
@@ -562,14 +613,14 @@ public:
     TrieCore set_entry(const K& key, const Entry& entry) const {
         bool added = false;
         auto r = set_in(root_.get(), hash_key(key), 0, key, entry, added);
-        return TrieCore(r, size_ + (added ? 1 : 0));
+        return TrieCore(r, size_ + (added ? 1 : 0), mem_);
     }
 
     /// Returns a new core without `key` (or an equal core if absent).
     TrieCore erase_key(const K& key) const {
         bool removed = false;
         auto r = erase_in(root_.get(), hash_key(key), 0, key, removed);
-        return TrieCore(r, size_ - (removed ? 1 : 0));
+        return TrieCore(r, size_ - (removed ? 1 : 0), mem_);
     }
 
     const Entry* get_entry(const K& key) const {
@@ -592,6 +643,13 @@ class PersistentMap {
 
 public:
     PersistentMap() = default;
+
+    /// EXPERIMENTAL: an empty map whose Node/Leaf allocations (this one and
+    /// every one later derived from it via set()/erase()) are pooled
+    /// through `mem` instead of plain new/delete. See detail::TrieCore::
+    /// mem_'s own comment for the lifetime obligation this places on the
+    /// caller.
+    explicit PersistentMap(std::pmr::memory_resource* mem) : core_(mem) {}
 
     std::size_t size() const noexcept { return core_.size(); }
     bool empty() const noexcept { return core_.empty(); }
@@ -635,6 +693,13 @@ class PersistentSet {
 
 public:
     PersistentSet() = default;
+
+    /// EXPERIMENTAL: an empty set whose Node/Leaf allocations (this one and
+    /// every one later derived from it via insert()/erase()) are pooled
+    /// through `mem` instead of plain new/delete. See detail::TrieCore::
+    /// mem_'s own comment for the lifetime obligation this places on the
+    /// caller.
+    explicit PersistentSet(std::pmr::memory_resource* mem) : core_(mem) {}
 
     std::size_t size() const noexcept { return core_.size(); }
     bool empty() const noexcept { return core_.empty(); }

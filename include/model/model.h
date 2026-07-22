@@ -46,6 +46,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -2811,6 +2812,55 @@ private:
     /// points is which `keep_undo` value they pass here -- same reasoning
     /// as try_commit_core().
     CommitResult run_pre_transaction_core(Transaction& txn, bool keep_undo);
+
+    /// EXPERIMENTAL: backs the Node/Leaf allocations of by_type_ (see
+    /// apply_create's by_type_[tag] seeding in model.cpp, the only current
+    /// user) instead of routing them through glibc's general-purpose
+    /// malloc/free -- see pmap::detail::TrieCore::mem_'s own comment for the
+    /// measured cost this targets.
+    ///
+    /// synchronized_pool_resource, NOT unsynchronized: this was the ONE
+    /// thing that looked safe here and wasn't. commit_mu_ (invariant 7)
+    /// only serializes ALLOCATION (every insert()/erase() during apply) --
+    /// it says nothing about DEALLOCATION, which happens whenever a Node's
+    /// shared_ptr refcount hits zero, and that can be triggered by ANY
+    /// thread: a reader dropping its Snapshot (and, with it, the last
+    /// reference to some old Root's copy of by_type_) NEVER takes
+    /// commit_mu_ at all -- that lock-free-reads guarantee is invariant 10,
+    /// not optional. So a writer's allocate() (under commit_mu_) and a
+    /// reader's deallocate() (under no lock whatsoever) can and do run
+    /// concurrently against this SAME pool's internal freelist. Confirmed
+    /// by TSan: a real data race between a Node destructor (triggered by
+    /// by_type_[tag]'s old value being overwritten/dropped) and a
+    /// concurrent allocate_shared<Node> on a different thread, in
+    /// performance_tests.cpp's four-writer-threads stress test -- caught
+    /// only once the ordering bug that had left the pool completely
+    /// unused (see apply_create's own comment) was fixed and the pool
+    /// started actually being exercised. unsynchronized_pool_resource is
+    /// therefore unsafe here NO MATTER how tightly it's scoped (Model-
+    /// owned or process-wide, it doesn't matter -- see persistent_map.h's
+    /// TrieCore::mem_ comment, which used to claim otherwise). Paying for
+    /// synchronization here is the price of NOT slowing down the
+    /// lock-free read path with a matching lock -- the alternative would
+    /// be routing every Root/Snapshot teardown through commit_mu_ too,
+    /// which is a strictly worse trade.
+    ///
+    /// MUST still be declared before every member that could still
+    /// reference a Node/Leaf allocated from it -- root_, by_type_,
+    /// by_field_, by_cached_field_, by_cached_reference_ below -- because
+    /// std::pmr::polymorphic_allocator stores only a raw memory_resource*
+    /// inside the shared_ptr control block std::allocate_shared builds
+    /// (see TrieCore::mem_), so this pool must outlive every Node/Leaf
+    /// ever allocated from it, thread-safety aside. Members are destroyed
+    /// in REVERSE declaration order, so declaring node_pool_ FIRST makes
+    /// it the LAST thing ~Model() tears down -- by which point
+    /// root_/by_type_/etc. (declared after, so destroyed first) have
+    /// already released every Node/Leaf they held. This is exactly the
+    /// precondition ~Model() already documents (every Snapshot/
+    /// Transaction/View must already be gone), just extended one step
+    /// further to this pool. Do not move this member, and do not add a
+    /// new Node/Leaf-holding member ABOVE it.
+    std::pmr::synchronized_pool_resource node_pool_;
 
     // ---- read/publish path -------------------------------------------------
     // root_ is atomic so snapshot() acquires the current version with a lock-free
