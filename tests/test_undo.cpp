@@ -562,6 +562,163 @@ TEST(lowering_max_undo_list_size_only_takes_effect_on_the_next_add) {
     CHECK_EQ(entries.size(), std::size_t{1});
 }
 
+// UndoEntry::approx_bytes/UndoSummary::approx_bytes sum sizeof(UndoAction)
+// plus each action's captured clone's ObjectBase::byte_size() -- an update's
+// RestoreUpdate action carries a real pre-image clone (unlike a create's
+// Remove action, which carries none; see undo_remove_action_deletes_the_
+// target above), so this is the case that actually exercises the clone term.
+TEST(undo_entry_reports_approx_bytes_including_the_captured_clones_size) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    m.clear_undo_list();  // isolate: only the update below should be in the list
+
+    update_field(m, a, [](Account* p) { p->balance = 42; });
+
+    const auto entries = m.list_undo();
+    CHECK_EQ(entries.size(), std::size_t{1});
+    CHECK_EQ(entries.front().action_count, std::size_t{1});
+    CHECK_EQ(entries.front().approx_bytes, sizeof(Model::UndoAction) + sizeof(Account));
+}
+
+// set_max_undo_memory_bytes() is the byte-budgeted sibling of set_max_undo_
+// list_size(): same lazy, oldest-first eviction, just checked against a
+// running byte total instead of a count.
+TEST(set_max_undo_memory_bytes_prunes_oldest_entries_to_make_room) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Account> a3 = make_account(m, "A3");
+    m.clear_undo_list();
+
+    const std::size_t one_entry_bytes = sizeof(Model::UndoAction) + sizeof(Account);
+    m.set_max_undo_memory_bytes(2 * one_entry_bytes);  // room for exactly two update-entries
+
+    update_field(m, a1, [](Account* p) { p->balance = 1; });
+    update_field(m, a2, [](Account* p) { p->balance = 2; });
+    update_field(m, a3, [](Account* p) { p->balance = 3; });  // pushes the total over budget
+
+    const auto entries = m.list_undo();
+    CHECK_EQ(entries.size(), std::size_t{2});  // a1's entry (oldest) got evicted to make room
+    CHECK(entries.front().version < entries.back().version);
+}
+
+// n == 0 means "keep no undo history at all" -- same immediate-clear, same
+// clone-skipping behavior as set_max_undo_list_size(0) (see that setter's
+// own tests above), just via the byte cap instead of the count cap.
+TEST(set_max_undo_memory_bytes_of_zero_never_adds_to_the_list) {
+    Model m;
+    m.set_max_undo_memory_bytes(0);
+
+    CommitResult r1 = [&] {
+        Transaction txn = m.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "A1";
+        txn.create(std::move(a));
+        return m.try_commit(txn);
+    }();
+    CHECK(r1.status == CommitStatus::Committed);  // the commit itself is unaffected
+    CHECK(m.list_undo().empty());
+
+    make_account(m, "A2");
+    CHECK(m.list_undo().empty());
+}
+
+TEST(set_max_undo_memory_bytes_of_zero_immediately_clears_existing_entries) {
+    Model m;
+    make_account(m, "A1");
+    make_account(m, "A2");
+    make_account(m, "A3");
+    CHECK_EQ(m.list_undo().size(), std::size_t{3});
+
+    m.set_max_undo_memory_bytes(0);
+    CHECK(m.list_undo().empty());  // immediate, not deferred to the next commit
+}
+
+TEST(set_max_undo_memory_bytes_of_zero_skips_the_per_object_undo_clone) {
+    Model m;
+
+    Transaction create_txn = m.begin();
+    auto w = std::make_unique<CountingWidget>();
+    w->name = "W1";
+    const Ref<CountingWidget> local = create_txn.create(std::move(w));
+    const CommitResult create_res = m.try_commit(create_txn);
+    CHECK(create_res.status == CommitStatus::Committed);
+    const Ref<CountingWidget> id = create_res.to_real(local);
+
+    m.set_max_undo_memory_bytes(0);
+    CountingWidget::copy_count = 0;
+
+    Transaction txn = m.begin();
+    txn.update(id)->name = "W1-updated";
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+    CHECK(m.list_undo().empty());
+
+    // Exactly one clone -- update_raw()'s own local-overlay clone. If
+    // apply_update() still captured a RestoreUpdate pre-image despite the 0
+    // cap, this would be 2.
+    CHECK_EQ(CountingWidget::copy_count, 1);
+}
+
+// The central guarantee: the byte cap governs RETENTION, never ADMISSION.
+// A single commit's own undo entry is never rejected, discarded, or
+// truncated for being larger than the configured budget -- eviction only
+// ever removes OTHER, already-published entries, and once none are left it
+// stops (there being nothing else to evict), leaving the new entry in place
+// even though the running total now exceeds the cap.
+TEST(set_max_undo_memory_bytes_never_refuses_to_add_an_oversized_entry) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    m.clear_undo_list();
+
+    const std::size_t one_entry_bytes = sizeof(Model::UndoAction) + sizeof(Account);
+    m.set_max_undo_memory_bytes(one_entry_bytes / 2);  // smaller than ANY single entry can ever be
+
+    Transaction txn1 = m.begin();
+    txn1.update(a1)->balance = 1;
+    const CommitResult r1 = m.try_commit(txn1);
+    CHECK(r1.status == CommitStatus::Committed);
+
+    // Never refused: the entry is there despite being over budget all on
+    // its own.
+    auto entries = m.list_undo();
+    CHECK_EQ(entries.size(), std::size_t{1});
+    CHECK_EQ(entries.front().version, r1.snapshot.version());
+    CHECK_EQ(entries.front().approx_bytes, one_entry_bytes);
+
+    // A later add (a DIFFERENT id, so this isn't the touched-conflict prune
+    // at play) evicts the oversized entry to make room, same as any other
+    // entry once it's no longer the newest.
+    Transaction txn2 = m.begin();
+    txn2.update(a2)->balance = 2;
+    const CommitResult r2 = m.try_commit(txn2);
+    CHECK(r2.status == CommitStatus::Committed);
+
+    entries = m.list_undo();
+    CHECK_EQ(entries.size(), std::size_t{1});
+    CHECK_EQ(entries.front().version, r2.snapshot.version());
+}
+
+// The two caps are independent and both apply -- whichever one the incoming
+// entry would violate triggers eviction against it.
+TEST(set_max_undo_list_size_and_memory_bytes_caps_both_apply) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Account> a3 = make_account(m, "A3");
+    m.clear_undo_list();
+
+    const std::size_t one_entry_bytes = sizeof(Model::UndoAction) + sizeof(Account);
+    m.set_max_undo_list_size(10);                        // count cap alone would keep all three
+    m.set_max_undo_memory_bytes(2 * one_entry_bytes + 1);  // byte cap alone permits only two
+
+    update_field(m, a1, [](Account* p) { p->balance = 1; });
+    update_field(m, a2, [](Account* p) { p->balance = 2; });
+    update_field(m, a3, [](Account* p) { p->balance = 3; });
+
+    CHECK_EQ(m.list_undo().size(), std::size_t{2});  // the tighter (byte) cap wins
+}
+
 // apply_undo is not a special-cased path: it just builds a Transaction and
 // calls try_commit(), so a stale entry -- one whose reconstruction would now
 // dangle -- reports Invalid exactly like any other build-time integrity

@@ -629,6 +629,18 @@ public:
     /// else in this API already carry, just not re-asserted here.
     virtual void assign_from(const ObjectBase& other) = 0;
 
+    /// Approximate in-memory footprint of this object's own value, for
+    /// budgeting undo history by bytes rather than by entry count (see
+    /// Model::set_max_undo_memory_bytes / UndoEntry::approx_bytes). Object<
+    /// Derived> implements this as `sizeof(Derived)` -- exact for the
+    /// object's fixed layout (numeric fields, Ref<>/Opt<>, embedded arrays),
+    /// but it does NOT follow heap-owned members (a std::string past SSO, a
+    /// std::vector's buffer): those are undercounted unless a concrete type
+    /// overrides this to add e.g. `.capacity()` of its own owned buffers.
+    /// This is a size estimate for a caller-configured memory cap, not an
+    /// exact accounting -- treat it the same way.
+    virtual std::size_t byte_size() const = 0;
+
     /// The type's identity, for the checked downcast (see TypeTag). Always
     /// type_tag<Derived>() -- Object<Derived> implements it.
     virtual TypeTag tag() const noexcept = 0;
@@ -834,6 +846,12 @@ template <class Derived>
 class Object : public ObjectBase {
 public:
     ObjectBase* clone() const override { return new Derived(static_cast<const Derived&>(*this)); }
+
+    // sizeof(Derived), not sizeof(*this) -- *this is statically typed as
+    // Object<Derived> at this point in the class body, and sizeof an
+    // expression uses its STATIC type, which would give the wrong (base)
+    // size. sizeof(Derived) is what clone() above actually allocates.
+    std::size_t byte_size() const override { return sizeof(Derived); }
 
     void assign_from(const ObjectBase& other) override {
         static_cast<Derived&>(*this) = static_cast<const Derived&>(other);
@@ -2184,6 +2202,17 @@ public:
         /// paths with no Transaction to draw an id from (commit_bulk_without_undo()),
         /// though those never produce undo data in the first place.
         std::uint64_t txn_id = 0;
+
+        /// Sum, over `actions`, of `sizeof(UndoAction)` plus
+        /// `previous_value->byte_size()` for the ones that carry a clone
+        /// (Remove actions don't -- see UndoAction::previous_value). Computed
+        /// once, in publish_now(), at the same point `actions` reaches its
+        /// final (collapsed) contents -- NOT recomputed by take_undo() or
+        /// apply_undo(). Same "approximate, not exact" caveat as
+        /// ObjectBase::byte_size(): touched/name/data's own bytes aren't
+        /// included, so this undercounts by their size. What
+        /// set_max_undo_memory_bytes() budgets against.
+        std::size_t approx_bytes = 0;
     };
 
     /// Lightweight, copyable summary of one UndoEntry still in the list --
@@ -2214,6 +2243,12 @@ public:
         /// Copied verbatim from UndoEntry::txn_id -- see that member's
         /// comment. Informational only; take_undo() still keys on `version`.
         std::uint64_t txn_id = 0;
+
+        /// Copied verbatim from UndoEntry::approx_bytes -- see that member's
+        /// comment. A cheap (already-computed, just copied) way to gauge an
+        /// entry's memory footprint from list_undo(), the same role
+        /// action_count plays for its shape.
+        std::size_t approx_bytes = 0;
     };
 
     /// Every undo entry still in the list, oldest first. See UndoEntry's
@@ -2279,6 +2314,37 @@ public:
         if (n == 0) {
             undo_list_.clear();
             undo_touch_index_.clear();
+            total_undo_bytes_ = 0;
+        }
+    }
+
+    /// Same idea as set_max_undo_list_size(), budgeted by UndoEntry::
+    /// approx_bytes instead of entry count -- the two caps are independent
+    /// and both apply (publish_now() evicts oldest-first against whichever
+    /// one, or both, the incoming entry would violate). n == 0 gets the same
+    /// immediate-clear treatment (and the same clone-skipping benefit,
+    /// folded into keep_undo alongside max_undo_list_size_ -- see
+    /// apply_transaction_contents()) as set_max_undo_list_size(0).
+    ///
+    /// Eviction only ever removes OTHER, already-published entries -- never
+    /// the one currently being added. So a single commit whose own
+    /// approx_bytes exceeds `n` is still appended in full, leaving
+    /// total_undo_bytes_ temporarily over budget; eviction resumes (this
+    /// entry included, once it's no longer the newest) the next time
+    /// anything would be added. The cap bounds steady-state memory, not any
+    /// one commit's worst case -- an undo entry is never the reason a commit
+    /// fails, only ever something garbage-collected around one.
+    ///
+    /// Default is unbounded (numeric_limits::max()), matching
+    /// max_undo_list_size_'s default. Same locking contract: takes
+    /// commit_mu_.
+    void set_max_undo_memory_bytes(std::size_t n) {
+        std::lock_guard lk(commit_mu_);
+        max_undo_bytes_ = n;
+        if (n == 0) {
+            undo_list_.clear();
+            undo_touch_index_.clear();
+            total_undo_bytes_ = 0;
         }
     }
 
@@ -2930,12 +2996,17 @@ private:
     /// index" can never drift apart.
     std::unordered_map<Id, std::list<UndoEntry>::iterator, IdHash> undo_touch_index_;
 
-    /// Removes every id in `e.touched` from undo_touch_index_ -- called
-    /// immediately before `e` itself is erased from undo_list_ (publish_now,
-    /// take_undo, clear_undo_list), never after: an id left indexed while
+    /// Removes every id in `e.touched` from undo_touch_index_, and unwinds
+    /// `e.approx_bytes` from total_undo_bytes_ -- called immediately before
+    /// `e` itself is erased from undo_list_ (publish_now, take_undo), never
+    /// after: an id left indexed (or a byte count left counted) while
     /// pointing at an already-erased list node is a dangling iterator the
-    /// next lookup would dereference. Doesn't touch undo_list_ itself; the
-    /// caller does that part.
+    /// next lookup would dereference, or a leaked count nothing will ever
+    /// re-subtract. Doesn't touch undo_list_ itself; the caller does that
+    /// part. clear_undo_list() and set_max_undo_(list_size|memory_bytes)(0)
+    /// wipe undo_list_/undo_touch_index_/total_undo_bytes_ wholesale instead
+    /// of calling this per-entry -- equivalent, cheaper when discarding
+    /// everything at once.
     void untrack_undo_entry(const UndoEntry& e);
 
     /// Cap enforced by set_max_undo_list_size(); default (max()) means
@@ -2945,6 +3016,19 @@ private:
     /// comment for why this is lazy (checked on add) rather than applied
     /// retroactively when the cap changes.
     std::size_t max_undo_list_size_ = std::numeric_limits<std::size_t>::max();
+
+    /// Cap enforced by set_max_undo_memory_bytes(), against total_undo_bytes_
+    /// below -- same lazy, checked-on-add, oldest-first-eviction discipline
+    /// as max_undo_list_size_, just budgeted by UndoEntry::approx_bytes
+    /// instead of by count. Default (max()) means unbounded.
+    std::size_t max_undo_bytes_ = std::numeric_limits<std::size_t>::max();
+
+    /// Running sum of UndoEntry::approx_bytes over every entry currently in
+    /// undo_list_ -- kept in lockstep with undo_list_ the same way
+    /// undo_touch_index_ is (see untrack_undo_entry()), so
+    /// set_max_undo_memory_bytes()'s cap check in publish_now() is an O(1)
+    /// comparison instead of an O(|undo_list_|) re-sum on every commit.
+    std::size_t total_undo_bytes_ = 0;
 
     PreTransactionsFn pre_transactions_;  ///< empty = no hook; swapped only under commit_mu_
                                           ///< (set_pre_transactions)

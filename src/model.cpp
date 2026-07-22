@@ -1595,16 +1595,18 @@ std::vector<Change> Transaction::estimate_changes_with_cascades() const {
 
 std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo) {
-    // publish_now() never appends an entry when max_undo_list_size_ == 0 (see
-    // set_max_undo_list_size()'s doc comment) -- it re-checks the cap itself,
-    // independently of what's passed here. So folding it into this LOCAL
+    // publish_now() never appends an entry when max_undo_list_size_ == 0 or
+    // max_undo_bytes_ == 0 (see set_max_undo_list_size()/set_max_undo_
+    // memory_bytes()'s doc comments) -- it re-checks both caps itself,
+    // independently of what's passed here. So folding them into this LOCAL
     // keep_undo, before the apply loop below ever pushes to pending_undo_, is
     // enough to skip the per-object clones (apply_update/remove_raw/
     // clone_for_cascade_null) that would only feed an entry publish_now() is
     // about to discard anyway -- no need to thread the fold back out to
     // either caller's own keep_undo. Both callers (via check_and_apply())
-    // hold commit_mu_ already, so max_undo_list_size_ is safe to read here.
-    keep_undo = keep_undo && max_undo_list_size_ != 0;
+    // hold commit_mu_ already, so max_undo_list_size_/max_undo_bytes_ are
+    // safe to read here.
+    keep_undo = keep_undo && max_undo_list_size_ != 0 && max_undo_bytes_ != 0;
 
     // Size hint for every container the apply loop below grows one entry (or
     // more, for changes_/pending_undo_/undo_) at a time -- creates+updates is
@@ -1955,14 +1957,34 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
 
         // Already inside `max_undo_list_size_ != 0` -- make room first
         // (oldest entries first, same ordering list_undo() promises) so
-        // this add never leaves the list over the configured cap.
+        // this add never leaves the list over either configured cap.
         if (keep_undo && !pending_undo_.empty()) {
-            while (undo_list_.size() >= max_undo_list_size_) {
+            // UndoEntry::approx_bytes for the entry about to be added --
+            // computed once, here, from pending_undo_'s final (collapsed)
+            // contents. See that member's own doc comment for exactly what
+            // this counts (and doesn't).
+            std::size_t new_bytes = 0;
+            for (const UndoAction& a : pending_undo_) {
+                new_bytes += sizeof(UndoAction) + (a.previous_value ? a.previous_value->byte_size() : 0);
+            }
+
+            // Evict oldest-first against WHICHEVER cap the incoming entry
+            // would violate -- count, bytes, or both. The loop can only ever
+            // empty undo_list_, never refuse to run: the entry being added
+            // here is never itself a candidate, so if new_bytes alone
+            // exceeds max_undo_bytes_ this still terminates (once
+            // undo_list_ is empty) and the add below proceeds anyway,
+            // temporarily leaving total_undo_bytes_ over budget -- see
+            // set_max_undo_memory_bytes()'s doc comment. An undo entry is
+            // never rejected for its own size.
+            while (undo_list_.size() >= max_undo_list_size_ ||
+                   (!undo_list_.empty() && total_undo_bytes_ + new_bytes > max_undo_bytes_)) {
                 untrack_undo_entry(undo_list_.front());
                 undo_list_.erase(undo_list_.begin());
             }
+            total_undo_bytes_ += new_bytes;
             undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched),
-                                  std::move(undo_name), std::move(undo_data), undo_txn_id});
+                                  std::move(undo_name), std::move(undo_data), undo_txn_id, new_bytes});
             // Index the just-added entry under every id it touches, so a
             // LATER commit's conflict check (the lookup above) can find it
             // in O(1) instead of scanning for it.
@@ -1993,6 +2015,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
 
 void Model::untrack_undo_entry(const UndoEntry& e) {
     for (Id id : e.touched) undo_touch_index_.erase(id);
+    total_undo_bytes_ -= e.approx_bytes;
 }
 
 std::vector<Model::UndoSummary> Model::list_undo() const {
@@ -2000,7 +2023,7 @@ std::vector<Model::UndoSummary> Model::list_undo() const {
     std::vector<UndoSummary> out;
     out.reserve(undo_list_.size());
     for (const UndoEntry& e : undo_list_)
-        out.push_back({e.version, e.actions.size(), e.name, e.data, e.txn_id});
+        out.push_back({e.version, e.actions.size(), e.name, e.data, e.txn_id, e.approx_bytes});
     return out;
 }
 
@@ -2020,6 +2043,7 @@ void Model::clear_undo_list() {
     std::lock_guard lk(commit_mu_);
     undo_list_.clear();
     undo_touch_index_.clear();  // every entry it indexed is gone too
+    total_undo_bytes_ = 0;
 }
 
 CommitResult Model::apply_undo(const UndoEntry& entry) {
@@ -2374,6 +2398,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     last_write_id_.clear();
     undo_list_.clear();
     undo_touch_index_.clear();  // every entry it indexed is gone too
+    total_undo_bytes_ = 0;
 
     // Pass 3: install. next_slot_ is 0 and free_slots_ is empty (just
     // cleared), so real ids are just 0..N-1 in order -- what alloc_slot()
