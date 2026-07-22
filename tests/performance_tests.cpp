@@ -1320,8 +1320,20 @@ PERF_TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
     CHECK(bulk_kb > 0);
     // The whole point of commit_bulk_without_undo(): no per-object undo-log retention, so
     // its per-item cost lands near the steady-state batched-commit figure,
-    // not the single-huge-transaction figure. Measured ratio, repeatedly:
-    // ~11-12x at n=200,000 in the default build, ~12-15x under TSan.
+    // not the single-huge-transaction figure.
+    //
+    // Historically measured ~11-12x at n=200,000 in the default build
+    // (~12-15x under TSan) -- back when EVERY create in a single-type bulk
+    // transaction logged its own separate capture of by_type_'s (and any
+    // indexed field's) prior persistent-map handle. Once that capture was
+    // changed to happen only on the FIRST touch of a given index per attempt
+    // (see Model::log_by_type_once()'s doc comment in model.h), the
+    // single-transaction path's own per-item retention shrank drastically --
+    // the remaining O(items) cost is now just each object's slot-write/
+    // slot-alloc/ref-edge inverses and its cheap per-id UndoAction, not N
+    // repeated copies of the same four index handles. Measured ratio,
+    // repeatedly, after that change: ~1.7-1.9x at n=200,000 in the default
+    // build.
     //
     // The ratio is asserted ONLY where kAssertTimings is (the default
     // build), for the same reason the timing bounds are: under ASan,
@@ -1329,13 +1341,13 @@ PERF_TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
     // and every allocation-count optimization in the persistent indexes
     // (PersistentSet, the inline-entry Leaf, its unique_ptr chain link --
     // see persistent_map.h) shrank ASan's measured floor for BOTH paths
-    // together, compressing the measured ratio at ASan's reduced n=8,000
-    // from ~2.2x through ~1.8x down to ~1.26x across this file's history
-    // while the default build's ratio stayed ~11x throughout. A floor
-    // asserted on that number would be asserting ASan's allocator profile,
-    // not the model's memory behavior. 5x leaves ~2x margin under the
-    // weakest default-build measurement.
-    if (kAssertTimings) CHECK(bulk_kb * 5 < single_txn_kb);
+    // together -- compressing the measured ratio there well below the
+    // default build's already-reduced figure. A floor asserted on that
+    // number would be asserting ASan's allocator profile, not the model's
+    // memory behavior. 1.3x leaves margin under the weakest default-build
+    // measurement while still failing loudly if a future change erases the
+    // bulk-load advantage entirely.
+    if (kAssertTimings) CHECK(bulk_kb * 13 < single_txn_kb * 10);
 }
 
 #endif  // PERF_HAS_MEMORY_SECTION

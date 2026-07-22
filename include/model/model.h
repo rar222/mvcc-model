@@ -1669,17 +1669,26 @@ public:
     // try_commit()'s per-object undo log -- log() every mutation's exact
     // inverse, so a conflicted/invalid/vetoed attempt can unwind cleanly --
     // is what makes multi-writer OCC safe. It is also, unavoidably, an
-    // O(items in the transaction) memory cost: every create logs a closure
-    // capturing the prior state of by_type_ (and, for indexed fields,
-    // by_field_/by_cached_field_/by_cached_reference_ too), and none of it
-    // is released until the WHOLE transaction resolves. Put 200,000 creates
-    // in one Transaction and you retain 200,000 of those closures
-    // simultaneously -- measured at ~15-17x the steady-state per-object
-    // cost of committing the same data in small batches. That is not a bug
-    // in try_commit(); it is the price of a guarantee (clean rollback) that
-    // a genuine bulk load does not need, because a bulk load either
-    // replaces the ENTIRE model or doesn't run at all -- there is no
-    // partial-failure state worth rolling back TO.
+    // O(items in the transaction) memory cost: every create logs its own
+    // slot-write inverse (set_slot), its own slot-allocation inverse
+    // (alloc_slot), one inverse per outgoing ref edge (add_out_refs), and a
+    // cheap per-id UndoAction (pending_undo_) -- none of it released until
+    // the WHOLE transaction resolves. (The four WHOLE-MAP-HANDLE indexes --
+    // by_type_/by_field_/by_cached_field_/by_cached_reference_ -- log their
+    // pre-attempt handle only ONCE per attempt per key touched, not once per
+    // object touching that key; see log_by_type_once()'s doc comment. That
+    // used to dominate this cost -- N objects of one type meant N separate
+    // captures of the SAME by_type_ handle -- which is why this used to be
+    // measured far higher than it is now.) Put 200,000 creates in one
+    // Transaction and you still retain 200,000 sets of the remaining
+    // per-object closures simultaneously -- measured at ~1.8x the
+    // steady-state per-object cost of a bulk load (default build,
+    // n=200,000; see performance_tests.cpp's
+    // bulk_load_avoids_the_single_transaction_undo_log_memory_blowup for the
+    // up-to-date number). That is not a bug in try_commit(); it is the price
+    // of a guarantee (clean rollback) that a genuine bulk load does not
+    // need, because a bulk load either replaces the ENTIRE model or doesn't
+    // run at all -- there is no partial-failure state worth rolling back TO.
     //
     // begin_bulk()/commit_bulk_without_undo() trade that guarantee away, deliberately
     // and only here, for exactly that case: wipe the whole Model and load a
@@ -2337,7 +2346,22 @@ private:
     /// CLAUDE.md) -- there is no "existed at base" test that distinguishes a
     /// real race from a caller who should have checked find_by_key() first,
     /// so this doesn't attempt one.
-    std::optional<IntegrityError> validate_field_key_uniqueness(const Transaction& txn) const;
+    ///
+    /// `old_keys_out`, keyed by slot index, is populated with exactly the
+    /// per-update `old_keys` list this pass already builds internally (each
+    /// updated object's baseline define_keys() fields, via
+    /// baseline->each_field_key()) -- one entry per id in
+    /// txn.local_updated_, unconditionally (every local_updated_ entry is a
+    /// real, non-null clone). apply_transaction_contents's later apply loop
+    /// hands the matching entry to apply_update (which forwards it to
+    /// reconcile_field_keys) so that object's baseline isn't walked via
+    /// each_field_key() a second time -- see reconcile_field_keys's own
+    /// `old_keys_hint` parameter for why a second traversal would otherwise
+    /// be needed.
+    std::optional<IntegrityError> validate_field_key_uniqueness(
+        const Transaction& txn,
+        std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>&
+            old_keys_out) const;
 
     // Reverse-index (referrers_) maintenance: add/drop an object's whole
     // outgoing edge set (create/delete), or diff before->after (update).
@@ -2350,7 +2374,17 @@ private:
     // Same trio for the unique key index (by_field_)...
     void add_field_keys(const ObjectBase* o);
     void drop_field_keys(const ObjectBase* o);
-    void reconcile_field_keys(const ObjectBase* before, const ObjectBase* after);
+    /// `old_keys_hint`, when non-null, is `before`'s already-computed
+    /// define_keys() field/value list -- so this skips walking
+    /// before->each_field_key() itself. Populated only by
+    /// validate_field_key_uniqueness() for an ordinary Transaction::update()
+    /// (apply_update passes it through); every OTHER caller (the cascade-null
+    /// branch in remove_raw, which reconciles a survivor's fields against a
+    /// baseline validate_field_key_uniqueness never saw) passes nullptr and
+    /// gets the original behavior, deriving old_keys from `before` itself.
+    void reconcile_field_keys(
+        const ObjectBase* before, const ObjectBase* after,
+        const std::vector<std::pair<const void*, std::string>>* old_keys_hint = nullptr);
 
     // ...and for the multimap index (by_cached_field_).
     void add_cached_fields(const ObjectBase* o);
@@ -2363,6 +2397,26 @@ private:
     void add_cached_references(const ObjectBase* o);
     void drop_cached_references(const ObjectBase* o);
     void reconcile_cached_references(const ObjectBase* before, const ObjectBase* after);
+
+    /// Log this key's pre-attempt value into the undo log, but only on the
+    /// FIRST touch of that key (type tag / field tag) this attempt -- mirrors
+    /// cow()'s dirty_ (first-touch-clones-the-chunk) trick, applied to the
+    /// four whole-map-handle indexes instead of a Chunk. Why this is safe:
+    /// rollback_apply() replays log() closures in REVERSE (undo_.rbegin() ->
+    /// rend()), and each closure OVERWRITES the map wholesale -- so of N
+    /// captures taken across N edits to the same key in one attempt, only the
+    /// FIRST (executed LAST during rollback) has any effect on the final
+    /// restored state; every later capture is silently clobbered before
+    /// rollback finishes. Logging on every touch of a type/field a large
+    /// transaction edits thousands of times was therefore pure waste: one
+    /// closure (alloc + capture + eventual invocation) per touch, when the
+    /// attempt only ever needed the very first one. These dirty_by_*_ sets
+    /// are cleared alongside dirty_ at the end of every attempt
+    /// (rollback_apply()/publish_now()) -- same attempt-scoped lifetime.
+    void log_by_type_once(TypeTag tag);
+    void log_by_field_once(const void* field);
+    void log_by_cached_field_once(const void* field);
+    void log_by_cached_reference_once(const void* field);
 
     /// Mark an object invisible from the NEXT version on; the reaper frees
     /// it once no live snapshot is older than that (invariant 4). Never
@@ -2434,11 +2488,35 @@ private:
                                                std::unordered_map<std::uint32_t, Id>& remap,
                                                const std::unordered_set<Id, IdHash>& pending,
                                                bool keep_undo = true);
-    std::optional<IntegrityError> apply_update(std::unique_ptr<ObjectBase> clone,
-                                               std::unordered_map<std::uint32_t, Id>& remap,
-                                               bool keep_undo = true);
-    std::vector<Id> remove_raw(Id id, bool keep_undo = true);  // cascade BFS, called from
-                                                               // try_commit()'s apply phase
+    /// `old_field_keys_hint`, when non-null, is the target's baseline
+    /// define_keys() field/value list, ALREADY computed by
+    /// validate_field_key_uniqueness() (see its own `old_keys_out` doc
+    /// comment) -- forwarded straight through to reconcile_field_keys() so
+    /// this update doesn't walk baseline->each_field_key() a second time.
+    /// nullptr for any caller (there are none today besides
+    /// apply_transaction_contents's own update loop) that hasn't already
+    /// computed it.
+    std::optional<IntegrityError> apply_update(
+        std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap,
+        const std::vector<std::pair<const void*, std::string>>* old_field_keys_hint = nullptr,
+        bool keep_undo = true);
+    /// Cascade BFS, called from try_commit()'s apply phase. `seeds` is
+    /// EVERY remove() intent this transaction resolves (deferred local
+    /// removes AND real remove_intents_), fed to the SAME BFS in one call
+    /// -- one shared `work` list and `visited` set -- instead of one
+    /// remove_raw() call per intent. Correctness is unaffected: each id is
+    /// still visited (and its cascade resolved) exactly once regardless of
+    /// which seed's fan-out reaches it first, exactly as if a later intent's
+    /// BFS had found it already-gone via peek_raw() -- the only thing this
+    /// changes is that finding avoids a second, separate BFS setup (a fresh
+    /// `work`/`visited` allocation and a redundant referrers_ lookup) to
+    /// discover it. The RELATIVE order of resulting Change/UndoAction
+    /// entries between two INDEPENDENT intents' cascades is unspecified
+    /// either way (see Change's own doc comment) -- only the phase order
+    /// relative to creates/updates (this always runs after both; see
+    /// apply_transaction_contents) and the per-id order within one id's own
+    /// cascade (still guaranteed by `visited`) are load-bearing.
+    std::vector<Id> remove_raw(const std::vector<Id>& seeds, bool keep_undo = true);
     // remove_raw's helper for a NULLABLE referrer: clone + install, so the
     // caller can null_ref() the field that pointed at the victim, then
     // reconcile immediately. See the .cpp for why reconciliation must happen
@@ -2677,6 +2755,13 @@ private:
                                                        ///< chunks land here, published via Root
     std::unordered_set<std::uint32_t> dirty_;  ///< chunks already cloned THIS attempt (see cow());
                                                ///< cleared per attempt so publish stays immutable
+    // First-touch-this-attempt tracking for the four whole-map-handle
+    // indexes' undo capture -- see log_by_type_once()'s doc comment. Same
+    // "attempt-scoped, cleared alongside dirty_" lifetime as dirty_ itself.
+    std::unordered_set<TypeTag> dirty_by_type_;
+    std::unordered_set<const void*> dirty_by_field_;
+    std::unordered_set<const void*> dirty_by_cached_field_;
+    std::unordered_set<const void*> dirty_by_cached_reference_;
     // The writer's working copies of Root's three indexes -- same persistent
     // structures, so publishing them into a new Root is a cheap map copy.
     std::unordered_map<TypeTag, pmap::PersistentSet<Id, IdHash>> by_type_;

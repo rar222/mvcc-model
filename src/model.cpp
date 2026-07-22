@@ -517,7 +517,9 @@ std::optional<Model::IntegrityError> Model::validate(
 }
 
 std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
-    const Transaction& txn) const {
+    const Transaction& txn,
+    std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>&
+        old_keys_out) const {
     // Per define_keys() field: every (key -> claiming object) this
     // transaction's creates/updates will install, plus the set of keys some
     // update in this same transaction is moving OFF of. `claims` uses the
@@ -547,7 +549,6 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
     }
 
     for (const auto& [slot, clone] : txn.local_updated_) {
-        (void)slot;
         // peek_raw(), not txn.update_baseline_: this runs from inside
         // apply_transaction_contents, the same "latest, not base" moment
         // apply_update() itself reads baseline from -- see validate()'s
@@ -555,14 +556,21 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
         // agree for every id in local_updated_ (nothing else could have
         // touched it since txn.base()).
         const ObjectBase* baseline = peek_raw(clone->id);
-        std::unordered_map<const void*, std::string> old_keys;
+        // A linear-scan vector, not an unordered_map -- see
+        // reconcile_out_refs()'s comment for why (a handful of fields at
+        // most). Moved into old_keys_out below so apply_update()'s later
+        // call to reconcile_field_keys() can reuse it instead of walking
+        // baseline->each_field_key() a second time -- see old_keys_out's own
+        // doc comment in model.h.
+        std::vector<std::pair<const void*, std::string>> old_keys;
         baseline->each_field_key(
-            [&](const void* field, std::string key) { old_keys.emplace(field, std::move(key)); });
+            [&](const void* field, std::string key) { old_keys.emplace_back(field, std::move(key)); });
 
         std::optional<IntegrityError> err;
         clone->each_field_key([&](const void* field, std::string new_key) {
             if (err) return;
-            const auto oldit = old_keys.find(field);
+            const auto oldit = std::find_if(old_keys.begin(), old_keys.end(),
+                                            [&](const auto& p) { return p.first == field; });
             if (oldit != old_keys.end() && oldit->second == new_key) return;  // unchanged
 
             auto& plan = plans[field];
@@ -574,6 +582,7 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
                                      "' claimed by more than one object within the same transaction",
                                      Id{}};
         });
+        old_keys_out.emplace(slot, std::move(old_keys));
         if (err) return err;
     }
 
@@ -710,6 +719,38 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
     });
 }
 
+// First-touch-this-attempt undo capture for the four whole-map-handle
+// indexes -- see log_by_type_once()'s doc comment in model.h for why only
+// the first touch of a given key needs to log anything.
+
+void Model::log_by_type_once(TypeTag tag) {
+    if (!dirty_by_type_.insert(tag).second) return;
+    auto prev = by_type_[tag];
+    log([this, tag, prev = std::move(prev)]() mutable { by_type_[tag] = std::move(prev); });
+}
+
+void Model::log_by_field_once(const void* field) {
+    if (!dirty_by_field_.insert(field).second) return;
+    auto prev = by_field_[field];
+    log([this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); });
+}
+
+void Model::log_by_cached_field_once(const void* field) {
+    if (!dirty_by_cached_field_.insert(field).second) return;
+    auto prev = by_cached_field_[field];
+    log([this, field, prev = std::move(prev)]() mutable {
+        by_cached_field_[field] = std::move(prev);
+    });
+}
+
+void Model::log_by_cached_reference_once(const void* field) {
+    if (!dirty_by_cached_reference_.insert(field).second) return;
+    auto prev = by_cached_reference_[field];
+    log([this, field, prev = std::move(prev)]() mutable {
+        by_cached_reference_[field] = std::move(prev);
+    });
+}
+
 // by_field_ maintenance: the define_keys() unique-key index (Root::by_field).
 // One persistent map PER FIELD (by_field_[field]), each mapping that field's
 // key string -> the single Id currently holding it -- unique, unlike the
@@ -722,38 +763,43 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
 void Model::add_field_keys(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
-        auto& sub = by_field_[field];  // one lookup; `sub` is this field's map, in place
-        auto prev = sub;                // snapshot before the insert, for the undo log below
+        log_by_field_once(field);  // captures the pre-attempt value once; see its own doc comment
+        auto& sub = by_field_[field];   // one lookup; `sub` is this field's map, in place
         sub = sub.set(key, id);         // key is unique per field by construction (see
                                         // define_keys' contract); a collision here is a
                                         // caller bug, not something this layer detects
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_field_[field] = std::move(prev);
-        });
     });
 }
 
 void Model::drop_field_keys(const ObjectBase* o) {
     o->each_field_key([&](const void* field, std::string key) {
+        log_by_field_once(field);
         auto& sub = by_field_[field];
-        auto prev = sub;
         sub = sub.erase(key);
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_field_[field] = std::move(prev);
-        });
     });
 }
 
-void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* after) {
+void Model::reconcile_field_keys(
+    const ObjectBase* before, const ObjectBase* after,
+    const std::vector<std::pair<const void*, std::string>>* old_keys_hint) {
     const Id id = after->id;
     // old_keys: this object's OWN key per field, as it was before the
-    // update -- one snapshot of each_field_key() taken up front, so the
-    // `after` pass below can diff against it field by field without a
-    // second traversal of `before`. A linear-scan vector, not an
-    // unordered_map -- see reconcile_out_refs()'s comment for why.
-    std::vector<std::pair<const void*, std::string>> old_keys;
-    before->each_field_key(
-        [&](const void* field, std::string key) { old_keys.emplace_back(field, std::move(key)); });
+    // update. If the caller already computed this (old_keys_hint --
+    // apply_update(), forwarding validate_field_key_uniqueness()'s own
+    // per-update pass; see that method's old_keys_out doc comment), reuse it
+    // instead of walking before->each_field_key() a second time. Every OTHER
+    // caller (remove_raw()'s cascade-null branch, reconciling a survivor
+    // against a baseline validate_field_key_uniqueness() never saw) computes
+    // it here, same as before. A linear-scan vector, not an unordered_map --
+    // see reconcile_out_refs()'s comment for why.
+    std::vector<std::pair<const void*, std::string>> computed_old_keys;
+    if (!old_keys_hint) {
+        before->each_field_key([&](const void* field, std::string key) {
+            computed_old_keys.emplace_back(field, std::move(key));
+        });
+        old_keys_hint = &computed_old_keys;
+    }
+    const std::vector<std::pair<const void*, std::string>>& old_keys = *old_keys_hint;
 
     after->each_field_key([&](const void* field, std::string new_key) {
         const auto it = std::find_if(old_keys.begin(), old_keys.end(),
@@ -761,11 +807,12 @@ void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* aft
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
         // Same undo pattern as add_field_keys/drop_field_keys: capture the
-        // whole prior map (cheap -- persistent, structure-shared) and restore
-        // it on rollback. Without this, a vetoed/conflicted attempt leaves
-        // by_field_ permanently indexing values that never committed.
+        // whole prior map (cheap -- persistent, structure-shared), once per
+        // attempt (log_by_field_once), and restore it on rollback. Without
+        // this, a vetoed/conflicted attempt leaves by_field_ permanently
+        // indexing values that never committed.
+        log_by_field_once(field);
         auto& sub = by_field_[field];
-        auto prev = sub;
         // Only erase the OLD key if we still hold it. local_updated_ is an
         // unordered_map -- apply order across objects in one transaction is
         // arbitrary -- so a same-transaction swap (this object vacates K
@@ -780,9 +827,6 @@ void Model::reconcile_field_keys(const ObjectBase* before, const ObjectBase* aft
             if (cur && *cur == id) sub = sub.erase(it->second);
         }
         sub = sub.set(new_key, id);
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_field_[field] = std::move(prev);
-        });
     });
 }
 
@@ -799,32 +843,26 @@ void Model::add_cached_fields(const ObjectBase* o) {
         // Two-level structure: by_cached_field_[field] is the OUTER map (key
         // string -> bucket); `bucket`, if this key already has other
         // holders, is the INNER set collecting every object currently
-        // holding that value. `prev` is the outer map's state before this
-        // insert, captured whole for the undo log below.
+        // holding that value. log_by_cached_field_once captures the outer
+        // map's pre-attempt state, once, for the undo log.
+        log_by_cached_field_once(field);
         auto& sub = by_cached_field_[field];
-        auto prev = sub;
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
         sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_cached_field_[field] = std::move(prev);
-        });
     });
 }
 
 void Model::drop_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_field([&](const void* field, std::string key) {
+        log_by_cached_field_once(field);
         auto& sub = by_cached_field_[field];
-        auto prev = sub;
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
         if (!bucket) return;  // nothing indexed under this key -- nothing to remove
         auto nb = bucket->erase(id);  // nb: the bucket with just this id removed
         // An emptied bucket is dropped outright, so a value with no remaining
         // holders doesn't leave a tombstone entry behind.
         sub = nb.empty() ? sub.erase(key) : sub.set(key, nb);
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_cached_field_[field] = std::move(prev);
-        });
     });
 }
 
@@ -843,13 +881,14 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
                                      [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
-        // prev: the OUTER map's state before any edit -- what the undo log
-        // restores wholesale on rollback. sub is written through directly
-        // across the two steps below (old value's bucket shrinks/drops, new
-        // value's bucket grows) -- each reassignment updates the map in
-        // place, so there's no separate "cur" to install at the end.
+        // log_by_cached_field_once captures the OUTER map's pre-attempt state
+        // (once) -- what the undo log restores wholesale on rollback. sub is
+        // written through directly across the two steps below (old value's
+        // bucket shrinks/drops, new value's bucket grows) -- each
+        // reassignment updates the map in place, so there's no separate
+        // "cur" to install at the end.
+        log_by_cached_field_once(field);
         auto& sub = by_cached_field_[field];
-        auto prev = sub;
         if (it != old_keys.end()) {
             // Remove this id from its OLD value's bucket (ob), unless that
             // value was never actually indexed (e.g. this field just started
@@ -863,9 +902,6 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
         // is the first object ever to hold this particular value.
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(new_key);
         sub = sub.set(new_key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_cached_field_[field] = std::move(prev);
-        });
     });
 }
 
@@ -881,13 +917,10 @@ void Model::add_cached_references(const ObjectBase* o) {
     const Id id = o->id;  // the REFERRER -- the value stored in the bucket, not the bucket's key
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;  // Opt<> currently null: nothing to index
+        log_by_cached_reference_once(field);
         auto& sub = by_cached_reference_[field];
-        auto prev = sub;
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
         sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_cached_reference_[field] = std::move(prev);
-        });
     });
 }
 
@@ -895,17 +928,14 @@ void Model::drop_cached_references(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;
+        log_by_cached_reference_once(field);
         auto& sub = by_cached_reference_[field];
-        auto prev = sub;
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
         if (!bucket) return;
         auto nb = bucket->erase(id);
         // An emptied bucket is dropped outright, so a target with no
         // remaining referrers doesn't leave a tombstone entry behind.
         sub = nb.empty() ? sub.erase(target) : sub.set(target, nb);
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_cached_reference_[field] = std::move(prev);
-        });
     });
 }
 
@@ -924,8 +954,8 @@ void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBa
         const Id old_target = (it != old_targets.end()) ? it->second : Id{};
         if (new_target == old_target) return;  // unchanged (incl. both still null)
 
+        log_by_cached_reference_once(field);
         auto& sub = by_cached_reference_[field];
-        auto prev = sub;
         if (old_target) {
             if (const pmap::PersistentSet<Id, IdHash>* ob = sub.get(old_target)) {
                 auto nb = ob->erase(id);
@@ -936,9 +966,6 @@ void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBa
             const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(new_target);
             sub = sub.set(new_target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
         }
-        log([this, field, prev = std::move(prev)]() mutable {
-            by_cached_reference_[field] = std::move(prev);
-        });
     });
 }
 
@@ -1195,12 +1222,9 @@ std::optional<Model::IntegrityError> Model::apply_create(
     // Every object gets an (internal, Id-keyed) entry in its type's
     // enumeration index, unconditionally -- this is what for_each<T>() scans.
     const TypeTag tag = raw->tag();
+    log_by_type_once(tag);
     auto& sub = by_type_[tag];
-    auto prev = sub;
     sub = sub.insert(id);
-    log([this, tag, prev = std::move(prev)]() mutable {
-        by_type_[tag] = std::move(prev);
-    });
 
     add_out_refs(raw);
     add_field_keys(raw);
@@ -1229,7 +1253,8 @@ std::optional<Model::IntegrityError> Model::apply_create(
 }
 
 std::optional<Model::IntegrityError> Model::apply_update(
-    std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo) {
+    std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap,
+    const std::vector<std::pair<const void*, std::string>>* old_field_keys_hint, bool keep_undo) {
     ObjectBase* raw = clone.release();
 
     // Log the clone's deletion FIRST (before anything can fail), so in
@@ -1279,7 +1304,7 @@ std::optional<Model::IntegrityError> Model::apply_update(
     // already updated, or the repointed-away-from object would incorrectly
     // be dragged into X's cascade.
     reconcile_out_refs(baseline, raw);
-    reconcile_field_keys(baseline, raw);
+    reconcile_field_keys(baseline, raw, old_field_keys_hint);
     reconcile_cached_fields(baseline, raw);
     reconcile_cached_references(baseline, raw);
     return std::nullopt;
@@ -1324,18 +1349,20 @@ ObjectBase* Model::clone_for_cascade_null(Id id, bool keep_undo) {
     return copy;
 }
 
-std::vector<Id> Model::remove_raw(Id id, bool keep_undo) {
+std::vector<Id> Model::remove_raw(const std::vector<Id>& seeds, bool keep_undo) {
     // Breadth-first cascade delete, resolved here (at apply time, under
     // commit_mu_) and never eagerly (invariant 8). `work` is the BFS
-    // frontier -- ids still waiting to be visited, seeded with the one
-    // Transaction::remove() intent this call is resolving; `visited` is the
-    // set of slot indices already processed, which both terminates cycles
-    // (a self- or mutually-referential graph would otherwise loop forever)
-    // and prevents processing the same victim twice; `killed` accumulates
-    // every id actually deleted, in visitation order, for the caller
-    // (try_commit()) to report.
+    // frontier -- ids still waiting to be visited, seeded with EVERY
+    // Transaction::remove() intent this attempt resolves (see this
+    // function's own doc comment in model.h for why one shared BFS replaces
+    // one call per intent); `visited` is the set of slot indices already
+    // processed, which both terminates cycles (a self- or
+    // mutually-referential graph would otherwise loop forever) and prevents
+    // processing the same victim twice -- including a victim reachable from
+    // more than one seed's cascade. `killed` accumulates every id actually
+    // deleted, in visitation order, for the caller (try_commit()) to report.
     std::vector<Id> killed;
-    std::vector<Id> work{id};
+    std::vector<Id> work(seeds);
     std::unordered_set<std::uint32_t> visited;
 
     while (!work.empty()) {
@@ -1408,12 +1435,9 @@ std::vector<Id> Model::remove_raw(Id id, bool keep_undo) {
         }
 
         const TypeTag tag = victim->tag();
+        log_by_type_once(tag);
         auto& sub = by_type_[tag];
-        auto prev = sub;
         sub = sub.erase(x);
-        log([this, tag, prev = std::move(prev)]() mutable {
-            by_type_[tag] = std::move(prev);
-        });
 
         drop_field_keys(victim);
         drop_cached_fields(victim);
@@ -1494,6 +1518,10 @@ void Model::rollback_apply() {
     pending_undo_.clear();  // not log()-replayed like changes_ -- see its own comment; a blunt
                             // clear is correct either way, since a failed attempt keeps nothing
     dirty_.clear();
+    dirty_by_type_.clear();
+    dirty_by_field_.clear();
+    dirty_by_cached_field_.clear();
+    dirty_by_cached_reference_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,7 +1608,13 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // even the pre-mint pass below) -- see validate_field_key_uniqueness()'s
     // own doc comment for why this can't be folded into the per-object
     // create/update loop the way validate() (Ref<> integrity) is.
-    if (auto err = validate_field_key_uniqueness(txn)) return err;
+    // old_field_keys: per-update baseline define_keys() fields, computed by
+    // this same pass -- handed to apply_update() below so it doesn't have to
+    // re-walk each baseline's each_field_key() a second time; see
+    // validate_field_key_uniqueness()'s own old_keys_out doc comment.
+    std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>
+        old_field_keys;
+    if (auto err = validate_field_key_uniqueness(txn, old_field_keys)) return err;
 
     // Pre-mint pass: every live create gets its real id BEFORE anything is
     // applied, so the remap table is complete when the first remap_refs()
@@ -1623,23 +1657,33 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     }
     if (!err) {
         for (auto& [slot, clone] : txn.local_updated_) {
-            (void)slot;
             // No `pending` needed here: every create installed before the
             // first update applies, so peek() resolves them directly.
-            if (clone && (err = apply_update(std::move(clone), remap, keep_undo))) break;
+            // old_field_keys[slot] was populated for every id in
+            // local_updated_ by validate_field_key_uniqueness() above --
+            // see apply_update()'s own old_field_keys_hint doc comment.
+            if (!clone) continue;
+            const auto hint_it = old_field_keys.find(slot);
+            const auto* hint = hint_it != old_field_keys.end() ? &hint_it->second : nullptr;
+            if ((err = apply_update(std::move(clone), remap, hint, keep_undo))) break;
         }
     }
     if (!err) {
-        // Deferred local removes first (see Transaction::remove_raw): each
-        // one's create just installed above, so its real id comes out of the
-        // remap table and takes the exact same cascade BFS a committed id
-        // does -- referrers_ already reflects every install and reconcile.
+        // Deferred local removes (see Transaction::remove_raw) and real
+        // remove_intents_ are resolved together, in ONE shared BFS call --
+        // see Model::remove_raw's own doc comment for why. Each deferred
+        // local's create just installed above, so its real id (out of the
+        // remap table) takes the exact same cascade BFS a committed id does
+        // -- referrers_ already reflects every install and reconcile.
+        std::vector<Id> remove_seeds;
+        remove_seeds.reserve(txn.local_remove_intents_.size() + txn.remove_intents_.size());
         for (std::uint32_t idx : txn.local_remove_intents_) {
             const auto it = remap.find(kLocalIdBit | idx);
             assert(it != remap.end() && "a deferred-removed create is still live, so it was minted");
-            if (it != remap.end()) remove_raw(it->second, keep_undo);
+            if (it != remap.end()) remove_seeds.push_back(it->second);
         }
-        for (Id rid : txn.remove_intents_) remove_raw(rid, keep_undo);
+        for (Id rid : txn.remove_intents_) remove_seeds.push_back(rid);
+        if (!remove_seeds.empty()) remove_raw(remove_seeds, keep_undo);
     }
     // Collapse pending_undo_ to at most one action per id -- see
     // collapse_undo_actions()'s own doc comment. Guarded by keep_undo, same
@@ -1880,6 +1924,10 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
 
     changes_.clear();
     dirty_.clear();        // next attempt re-COWs each chunk it touches
+    dirty_by_type_.clear();
+    dirty_by_field_.clear();
+    dirty_by_cached_field_.clear();
+    dirty_by_cached_reference_.clear();
     undo_.clear();         // committed: nothing to roll back to
     txn_created_.clear();  // published objects are now owned by the spine
 
@@ -2251,6 +2299,10 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
         for (std::uint32_t i = 0; i < kChunkSize; ++i) delete ch->obj[i];  // delete(nullptr): no-op
     spine_.clear();
     dirty_.clear();
+    dirty_by_type_.clear();
+    dirty_by_field_.clear();
+    dirty_by_cached_field_.clear();
+    dirty_by_cached_reference_.clear();
     by_type_.clear();
     by_field_.clear();
     by_cached_field_.clear();

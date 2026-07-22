@@ -128,6 +128,14 @@ add_executable(single_vs_multi_txn_bench examples/single_vs_multi_txn_bench.cpp)
 target_link_libraries(single_vs_multi_txn_bench PRIVATE model)
 target_precompile_headers(single_vs_multi_txn_bench REUSE_FROM model)
 
+# Isolates apply_transaction_contents()'s per-object index-maintenance cost
+# (by_type_/by_field_/by_cached_field_/by_cached_reference_/referrers_) for
+# one huge bulk create, one huge bulk update, and one transaction with many
+# separate cascading remove() intents -- times only the try_commit() call.
+add_executable(large_txn_bench examples/large_txn_bench.cpp)
+target_link_libraries(large_txn_bench PRIVATE model)
+target_precompile_headers(large_txn_bench REUSE_FROM model)
+
 # --- tests ------------------------------------------------------------------
 
 enable_testing()
