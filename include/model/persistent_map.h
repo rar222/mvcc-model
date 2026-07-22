@@ -610,6 +610,12 @@ public:
         return e ? &e->second : nullptr;
     }
 
+    /// Visits every (key, value) pair once. Order is the trie's own layout
+    /// (hash-slice bucket order, walked idx 0..31 per node -- see
+    /// detail::TrieCore::each_in) -- NOT insertion order and NOT sorted by
+    /// key. Every model.h caller built on this (Root::by_field's iteration,
+    /// etc.) inherits that same "unspecified order" contract already stated
+    /// for the model's own find_by_cached_field and friends.
     template <class F>
     void for_each(F&& f) const {
         core_.each_entry([&](const std::pair<K, V>& e) { f(e.first, e.second); });
@@ -642,6 +648,9 @@ public:
 
     bool contains(const K& key) const { return core_.get_entry(key) != nullptr; }
 
+    /// Visits every key once. Same "trie layout order, not insertion or
+    /// sorted order" caveat as PersistentMap::for_each above -- see its
+    /// comment.
     template <class F>
     void for_each(F&& f) const {
         core_.each_entry([&](const K& k) { f(k); });

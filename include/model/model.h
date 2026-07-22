@@ -1060,6 +1060,13 @@ struct FieldLookupKey {
     const void* field;
     friend bool operator==(FieldLookupKey, FieldLookupKey) noexcept = default;
 };
+/// Hasher for FieldLookupKey. Unlike IdHash, this makes no collision-free
+/// claim and needs none: it only keys field_lookup_counts_, a diagnostics-
+/// only map (see Model::record_field_lookup) that is never on a hot path
+/// and never affects correctness -- an occasional bucket collision just
+/// costs one extra comparison, not a wrong answer. A plain XOR-of-hashes
+/// combination is enough for that; no `is_perfect` opt-in (see
+/// pmap::detail::hash_is_perfect_v) is declared or needed here.
 struct FieldLookupKeyHash {
     std::size_t operator()(FieldLookupKey k) const noexcept {
         return std::hash<const void*>{}(static_cast<const void*>(k.type)) ^
@@ -2847,6 +2854,16 @@ private:
 
     // FieldLookupKey/FieldLookupKeyHash live at namespace scope, not here --
     // see FieldLookupKey's own doc comment for why.
+
+    /// The atomic mirror of the public LookupCounts: one instance per
+    /// looked-up field, held inside field_lookup_counts_. Split into atomics
+    /// (rather than storing LookupCounts directly) is what lets the
+    /// steady-state increment in record_field_lookup() take field_lookup_mu_
+    /// only SHARED -- concurrent lookups bump their own counter without
+    /// serializing against each other, only against a never-seen-before
+    /// field's insert. LookupCounts itself stays a plain (non-atomic) value
+    /// type because it's also the return type callers see (lookup_stats(),
+    /// LookupDiagnostics::stats), copied out once, after the atomics are read.
     struct FieldLookupCounters {
         std::atomic<std::uint64_t> cached{0};
         std::atomic<std::uint64_t> uncached{0};
