@@ -1543,9 +1543,16 @@ using PostCommitFn = std::function<void(Model&, const Transaction&, const Commit
 /// own snapshot, never a fresh Model::snapshot() (which may already be
 /// newer, and would tear the "state matches changes" pairing).
 struct Update {
-    Snapshot snapshot;            ///< state as of these changes; pins its version until dropped
-    std::vector<Change> changes;  ///< every id that changed since the last delivery
-    bool coalesced = false;       ///< true if intermediate versions were folded away
+    Snapshot snapshot;  ///< state as of these changes; pins its version until dropped
+    /// Every id that changed since the last delivery. Shared (not owned
+    /// per-Update): publish_now() hands the SAME changeset to every
+    /// subscriber, so this is a shared_ptr<const ...> rather than a
+    /// std::vector<Change> -- one commit with N subscribers builds the
+    /// changeset once instead of copying it N times. Read-only by
+    /// construction (const), so sharing is safe even though each
+    /// subscriber's queue is drained on its own thread.
+    std::shared_ptr<const std::vector<Change>> changes;
+    bool coalesced = false;  ///< true if intermediate versions were folded away
 };
 
 /// One bounded queue per subscriber, drained on the subscriber's own thread.
@@ -2282,7 +2289,10 @@ private:
     /// no separate retention bookkeeping needed.
     struct ChangelogEntry {
         std::uint64_t version;
-        std::vector<Change> changes;
+        /// Same shared_ptr instance publish_now() also hands every
+        /// subscriber's Update -- one changeset, not a second copy just for
+        /// the changelog. See Update::changes.
+        std::shared_ptr<const std::vector<Change>> changes;
     };
 
     // All of the following run only under commit_mu_ (invariant 7), except
@@ -2634,9 +2644,15 @@ private:
     std::mutex reap_mu_;               ///< guards everything below except reap_backlog_
     std::condition_variable reap_cv_;  ///< wakes the reaper: work arrived, or stopping
     std::condition_variable reap_done_cv_;  ///< wakes wait_for_reclamation(): a pass finished
-    std::vector<std::pair<std::uint64_t, const ObjectBase*>> reap_queue_;
+    std::deque<std::pair<std::uint64_t, const ObjectBase*>> reap_queue_;
     ///< ^ (version at which each object became invisible, object); freed once
-    ///< the live watermark reaches that version
+    ///< the live watermark reaches that version. ALWAYS sorted ascending by
+    ///< version: every batch enqueue_retired() appends carries version_+1 of
+    ///< the commit that produced it, and commits are serialized (commit_mu_)
+    ///< with version_ strictly increasing -- so freeable entries are always
+    ///< exactly the front prefix. A deque (not vector), so reaper_loop() can
+    ///< pop that prefix in O(1) per entry instead of re-scanning the whole
+    ///< queue every pass -- see its own comment.
     std::atomic<std::size_t> reap_backlog_{0};  ///< reaper backlog, cheaply answer "how far behind is the background reaper right now?" 
                                                 ///< — e.g. to monitor whether cascade-heavy churn is outpacing reclamation — without
                                                 ///< paying reap_mu_ contention or reap_queue_.size()'s cost under load. It's kept as a

@@ -98,7 +98,7 @@ void subscriber_thread(std::shared_ptr<Subscription> sub) {
     while (sub->wait(u)) {
         ++batches;
         if (u.coalesced) ++coalesced;
-        for (const Change& c : u.changes) {
+        for (const Change& c : *u.changes) {
             switch (c.kind) {
                 case ChangeKind::Created: ++created; break;
                 case ChangeKind::Updated: ++updated; break;

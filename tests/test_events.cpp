@@ -29,9 +29,9 @@ TEST(subscriber_gets_a_changeset_per_commit) {
 
     Update u;
     CHECK(sub->try_drain(u));
-    CHECK_EQ(u.changes.size(), std::size_t{1});
-    CHECK_EQ(u.changes[0].id, a.raw());
-    CHECK(u.changes[0].kind == ChangeKind::Created);
+    CHECK_EQ(u.changes->size(), std::size_t{1});
+    CHECK_EQ((*u.changes)[0].id, a.raw());
+    CHECK((*u.changes)[0].kind == ChangeKind::Created);
     CHECK(!u.coalesced);
     CHECK(u.snapshot.find(a) != nullptr);
     CHECK(!sub->try_drain(u));
@@ -85,7 +85,7 @@ TEST(create_then_delete_between_drains_cancels_out) {
     int mentions_o = 0, mentions_a = 0;
     Update u;
     while (sub->try_drain(u)) {
-        for (const Change& c : u.changes) {
+        for (const Change& c : *u.changes) {
             if (c.id == o.raw()) ++mentions_o;
             if (c.id == a.raw()) ++mentions_a;
         }
@@ -146,7 +146,7 @@ TEST(multiple_independent_subscribers_receive_independent_coalescing_streams) {
         Update u;
         CHECK(fast->try_drain(u));
         CHECK(!u.coalesced);
-        CHECK_EQ(u.changes.size(), std::size_t{1});
+        CHECK_EQ(u.changes->size(), std::size_t{1});
         CHECK(!fast->try_drain(u));  // nothing else queued behind it
     }
 

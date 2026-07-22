@@ -98,8 +98,8 @@ void subscriber_thread(std::shared_ptr<Subscription> sub) {
         ++batch;
         std::printf("[subscriber] batch %llu v%llu%s: %zu change(s)\n",
                     static_cast<unsigned long long>(batch), static_cast<unsigned long long>(u.snapshot.version()),
-                    u.coalesced ? " (coalesced)" : "", u.changes.size());
-        for (const Change& c : u.changes) print_change(u.snapshot, c);
+                    u.coalesced ? " (coalesced)" : "", u.changes->size());
+        for (const Change& c : *u.changes) print_change(u.snapshot, c);
     }
     std::printf("[subscriber] done: %llu batches\n", static_cast<unsigned long long>(batch));
 }

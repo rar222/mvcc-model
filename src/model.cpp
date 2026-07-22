@@ -189,15 +189,18 @@ void Subscription::collapse(Update tail) {
     // tail (the newest, about to overflow the queue) -- so `merged`'s final
     // state reflects the changes in the order they actually happened.
     for (auto& u : q_)
-        for (auto& c : u.changes) apply(c);
-    for (auto& c : tail.changes) apply(c);
+        for (auto& c : *u.changes) apply(c);
+    for (auto& c : *tail.changes) apply(c);
 
     Update out;
     out.snapshot = std::move(tail.snapshot);  // the newest version -- every older Snapshot in the
                                               // queue is dropped along with q_ below
     out.coalesced = true;  // tells the consumer this Update skipped intermediate versions
-    out.changes.reserve(merged.size());
-    for (auto& [id, kind] : merged) out.changes.push_back({id, kind, tags.at(id)});
+    auto merged_changes = std::make_shared<std::vector<Change>>();
+    merged_changes->reserve(merged.size());
+    for (auto& [id, kind] : merged) merged_changes->push_back({id, kind, tags.at(id)});
+    out.changes = std::move(merged_changes);  // this IS a genuinely new, synthesized changeset --
+                                              // nothing to share with q_'s or tail's own changes
 
     q_.clear();  // drops the intermediate snapshots -- the whole point (each one was pinning a
                  // version, and everything retired since, alive)
@@ -282,20 +285,18 @@ void Model::reaper_loop() {
             min_live = live_.empty() ? UINT64_MAX : live_.begin()->first;
         }
 
-        // Free everything no live snapshot can still see; keep the rest in the
-        // shared queue so a barrier (wait_for_reclamation) can observe exactly
-        // what remains pinned. remove_if partitions reap_queue_ in place
-        // (freeable entries deleted and moved to the tail); `it` marks where
-        // the surviving (still-pinned) entries end, so erase() below drops
-        // exactly the tail that remove_if already deleted through.
+        // Free everything no live snapshot can still see. reap_queue_ is
+        // ALWAYS sorted ascending by version (see its own comment), so every
+        // freeable entry is a prefix of the queue -- pop it from the front
+        // instead of re-testing the whole queue every pass. Without this, a
+        // single reader lagging a few commits behind turns every subsequent
+        // pass into an O(backlog) rescan of entries already known unfreeable.
         std::size_t freed = 0;
-        auto it = std::remove_if(reap_queue_.begin(), reap_queue_.end(), [&](auto& e) {
-            if (min_live < e.first) return false;  // still visible somewhere
-            delete e.second;
+        while (!reap_queue_.empty() && reap_queue_.front().first <= min_live) {
+            delete reap_queue_.front().second;
+            reap_queue_.pop_front();
             ++freed;
-            return true;
-        });
-        reap_queue_.erase(it, reap_queue_.end());
+        }
         if (freed) reap_backlog_.fetch_sub(freed, std::memory_order_relaxed);
 
         // Completing a pass -- even one that freed nothing -- advances the
@@ -1043,7 +1044,7 @@ Model::Diagnostics Model::diagnostics() const {
 
         diag.retained_commit_history.reserve(changelog_.size());
         for (const auto& entry : changelog_)
-            diag.retained_commit_history.emplace_back(entry.version, entry.changes.size());
+            diag.retained_commit_history.emplace_back(entry.version, entry.changes->size());
     }
 
     {
@@ -1797,6 +1798,14 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
         pub.lease_ = std::make_shared<Snapshot::Lease>(this, r->version);
     }
 
+    // Built once and shared (not copied) into every subscriber's Update AND
+    // the changelog entry below -- changes_ itself is still read a few more
+    // times past this point (last_write_version_, the undo list's `touched`
+    // set, and the final CommitResult), so this is one copy out of it, same
+    // as before; what's eliminated is the PER-SUBSCRIBER copy the old code
+    // made by passing changes_ by value into each Update.
+    auto shared_changes = std::make_shared<const std::vector<Change>>(changes_);
+
     {
         // subs: a copy of the subscriber list, taken and immediately
         // released from subs_mu_ before any push() -- a slow subscriber's
@@ -1808,7 +1817,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
             std::lock_guard lk(subs_mu_);
             subs = subs_;
         }
-        for (auto& s : subs) s->push(Update{pub, changes_, false});
+        for (auto& s : subs) s->push(Update{pub, shared_changes, false});
     }
 
     // Hand this attempt's retired objects to the background reaper rather
@@ -1817,7 +1826,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     enqueue_retired(std::move(retired_));
     retired_.clear();
 
-    changelog_.push_back({r->version, changes_});
+    changelog_.push_back({r->version, shared_changes});
     prune_changelog();
 
     // Feed check_id_overlap()'s slot-indexed conflict index -- see
