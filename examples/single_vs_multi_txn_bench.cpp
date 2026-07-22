@@ -37,6 +37,32 @@
 // access (no concurrent readers/writers) and wipes the whole model, so
 // it's for initial load, not incremental writes -- see its own doc comment
 // in model.h.
+//
+// Each scenario also runs again with set_max_undo_list_size(0). Measured
+// result: it makes essentially no difference here --
+//
+//   single-txn, uncapped:   17726.4 ms
+//   multi-txn,  uncapped:   20812.7 ms
+//   single-txn, capped=0:   16832.5 ms
+//   multi-txn,  capped=0:   20970.3 ms
+//   ratio uncapped/capped=0, single-txn:  1.05x
+//   ratio uncapped/capped=0, multi-txn:   0.99x
+//
+// -- which is exactly what set_max_undo_list_size()'s own doc comment
+// predicts: n == 0 only skips APPENDING the finished UndoEntry to
+// undo_list_; the per-attempt pending_undo_ capture during apply
+// (collapse_undo_actions()) still happens exactly the same either way --
+// that's a separate, earlier step gated by try_commit() vs.
+// try_commit_without_undo(), not by this cap. With only 1 commit (scenario
+// A) or 4 commits (scenario B) total, undo_list_ never grows large enough
+// for its trim-from-the-front cost (set_max_undo_list_size()'s `while
+// (undo_list_.size() >= max_undo_list_size_) erase(begin())` loop) to
+// matter regardless of the cap. Contrast performance_tests.cpp's own
+// four_threads_updating_private_objects_with_undo_list_capped_at_0_is_
+// never_slower_than_uncapped, which stresses MANY repeated small commits
+// instead of a few huge ones -- THAT's the shape where retention (and the
+// repeated trim) actually costs something; a handful of huge transactions
+// never accumulates enough undo history for the cap to matter.
 
 #include "example/types.h"
 #include <algorithm>
@@ -57,8 +83,11 @@ double ms_since(Clock::time_point t0) {
 }
 
 // Scenario A: one thread, one Transaction, n creates, one try_commit().
-double bench_single_txn(int n) {
+// `cap_undo_to_zero`: see the file header comment -- set_max_undo_list_size(0)
+// skips RETAINING the commit's UndoEntry, not collecting it during apply.
+double bench_single_txn(int n, bool cap_undo_to_zero) {
     Model m;
+    if (cap_undo_to_zero) m.set_max_undo_list_size(0);
     auto t0 = Clock::now();
     Transaction txn = m.begin();
     for (int i = 0; i < n; ++i) {
@@ -81,9 +110,10 @@ double bench_single_txn(int n) {
 // of items_per_thread creates. Names are prefixed per-thread so no two
 // threads' Accounts collide on the define_keys() name field (a duplicate
 // there is a rejected commit, not an overwrite -- see Account's own doc
-// comment in example/types.h).
-double bench_multi_txn(int n_threads, int items_per_thread) {
+// comment in example/types.h). `cap_undo_to_zero`: see bench_single_txn.
+double bench_multi_txn(int n_threads, int items_per_thread, bool cap_undo_to_zero) {
     Model m;
+    if (cap_undo_to_zero) m.set_max_undo_list_size(0);
     std::vector<double> build_ms(static_cast<std::size_t>(n_threads), 0.0);
     std::vector<double> commit_ms(static_cast<std::size_t>(n_threads), 0.0);
     std::vector<CommitStatus> status(static_cast<std::size_t>(n_threads));
@@ -126,25 +156,44 @@ int main() {
     constexpr int kPerThread = kTotal / kThreads;
     constexpr int kRepeats = 3;
 
-    std::printf("=== Scenario A: 1 thread, 1 transaction, %d creates ===\n", kTotal);
-    std::vector<double> a_totals;
-    for (int r = 0; r < kRepeats; ++r) {
-        std::printf(" run %d:\n", r);
-        a_totals.push_back(bench_single_txn(kTotal));
+    struct Result {
+        const char* label;
+        double best_ms;
+    };
+    std::vector<Result> results;
+
+    for (bool capped : {false, true}) {
+        const char* mode = capped ? "undo list capped at 0" : "undo list uncapped (default)";
+
+        std::printf("=== Scenario A (%s): 1 thread, 1 transaction, %d creates ===\n", mode,
+                   kTotal);
+        std::vector<double> a_totals;
+        for (int r = 0; r < kRepeats; ++r) {
+            std::printf(" run %d:\n", r);
+            a_totals.push_back(bench_single_txn(kTotal, capped));
+        }
+        results.push_back({capped ? "single-txn, capped=0" : "single-txn, uncapped",
+                           *std::min_element(a_totals.begin(), a_totals.end())});
+
+        std::printf("\n=== Scenario B (%s): %d threads, %d creates each (own transaction) ===\n",
+                   mode, kThreads, kPerThread);
+        std::vector<double> b_totals;
+        for (int r = 0; r < kRepeats; ++r) {
+            std::printf(" run %d:\n", r);
+            b_totals.push_back(bench_multi_txn(kThreads, kPerThread, capped));
+        }
+        results.push_back({capped ? "multi-txn,  capped=0" : "multi-txn,  uncapped",
+                           *std::min_element(b_totals.begin(), b_totals.end())});
+        std::printf("\n");
     }
 
-    std::printf("\n=== Scenario B: %d threads, %d creates each (own transaction) ===\n", kThreads,
-               kPerThread);
-    std::vector<double> b_totals;
-    for (int r = 0; r < kRepeats; ++r) {
-        std::printf(" run %d:\n", r);
-        b_totals.push_back(bench_multi_txn(kThreads, kPerThread));
-    }
-
-    const double a_best = *std::min_element(a_totals.begin(), a_totals.end());
-    const double b_best = *std::min_element(b_totals.begin(), b_totals.end());
-    std::printf("\nbest single-txn total:  %.1f ms\n", a_best);
-    std::printf("best multi-txn wall:    %.1f ms\n", b_best);
-    std::printf("ratio (single/multi):   %.2fx\n", a_best / b_best);
+    std::printf("=== summary (best of %d) ===\n", kRepeats);
+    for (const Result& r : results) std::printf("  %s:  %8.1f ms\n", r.label, r.best_ms);
+    std::printf("ratio single/multi, uncapped:  %.2fx\n", results[0].best_ms / results[1].best_ms);
+    std::printf("ratio single/multi, capped=0:  %.2fx\n", results[2].best_ms / results[3].best_ms);
+    std::printf("ratio uncapped/capped=0, single-txn:  %.2fx\n",
+               results[0].best_ms / results[2].best_ms);
+    std::printf("ratio uncapped/capped=0, multi-txn:   %.2fx\n",
+               results[1].best_ms / results[3].best_ms);
     return 0;
 }
