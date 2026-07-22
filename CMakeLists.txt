@@ -144,6 +144,15 @@ add_executable(small_txn_bench examples/small_txn_bench.cpp)
 target_link_libraries(small_txn_bench PRIVATE model)
 target_precompile_headers(small_txn_bench REUSE_FROM model)
 
+# Stand-alone copy of performance_tests.cpp's one_million_random_basic_
+# records_in_a_single_transaction_without_undo, isolated into its own binary
+# so it can be profiled (gprof/callgrind) without the rest of the
+# performance suite running alongside it. BasicRecord declares no keys and
+# no references, so this is close to the model's own per-object floor.
+add_executable(basic_record_bench examples/basic_record_bench.cpp)
+target_link_libraries(basic_record_bench PRIVATE model)
+target_precompile_headers(basic_record_bench REUSE_FROM model)
+
 # --- tests ------------------------------------------------------------------
 
 enable_testing()
