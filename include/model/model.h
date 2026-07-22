@@ -2232,12 +2232,14 @@ public:
     /// one about to be added. Does not retroactively prune when THIS call
     /// lowers the cap; a list already over the new limit only shrinks the
     /// next time a commit would add to it. n == 0 means "keep no undo
-    /// history at all": a commit that would otherwise gain an UndoEntry
-    /// skips adding one entirely (pending_undo_ is still collected during
-    /// apply when the caller asked for it via try_commit() vs.
-    /// try_commit_without_undo() -- this is a separate, later cap on
-    /// RETENTION, not a way to skip collecting undo data mid-apply).
-    /// Default is unbounded (matching every version of this Model before
+    /// history at all": apply_transaction_contents() folds this cap into
+    /// keep_undo before its apply loop starts, so a 0 cap also skips
+    /// collecting pending_undo_ mid-apply -- no per-object clone
+    /// (apply_update/remove_raw/clone_for_cascade_null) for a commit whose
+    /// undo data publish_now() would just discard anyway. This is read
+    /// under commit_mu_ (already held at that point), same as every other
+    /// commit_mu_-protected member. Default is unbounded (matching every
+    /// version of this Model before
     /// this method existed). Takes commit_mu_, same locking contract as
     /// set_pre_commit/set_pre_transactions/set_post_commit.
     void set_max_undo_list_size(std::size_t n) {
@@ -2459,6 +2461,10 @@ private:
     /// one action per id before the caller ever sees it. Returns nullopt on
     /// success; the caller must then check changes_ and eventually publish
     /// or, on failure, pass the returned error to classify_apply_failure().
+    /// Also where `keep_undo` gets ANDed against `max_undo_list_size_ != 0`
+    /// (a local fold, not threaded back to either caller's own keep_undo --
+    /// see set_max_undo_list_size()'s doc comment for why publish_now()
+    /// doesn't need it threaded back).
     std::optional<IntegrityError> apply_transaction_contents(
         Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo = true);
 

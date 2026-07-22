@@ -72,6 +72,33 @@ CommitResult apply_test_undo(Model& m, const std::vector<TestUndoAction>& action
     return m.try_commit(inv);
 }
 
+/// Test-only type whose copy constructor counts how many times it runs --
+/// used to observe clone() calls directly (Object<Derived>::clone() is just
+/// `new Derived(copy ctor)`), rather than inferring them from undo_list_
+/// contents alone. Deliberately not Account/Order: this must be the ONLY
+/// type touched by the test below, so every copy observed is attributable to
+/// either Transaction::update_raw()'s own clone or apply_update()'s pending_
+/// undo_ capture -- nothing else in the model clones an object type it never
+/// touches.
+struct CountingWidget final : model::Object<CountingWidget> {
+    std::string name;
+    static inline int copy_count = 0;
+
+    CountingWidget() = default;
+    // Must chain to Object<CountingWidget>'s own copy ctor -- otherwise the
+    // base class subobject (ObjectBase::id) default-constructs instead of
+    // copying, and the clone silently gets the wrong id.
+    CountingWidget(const CountingWidget& other) : model::Object<CountingWidget>(other), name(other.name) {
+        ++copy_count;
+    }
+    CountingWidget& operator=(const CountingWidget&) = default;
+
+    template <class Self>
+    static void define_keys(Self& s, const model::FieldKeyReader& v) {
+        v.key<&CountingWidget::name>(s.name, "name");
+    }
+};
+
 }  // namespace
 
 // A Remove action (the inverse of a create) deletes the target -- no
@@ -441,8 +468,9 @@ TEST(set_max_undo_list_size_prunes_oldest_entries_to_make_room) {
 }
 
 // n == 0 means "keep no undo history at all" -- commits still succeed
-// normally (this is a RETENTION cap, not a way to skip collecting undo data
-// mid-apply), they just never gain an entry in undo_list_.
+// normally, they just never gain an entry in undo_list_. See the clone-
+// counting test below for the fact that a 0 cap ALSO skips collecting undo
+// data mid-apply (not just its retention).
 TEST(set_max_undo_list_size_of_zero_never_adds_to_the_list) {
     Model m;
     m.set_max_undo_list_size(0);
@@ -459,6 +487,40 @@ TEST(set_max_undo_list_size_of_zero_never_adds_to_the_list) {
 
     make_account(m, "A2");
     CHECK(m.list_undo().empty());
+}
+
+// A 0 cap doesn't just skip RETENTION -- it skips the per-object pre-image
+// clone during apply too (apply_update's baseline->clone(), remove_raw's
+// victim->clone(), clone_for_cascade_null's cur->clone()):
+// apply_transaction_contents() folds the cap into keep_undo before its apply
+// loop ever runs, so those clones -- which would only feed an UndoEntry
+// publish_now() is about to discard anyway -- never happen.
+// Transaction::update_raw() makes its own, SEPARATE clone regardless (the
+// mutable local overlay the caller writes into) -- that one is unavoidable
+// and not what this test is checking for.
+TEST(set_max_undo_list_size_of_zero_skips_the_per_object_undo_clone) {
+    Model m;
+
+    Transaction create_txn = m.begin();
+    auto w = std::make_unique<CountingWidget>();
+    w->name = "W1";
+    const Ref<CountingWidget> local = create_txn.create(std::move(w));
+    const CommitResult create_res = m.try_commit(create_txn);
+    CHECK(create_res.status == CommitStatus::Committed);
+    const Ref<CountingWidget> id = create_res.to_real(local);
+
+    m.set_max_undo_list_size(0);
+    CountingWidget::copy_count = 0;
+
+    Transaction txn = m.begin();
+    txn.update(id)->name = "W1-updated";
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+    CHECK(m.list_undo().empty());
+
+    // Exactly one clone -- update_raw()'s own local-overlay clone. If
+    // apply_update() still captured a RestoreUpdate pre-image despite the 0
+    // cap, this would be 2.
+    CHECK_EQ(CountingWidget::copy_count, 1);
 }
 
 // Lowering the cap does not retroactively prune what's already in the

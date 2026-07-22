@@ -1537,6 +1537,17 @@ std::vector<Change> Transaction::estimate_changes_with_cascades() const {
 
 std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo) {
+    // publish_now() never appends an entry when max_undo_list_size_ == 0 (see
+    // set_max_undo_list_size()'s doc comment) -- it re-checks the cap itself,
+    // independently of what's passed here. So folding it into this LOCAL
+    // keep_undo, before the apply loop below ever pushes to pending_undo_, is
+    // enough to skip the per-object clones (apply_update/remove_raw/
+    // clone_for_cascade_null) that would only feed an entry publish_now() is
+    // about to discard anyway -- no need to thread the fold back out to
+    // either caller's own keep_undo. Both callers (via check_and_apply())
+    // hold commit_mu_ already, so max_undo_list_size_ is safe to read here.
+    keep_undo = keep_undo && max_undo_list_size_ != 0;
+
     // Whole-transaction key-uniqueness check, before ANYTHING mutates (not
     // even the pre-mint pass below) -- see validate_field_key_uniqueness()'s
     // own doc comment for why this can't be folded into the per-object
