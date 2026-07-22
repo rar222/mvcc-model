@@ -61,6 +61,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1625,6 +1626,70 @@ PERF_TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
 }
 
 #endif  // PERF_HAS_MEMORY_SECTION
+
+// ---------------------------------------------------------------------------
+// Basic bulk-insert timing: a plain type with NOTHING declared -- no
+// define_keys(), no define_references(), no define_scan_fields(), no
+// define_cached_fields() -- so each_ref()/each_field_key()/each_cached_
+// field()/each_scan_field() all fall back to Object<>'s own no-op defaults
+// (see ObjectBase's own doc comments). That makes apply's per-object cost
+// as close to "just write a slot" as this model gets: no ref to validate
+// (invariant 1), no index to insert into. One giant Transaction, committed
+// via try_commit_without_undo() (see its own doc comment: skips the
+// per-object pre-image clone try_commit() would otherwise capture for
+// every one of these creates, since nothing here is ever meant to be
+// undone). Not a scaling sweep like the tests above -- just the plain
+// wall-clock number at this project's own stated target scale (CLAUDE.md:
+// "Objects: 100k-1M").
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class BasicRecord final : public model::Object<BasicRecord> {
+public:
+    int number = 0;
+    std::string text;
+};
+
+}  // namespace
+
+PERF_TEST(one_million_random_basic_records_in_a_single_transaction_without_undo) {
+    // scaled(), same as every other size constant in this file: under a
+    // sanitizer, per-op instrumentation overhead alone (20-50x, see
+    // scaled()'s own comment) would push a full 1,000,000-object single
+    // transaction well past this suite's 300s ctest TIMEOUT. The default
+    // build runs the real, literal 1,000,000 this test is named for.
+    const int kCount = scaled(1'000'000);
+    Model m;
+
+    // Fixed seed: a random-but-representative workload (varied int values,
+    // varied string lengths/content), not a fresh reshuffle every run --
+    // a timing regression should be reproducible from one run to the next,
+    // not dependent on which random bytes a seedless RNG happened to draw.
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int> number_dist(std::numeric_limits<int>::min(),
+                                                    std::numeric_limits<int>::max());
+    std::uniform_int_distribution<int> len_dist(4, 32);
+    std::uniform_int_distribution<int> char_dist('a', 'z');
+
+    Transaction txn = m.begin();
+    for (int i = 0; i < kCount; ++i) {
+        auto r = std::make_unique<BasicRecord>();
+        r->number = number_dist(rng);
+        r->text.resize(static_cast<std::size_t>(len_dist(rng)));
+        for (char& c : r->text) c = static_cast<char>(char_dist(rng));
+        txn.create(std::move(r));
+    }
+
+    CommitResult res;
+    const double commit_ms = time_ms([&] { res = m.try_commit_without_undo(txn); });
+
+    std::printf("  %d creates (single txn, no undo) = %8.2f ms  (%.1f ns/object)\n", kCount, commit_ms,
+                commit_ms * 1e6 / kCount);
+
+    CHECK(res.status == CommitStatus::Committed);
+    CHECK(m.snapshot().size() == static_cast<std::size_t>(kCount));
+}
 
 // ---------------------------------------------------------------------------
 
