@@ -23,6 +23,16 @@
 // (referrers_) a single, writer-owned structure -- never per-transaction,
 // never needing to be merged -- even though many threads can now build
 // transactions concurrently. See CLAUDE.md invariant 8.
+//
+// Comment style used throughout this file:
+//   ///        doc comment for whatever declaration follows it
+//   ///<       trailing doc comment for the declaration it follows, same line
+//   ///< ^     continuation of a ///< comment, wrapped onto the next line(s)
+//              because it didn't fit trailing the declaration -- the ^ points
+//              back up at the member it documents, so it isn't mistaken for
+//              an ordinary /// comment documenting whatever comes AFTER it
+//   //         plain comment: section dividers, or prose that isn't
+//              Doxygen-extractable documentation of one specific declaration
 
 #include <algorithm>
 #include <any>
@@ -1060,6 +1070,7 @@ struct FieldLookupKey {
     const void* field;
     friend bool operator==(FieldLookupKey, FieldLookupKey) noexcept = default;
 };
+
 /// Hasher for FieldLookupKey. Unlike IdHash, this makes no collision-free
 /// claim and needs none: it only keys field_lookup_counts_, a diagnostics-
 /// only map (see Model::record_field_lookup) that is never on a hot path
