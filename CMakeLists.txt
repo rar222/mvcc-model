@@ -14,7 +14,6 @@ endif()
 
 option(MODEL_ASAN "Build with AddressSanitizer + UBSan" OFF)
 option(MODEL_TSAN "Build with ThreadSanitizer" OFF)
-option(MODEL_WERROR "Treat warnings as errors" OFF)
 
 if(MODEL_ASAN AND MODEL_TSAN)
   message(FATAL_ERROR "ASan and TSan cannot be enabled at the same time")
@@ -22,21 +21,44 @@ endif()
 
 add_library(model_flags INTERFACE)
 
+# Warnings are always errors, in every preset -- there is no "warm-up" mode
+# where they're merely advisory. Fix the code, not the flag.
 if(MSVC)
-  target_compile_options(model_flags INTERFACE /W4 /permissive-)
-  if(MODEL_WERROR)
-    target_compile_options(model_flags INTERFACE /WX)
-  endif()
+  target_compile_options(model_flags INTERFACE /W4 /permissive- /WX)
 else()
-  target_compile_options(model_flags INTERFACE -Wall -Wextra -Wpedantic)
+  target_compile_options(model_flags INTERFACE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+    -Wshadow
+    -Wnon-virtual-dtor
+    -Woverloaded-virtual
+    -Wcast-align
+    -Wcast-qual
+    -Wunused
+    -Wnull-dereference
+    -Wdouble-promotion
+    -Wformat=2
+    -Wimplicit-fallthrough
+    -Wold-style-cast
+    -Wuseless-cast
+    -Wredundant-decls
+    -Wextra-semi
+  )
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(model_flags INTERFACE
+      -Wduplicated-cond
+      -Wduplicated-branches
+      -Wlogical-op
+      -Wmisleading-indentation
+    )
+  endif()
   # No C++ exceptions anywhere in this project (see CLAUDE.md): errors are
   # reported through CommitResult / return values, and anything unrecoverable
   # (e.g. bad_alloc out of the standard library) terminates loudly instead of
   # unwinding. The flag makes an accidental `throw` or `try` a compile error.
   target_compile_options(model_flags INTERFACE -fno-exceptions)
-  if(MODEL_WERROR)
-    target_compile_options(model_flags INTERFACE -Werror)
-  endif()
   if(MODEL_ASAN)
     target_compile_options(model_flags INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer -g)
     target_link_options(model_flags INTERFACE -fsanitize=address,undefined)

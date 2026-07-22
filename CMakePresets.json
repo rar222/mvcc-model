@@ -8,8 +8,7 @@
       "binaryDir": "${sourceDir}/build/default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g",
-        "MODEL_WERROR": "ON"
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g"
       }
     },
     {

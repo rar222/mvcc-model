@@ -131,7 +131,7 @@ void seed(Fixture& fx, int n_per_type) {
     for (int i = 0; i < n_per_type; i += 1000) {
         Transaction txn = fx.m.begin();
         for (int j = 0; j < 1000 && i + j < n_per_type; ++j) {
-            const Ref<Bucket> b = fx.buckets[static_cast<std::size_t>((i + j) % fx.buckets.size())];
+            const Ref<Bucket> b = fx.buckets[(i + j) % fx.buckets.size()];
             auto u = std::make_unique<UncachedItem>();
             u->bucket = b;
             u->payload = i + j;
@@ -166,7 +166,7 @@ void seed_one_type(Fixture& fx, int n_per_type) {
     for (int i = 0; i < n_per_type; i += 1000) {
         Transaction txn = fx.m.begin();
         for (int j = 0; j < 1000 && i + j < n_per_type; ++j) {
-            const Ref<Bucket> b = fx.buckets[static_cast<std::size_t>((i + j) % fx.buckets.size())];
+            const Ref<Bucket> b = fx.buckets[(i + j) % fx.buckets.size()];
             auto o = std::make_unique<T>();
             o->bucket = b;
             o->payload = i + j;
@@ -202,7 +202,7 @@ double bench_reassign(Model& m, const std::vector<Ref<T>>& items, const std::vec
     const double total_us = time_us(reps, [&] {
         Transaction txn = m.begin();
         for (int k = 0; k < batch; ++k) {
-            const Ref<Bucket> nb = buckets[static_cast<std::size_t>((k + rep) % buckets.size())];
+            const Ref<Bucket> nb = buckets[(k + rep) % buckets.size()];
             if (T* p = txn.update(items[static_cast<std::size_t>(k)])) p->bucket = nb;
         }
         const CommitResult res = m.try_commit(txn);

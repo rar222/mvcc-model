@@ -2240,7 +2240,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     remap.reserve(txn.objects_.size());
     for (std::size_t i = 0; i < txn.objects_.size(); ++i)
         remap[kLocalIdBit | static_cast<std::uint32_t>(i)] =
-            Id{static_cast<std::uint32_t>(next_slot_++), 1};
+            Id{next_slot_++, 1};
 
     for (std::size_t i = 0; i < txn.objects_.size(); ++i) {
         ObjectBase* raw = txn.objects_[i].release();

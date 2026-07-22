@@ -286,7 +286,7 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
             r->label = "R" + std::to_string(i + j);
             r->value = i + j;
             r->flag = (i + j) % 2 == 0;
-            r->owner = accounts[static_cast<std::size_t>((i + j) % accounts.size())];
+            r->owner = accounts[(i + j) % accounts.size()];
             local.push_back(txn.create(std::move(r)));
         }
         const CommitResult res = commit_ok(m, txn);

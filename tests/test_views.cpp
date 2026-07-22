@@ -155,7 +155,7 @@ TEST(find_cached_referrers_matches_the_slow_scan_and_tracks_updates_and_is_versi
 
     Snapshot before = m.snapshot();
     // The indexed and scan forms agree on every account, empty included.
-    for (Ref<Account> a : {a1, a2, Ref<Account>(make_account(m, "A3"))}) {
+    for (Ref<Account> a : {a1, a2, make_account(m, "A3")}) {
         auto fast = before.find_cached_referrers<&Order::account>(a);
         auto slow = before.find_referrers<&Order::account>(a);
         CHECK_EQ(fast.size(), slow.size());

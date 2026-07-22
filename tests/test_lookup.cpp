@@ -546,7 +546,7 @@ TEST(lookup_diagnostics_shows_names_for_reference_fields_too) {
     Snapshot s = m.snapshot();
 
     (void)s.find_cached_referrers<&Order::account>(a);
-    (void)s.for_each_referrer<&Order::parent>(parent_order, [](const Order&) {});
+    s.for_each_referrer<&Order::parent>(parent_order, [](const Order&) {});
 
     const std::string report = m.lookup_diagnostics().to_string();
     CHECK(report.find("Order::account") != std::string::npos);   // named
