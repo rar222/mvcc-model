@@ -383,10 +383,16 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 // ---------------------------------------------------------------------------
 
 // Account::name is declared in BOTH define_keys() (find_by_key, unique,
-// O(1)) and define_scan_fields() (find_by_scan_field, O(#accounts) linear
-// scan) -- see tests/test_types.h. Same field, same data, same query: any timing
-// difference is attributable entirely to the index, not to anything else.
-TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
+// backed by by_field_'s persistent map -- O(log n), same as the
+// kSmallIndexedRead lookups above, not truly flat) and define_scan_fields()
+// (find_by_scan_field, O(#accounts) linear scan) -- see tests/test_types.h.
+// Same field, same data, same query: any timing difference is attributable
+// entirely to the index, not to anything else. Uses kSmallIndexedRead for
+// the same reason find_by_cached_field and find_cached_referrers do: a
+// sub-microsecond O(log n) call only predicts a ~x1.07 change per step, so
+// ordinary jitter swamps a two-sided 20% band -- see kSmallIndexedRead's
+// own comment.
+TEST(find_by_key_stays_near_flat_while_find_by_scan_field_grows_with_population) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> key_us, scan_us;
     for (int n : sizes) {
@@ -420,7 +426,7 @@ TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
         std::printf("  n=%7d  find_by_key=%9.4f us/call   find_by_scan_field=%9.2f us/call\n", n,
                     key_us.back(), scan_us.back());
     }
-    check_scaling("find_by_key", GrowthOrder::kConstant, sizes, key_us);
+    check_scaling("find_by_key", GrowthOrder::kLogN, sizes, key_us, kSmallIndexedRead);
     check_gap_widens("find_by_key vs scan", scan_us.front(), key_us.front(), scan_us.back(),
                      key_us.back(), 3.0);
 }
