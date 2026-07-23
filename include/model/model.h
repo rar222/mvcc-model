@@ -2217,7 +2217,19 @@ public:
         /// commit that touches ANY id in this set invalidates the whole
         /// entry (the loop in try_commit() that erases conflicting undo_list_
         /// entries), not just the actions that reference it.
-        std::unordered_set<Id, IdHash> touched;
+        ///
+        /// A plain vector, not a set: both consumers (untrack_undo_entry's
+        /// erase loop and the index-seeding loop right after this entry is
+        /// pushed) only ever iterate the whole thing -- nothing ever tests
+        /// membership in a STORED entry's `touched` -- so paying an
+        /// unordered_set's per-element allocation for a property (dedup)
+        /// nothing reads is wasted. changes_ can legitimately repeat an id
+        /// (see actions' own comment), so this can too; a duplicate just
+        /// means undo_touch_index_[id] gets assigned, or erased, twice --
+        /// harmless. See basic_record_bench's profiling note on `pending`
+        /// (apply_transaction_contents, model.cpp) for the matching fix this
+        /// mirrors.
+        std::vector<Id> touched;
 
         std::string name;  ///< copied from the committing Transaction::name() (see publish_now())
         std::any data;     ///< copied from the committing Transaction::data() (see publish_now())
@@ -2434,9 +2446,15 @@ private:
     /// apply_transaction_contents): a Ref<> to one of those is valid --
     /// either every create in the attempt installs, or the whole attempt
     /// rolls back, so "minted" is as good as "installed" for integrity.
-    std::optional<IntegrityError> validate(const ObjectBase* o,
-                                           const std::unordered_set<Id, IdHash>* pending
-                                           = nullptr) const;
+    /// Sorted (by apply_transaction_contents, once, right after the pre-mint
+    /// pass, before the first validate() call that could need it) rather
+    /// than an unordered_set -- membership is checked, never mutated, once
+    /// built, so a sorted vector + binary_search gives the same O(log n)
+    /// lookup as a hash lookup for O(1) the allocations: one vector growth
+    /// instead of one hash-node malloc per minted id. See apply_create's
+    /// profiling note (basic_record_bench) for why that traffic mattered.
+    std::optional<IntegrityError> validate(const ObjectBase* o, const std::vector<Id>* pending
+                                                                 = nullptr) const;
 
     /// One entry per id in txn.local_updated_ (every entry is a real,
     /// non-null clone, so this is unconditional): that object's baseline
@@ -2747,8 +2765,7 @@ private:
     // than capturing it and throwing it away.
     std::optional<IntegrityError> apply_create(std::unique_ptr<ObjectBase> o,
                                                std::unordered_map<std::uint32_t, Id>& remap,
-                                               const std::unordered_set<Id, IdHash>& pending,
-                                               bool keep_undo = true);
+                                               const std::vector<Id>& pending, bool keep_undo = true);
     /// `old_field_keys_hint`, when non-null, is the target's baseline
     /// define_keys() field/value list, ALREADY computed by
     /// collect_update_baseline_field_keys() (see its own doc comment) --

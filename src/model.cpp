@@ -43,6 +43,23 @@ constexpr const char* kUnmappedLocalMsg =
     "Ref<>/Opt<> points at a local id that was never created, or was removed "
     "within the same transaction before it was ever committed";
 
+/// Total order over Id (index, then gen) -- NOT the same relation as
+/// operator==, which is what Id actually needs for its own invariants
+/// (different generations of the same slot are different objects). Exists
+/// purely as the sort/binary_search key for apply_transaction_contents's
+/// `pending` vector, so it stays local to this file rather than becoming
+/// part of Id's public interface. A function OBJECT, not a plain function:
+/// std::sort/std::binary_search take it by value as a template parameter
+/// either way, but a free function decays to a pointer that GCC's -O2
+/// measurably failed to inline through here (seen as its own separate frame
+/// in basic_record_bench's callgrind profile) -- a distinctly-typed functor
+/// gives the template instantiation a unique type to inline instead.
+struct IdLess {
+    bool operator()(Id a, Id b) const noexcept {
+        return a.index != b.index ? a.index < b.index : a.gen < b.gen;
+    }
+};
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -481,8 +498,8 @@ void Model::set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t ge
     log(RestoreSlot{slot, prev_obj, prev_gen});
 }
 
-std::optional<Model::IntegrityError> Model::validate(
-    const ObjectBase* o, const std::unordered_set<Id, IdHash>* pending) const {
+std::optional<Model::IntegrityError> Model::validate(const ObjectBase* o,
+                                                      const std::vector<Id>* pending) const {
     // Referential integrity is enforced *here*, at apply time, against the
     // CURRENT (latest) state -- not the transaction's base. That's what makes
     // "Ref<T> re-validated against latest, not just base" fall out for free,
@@ -505,7 +522,8 @@ std::optional<Model::IntegrityError> Model::validate(
                                      Id{}};
             return;
         }
-        if (!peek_raw(target) && !(pending && pending->count(target)))
+        if (!peek_raw(target) &&
+            !(pending && std::binary_search(pending->begin(), pending->end(), target, IdLess{})))
             err = IntegrityError{
                 std::string(o->type()) + " field " + name + " references a dead object", target};
     });
@@ -1219,9 +1237,10 @@ std::string Model::LookupDiagnostics::to_string() const {
 // try_commit() internals
 // ---------------------------------------------------------------------------
 
-std::optional<Model::IntegrityError> Model::apply_create(
-    std::unique_ptr<ObjectBase> o, std::unordered_map<std::uint32_t, Id>& remap,
-    const std::unordered_set<Id, IdHash>& pending, bool keep_undo) {
+std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectBase> o,
+                                                          std::unordered_map<std::uint32_t, Id>& remap,
+                                                          const std::vector<Id>& pending,
+                                                          bool keep_undo) {
     const std::uint32_t local_index = o->id.index;  // still local; the remap key
 
     // May reference ANY local create in this txn -- earlier, later, or this
@@ -1681,7 +1700,7 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // place of an installed slot during the create loop below: a minted id
     // either installs later this same attempt or the whole attempt rolls
     // back, so integrity holds either way.
-    std::unordered_set<Id, IdHash> pending;
+    std::vector<Id> pending;
     pending.reserve(txn.local_created_.size());
     for (auto& obj : txn.local_created_) {
         if (!obj) continue;
@@ -1691,8 +1710,13 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
             (slot >> kChunkBits) < spine_.size() ? spine_[slot >> kChunkBits]->gen[i] : 0;
         const Id id{slot, cur_gen + 1};  // recycled slot gets a fresh generation
         remap[obj->id.index] = id;
-        pending.insert(id);
+        pending.push_back(id);
     }
+    // One allocation for the whole vector (via reserve() above) instead of a
+    // hash-node malloc per minted id, at the cost of a single sort here --
+    // `pending` is fully built and never mutated again below, so this is the
+    // one place a sort can happen. See its type's own doc comment (model.h).
+    std::sort(pending.begin(), pending.end(), IdLess{});
 
     // Creates first, then updates (reconciled immediately, see apply_update),
     // then deletes resolved last -- in that order, so a same-transaction
@@ -1959,24 +1983,23 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     // fact here -- there is nothing this block could possibly find to
     // prune or append.
     if (max_undo_list_size_ != 0) {
-        std::unordered_set<Id, IdHash> touched;
-        for (const Change& c : changes_) touched.insert(c.id);
-
-        // Conflicting entries, via undo_touch_index_ -- O(|touched|) expected
+        // Conflicting entries, via undo_touch_index_ -- O(|changes_|) expected
         // lookups instead of an O(|undo_list_|) scan of every retained
-        // entry regardless of whether it could possibly conflict. Collected
-        // into `to_erase` first (deduped by list-node address: more than
-        // one id in `touched` can resolve to the SAME entry) rather than
-        // erased inline, since untrack_undo_entry() below reads an entry's
-        // OWN touched set -- which may contain ids not in `touched` at all
-        // -- to unindex it, and doing that while also iterating `touched`
-        // itself would be iterating one container while mutating another
-        // it doesn't own.
+        // entry regardless of whether it could possibly conflict. Walks
+        // changes_ directly rather than collecting a deduped `touched` set
+        // first -- a duplicate id in changes_ just costs one redundant
+        // lookup here, and is deduped anyway by `seen` below (by list-node
+        // address), so a set's per-element allocation would buy nothing.
+        // Collected into `to_erase` first rather than erased inline, since
+        // untrack_undo_entry() below reads an entry's OWN touched list --
+        // which may contain ids not in changes_ at all -- to unindex it, and
+        // doing that while also iterating changes_ would be iterating one
+        // container while mutating another it doesn't own.
         std::vector<std::list<UndoEntry>::iterator> to_erase;
         {
             std::unordered_set<const UndoEntry*> seen;
-            for (Id id : touched) {
-                auto it = undo_touch_index_.find(id);
+            for (const Change& c : changes_) {
+                auto it = undo_touch_index_.find(c.id);
                 if (it == undo_touch_index_.end()) continue;
                 if (seen.insert(&*it->second).second) to_erase.push_back(it->second);
             }
@@ -2014,6 +2037,14 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
                 undo_list_.erase(undo_list_.begin());
             }
             total_undo_bytes_ += new_bytes;
+
+            // Materialized only now that an entry is actually going to be
+            // stored -- see UndoEntry::touched's own doc comment for why a
+            // plain (possibly-duplicate) vector is enough.
+            std::vector<Id> touched;
+            touched.reserve(changes_.size());
+            for (const Change& c : changes_) touched.push_back(c.id);
+
             undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched),
                                   std::move(undo_name), std::move(undo_data), undo_txn_id, new_bytes});
             // Index the just-added entry under every id it touches, so a
