@@ -37,6 +37,10 @@
 
 #include "model/model.h"
 
+#if defined(MODEL_BENCH_CALLGRIND)
+#include <valgrind/callgrind.h>
+#endif
+
 using namespace model;
 using Clock = std::chrono::steady_clock;
 
@@ -77,9 +81,17 @@ int main(int argc, char** argv) {
     }
     const double build_ms = ms_since(t_build0);
 
+#if defined(MODEL_BENCH_CALLGRIND)
+    CALLGRIND_ZERO_STATS;
+    CALLGRIND_START_INSTRUMENTATION;
+#endif
     const auto t_commit0 = Clock::now();
     const CommitResult res = m.try_commit_without_undo(txn);
     const double commit_ms = ms_since(t_commit0);
+#if defined(MODEL_BENCH_CALLGRIND)
+    CALLGRIND_STOP_INSTRUMENTATION;
+    CALLGRIND_DUMP_STATS;
+#endif
 
     std::printf("count=%d\n", kCount);
     std::printf("build  (random gen + txn.create) = %9.2f ms  (%.1f ns/object)\n", build_ms,

@@ -152,6 +152,12 @@ target_precompile_headers(small_txn_bench REUSE_FROM model)
 add_executable(basic_record_bench examples/basic_record_bench.cpp)
 target_link_libraries(basic_record_bench PRIVATE model)
 target_precompile_headers(basic_record_bench REUSE_FROM model)
+# CALLGRIND_{ZERO_STATS,START/STOP_INSTRUMENTATION,DUMP_STATS} bracket just the
+# try_commit_without_undo() call so `callgrind --instr-atstart=no` profiles
+# only the commit phase, not the random-data build loop before it. These are
+# inline no-op asm hints outside of valgrind, so defining this unconditionally
+# costs nothing on a normal run.
+target_compile_definitions(basic_record_bench PRIVATE MODEL_BENCH_CALLGRIND)
 
 # Same shape as large_txn_bench.cpp's bench_bulk_create, isolated into its
 # own binary (build/commit phase split, argv count override) so it can be
