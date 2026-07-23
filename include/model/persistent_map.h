@@ -261,7 +261,14 @@ class TrieCore {
         return static_cast<std::uint32_t>(__builtin_popcount(bitmap & (bit(idx) - 1)));
     }
 
-    std::shared_ptr<const Node> root_;
+    // shared_ptr<const void>, not shared_ptr<const Node>: set_in's in-place
+    // mutation fast path (see its own comment) needs to pass this exact
+    // handle down to set_in without any type-converting copy along the way
+    // -- a conversion (Node* -> void*) constructs a temporary shared_ptr,
+    // which bumps use_count() for the temporary's lifetime and would make
+    // the very check that fast path relies on always see "shared." Keeping
+    // root_ pre-erased means passing it costs nothing beyond a reference.
+    std::shared_ptr<const void> root_;
     std::size_t size_ = 0;
 
     /// EXPERIMENTAL: where this instance's Node/Leaf HEAD allocations come
@@ -300,7 +307,7 @@ class TrieCore {
     /// recursive call.
     std::pmr::memory_resource* mem_ = nullptr;
 
-    explicit TrieCore(std::shared_ptr<const Node> r, std::size_t n, std::pmr::memory_resource* mem)
+    explicit TrieCore(std::shared_ptr<const void> r, std::size_t n, std::pmr::memory_resource* mem)
         : root_(std::move(r)), size_(n), mem_(mem) {}
 
     // Return a new node equal to `n` but with slot `pos` replaced/inserted.
@@ -435,34 +442,110 @@ class TrieCore {
     }
 
     // ---- set ----
-    // Returns the new subtree root for the node at `shift`, and reports whether
-    // the key was newly inserted (vs replaced) via `added`.
-    std::shared_ptr<const Node> set_in(const Node* n, std::uint64_t hash, int shift, const K& key,
-                                       const Entry& entry, bool& added) const {
+    // Returns the new subtree root for the node currently held by `owner`
+    // (aliasing a Node, or a null shared_ptr for an empty subtree at this
+    // position), and reports whether the key was newly inserted (vs
+    // replaced) via `added`.
+    //
+    // MUTATE-IN-PLACE FAST PATH: `parent_private` says every ancestor from
+    // the true root down to (but not including) `owner` has ALREADY been
+    // confirmed exclusive to this call chain -- the top-level caller
+    // (set_entry) passes true (there is no ancestor to worry about), and
+    // every recursive call below passes down its OWN can_mutate decision,
+    // never a freshly-derived one.
+    //
+    // `owner.use_count() == 1` is necessary but NOT sufficient on its own:
+    // if `pb = pa` copies a whole map/set, the shared TOP node's refcount
+    // correctly reads 2 and forces a clone there -- but each of ITS
+    // children is still referenced by exactly ONE shared_ptr (the single
+    // shared top node's own slots vector), so a child's OWN use_count()
+    // reads 1 even though it is only reachable through that still-shared
+    // parent, and mutating it in place would corrupt what `pa` sees through
+    // the very same parent. (Caught by persistent_map_tests.cpp's
+    // perfect_hash_map_persists_old_version_across_derived_edits during
+    // development of this optimization -- see git history if this comment
+    // and the bug it describes ever drift apart.) So a node is only
+    // eligible to be mutated in place when BOTH hold: its ancestors are
+    // already private (parent_private), AND it itself isn't additionally
+    // referenced (use_count() == 1).
+    //
+    // Model's per-index tries are only ever touched from inside
+    // try_commit(), under commit_mu_ (see model.h's invariant 7), and are
+    // only ever exposed to a reader by publish_now()'s atomic Root swap,
+    // strictly after every insert in the transaction has run -- so a node
+    // that passes BOTH checks genuinely cannot be observed by anything
+    // else, at any point before this function returns and replaces it.
+    // That's what turns clone_node's O(fanout) cost (a fresh Node/Leaf
+    // allocation plus a full shared_ptr<const void> vector copy -- measured
+    // as the single largest cost of a commit, see clone_node's own comment)
+    // into an O(1) in-place field write for every touch after the first of
+    // a given node within the SAME apply -- e.g. every insert past the
+    // first into the same bulk-create transaction's by_type_ set.
+    //
+    // A single-item transaction never sees use_count() drop to 1 at the
+    // root: its one insert touches nodes still referenced by the
+    // previously-published Root (or, for a brand-new tag's first touch,
+    // additionally by the rollback capture -- see log_by_type_once's doc
+    // comment in model.cpp), so it clones exactly as before -- this path
+    // can only ever remove clones for a MULTI-insert transaction revisiting
+    // the same node, never add cost to a single-insert one (see
+    // small_txn_bench.cpp, which exists to catch exactly this class of
+    // regression).
+    //
+    // Ordering is what makes the use_count() check correct even with
+    // parent_private threaded through: every branch below computes the
+    // replacement child/leaf value FIRST, using owner's ORIGINAL
+    // (not-yet-cloned) children, and decides mutate-vs-clone for THIS level
+    // only afterward. clone_node bumps every child's refcount (it copies
+    // the whole slots vector), so checking a child's use_count() AFTER its
+    // parent was cloned would see the clone's extra reference and wrongly
+    // report "shared" for a child that was still private one statement
+    // earlier.
+    std::shared_ptr<const void> set_in(const std::shared_ptr<const void>& owner, bool parent_private,
+                                       std::uint64_t hash, int shift, const K& key, const Entry& entry,
+                                       bool& added) const {
+        const Node* n = as_node(owner);
         const std::uint32_t idx = slice(hash, shift);
         const std::uint32_t b = bit(idx);
+        const bool can_mutate = parent_private && n && owner.use_count() == 1;
 
         if (!n || !(n->bitmap & b)) {
             // Empty slot: insert a fresh single-entry leaf.
-            auto nn = clone_node(n);
-            const std::uint32_t pos = popcount_below(nn->bitmap, idx);
+            const std::uint32_t pos = n ? popcount_below(n->bitmap, idx) : 0;
             // ChainLink{}, not nullptr: this code path is common to both
             // Leaf shapes (unlike chain_set/chain_erase, it never forks on
             // kPerfectHash), and nullptr has no conversion to NoChain.
             auto lf = make_leaf(entry, ChainLink{});
+            added = true;
+            if (can_mutate) {
+                Node* mut = const_cast<Node*>(n);
+                mut->bitmap |= b;
+                mut->is_leaf |= b;
+                mut->slots.insert(mut->slots.begin() + pos, std::move(lf));
+                return owner;
+            }
+            auto nn = clone_node(n);
             nn->bitmap |= b;
             nn->is_leaf |= b;
             nn->slots.insert(nn->slots.begin() + pos, std::move(lf));
-            added = true;
             return nn;
         }
 
         const std::uint32_t pos = popcount_below(n->bitmap, idx);
-        auto nn = clone_node(n);
 
         if (!(n->is_leaf & b)) {
-            // Slot holds a subtree: recurse.
-            nn->slots[pos] = set_in(as_node(n->slots[pos]), hash, shift + 5, key, entry, added);
+            // Slot holds a subtree: recurse using the ORIGINAL child (not a
+            // clone's copy of it), passing THIS level's own can_mutate as
+            // the child's parent_private -- see this function's doc
+            // comment on why an isolated child use_count() check is not
+            // enough on its own.
+            auto new_child = set_in(n->slots[pos], can_mutate, hash, shift + 5, key, entry, added);
+            if (can_mutate) {
+                const_cast<Node*>(n)->slots[pos] = std::move(new_child);
+                return owner;
+            }
+            auto nn = clone_node(n);
+            nn->slots[pos] = std::move(new_child);
             return nn;
         }
 
@@ -474,7 +557,13 @@ class TrieCore {
         if (lf_hash == hash) {
             // Same hash: replace-or-append within the chain (true collision or
             // same key).
-            nn->slots[pos] = chain_set(lf, key, entry, added);
+            auto new_slot = chain_set(lf, key, entry, added);
+            if (can_mutate) {
+                const_cast<Node*>(n)->slots[pos] = std::move(new_slot);
+                return owner;
+            }
+            auto nn = clone_node(n);
+            nn->slots[pos] = std::move(new_slot);
             return nn;
         }
 
@@ -483,8 +572,14 @@ class TrieCore {
         if (shift + 5 >= 64) {
             // Ran out of hash bits (astronomically unlikely with distinct hashes,
             // but handle it): merge into one collision chain.
-            nn->slots[pos] = make_leaf(entry, chain_copy(lf));
+            auto new_slot = make_leaf(entry, chain_copy(lf));
             added = true;
+            if (can_mutate) {
+                const_cast<Node*>(n)->slots[pos] = std::move(new_slot);
+                return owner;
+            }
+            auto nn = clone_node(n);
+            nn->slots[pos] = std::move(new_slot);
             return nn;
         }
         auto sub = clone_node(nullptr);
@@ -492,8 +587,24 @@ class TrieCore {
         sub->bitmap = bit(exist_idx);
         sub->is_leaf = bit(exist_idx);
         sub->slots.push_back(n->slots[pos]);
-        auto sub2 = set_in(sub.get(), hash, shift + 5, key, entry, added);
-        nn->slots[pos] = sub2;
+        // Move, not copy: `sub` is exclusively owned (nothing else can name
+        // it yet), and a copy here -- even a temporary one -- would bump
+        // its use_count to 2 for the recursive call below, permanently
+        // hiding the fact that this brand-new subtree was actually free to
+        // mutate in place for its own insert. parent_private is true
+        // unconditionally here (not `can_mutate`): `sub` is freshly
+        // allocated by THIS call no matter whether the current level itself
+        // is shared, so it starts a brand new private lineage regardless.
+        std::shared_ptr<const void> sub_owner = std::move(sub);
+        auto sub2 = set_in(sub_owner, /*parent_private=*/true, hash, shift + 5, key, entry, added);
+        if (can_mutate) {
+            Node* mut = const_cast<Node*>(n);
+            mut->slots[pos] = std::move(sub2);
+            mut->is_leaf &= ~b;  // this slot now holds a Node, not a Leaf
+            return owner;
+        }
+        auto nn = clone_node(n);
+        nn->slots[pos] = std::move(sub2);
         nn->is_leaf &= ~b;  // this slot now holds a Node, not a Leaf
         return nn;
     }
@@ -612,24 +723,28 @@ public:
     /// shares the rest of the structure with `*this`.
     TrieCore set_entry(const K& key, const Entry& entry) const {
         bool added = false;
-        auto r = set_in(root_.get(), hash_key(key), 0, key, entry, added);
+        // root_ itself, NOT root_.get()/as_node(root_): set_in needs the
+        // actual shared_ptr (by reference, no copy) to check use_count() --
+        // see its own doc comment. parent_private=true: there is no
+        // ancestor above the root to be shared with.
+        auto r = set_in(root_, /*parent_private=*/true, hash_key(key), 0, key, entry, added);
         return TrieCore(r, size_ + (added ? 1 : 0), mem_);
     }
 
     /// Returns a new core without `key` (or an equal core if absent).
     TrieCore erase_key(const K& key) const {
         bool removed = false;
-        auto r = erase_in(root_.get(), hash_key(key), 0, key, removed);
+        auto r = erase_in(as_node(root_), hash_key(key), 0, key, removed);
         return TrieCore(r, size_ - (removed ? 1 : 0), mem_);
     }
 
     const Entry* get_entry(const K& key) const {
-        return get_in(root_.get(), hash_key(key), 0, key);
+        return get_in(as_node(root_), hash_key(key), 0, key);
     }
 
     template <class F>
     void each_entry(F&& f) const {
-        each_in(root_.get(), f);
+        each_in(as_node(root_), f);
     }
 };
 
