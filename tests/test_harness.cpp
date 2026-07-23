@@ -6,6 +6,8 @@
 
 #include "test_harness.h"
 
+#include <chrono>
+
 std::vector<TestCase>& registry() {
     static std::vector<TestCase> r;
     return r;
@@ -44,9 +46,13 @@ int main(int argc, char** argv) {
         g_current = t.name;
         const int before = g_failures;
         std::printf("[ RUN  ] %s\n", t.name);
+        const auto t0 = std::chrono::steady_clock::now();
         t.fn();
+        const auto elapsed_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++run;
-        std::printf("[%s] %s\n", g_failures == before ? "  OK  " : " FAIL ", t.name);
+        std::printf("[%s] %s (%.2f ms)\n", g_failures == before ? "  OK  " : " FAIL ", t.name,
+                    elapsed_ms);
     }
 
     std::printf("\n%d test(s) run, %d check(s) failed\n", run, g_failures);
