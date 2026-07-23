@@ -778,8 +778,17 @@ void Model::log_by_cached_reference_once(const void* field) {
 void Model::add_field_keys(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
+        // try_emplace, not operator[], and BEFORE log_by_field_once(): the
+        // FIRST time this field is seen, seed it with node_pool_ -- see
+        // apply_create's identical by_type_ seeding for why the ordering
+        // matters (log_by_field_once's own by_field_[field] read would
+        // otherwise default-construct an unpooled entry first, and
+        // try_emplace would then find the key already present and silently
+        // keep it unpooled).
+        auto& sub =
+            by_field_.try_emplace(field, pmap::PersistentMap<std::string, Id, pmap::StringHash>(&node_pool_))
+                .first->second;
         log_by_field_once(field);  // captures the pre-attempt value once; see its own doc comment
-        auto& sub = by_field_[field];   // one lookup; `sub` is this field's map, in place
         sub = sub.set(key, id);         // key is unique per field by construction (see
                                         // define_keys' contract); a collision here is a
                                         // caller bug, not something this layer detects
@@ -860,10 +869,21 @@ void Model::add_cached_fields(const ObjectBase* o) {
         // holders, is the INNER set collecting every object currently
         // holding that value. log_by_cached_field_once captures the outer
         // map's pre-attempt state, once, for the undo log.
+        //
+        // try_emplace, not operator[], and BEFORE log_by_cached_field_once():
+        // same ordering hazard as add_field_keys -- log_by_cached_field_once's
+        // own by_cached_field_[field] read would otherwise default-construct
+        // an unpooled entry first. See that function's comment.
+        auto& sub = by_cached_field_
+                       .try_emplace(field, pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
+                                                               pmap::StringHash>(&node_pool_))
+                       .first->second;
         log_by_cached_field_once(field);
-        auto& sub = by_cached_field_[field];
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
-        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
+        // Pool-seeded empty bucket, not `{}`: the first object ever to hold
+        // this particular value would otherwise start an unpooled lineage
+        // for that bucket, same as the outer map above.
+        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
     });
 }
 
@@ -914,9 +934,10 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
             }
         }
         // Add this id to its NEW value's bucket, creating that bucket if this
-        // is the first object ever to hold this particular value.
+        // is the first object ever to hold this particular value -- pool-
+        // seeded, not `{}` (see add_cached_fields's identical bucket seeding).
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(new_key);
-        sub = sub.set(new_key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
+        sub = sub.set(new_key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
     });
 }
 
@@ -932,10 +953,19 @@ void Model::add_cached_references(const ObjectBase* o) {
     const Id id = o->id;  // the REFERRER -- the value stored in the bucket, not the bucket's key
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;  // Opt<> currently null: nothing to index
+        // try_emplace, not operator[], and BEFORE log_by_cached_reference_once():
+        // same ordering hazard as add_cached_fields -- see that function's
+        // comment.
+        auto& sub =
+            by_cached_reference_
+                .try_emplace(field, pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>(
+                                        &node_pool_))
+                .first->second;
         log_by_cached_reference_once(field);
-        auto& sub = by_cached_reference_[field];
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
-        sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
+        // Pool-seeded empty bucket, not `{}` -- see add_cached_fields's
+        // identical bucket seeding.
+        sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
     });
 }
 
@@ -978,8 +1008,11 @@ void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBa
             }
         }
         if (new_target) {
+            // Pool-seeded empty bucket, not `{}` -- see add_cached_fields's
+            // identical bucket seeding.
             const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(new_target);
-            sub = sub.set(new_target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
+            sub = sub.set(new_target,
+                          (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
         }
     });
 }
@@ -2310,7 +2343,12 @@ void Model::add_out_refs_no_log(const ObjectBase* o) {
 void Model::add_field_keys_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
-        auto& sub = by_field_[field];
+        // try_emplace, not operator[]: see add_field_keys's identical seeding
+        // for why (no log_by_field_once ordering hazard on this bulk-load
+        // path, but still needs to seed the pool on first touch).
+        auto& sub =
+            by_field_.try_emplace(field, pmap::PersistentMap<std::string, Id, pmap::StringHash>(&node_pool_))
+                .first->second;
         sub = sub.set(key, id);
     });
 }
@@ -2322,9 +2360,15 @@ void Model::add_field_keys_no_log(const ObjectBase* o) {
 void Model::add_cached_fields_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_field([&](const void* field, std::string key) {
-        auto& sub = by_cached_field_[field];
+        // try_emplace + pool-seeded bucket: see add_cached_fields's identical
+        // seeding (no log_by_cached_field_once ordering hazard on this
+        // bulk-load path, but still needs to seed the pool on first touch).
+        auto& sub = by_cached_field_
+                       .try_emplace(field, pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
+                                                               pmap::StringHash>(&node_pool_))
+                       .first->second;
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
-        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
+        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
     });
 }
 
@@ -2336,9 +2380,17 @@ void Model::add_cached_references_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;
-        auto& sub = by_cached_reference_[field];
+        // try_emplace + pool-seeded bucket: see add_cached_references's
+        // identical seeding (no log_by_cached_reference_once ordering
+        // hazard on this bulk-load path, but still needs to seed the pool
+        // on first touch).
+        auto& sub =
+            by_cached_reference_
+                .try_emplace(field, pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>(
+                                        &node_pool_))
+                .first->second;
         const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
-        sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{}).insert(id));
+        sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
     });
 }
 

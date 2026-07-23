@@ -153,6 +153,15 @@ add_executable(basic_record_bench examples/basic_record_bench.cpp)
 target_link_libraries(basic_record_bench PRIVATE model)
 target_precompile_headers(basic_record_bench REUSE_FROM model)
 
+# Same shape as large_txn_bench.cpp's bench_bulk_create, isolated into its
+# own binary (build/commit phase split, argv count override) so it can be
+# profiled the same way as basic_record_bench -- Order touches every index
+# (by_type_, by_field_, by_cached_field_, by_cached_reference_, referrers_),
+# the natural next question after basic_record_bench's by_type_-only finding.
+add_executable(order_record_bench examples/order_record_bench.cpp)
+target_link_libraries(order_record_bench PRIVATE model)
+target_precompile_headers(order_record_bench REUSE_FROM model)
+
 # --- tests ------------------------------------------------------------------
 
 enable_testing()
