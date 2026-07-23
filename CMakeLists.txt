@@ -178,8 +178,11 @@ target_precompile_headers(order_record_bench REUSE_FROM model)
 
 # --- tests ------------------------------------------------------------------
 
-enable_testing()
+include(CTest)
 include(cmake/DiscoverTests.cmake)
+
+########################
+# model_tests
 add_executable(model_tests
     tests/test_harness.cpp
     tests/test_helpers.cpp
@@ -197,30 +200,14 @@ add_executable(model_tests
 )
 target_link_libraries(model_tests PRIVATE model)
 target_precompile_headers(model_tests REUSE_FROM model)
-
 # Registers every TEST() in the sources above as its own CTest entry (see
 # cmake/DiscoverTests.cmake) so IDE test explorers and `ctest -R <name>`
 # see each case individually, not just one "model_tests" binary.
 mvcc_discover_tests(model_tests)
 
-# The persistent index (HAMT) is differential-tested against std::unordered_map.
-# Shares tests/test_harness.cpp/.h with model_tests (TEST()/CHECK()/g_failures/
-# main()) -- test_harness.h has no model.h dependency, so this stays independent
-# of libmodel (model_flags only: compiler flags, not the model library itself).
-add_executable(persistent_map_tests tests/persistent_map_tests.cpp tests/test_harness.cpp)
-target_link_libraries(persistent_map_tests PRIVATE model_flags)
-target_include_directories(persistent_map_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-mvcc_discover_tests(persistent_map_tests TIMEOUT 120)
-
-# The demo doubles as an integration test: its internal asserts fire if a Ref
-# ever dangles or a conflict is silently missed, so run it under CTest too
-# (needs a Debug-ish build for asserts).
-add_test(NAME demo_integration COMMAND demo)
-set_tests_properties(demo_integration PROPERTIES TIMEOUT 300)
-
-add_test(NAME two_writer_demo_integration COMMAND two_writer_demo)
-set_tests_properties(two_writer_demo_integration PROPERTIES TIMEOUT 300)
-
+########################
+# performance_tests
+#
 # This project's own documented complexity/memory claims (CLAUDE.md,
 # DESIGN.md, README.md), asserted across several sizes instead of only
 # ever printed for a human to eyeball -- see the file's own header comment.
@@ -236,3 +223,30 @@ target_precompile_headers(performance_tests REUSE_FROM model)
 # the jitter check_scaling()'s bands are designed to tolerate but not
 # multiply.
 mvcc_discover_tests(performance_tests RUN_SERIAL)
+
+########################
+# persistent_map_tests
+#
+# The persistent index (HAMT) is differential-tested against std::unordered_map.
+# Shares tests/test_harness.cpp/.h with model_tests (TEST()/CHECK()/g_failures/
+# main()) -- test_harness.h has no model.h dependency, so this stays independent
+# of libmodel (model_flags only: compiler flags, not the model library itself).
+add_executable(persistent_map_tests tests/persistent_map_tests.cpp tests/test_harness.cpp)
+target_link_libraries(persistent_map_tests PRIVATE model_flags)
+target_include_directories(persistent_map_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+mvcc_discover_tests(persistent_map_tests TIMEOUT 120)
+
+########################
+# stand_alone tests
+#
+# Added with "stand_alone" prefix for grouping
+
+# The demo doubles as an test: its internal asserts fire if a Ref
+# ever dangles or a conflict is silently missed, so run it under CTest too
+# (needs a Debug-ish build for asserts).
+add_test(NAME "stand_alone.demo" COMMAND demo)
+set_tests_properties("stand_alone.demo" PROPERTIES TIMEOUT 300)
+
+add_test(NAME "stand_alone.two_writer_demo_integration" COMMAND two_writer_demo)
+set_tests_properties("stand_alone.two_writer_demo_integration" PROPERTIES TIMEOUT 300)
+
