@@ -441,17 +441,17 @@ std::uint32_t Model::alloc_slot() {
     while (!free_slots_.empty()) {
         const std::uint32_t s = free_slots_.back();
         free_slots_.pop_back();
-        log([this, s] { free_slots_.push_back(s); });  // undo the pop
+        log(PushFreeSlot{s});  // undo the pop
         const std::uint32_t c = s >> kChunkBits, i = s & kChunkMask;
         if (c < spine_.size() && spine_[c]->gen[i] >= kGenMax) {
             ++exhausted_slots_;  // permanently retired; never returned to circulation
-            log([this] { --exhausted_slots_; });
+            log(DecExhaustedSlots{});
             continue;
         }
         return s;
     }
     const std::uint32_t s = next_slot_++;
-    log([this] { --next_slot_; });
+    log(DecNextSlot{});
     // Real slots must never collide with a local (not-yet-committed) id's
     // reserved bit -- see kLocalIdBit. Unreachable at this project's target
     // scale (100k-1M objects); asserting rather than silently misbehaving if
@@ -472,17 +472,13 @@ void Model::set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t ge
     const std::uint32_t prev_gen = ch->gen[i];
     ch->obj[i] = obj;
     ch->gen[i] = gen;
-    // The undo closure re-derives (cc, ii, c2) rather than capturing `ch`/`i`
-    // directly: replay can happen after further COW churn this same attempt,
-    // so `ch` (a raw Chunk* into a specific shared_ptr<Chunk> generation)
-    // could be dangling by then -- re-running cow(cc) gets whatever chunk
-    // object is currently live for that index instead.
-    log([this, slot, prev_obj, prev_gen] {
-        const std::uint32_t cc = slot >> kChunkBits, ii = slot & kChunkMask;
-        Chunk* c2 = cow(cc);
-        c2->obj[ii] = prev_obj;
-        c2->gen[ii] = prev_gen;
-    });
+    // RestoreSlot re-derives (cc, ii, c2) from `slot` rather than storing
+    // `ch`/`i` directly: replay can happen after further COW churn this same
+    // attempt, so `ch` (a raw Chunk* into a specific shared_ptr<Chunk>
+    // generation) could be dangling by then -- re-running cow(cc) gets
+    // whatever chunk object is currently live for that index instead. See
+    // apply_undo_op(RestoreSlot).
+    log(RestoreSlot{slot, prev_obj, prev_gen});
 }
 
 std::optional<Model::IntegrityError> Model::validate(
@@ -641,16 +637,7 @@ void Model::add_out_refs(const ObjectBase* o) {
         // this (from, field) pair without disturbing some other field on the
         // same object that happens to point at the same target.
         referrers_[target.index].push_back(RefEdge{from, field, nullable});
-        const std::uint32_t key = target.index;  // copied out for the undo closure below, since
-                                                 // `target` itself is a loop-local captured by
-                                                 // value into each_ref's lambda, not by the log()
-        log([this, key] {
-            auto it = referrers_.find(key);
-            if (it != referrers_.end()) {
-                it->second.pop_back();  // exact inverse of the push_back above
-                if (it->second.empty()) referrers_.erase(it);
-            }
-        });
+        log(ReferrersPopBack{target.index});  // exact inverse of the push_back above
     });
 }
 
@@ -670,11 +657,9 @@ void Model::drop_out_refs(const ObjectBase* o) {
             return e.from == from && e.field == field;
         });
         if (pos == v.end()) return;
-        const RefEdge edge =
-            *pos;  // saved for the undo closure -- `pos` itself won't survive the erase
+        const RefEdge edge = *pos;  // saved for the undo op -- `pos` itself won't survive the erase
         v.erase(pos);
-        const std::uint32_t key = target.index;
-        log([this, key, edge] { referrers_[key].push_back(edge); });
+        log(ReferrersPushEdge{target.index, edge});
     });
 }
 
@@ -715,21 +700,13 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
                     const RefEdge edge = *pos;
                     v.erase(pos);
                     if (v.empty()) referrers_.erase(rit);
-                    const std::uint32_t key = old_target.index;
-                    log([this, key, edge] { referrers_[key].push_back(edge); });
+                    log(ReferrersPushEdge{old_target.index, edge});
                 }
             }
         }
         if (new_target) {
             referrers_[new_target.index].push_back(RefEdge{id, field, nullable});
-            const std::uint32_t key = new_target.index;
-            log([this, key] {
-                auto rit = referrers_.find(key);
-                if (rit != referrers_.end()) {
-                    rit->second.pop_back();  // exact inverse of the push_back above
-                    if (rit->second.empty()) referrers_.erase(rit);
-                }
-            });
+            log(ReferrersPopBack{new_target.index});  // exact inverse of the push_back above
         }
     });
 }
@@ -741,29 +718,34 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
 void Model::log_by_type_once(TypeTag tag) {
     if (!dirty_by_type_.insert(tag).second) return;
     auto prev = by_type_[tag];
-    log([this, tag, prev = std::move(prev)]() mutable { by_type_[tag] = std::move(prev); });
+    // GenericUndo, not a dedicated Kind: this fires at most once per
+    // DISTINCT type touched per attempt (bounded by #types, never by object
+    // count), so it was never the cost the UndoOp conversion targets -- see
+    // log()'s own doc comment.
+    log(GenericUndo{[this, tag, prev = std::move(prev)]() mutable { by_type_[tag] = std::move(prev); }});
 }
 
 void Model::log_by_field_once(const void* field) {
     if (!dirty_by_field_.insert(field).second) return;
     auto prev = by_field_[field];
-    log([this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); });
+    log(GenericUndo{
+        [this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); }});
 }
 
 void Model::log_by_cached_field_once(const void* field) {
     if (!dirty_by_cached_field_.insert(field).second) return;
     auto prev = by_cached_field_[field];
-    log([this, field, prev = std::move(prev)]() mutable {
+    log(GenericUndo{[this, field, prev = std::move(prev)]() mutable {
         by_cached_field_[field] = std::move(prev);
-    });
+    }});
 }
 
 void Model::log_by_cached_reference_once(const void* field) {
     if (!dirty_by_cached_reference_.insert(field).second) return;
     auto prev = by_cached_reference_[field];
-    log([this, field, prev = std::move(prev)]() mutable {
+    log(GenericUndo{[this, field, prev = std::move(prev)]() mutable {
         by_cached_reference_[field] = std::move(prev);
-    });
+    }});
 }
 
 // by_field_ maintenance: the define_keys() unique-key index (Root::by_field).
@@ -1294,7 +1276,7 @@ std::optional<Model::IntegrityError> Model::apply_create(
     add_cached_references(raw);
 
     changes_.push_back({id, ChangeKind::Created, tag});
-    log([this] { changes_.pop_back(); });
+    log(PopChanges{});
 
     // Undo: the inverse of a create is removing it. No snapshot data
     // needed -- unlike pending_undo_'s other two action kinds, there is no
@@ -1323,7 +1305,7 @@ std::optional<Model::IntegrityError> Model::apply_update(
     // reverse replay it runs LAST -- after set_slot's undo has repointed the
     // slot back at the baseline. Otherwise we'd free `raw` while the slot
     // still referenced it, and an early error return below would leak it.
-    log([raw] { delete raw; });
+    log(DeleteObject{raw});
 
     bool unmapped = false;
     raw->remap_refs(
@@ -1350,12 +1332,12 @@ std::optional<Model::IntegrityError> Model::apply_update(
             {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(baseline->clone())});
 
     retire(baseline);
-    log([this] { retired_.pop_back(); });
+    log(PopRetired{});
 
     set_slot(id.index, raw, id.gen);  // logs restore of baseline + its generation
 
     changes_.push_back({id, ChangeKind::Updated, raw->tag()});
-    log([this] { changes_.pop_back(); });
+    log(PopChanges{});
 
     // Unlike the single-writer design this project's sibling uses, `raw` is
     // already fully written by the time we get here (the caller finished
@@ -1398,15 +1380,15 @@ ObjectBase* Model::clone_for_cascade_null(Id id, bool keep_undo) {
             {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(cur->clone())});
 
     ObjectBase* copy = cur->clone();
-    log([copy] { delete copy; });
+    log(DeleteObject{copy});
 
     retire(cur);
-    log([this] { retired_.pop_back(); });
+    log(PopRetired{});
 
     set_slot(id.index, copy, id.gen);
 
     changes_.push_back({id, ChangeKind::Updated, copy->tag()});
-    log([this] { changes_.pop_back(); });
+    log(PopChanges{});
 
     return copy;
 }
@@ -1490,10 +1472,7 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
         if (rit != referrers_.end()) {
             std::vector<RefEdge> saved = std::move(rit->second);
             referrers_.erase(rit);
-            const std::uint32_t key = x.index;
-            log([this, key, saved = std::move(saved)]() mutable {
-                referrers_[key] = std::move(saved);
-            });
+            log(RestoreReferrersBucket{x.index, std::move(saved)});
         }
 
         const TypeTag tag = victim->tag();
@@ -1508,13 +1487,13 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
         set_slot(x.index, nullptr, x.gen);  // logs restore of victim + its gen
 
         retire(victim);
-        log([this] { retired_.pop_back(); });
+        log(PopRetired{});
 
         free_slots_.push_back(x.index);
-        log([this] { free_slots_.pop_back(); });
+        log(PopFreeSlot{});
 
         changes_.push_back({x, ChangeKind::Deleted, tag});
-        log([this] { changes_.pop_back(); });
+        log(PopChanges{});
 
         killed.push_back(x);
     }
@@ -1565,10 +1544,15 @@ void Model::prune_changelog() {
 }
 
 void Model::rollback_apply() {
-    // Replay inverses in reverse. Each closure exactly undoes one primitive
+    // Replay inverses in reverse. Each op exactly undoes one primitive
     // mutation, so commit-lock-protected state returns to its last committed
-    // shape.
-    for (auto it = undo_.rbegin(); it != undo_.rend(); ++it) (*it)();
+    // shape. std::visit + apply_undo_op's overload set is exhaustive at
+    // compile time -- see UndoOp's own doc comment. Moving *it in (rather
+    // than visiting a reference) lets RestoreReferrersBucket/GenericUndo
+    // move their payload out instead of copying it; every other alternative
+    // is trivially-copyable-sized, so the move costs nothing extra there.
+    for (auto it = undo_.rbegin(); it != undo_.rend(); ++it)
+        std::visit([this](auto&& op) { apply_undo_op(std::forward<decltype(op)>(op)); }, std::move(*it));
     undo_.clear();
 
     // Objects created this attempt were never published and are owned by

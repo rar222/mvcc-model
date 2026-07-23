@@ -56,6 +56,7 @@
 #include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "model/persistent_map.h"
@@ -2600,10 +2601,107 @@ private:
     // Undo log. Every mutation of writer-private state during a try_commit()
     // attempt pushes its inverse here; rollback_apply() runs the inverses in
     // reverse if that attempt fails; a successful try_commit() clears the log.
-    // Kept as closures so each write op records its own undo inline, which is
-    // far harder to get out of sync than a parallel variant type. The log is
-    // proportional to the changes made, never to model size.
-    void log(std::function<void()> undo) { undo_.push_back(std::move(undo)); }
+    // The log is proportional to the changes made, never to model size.
+    //
+    // UndoOp (a closed tagged union, not std::function<void()>): profiling
+    // basic_record_bench found this log's PUSH side -- not replay, which only
+    // runs on the rare rollback path -- among the largest costs of a commit
+    // in its own right: every alloc_slot()/set_slot()/changes_ push (i.e.
+    // every single create/update/remove, not just once per attempt like
+    // log_by_type_once et al.) built a std::function closure, and most of
+    // those closures capture enough state (e.g. set_slot's [this, slot,
+    // prev_obj, prev_gen]) to exceed libstdc++'s small-object buffer and
+    // heap-allocate -- allocated, then almost always simply discarded
+    // wholesale on the (overwhelmingly common) successful-commit path
+    // (undo_.clear() below). A closed variant of small, POD-ish "what to
+    // undo" structs removes that allocation entirely: pushing one is just
+    // writing its fields into the vector's next slot, same as any other
+    // value type.
+    //
+    // This does give up the ORIGINAL reason closures were chosen here (see
+    // git history): a hand-written closure at the write site can't drift
+    // from what it undoes, while a Kind/payload pair COULD, in principle,
+    // stop matching its apply_undo_op() case somewhere else in this file.
+    // std::variant (rather than a raw union or an enum + void*) is what
+    // keeps that risk small: every alternative is a distinct, named,
+    // strongly-typed struct, log()/apply_undo_op() are both exhaustively
+    // checked by the compiler (a missing overload is a compile error, a
+    // std::visit is never partial), and each Kind is still defined
+    // immediately next to the handful of log() call sites that produce it.
+    // GenericUndo (a std::function<void()> fallback) is kept for the four
+    // log_by_*_once() closures: those capture a whole PersistentMap/Set
+    // `prev` by move and fire at most once per DISTINCT index touched per
+    // attempt (see log_by_type_once's own comment) -- bounded by the number
+    // of declared fields/types, never by object count -- so they were never
+    // the cost this change targets, and giving each of the four its own
+    // dedicated, differently-shaped Kind would add real complexity for a
+    // closure that was already cheap relative to model size.
+    struct PushFreeSlot {
+        std::uint32_t slot;
+    };
+    struct DecExhaustedSlots {};
+    struct DecNextSlot {};
+    struct RestoreSlot {
+        std::uint32_t slot;
+        const ObjectBase* prev_obj;
+        std::uint32_t prev_gen;
+    };
+    struct ReferrersPopBack {
+        std::uint32_t key;
+    };
+    struct ReferrersPushEdge {
+        std::uint32_t key;
+        RefEdge edge;
+    };
+    struct PopChanges {};
+    struct DeleteObject {
+        ObjectBase* obj;
+    };
+    struct PopRetired {};
+    struct PopFreeSlot {};
+    struct RestoreReferrersBucket {
+        std::uint32_t key;
+        std::vector<RefEdge> saved;
+    };
+    struct GenericUndo {
+        std::function<void()> fn;
+    };
+    using UndoOp = std::variant<PushFreeSlot, DecExhaustedSlots, DecNextSlot, RestoreSlot,
+                                ReferrersPopBack, ReferrersPushEdge, PopChanges, DeleteObject,
+                                PopRetired, PopFreeSlot, RestoreReferrersBucket, GenericUndo>;
+
+    template <class Op>
+    void log(Op op) {
+        undo_.emplace_back(std::move(op));
+    }
+
+    // One overload per UndoOp alternative -- see rollback_apply()'s use of
+    // std::visit, which is exhaustive at compile time (a Kind added to the
+    // variant above without a matching overload here is a compile error,
+    // not a silent no-op).
+    void apply_undo_op(PushFreeSlot op) { free_slots_.push_back(op.slot); }
+    void apply_undo_op(DecExhaustedSlots) { --exhausted_slots_; }
+    void apply_undo_op(DecNextSlot) { --next_slot_; }
+    void apply_undo_op(RestoreSlot op) {
+        const std::uint32_t cc = op.slot >> kChunkBits, ii = op.slot & kChunkMask;
+        Chunk* c2 = cow(cc);
+        c2->obj[ii] = op.prev_obj;
+        c2->gen[ii] = op.prev_gen;
+    }
+    void apply_undo_op(ReferrersPopBack op) {
+        auto it = referrers_.find(op.key);
+        if (it != referrers_.end()) {
+            it->second.pop_back();  // exact inverse of the push_back it undoes
+            if (it->second.empty()) referrers_.erase(it);
+        }
+    }
+    void apply_undo_op(ReferrersPushEdge op) { referrers_[op.key].push_back(op.edge); }
+    void apply_undo_op(PopChanges) { changes_.pop_back(); }
+    void apply_undo_op(DeleteObject op) { delete op.obj; }
+    void apply_undo_op(PopRetired) { retired_.pop_back(); }
+    void apply_undo_op(PopFreeSlot) { free_slots_.pop_back(); }
+    void apply_undo_op(RestoreReferrersBucket op) { referrers_[op.key] = std::move(op.saved); }
+    void apply_undo_op(GenericUndo op) { op.fn(); }
 
     /// Point a slot at an object (or null) with a new generation, through
     /// cow(); logs the exact inverse (previous object + generation).
@@ -3150,7 +3248,7 @@ private:
     // Undo log and the objects created this attempt (which rollback_apply()
     // must delete, since they were never published and nothing else owns them).
     // Scratch: cleared at the start of every try_commit() attempt.
-    std::vector<std::function<void()>> undo_;
+    std::vector<UndoOp> undo_;
     std::vector<const ObjectBase*> txn_created_;
 };
 
