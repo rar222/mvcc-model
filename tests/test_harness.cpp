@@ -19,11 +19,28 @@ Registrar::Registrar(const char* name, std::function<void()> fn) {
 }
 
 int main(int argc, char** argv) {
-    const char* filter = argc > 1 ? argv[1] : nullptr;
+    // --list: print each registered test name, one per line, and exit. Used
+    // by CMake's mvcc_discover_tests() (cmake/DiscoverTests.cmake) to turn
+    // every TEST() case into its own CTest entry, so IDE test explorers (and
+    // `ctest -R`) see them individually instead of one opaque binary.
+    if (argc > 1 && std::string(argv[1]) == "--list") {
+        for (const auto& t : registry()) std::printf("%s\n", t.name);
+        return 0;
+    }
+
+    // --exact <name>: run precisely the named test, not a substring match.
+    // This is what the discovered per-test CTest entries invoke, so a test
+    // named e.g. "cascade" can't accidentally also run "cascade_delete_...".
+    const bool exact = argc > 2 && std::string(argv[1]) == "--exact";
+    const char* filter = exact ? argv[2] : (argc > 1 ? argv[1] : nullptr);
     int run = 0;
 
     for (const auto& t : registry()) {
-        if (filter && std::string(t.name).find(filter) == std::string::npos) continue;
+        if (filter) {
+            const bool match = exact ? std::string(t.name) == filter
+                                      : std::string(t.name).find(filter) != std::string::npos;
+            if (!match) continue;
+        }
         g_current = t.name;
         const int before = g_failures;
         std::printf("[ RUN  ] %s\n", t.name);

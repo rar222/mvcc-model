@@ -46,19 +46,21 @@
 // the instrumentation overhead is not proportional to algorithmic work.
 // See kAssertTimings. Correctness assertions run everywhere.
 //
-// Dependency-free, same as tests/tests.cpp (see CLAUDE.md: "Don't add
-// gtest/Catch2") -- a small self-contained harness, adapted here to print
-// a timing line per measurement instead of just OK/FAIL.
+// Shares tests/test_harness.h/.cpp's TEST()/CHECK()/registry()/main() with
+// the rest of the suite (see CLAUDE.md: "Don't add gtest/Catch2") -- this
+// file only adds its own timing/scaling helpers on top, it doesn't
+// duplicate the harness itself. Each TEST() here also prints a timing line
+// per measurement, on top of the shared OK/FAIL reporting.
 //
 // Run: ctest --preset default -R performance_tests --output-on-failure
 //   or: ./build/default/performance_tests
+//   or: ./build/default/performance_tests --exact <test_name>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <random>
@@ -67,6 +69,7 @@
 #include <vector>
 
 #include "model/model.h"
+#include "test_harness.h"
 #include "test_types.h"
 
 #if defined(__linux__)
@@ -81,45 +84,6 @@
 #endif
 
 using namespace model;
-
-// ---------------------------------------------------------------------------
-// Harness
-// ---------------------------------------------------------------------------
-
-namespace {
-
-struct TestCase {
-    const char* name;
-    std::function<void()> fn;
-};
-
-std::vector<TestCase>& registry() {
-    static std::vector<TestCase> r;
-    return r;
-}
-
-int g_failures = 0;
-
-struct Registrar {
-    Registrar(const char* name, std::function<void()> fn) {
-        registry().push_back({name, std::move(fn)});
-    }
-};
-
-}  // namespace
-
-#define PERF_TEST(name)                       \
-    static void name();                       \
-    static Registrar reg_##name(#name, name); \
-    static void name()
-
-#define CHECK(cond)                                                       \
-    do {                                                                  \
-        if (!(cond)) {                                                    \
-            std::printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-            ++g_failures;                                                 \
-        }                                                                 \
-    } while (0)
 
 namespace {
 
@@ -397,7 +361,7 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 // O(1)) and define_scan_fields() (find_by_scan_field, O(#accounts) linear
 // scan) -- see tests/test_types.h. Same field, same data, same query: any timing
 // difference is attributable entirely to the index, not to anything else.
-PERF_TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
+TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> key_us, scan_us;
     for (int n : sizes) {
@@ -438,7 +402,7 @@ PERF_TEST(find_by_key_is_flat_while_find_by_scan_field_grows_with_population) {
 
 // Same comparison, one level up: Order::qty is in BOTH define_cached_fields
 // (indexed, O(log n + matches)) and define_scan_fields (O(#orders) scan).
-PERF_TEST(find_by_cached_field_stays_near_flat_while_scan_grows_on_the_same_field) {
+TEST(find_by_cached_field_stays_near_flat_while_scan_grows_on_the_same_field) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> cached_us, scan_us;
     for (int n : sizes) {
@@ -489,7 +453,7 @@ PERF_TEST(find_by_cached_field_stays_near_flat_while_scan_grows_on_the_same_fiel
 // find_cached_referrers is the O(log n + matches) indexed alternative --
 // same comparison examples/cached_reference_bench.cpp benchmarks in more
 // depth, here as an asserted claim at smaller, CI-friendly sizes.
-PERF_TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_population) {
+TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_population) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> scan_us, indexed_us;
     for (int n : sizes) {
@@ -546,7 +510,7 @@ PERF_TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_populatio
 // a single-field update's commit latency grows LINEARLY with model size --
 // not flat, but also not proportional to a deep copy of the whole model
 // (which would grow far faster than linear).
-PERF_TEST(single_field_commit_latency_stays_bounded_as_total_model_size_grows) {
+TEST(single_field_commit_latency_stays_bounded_as_total_model_size_grows) {
     const std::vector<int> sizes = {scaled(6250), scaled(25000), scaled(100000)};
     std::vector<double> ms_per_commit;
     for (int n : sizes) {
@@ -702,7 +666,7 @@ double bench_concurrent_create_and_update_with_undo_cap(std::size_t max_undo_lis
 // at all -- so while one thread holds commit_mu_ applying, the other three
 // can be off cloning and mutating their own next transaction instead of
 // waiting idle, which the fully-sequential run can never do.
-PERF_TEST(
+TEST(
     four_threads_updating_private_objects_concurrently_beats_running_the_same_transactions_sequentially) {
     const int kIters = scaled(300);
 
@@ -792,7 +756,7 @@ PERF_TEST(
 // still buys measurable speed -- it no longer needs to, since bounding
 // memory retention is set_max_undo_list_size()'s only remaining reason to
 // exist (see its own doc comment).
-PERF_TEST(
+TEST(
     four_threads_updating_private_objects_with_undo_list_capped_at_1000_is_not_meaningfully_slower_than_uncapped) {
     // kThreads * kIters needs to clear kCap by a wide margin, not just cross
     // it -- at 1200 (kIters=300, the other two tests' iteration count) the
@@ -817,7 +781,7 @@ PERF_TEST(
     CHECK(speedup >= 0.85);
 }
 
-PERF_TEST(
+TEST(
     four_threads_updating_private_objects_with_undo_list_capped_at_100_is_not_meaningfully_slower_than_uncapped) {
     const int kIters = scaled(300);
     constexpr int kBatchSize = 10;
@@ -835,7 +799,7 @@ PERF_TEST(
     CHECK(speedup >= 0.85);
 }
 
-PERF_TEST(
+TEST(
     four_threads_updating_private_objects_with_undo_list_capped_at_0_is_not_meaningfully_slower_than_uncapped) {
     const int kIters = scaled(300);
     constexpr int kBatchSize = 10;
@@ -917,7 +881,7 @@ void seed_hub_with_fanout(Model& m, int fanout, int background, Ref<Account>& hu
 // still worth having: it rejects the regression that actually matters
 // (this operation going quadratic), while not pretending the linear term
 // is separable from commit overhead at any size this suite can afford.
-PERF_TEST(worst_case_removing_one_referrer_of_a_hub_scales_with_hub_fanout) {
+TEST(worst_case_removing_one_referrer_of_a_hub_scales_with_hub_fanout) {
     const std::vector<int> fanouts = {scaled(6250), scaled(25000), scaled(100000)};
     constexpr int kTrials = 5;
     std::vector<double> times_ms;
@@ -973,7 +937,7 @@ PERF_TEST(worst_case_removing_one_referrer_of_a_hub_scales_with_hub_fanout) {
 // case regardless: the cascade BFS does the same per-victim work whether
 // the victims arrive broad or deep, so cost scales with the cascade's
 // SIZE either way, which is what this test measures.
-PERF_TEST(worst_case_removing_a_hub_scales_with_the_size_of_its_cascade) {
+TEST(worst_case_removing_a_hub_scales_with_the_size_of_its_cascade) {
     const std::vector<int> fanouts = {scaled(1250), scaled(5000), scaled(20000)};
     constexpr int kTrials = 5;
     std::vector<double> times_ms;
@@ -1070,7 +1034,7 @@ void seed_blobs(Model& m, const PayloadCase& c, int count, std::vector<Ref<Blob>
 // with the object's OWN byte size, holding object COUNT fixed -- a
 // different axis than every size-sweep test above, which holds payload
 // fixed and varies count.
-PERF_TEST(write_cost_scales_with_object_payload_size_at_a_fixed_object_count) {
+TEST(write_cost_scales_with_object_payload_size_at_a_fixed_object_count) {
     const int kCount = scaled(5000);
     std::vector<double> create_ms, update_ms;
     for (const PayloadCase& c : payload_cases()) {
@@ -1103,7 +1067,7 @@ PERF_TEST(write_cost_scales_with_object_payload_size_at_a_fixed_object_count) {
 // Contrast with the write-side test above: find_by_key never copies the
 // object, so lookup time should stay flat regardless of payload size, at
 // the SAME fixed object count.
-PERF_TEST(read_lookup_time_is_insensitive_to_object_payload_size) {
+TEST(read_lookup_time_is_insensitive_to_object_payload_size) {
     const int kCount = scaled(5000);
     std::vector<double> lookup_us;
     for (const PayloadCase& c : payload_cases()) {
@@ -1236,7 +1200,7 @@ void seed_str_keyed(Model& m, const StringKeyCase& c, int count, int dup_fanout,
 // now returns ~count/dup_fanout matches instead of one -- isolating the
 // O(#matches) term from the O(string length) term the unique_key column
 // already isolates from population.
-PERF_TEST(indexed_lookup_time_vs_string_key_length_unique_vs_clashing) {
+TEST(indexed_lookup_time_vs_string_key_length_unique_vs_clashing) {
     const int kCount = scaled(20000);
     const int kDupFanout = 100;  // ~200 matches per dup_key probe at kCount
     std::vector<double> key_us, cached_unique_us, cached_dup_us;
@@ -1307,7 +1271,7 @@ PERF_TEST(indexed_lookup_time_vs_string_key_length_unique_vs_clashing) {
 // gets its own full string compare, not just the O(log n) handful an index
 // descent touches) -- so this is the scan-side counterpart of the test
 // above, over the same string_key_cases().
-PERF_TEST(scan_field_time_vs_string_key_length_is_insensitive_to_key_uniqueness) {
+TEST(scan_field_time_vs_string_key_length_is_insensitive_to_key_uniqueness) {
     const int kCount = scaled(20000);
     const int kDupFanout = 100;
     std::vector<double> scan_unique_us, scan_dup_us;
@@ -1489,7 +1453,7 @@ void seed_one_type_spread_across_buckets(Model& m, int n) {
 
 }  // namespace
 
-PERF_TEST(cached_reference_index_memory_overhead_is_present_but_bounded) {
+TEST(cached_reference_index_memory_overhead_is_present_but_bounded) {
     const int kN = scaled(200000);
     const long baseline_kb = measure_child_peak_kb([] { /* just process startup cost */ });
 
@@ -1569,7 +1533,7 @@ void seed_one_type_via_bulk_load(Model& m, int n) {
 
 }  // namespace
 
-PERF_TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
+TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
     const int kN = scaled(200000);
     const long baseline_kb = measure_child_peak_kb([] { /* just process startup cost */ });
 
@@ -1653,7 +1617,7 @@ public:
 
 }  // namespace
 
-PERF_TEST(one_million_random_basic_records_in_a_single_transaction_without_undo) {
+TEST(one_million_random_basic_records_in_a_single_transaction_without_undo) {
     // scaled(), same as every other size constant in this file: under a
     // sanitizer, per-op instrumentation overhead alone (20-50x, see
     // scaled()'s own comment) would push a full 1,000,000-object single
@@ -1689,19 +1653,4 @@ PERF_TEST(one_million_random_basic_records_in_a_single_transaction_without_undo)
 
     CHECK(res.status == CommitStatus::Committed);
     CHECK(m.snapshot().size() == static_cast<std::size_t>(kCount));
-}
-
-// ---------------------------------------------------------------------------
-
-int main() {
-    int total = 0;
-    for (auto& t : registry()) {
-        std::printf("[ RUN  ] %s\n", t.name);
-        const int failed_before = g_failures;
-        t.fn();
-        std::printf("[ %s ] %s\n\n", g_failures == failed_before ? " OK " : "FAIL", t.name);
-        ++total;
-    }
-    std::printf("%d test(s) run, %d check(s) failed\n", total, g_failures);
-    return g_failures == 0 ? 0 : 1;
 }

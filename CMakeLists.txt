@@ -179,6 +179,7 @@ target_precompile_headers(order_record_bench REUSE_FROM model)
 # --- tests ------------------------------------------------------------------
 
 enable_testing()
+include(cmake/DiscoverTests.cmake)
 add_executable(model_tests
     tests/test_harness.cpp
     tests/test_helpers.cpp
@@ -197,8 +198,10 @@ add_executable(model_tests
 target_link_libraries(model_tests PRIVATE model)
 target_precompile_headers(model_tests REUSE_FROM model)
 
-add_test(NAME model_tests COMMAND model_tests)
-set_tests_properties(model_tests PROPERTIES TIMEOUT 300)
+# Registers every TEST() in the sources above as its own CTest entry (see
+# cmake/DiscoverTests.cmake) so IDE test explorers and `ctest -R <name>`
+# see each case individually, not just one "model_tests" binary.
+mvcc_discover_tests(model_tests)
 
 # The persistent index (HAMT) is differential-tested against std::unordered_map.
 # Shares tests/test_harness.cpp/.h with model_tests (TEST()/CHECK()/g_failures/
@@ -207,8 +210,7 @@ set_tests_properties(model_tests PROPERTIES TIMEOUT 300)
 add_executable(persistent_map_tests tests/persistent_map_tests.cpp tests/test_harness.cpp)
 target_link_libraries(persistent_map_tests PRIVATE model_flags)
 target_include_directories(persistent_map_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-add_test(NAME persistent_map_tests COMMAND persistent_map_tests)
-set_tests_properties(persistent_map_tests PROPERTIES TIMEOUT 120)
+mvcc_discover_tests(persistent_map_tests TIMEOUT 120)
 
 # The demo doubles as an integration test: its internal asserts fire if a Ref
 # ever dangles or a conflict is silently missed, so run it under CTest too
@@ -222,8 +224,15 @@ set_tests_properties(two_writer_demo_integration PROPERTIES TIMEOUT 300)
 # This project's own documented complexity/memory claims (CLAUDE.md,
 # DESIGN.md, README.md), asserted across several sizes instead of only
 # ever printed for a human to eyeball -- see the file's own header comment.
-add_executable(performance_tests tests/performance_tests.cpp)
+add_executable(performance_tests tests/performance_tests.cpp tests/test_harness.cpp)
 target_link_libraries(performance_tests PRIVATE model)
 target_precompile_headers(performance_tests REUSE_FROM model)
-add_test(NAME performance_tests COMMAND performance_tests)
-set_tests_properties(performance_tests PROPERTIES TIMEOUT 300)
+# RUN_SERIAL: these assert on wall-clock timing/scaling, not just
+# correctness (see the file's own header comment). Before this file's tests
+# were individually discovered, they only ever ran as one serial process;
+# splitting them into per-test CTest entries would otherwise let `ctest -j`
+# schedule several of THIS binary's own timing-sensitive subtests
+# concurrently, competing for the same CPU cores and reintroducing exactly
+# the jitter check_scaling()'s bands are designed to tolerate but not
+# multiply.
+mvcc_discover_tests(performance_tests RUN_SERIAL)
