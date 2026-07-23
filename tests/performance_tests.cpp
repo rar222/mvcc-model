@@ -128,6 +128,31 @@ int scaled(int n) {
 // everywhere.
 constexpr bool kAssertTimings = !kSlowSanitizedBuild;
 
+// GCC and Clang both define __OPTIMIZE__ whenever any optimization level
+// (-O1 and above) is active, and leave it undefined at -O0. Unlike
+// CMAKE_BUILD_TYPE -- which is "Debug" for both the debug preset (-O0, no
+// sanitizer) AND the asan/tsan presets (also Debug, distinguished instead
+// by kSlowSanitizedBuild above) -- this is a portable, build-system-
+// independent way to tell "unoptimized" apart from "optimized, debug info
+// kept" (the default preset, RelWithDebInfo).
+#if defined(__OPTIMIZE__)
+constexpr bool kOptimizedBuild = true;
+#else
+constexpr bool kOptimizedBuild = false;
+#endif
+
+// The four_threads_updating_private_objects_* family below measures
+// whether parallel Transaction BUILDING overlaps with serialized APPLY
+// (CLAUDE.md invariant 7) -- a margin that comfortably clears its bounds
+// under optimization, but at -O0 the per-object clone/allocate work each
+// thread does while NOT holding commit_mu_ grows so much relative to the
+// (also -O0, equally unshortened) time spent holding it that the overlap
+// this test is measuring gets lost in noise: observed speedup at -O0 has
+// landed anywhere from ~0.9x to ~1.3x, which is not a meaningful signal
+// either way. kAssertTimings alone doesn't catch this, because -O0 without
+// a sanitizer isn't kSlowSanitizedBuild.
+constexpr bool kAssertConcurrencySpeedup = kAssertTimings && kOptimizedBuild;
+
 template <class F>
 double time_ms(F&& f) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -716,7 +741,7 @@ TEST(
         "speedup=%.2fx\n",
         kThreads, kIters, kObjectsPerThread, concurrent_ms, sequential_ms, speedup);
 
-    if (!kAssertTimings) return;  // see kAssertTimings
+    if (!kAssertConcurrencySpeedup) return;  // see kAssertConcurrencySpeedup
     // Not asserting anywhere near kThreads-fold: apply is fully serialized,
     // so the ceiling on speedup is nowhere close to 4x. The floor asserted
     // here is deliberately modest -- it only needs to catch a regression
@@ -777,7 +802,7 @@ TEST(
     std::printf(
         "  undo list cap=%4zu vs maximum:  uncapped=%7.2f ms   capped=%7.2f ms   speedup=%.2fx\n",
         kCap, uncapped_ms, capped_ms, speedup);
-    if (!kAssertTimings) return;  // see kAssertTimings
+    if (!kAssertConcurrencySpeedup) return;  // see kAssertConcurrencySpeedup
     CHECK(speedup >= 0.85);
 }
 
@@ -795,7 +820,7 @@ TEST(
     std::printf(
         "  undo list cap=%4zu vs maximum:  uncapped=%7.2f ms   capped=%7.2f ms   speedup=%.2fx\n",
         kCap, uncapped_ms, capped_ms, speedup);
-    if (!kAssertTimings) return;  // see kAssertTimings
+    if (!kAssertConcurrencySpeedup) return;  // see kAssertConcurrencySpeedup
     CHECK(speedup >= 0.85);
 }
 
@@ -813,7 +838,7 @@ TEST(
     std::printf(
         "  undo list cap=%4zu vs maximum:  uncapped=%7.2f ms   capped=%7.2f ms   speedup=%.2fx\n",
         kCap, uncapped_ms, capped_ms, speedup);
-    if (!kAssertTimings) return;  // see kAssertTimings
+    if (!kAssertConcurrencySpeedup) return;  // see kAssertConcurrencySpeedup
     // cap=0 still gets set_max_undo_list_size()'s immediate-clear special
     // case (see its own doc comment) -- publish_now() skips the whole
     // conflict-prune-and-append step outright here, so this one CAN still
