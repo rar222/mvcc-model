@@ -159,6 +159,14 @@ target_precompile_headers(basic_record_bench REUSE_FROM model)
 # costs nothing on a normal run.
 target_compile_definitions(basic_record_bench PRIVATE MODEL_BENCH_CALLGRIND)
 
+# Same as basic_record_bench, except the commit call is try_commit() (the
+# undo-tracking path) instead of try_commit_without_undo() -- isolates what
+# keeping an undo entry costs on top of the same per-object apply work.
+add_executable(basic_record_bench_with_undo examples/basic_record_bench_with_undo.cpp)
+target_link_libraries(basic_record_bench_with_undo PRIVATE model)
+target_precompile_headers(basic_record_bench_with_undo REUSE_FROM model)
+target_compile_definitions(basic_record_bench_with_undo PRIVATE MODEL_BENCH_CALLGRIND)
+
 # Same shape as large_txn_bench.cpp's bench_bulk_create, isolated into its
 # own binary (build/commit phase split, argv count override) so it can be
 # profiled the same way as basic_record_bench -- Order touches every index
