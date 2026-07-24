@@ -746,6 +746,37 @@ public:
     void each_entry(F&& f) const {
         each_in(as_node(root_), f);
     }
+
+    // Same walk as each_in, but f returns bool (true = keep going, false =
+    // stop) and the walk itself actually stops the moment f says so --
+    // unlike a caller wrapping each_in in a "stop calling f once a flag
+    // flips" guard, which still pays for visiting every remaining entry.
+    // Needed for a real std::all_of/std::any_of over a trie-backed index
+    // (see model.h's all_of_by_scan_field/all_of_by_cached_field): a
+    // predicate that fails on the very first match should not force a scan
+    // of the other 999,999.
+    template <class F>
+    static bool each_in_short_circuit(const Node* n, F& f) {
+        if (!n) return true;
+        std::uint32_t pos = 0;
+        for (std::uint32_t idx = 0; idx < 32; ++idx) {
+            const std::uint32_t b = bit(idx);
+            if (!(n->bitmap & b)) continue;
+            if (n->is_leaf & b) {
+                for (const Leaf* l = as_leaf(n->slots[pos]); l; l = l->next.get())
+                    if (!f(l->entry)) return false;
+            } else {
+                if (!each_in_short_circuit(as_node(n->slots[pos]), f)) return false;
+            }
+            ++pos;
+        }
+        return true;
+    }
+
+    template <class F>
+    bool each_entry_short_circuit(F&& f) const {
+        return each_in_short_circuit(as_node(root_), f);
+    }
 };
 
 }  // namespace detail
@@ -793,6 +824,16 @@ public:
     void for_each(F&& f) const {
         core_.each_entry([&](const std::pair<K, V>& e) { f(e.first, e.second); });
     }
+
+    /// Short-circuiting form of for_each: `f(key, value)` returns bool (true
+    /// = keep going, false = stop), and this returns whether the walk ran to
+    /// completion (false iff `f` stopped it early). See TrieCore::
+    /// each_entry_short_circuit for what this is built on.
+    template <class F>
+    bool for_each_short_circuit(F&& f) const {
+        return core_.each_entry_short_circuit(
+            [&](const std::pair<K, V>& e) { return f(e.first, e.second); });
+    }
 };
 
 /// A persistent SET: like PersistentMap, but there is no value -- the key IS
@@ -834,6 +875,15 @@ public:
     template <class F>
     void for_each(F&& f) const {
         core_.each_entry([&](const K& k) { f(k); });
+    }
+
+    /// Short-circuiting form of for_each: `f(key)` returns bool (true = keep
+    /// going, false = stop), and this returns whether the walk ran to
+    /// completion (false iff `f` stopped it early). See TrieCore::
+    /// each_entry_short_circuit for what this is built on.
+    template <class F>
+    bool for_each_short_circuit(F&& f) const {
+        return core_.each_entry_short_circuit([&](const K& k) { return f(k); });
     }
 };
 

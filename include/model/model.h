@@ -1195,10 +1195,35 @@ public:
     std::vector<const member_class_t<decltype(Field)>*> find_by_scan_field(
         const member_value_t<decltype(Field)>& value) const;
 
+    /// Same matches as find_by_scan_field, without collecting them into a
+    /// vector first: calls `f(const ClassT&)` for each one directly.
+    /// find_by_scan_field itself is defined in terms of this. Prefer this
+    /// form when you're just going to iterate the result anyway -- it skips
+    /// the vector allocation.
+    template <auto Field, class F>
+    void for_each_by_scan_field(const member_value_t<decltype(Field)>& value, F&& f) const;
+
+    /// std::all_of over the same matches as find_by_scan_field: true if
+    /// `pred(const ClassT&)` holds for every match, vacuously true if there
+    /// are none. Genuinely short-circuits -- built on pmap::PersistentSet::
+    /// for_each_short_circuit (via Snapshot::for_each_short_circuit), so the
+    /// underlying by_type walk itself stops the moment `pred` returns false,
+    /// not just further calls to `pred`.
+    template <auto Field, class Pred>
+    bool all_of_by_scan_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const;
+
     /// View-returning form of find_by_scan_field.
     template <auto Field>
     std::vector<View<member_class_t<decltype(Field)>>> view_by_scan_field(
         const member_value_t<decltype(Field)>& value) const;
+
+    /// View-returning form of for_each_by_scan_field.
+    template <auto Field, class F>
+    void for_each_view_by_scan_field(const member_value_t<decltype(Field)>& value, F&& f) const;
+
+    /// View-returning form of all_of_by_scan_field.
+    template <auto Field, class Pred>
+    bool all_of_view_by_scan_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const;
 
     /// INDEXED multi-match lookup: every object whose `Field` -- declared via
     /// define_cached_fields() -- currently equals `value`. O(log n + #matches),
@@ -1214,10 +1239,31 @@ public:
     std::vector<const member_class_t<decltype(Field)>*> find_by_cached_field(
         const member_value_t<decltype(Field)>& value) const;
 
+    /// Same matches as find_by_cached_field, without collecting them into a
+    /// vector first -- see for_each_by_scan_field's comment (the scan/cached
+    /// counterpart of the same idea).
+    template <auto Field, class F>
+    void for_each_by_cached_field(const member_value_t<decltype(Field)>& value, F&& f) const;
+
+    /// std::all_of over the same matches as find_by_cached_field. Genuinely
+    /// short-circuits, same as all_of_by_scan_field -- see its comment; here
+    /// the bucket itself is a pmap::PersistentSet, so this calls
+    /// PersistentSet::for_each_short_circuit directly on it.
+    template <auto Field, class Pred>
+    bool all_of_by_cached_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const;
+
     /// View-returning form of find_by_cached_field.
     template <auto Field>
     std::vector<View<member_class_t<decltype(Field)>>> view_by_cached_field(
         const member_value_t<decltype(Field)>& value) const;
+
+    /// View-returning form of for_each_by_cached_field.
+    template <auto Field, class F>
+    void for_each_view_by_cached_field(const member_value_t<decltype(Field)>& value, F&& f) const;
+
+    /// View-returning form of all_of_by_cached_field.
+    template <auto Field, class Pred>
+    bool all_of_view_by_cached_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const;
 
     /// Visit every object of type T. O(#T objects): backed by a per-type
     /// index of every Id of that type (Root::by_type), not a full spine scan.
@@ -1229,6 +1275,24 @@ public:
         it->second.for_each([&](Id id) {
             if (const T* p = cast<T>(find_raw(id))) f(*p);
         });
+    }
+
+    /// Short-circuiting counterpart of for_each<T>: `f` returns bool (true =
+    /// keep going, false = stop), and this returns whether the walk ran to
+    /// completion (false iff `f` stopped it early) -- built on pmap::
+    /// PersistentSet::for_each_short_circuit, so unlike for_each<T> this
+    /// actually stops the underlying by_type walk, not just further calls to
+    /// `f`. What all_of_by_scan_field is built on.
+    template <class T, class F>
+    bool for_each_short_circuit(F&& f) const {
+        if (!root_) return true;
+        auto it = root_->by_type.find(type_tag<T>());
+        if (it == root_->by_type.end()) return true;
+        return it->second.for_each_short_circuit(
+            [&](Id id) {
+                const T* p = cast<T>(find_raw(id));
+                return !p || f(*p);
+            });
     }
 
     /// Slow linear scan over every object of type T, keeping those for which
@@ -1369,6 +1433,14 @@ private:
         if (!o || o->tag() != type_tag<T>()) return nullptr;
         return static_cast<const T*>(o);
     }
+
+    /// Shared, short-circuiting scan implementation behind BOTH
+    /// for_each_by_scan_field (wraps `f` to always report "keep going") and
+    /// all_of_by_scan_field (passes `pred` straight through, so a false
+    /// genuinely stops the walk). Defined out-of-line alongside them -- see
+    /// find_by_scan_field's comment for why (record_field_lookup).
+    template <auto Field, class F>
+    bool scan_field_short_circuit(const member_value_t<decltype(Field)>& value, F&& f) const;
 
     /// Generic ("any type, any field") counterpart of for_each_referrer<Field>:
     /// walks EVERY live object of EVERY type via by_type, and every one of
@@ -3270,14 +3342,12 @@ private:
 // forward declaration).
 // ---------------------------------------------------------------------------
 
-template <auto Field>
-std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_by_scan_field(
-    const member_value_t<decltype(Field)>& value) const {
+template <auto Field, class F>
+bool Snapshot::scan_field_short_circuit(const member_value_t<decltype(Field)>& value, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
-    std::vector<const ClassT*> out;
     record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
     bool checked = false, declared = false;
-    for_each<ClassT>([&](const ClassT& o) {
+    return for_each_short_circuit<ClassT>([&](const ClassT& o) {
         if (!checked) {
             // define_scan_fields() is static per type: ask the first
             // object once, on behalf of the whole scan.
@@ -3286,16 +3356,66 @@ std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_by_scan_field
                 if (field == field_tag<Field>()) declared = true;
             });
         }
-        if (!declared) return;
+        if (!declared) return true;  // not a match -- keep going
         // Field is either a data member or a nullary const method -- the
         // same two shapes member_class/member_value accept everywhere else.
-        if constexpr (std::is_member_object_pointer_v<decltype(Field)>) {
-            if (o.*Field == value) out.push_back(&o);
-        } else {
-            if ((o.*Field)() == value) out.push_back(&o);
-        }
+        const bool matches = [&] {
+            if constexpr (std::is_member_object_pointer_v<decltype(Field)>) return o.*Field == value;
+            else return (o.*Field)() == value;
+        }();
+        return matches ? f(o) : true;
     });
+}
+
+template <auto Field, class F>
+void Snapshot::for_each_by_scan_field(const member_value_t<decltype(Field)>& value, F&& f) const {
+    scan_field_short_circuit<Field>(value, [&](const auto& o) {
+        f(o);
+        return true;  // for_each_by_scan_field never stops early
+    });
+}
+
+template <auto Field, class Pred>
+bool Snapshot::all_of_by_scan_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const {
+    return scan_field_short_circuit<Field>(value, std::forward<Pred>(pred));
+}
+
+template <auto Field>
+std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_by_scan_field(
+    const member_value_t<decltype(Field)>& value) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    std::vector<const ClassT*> out;
+    for_each_by_scan_field<Field>(value, [&](const ClassT& o) { out.push_back(&o); });
     return out;
+}
+
+template <auto Field, class F>
+void Snapshot::for_each_by_cached_field(const member_value_t<decltype(Field)>& value, F&& f) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    if (!root_) return;
+    auto it = root_->by_cached_field.find(field_tag<Field>());
+    if (it == root_->by_cached_field.end()) return;
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(to_field_key(value));
+    if (!bucket) return;
+    bucket->for_each([&](Id id) {
+        if (const ClassT* p = cast<ClassT>(find_raw(id))) f(*p);
+    });
+}
+
+template <auto Field, class Pred>
+bool Snapshot::all_of_by_cached_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    if (!root_) return true;
+    auto it = root_->by_cached_field.find(field_tag<Field>());
+    if (it == root_->by_cached_field.end()) return true;  // vacuous: undeclared field, no matches
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(to_field_key(value));
+    if (!bucket) return true;  // vacuous: no matches
+    return bucket->for_each_short_circuit([&](Id id) {
+        const ClassT* p = cast<ClassT>(find_raw(id));
+        return !p || pred(*p);
+    });
 }
 
 template <auto Field>
@@ -3303,15 +3423,7 @@ std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_by_cached_fie
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
     std::vector<const ClassT*> out;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-    if (!root_) return out;
-    auto it = root_->by_cached_field.find(field_tag<Field>());
-    if (it == root_->by_cached_field.end()) return out;
-    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(to_field_key(value));
-    if (!bucket) return out;
-    bucket->for_each([&](Id id) {
-        if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
-    });
+    for_each_by_cached_field<Field>(value, [&](const ClassT& o) { out.push_back(&o); });
     return out;
 }
 
@@ -4119,13 +4231,40 @@ std::optional<View<member_class_t<decltype(Field)>>> Snapshot::view_by_key(
     return std::nullopt;
 }
 
+template <auto Field, class F>
+void Snapshot::for_each_view_by_scan_field(const member_value_t<decltype(Field)>& value, F&& f) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    for_each_by_scan_field<Field>(value, [&](const ClassT& o) { f(View<ClassT>(*this, o)); });
+}
+
+template <auto Field, class Pred>
+bool Snapshot::all_of_view_by_scan_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    return all_of_by_scan_field<Field>(
+        value, [&](const ClassT& o) { return pred(View<ClassT>(*this, o)); });
+}
+
 template <auto Field>
 std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_by_scan_field(
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
     std::vector<View<ClassT>> out;
-    for (const ClassT* p : find_by_scan_field<Field>(value)) out.push_back(View<ClassT>(*this, *p));
+    for_each_view_by_scan_field<Field>(value, [&](View<ClassT> v) { out.push_back(v); });
     return out;
+}
+
+template <auto Field, class F>
+void Snapshot::for_each_view_by_cached_field(const member_value_t<decltype(Field)>& value, F&& f) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    for_each_by_cached_field<Field>(value, [&](const ClassT& o) { f(View<ClassT>(*this, o)); });
+}
+
+template <auto Field, class Pred>
+bool Snapshot::all_of_view_by_cached_field(const member_value_t<decltype(Field)>& value,
+                                           Pred&& pred) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    return all_of_by_cached_field<Field>(
+        value, [&](const ClassT& o) { return pred(View<ClassT>(*this, o)); });
 }
 
 template <auto Field>
@@ -4133,7 +4272,7 @@ std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_by_cached_fiel
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
     std::vector<View<ClassT>> out;
-    for (const ClassT* p : find_by_cached_field<Field>(value)) out.push_back(View<ClassT>(*this, *p));
+    for_each_view_by_cached_field<Field>(value, [&](View<ClassT> v) { out.push_back(v); });
     return out;
 }
 

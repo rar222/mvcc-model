@@ -374,6 +374,82 @@ TEST(lookup_stats_counts_cached_and_uncached_calls_independently) {
     CHECK_EQ(c.uncached_calls, std::uint64_t{1});
 }
 
+// for_each_by_scan_field/for_each_by_cached_field are find_by_scan_field/
+// find_by_cached_field's no-vector siblings -- same matches, delivered via
+// callback instead of a returned std::vector.
+TEST(for_each_by_scan_field_and_for_each_by_cached_field_visit_every_match) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    make_order(m, "O2", a, Opt<Order>{}, 5);
+    make_order(m, "O3", a, Opt<Order>{}, 7);
+    Snapshot s = m.snapshot();
+
+    int scan_hits = 0;
+    s.for_each_by_scan_field<&Order::qty>(5, [&](const Order& o) {
+        CHECK_EQ(o.qty, std::int64_t{5});
+        ++scan_hits;
+    });
+    CHECK_EQ(scan_hits, 2);
+
+    int cached_hits = 0;
+    s.for_each_by_cached_field<&Order::qty>(5, [&](const Order& o) {
+        CHECK_EQ(o.qty, std::int64_t{5});
+        ++cached_hits;
+    });
+    CHECK_EQ(cached_hits, 2);
+
+    int no_match_hits = 0;
+    s.for_each_by_scan_field<&Order::qty>(99, [&](const Order&) { ++no_match_hits; });
+    CHECK_EQ(no_match_hits, 0);
+}
+
+// all_of_by_scan_field/all_of_by_cached_field: std::all_of's boolean
+// contract (vacuously true on no matches, false as soon as one match fails
+// pred) -- see the declarations' own comment for why pred simply stops
+// being CALLED after the first failure rather than the underlying scan
+// stopping early.
+TEST(all_of_by_scan_field_and_all_of_by_cached_field_match_std_all_of_semantics) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    make_order(m, "O2", a, Opt<Order>{}, 5);
+    make_order(m, "O3", a, Opt<Order>{}, 7);
+    Snapshot s = m.snapshot();
+
+    CHECK(s.all_of_by_scan_field<&Order::qty>(99, [](const Order&) { return false; }));  // vacuous
+    CHECK(s.all_of_by_scan_field<&Order::qty>(5, [](const Order& o) { return o.qty == 5; }));
+    CHECK(s.all_of_by_cached_field<&Order::qty>(5, [](const Order& o) { return o.qty == 5; }));
+
+    int calls = 0;
+    const bool result = s.all_of_by_cached_field<&Order::qty>(5, [&](const Order&) {
+        ++calls;
+        return false;  // fails on the FIRST match -- pred should not run again
+    });
+    CHECK(!result);
+    CHECK_EQ(calls, 1);
+}
+
+// View-returning forms of the same two functions.
+TEST(for_each_view_by_scan_field_and_all_of_view_by_cached_field_bind_to_this_snapshot) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    make_order(m, "O2", a, Opt<Order>{}, 5);
+    Snapshot s = m.snapshot();
+
+    int hits = 0;
+    s.for_each_view_by_scan_field<&Order::qty>(5, [&](View<Order> v) {
+        CHECK_EQ(v->qty, std::int64_t{5});
+        ++hits;
+    });
+    CHECK_EQ(hits, 2);
+
+    CHECK(s.all_of_view_by_cached_field<&Order::qty>(5, [](View<Order> v) { return v->qty == 5; }));
+    CHECK(!s.all_of_view_by_cached_field<&Order::qty>(5, [](View<Order> v) { return v->qty != 5; }));
+    CHECK(s.all_of_view_by_scan_field<&Order::qty>(99, [](View<Order>) { return false; }));  // vacuous
+}
+
 // find_referrers<Field> is a thin wrapper around for_each_referrer<Field> --
 // the count must land once per CALL to the public API, not once per object
 // for_each_referrer happens to visit internally.

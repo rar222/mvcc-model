@@ -932,6 +932,122 @@ TEST(set_edge_cases_perfect_u64_hash) {
     check_set_edge_cases<std::uint64_t, PerfectU64Hash>("PerfectU64Hash", 1, 2, 999);
 }
 
+// for_each_short_circuit's whole reason to exist (see its own comment in
+// persistent_map.h) is that it stops the underlying trie walk itself, not
+// just further calls to `f` -- a distinction for_each's void contract can't
+// express. Counting invocations is the only way to prove that from outside
+// TrieCore: a fake short-circuit built by wrapping for_each in an "if (ok)"
+// guard would still report exactly 1 CALL to the user's predicate too, but
+// would have walked all `n` entries doing it. 500 entries makes that
+// difference unmistakable if this regresses to the fake version.
+template <class K, class Hash, class MakeKey>
+void check_map_for_each_short_circuit(const char* label, int n, MakeKey make_key) {
+    auto require = [&](bool cond, const char* what) {
+        if (!cond) {
+            std::printf("SHORT-CIRCUIT FAIL (map/%s): %s\n", label, what);
+            ++g_failures;
+        }
+    };
+
+    PersistentMap<K, int, Hash> m;
+    for (int i = 0; i < n; ++i) m = m.set(make_key(i), i);
+
+    // Empty map: vacuously true, f never called.
+    PersistentMap<K, int, Hash> empty;
+    bool empty_visited = false;
+    const bool empty_completed =
+        empty.for_each_short_circuit([&](const K&, int) {
+            empty_visited = true;
+            return true;
+        });
+    require(empty_completed, "empty map: walk reports completed");
+    require(!empty_visited, "empty map: f never invoked");
+
+    // Never stopping: completes, and visits exactly `n` entries -- same
+    // coverage as for_each, just via the bool-returning callback.
+    int full_count = 0;
+    const bool full_completed = m.for_each_short_circuit([&](const K&, int) {
+        ++full_count;
+        return true;
+    });
+    require(full_completed, "never stopping -> walk reports completed");
+    require(full_count == n, "never stopping -> visits every entry");
+
+    // Stopping on the very first call: walk reports NOT completed, and --
+    // the actual point of this primitive -- exactly ONE entry was visited,
+    // not all n.
+    int stop_count = 0;
+    const bool stop_completed = m.for_each_short_circuit([&](const K&, int) {
+        ++stop_count;
+        return false;
+    });
+    require(!stop_completed, "stopping on first call -> walk reports NOT completed");
+    require(stop_count == 1, "stopping on first call -> exactly one entry visited, not all n");
+}
+
+template <class K, class Hash, class MakeKey>
+void check_set_for_each_short_circuit(const char* label, int n, MakeKey make_key) {
+    auto require = [&](bool cond, const char* what) {
+        if (!cond) {
+            std::printf("SHORT-CIRCUIT FAIL (set/%s): %s\n", label, what);
+            ++g_failures;
+        }
+    };
+
+    PersistentSet<K, Hash> s;
+    for (int i = 0; i < n; ++i) s = s.insert(make_key(i));
+
+    PersistentSet<K, Hash> empty;
+    bool empty_visited = false;
+    const bool empty_completed = empty.for_each_short_circuit([&](const K&) {
+        empty_visited = true;
+        return true;
+    });
+    require(empty_completed, "empty set: walk reports completed");
+    require(!empty_visited, "empty set: f never invoked");
+
+    int full_count = 0;
+    const bool full_completed = s.for_each_short_circuit([&](const K&) {
+        ++full_count;
+        return true;
+    });
+    require(full_completed, "never stopping -> walk reports completed");
+    require(full_count == n, "never stopping -> visits every entry");
+
+    int stop_count = 0;
+    const bool stop_completed = s.for_each_short_circuit([&](const K&) {
+        ++stop_count;
+        return false;
+    });
+    require(!stop_completed, "stopping on first call -> walk reports NOT completed");
+    require(stop_count == 1, "stopping on first call -> exactly one entry visited, not all n");
+}
+
+TEST(for_each_short_circuit_map_u64_hash) {
+    check_map_for_each_short_circuit<std::uint64_t, U64Hash>(
+        "U64Hash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(for_each_short_circuit_map_perfect_u64_hash) {
+    check_map_for_each_short_circuit<std::uint64_t, PerfectU64Hash>(
+        "PerfectU64Hash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+// ClashHash collapses every key onto one of three hash values, forcing long
+// collision chains -- exercises each_in_short_circuit's inner chain loop
+// (`for (l = ...; l; l = l->next.get()) if (!f(...)) return false;`), which
+// U64Hash/PerfectU64Hash's short (depth <=1) chains never reach.
+TEST(for_each_short_circuit_map_clash_hash) {
+    check_map_for_each_short_circuit<std::uint64_t, ClashHash>(
+        "ClashHash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(for_each_short_circuit_set_u64_hash) {
+    check_set_for_each_short_circuit<std::uint64_t, U64Hash>(
+        "U64Hash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(for_each_short_circuit_set_clash_hash) {
+    check_set_for_each_short_circuit<std::uint64_t, ClashHash>(
+        "ClashHash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+
 // Speed: set()/contains() latency must grow like O(log32 n), not O(n), as
 // the population grows -- see the timing helpers' own comment. Run against
 // PersistentSet<uint64_t, PerfectU64Hash>: the newest code path (NoChain,
