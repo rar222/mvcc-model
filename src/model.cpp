@@ -494,7 +494,7 @@ void Model::set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t ge
     // attempt, so `ch` (a raw Chunk* into a specific shared_ptr<Chunk>
     // generation) could be dangling by then -- re-running cow(cc) gets
     // whatever chunk object is currently live for that index instead. See
-    // apply_undo_op(RestoreSlot).
+    // apply_rollback_op(RestoreSlot).
     log(RestoreSlot{slot, prev_obj, prev_gen});
 }
 
@@ -738,7 +738,7 @@ void Model::log_by_type_once(TypeTag tag) {
     auto prev = by_type_[tag];
     // GenericUndo, not a dedicated Kind: this fires at most once per
     // DISTINCT type touched per attempt (bounded by #types, never by object
-    // count), so it was never the cost the UndoOp conversion targets -- see
+    // count), so it was never the cost the TxnRollbackOp conversion targets -- see
     // log()'s own doc comment.
     log(GenericUndo{[this, tag, prev = std::move(prev)]() mutable { by_type_[tag] = std::move(prev); }});
 }
@@ -1298,13 +1298,13 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
     log(PopChanges{});
 
     // Undo: the inverse of a create is removing it. No snapshot data
-    // needed -- unlike pending_undo_'s other two action kinds, there is no
-    // pre-image to capture. Not logged for rollback -- see pending_undo_'s
+    // needed -- unlike pending_undo_actions_'s other two action kinds, there is no
+    // pre-image to capture. Not logged for rollback -- see pending_undo_actions_'s
     // own comment: it's cleared wholesale in rollback_apply(), not
     // unwound entry-by-entry like changes_. Skipped entirely (not just
     // discarded later) when keep_undo is false -- see try_commit_without_
     // undo()'s own comment for why that distinction matters.
-    if (keep_undo) pending_undo_.push_back({UndoAction::Kind::Remove, id, nullptr});
+    if (keep_undo) pending_undo_actions_.push_back({UndoAction::Kind::Remove, id, nullptr});
 
     // Never published, nothing else owns it: rollback_apply() deletes
     // everything in txn_created_. Deliberately NOT logged as an undo op -- the
@@ -1343,11 +1343,11 @@ std::optional<Model::IntegrityError> Model::apply_update(
 
     // Undo: capture BEFORE baseline is retired -- this IS the pre-image a
     // RestoreUpdate action needs. Same reasoning as changes_: not logged
-    // for rollback, since pending_undo_ is cleared wholesale on failure.
+    // for rollback, since pending_undo_actions_ is cleared wholesale on failure.
     // The clone() itself -- not just its retention -- is skipped when
     // keep_undo is false; see try_commit_without_undo()'s own comment.
     if (keep_undo)
-        pending_undo_.push_back(
+        pending_undo_actions_.push_back(
             {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(baseline->clone())});
 
     retire(baseline);
@@ -1395,7 +1395,7 @@ ObjectBase* Model::clone_for_cascade_null(Id id, bool keep_undo) {
     // same fix from undo's perspective: restore the captured pre-image.
     // Skipped entirely (not just discarded) when keep_undo is false.
     if (keep_undo)
-        pending_undo_.push_back(
+        pending_undo_actions_.push_back(
             {UndoAction::Kind::RestoreUpdate, id, std::unique_ptr<ObjectBase>(cur->clone())});
 
     ObjectBase* copy = cur->clone();
@@ -1479,7 +1479,7 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
         // anything below touches victim's data. Skipped entirely (not
         // just discarded) when keep_undo is false.
         if (keep_undo)
-            pending_undo_.push_back(
+            pending_undo_actions_.push_back(
                 {UndoAction::Kind::Recreate, x, std::unique_ptr<ObjectBase>(victim->clone())});
 
         drop_out_refs(victim);  // logs re-add of victim's outgoing edges
@@ -1565,14 +1565,14 @@ void Model::prune_changelog() {
 void Model::rollback_apply() {
     // Replay inverses in reverse. Each op exactly undoes one primitive
     // mutation, so commit-lock-protected state returns to its last committed
-    // shape. std::visit + apply_undo_op's overload set is exhaustive at
-    // compile time -- see UndoOp's own doc comment. Moving *it in (rather
+    // shape. std::visit + apply_rollback_op's overload set is exhaustive at
+    // compile time -- see TxnRollbackOp's own doc comment. Moving *it in (rather
     // than visiting a reference) lets RestoreReferrersBucket/GenericUndo
     // move their payload out instead of copying it; every other alternative
     // is trivially-copyable-sized, so the move costs nothing extra there.
-    for (auto it = undo_.rbegin(); it != undo_.rend(); ++it)
-        std::visit([this](auto&& op) { apply_undo_op(std::forward<decltype(op)>(op)); }, std::move(*it));
-    undo_.clear();
+    for (auto it = txn_rollback_log_.rbegin(); it != txn_rollback_log_.rend(); ++it)
+        std::visit([this](auto&& op) { apply_rollback_op(std::forward<decltype(op)>(op)); }, std::move(*it));
+    txn_rollback_log_.clear();
 
     // Objects created this attempt were never published and are owned by
     // nothing after their slot-writes are undone. Free them.
@@ -1580,7 +1580,7 @@ void Model::rollback_apply() {
     txn_created_.clear();
 
     changes_.clear();  // any survivors were popped by the log; clear defensively
-    pending_undo_.clear();  // not log()-replayed like changes_ -- see its own comment; a blunt
+    pending_undo_actions_.clear();  // not log()-replayed like changes_ -- see its own comment; a blunt
                             // clear is correct either way, since a failed attempt keeps nothing
     dirty_.clear();
     dirty_by_type_.clear();
@@ -1649,7 +1649,7 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // max_undo_bytes_ == 0 (see set_max_undo_list_size()/set_max_undo_
     // memory_bytes()'s doc comments) -- it re-checks both caps itself,
     // independently of what's passed here. So folding them into this LOCAL
-    // keep_undo, before the apply loop below ever pushes to pending_undo_, is
+    // keep_undo, before the apply loop below ever pushes to pending_undo_actions_, is
     // enough to skip the per-object clones (apply_update/remove_raw/
     // clone_for_cascade_null) that would only feed an entry publish_now() is
     // about to discard anyway -- no need to thread the fold back out to
@@ -1659,17 +1659,17 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     keep_undo = keep_undo && max_undo_list_size_ != 0 && max_undo_bytes_ != 0;
 
     // Size hint for every container the apply loop below grows one entry (or
-    // more, for changes_/pending_undo_/undo_) at a time -- creates+updates is
+    // more, for changes_/pending_undo_actions_/txn_rollback_log_) at a time -- creates+updates is
     // a lower bound (cascade deletes add more, unpredictably), but reserving
     // even that much upfront avoids the geometric-growth reallocations a
     // large transaction would otherwise pay on remap/pending/changes_/
-    // pending_undo_/undo_ every time. Only changes remap/pending/changes_/
-    // pending_undo_/undo_'s CAPACITY, never their contents.
+    // pending_undo_actions_/txn_rollback_log_ every time. Only changes remap/pending/changes_/
+    // pending_undo_actions_/txn_rollback_log_'s CAPACITY, never their contents.
     const std::size_t apply_size_hint = txn.local_created_.size() + txn.local_updated_.size();
     remap.reserve(remap.size() + apply_size_hint);
     changes_.reserve(changes_.size() + apply_size_hint);
-    if (keep_undo) pending_undo_.reserve(pending_undo_.size() + apply_size_hint);
-    undo_.reserve(undo_.size() + apply_size_hint);
+    if (keep_undo) pending_undo_actions_.reserve(pending_undo_actions_.size() + apply_size_hint);
+    txn_rollback_log_.reserve(txn_rollback_log_.size() + apply_size_hint);
 
     // old_field_keys: per-update baseline define_keys() fields -- collected
     // once, up front, and handed to BOTH validate_field_key_uniqueness()
@@ -1763,9 +1763,9 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
         // built it once above) for no reason, right before its only use.
         if (!remove_seeds.empty()) remove_raw(std::move(remove_seeds), keep_undo);
     }
-    // Collapse pending_undo_ to at most one action per id -- see
+    // Collapse pending_undo_actions_ to at most one action per id -- see
     // collapse_undo_actions()'s own doc comment. Guarded by keep_undo, same
-    // as every push into pending_undo_ above (apply_create/apply_update/
+    // as every push into pending_undo_actions_ above (apply_create/apply_update/
     // clone_for_cascade_null/remove_raw): when keep_undo is false the vector
     // never had anything in it to collapse, so this would be a no-op anyway,
     // but gating explicitly keeps that fact grep-able here rather than
@@ -1793,30 +1793,30 @@ CommitResult Model::classify_apply_failure(IntegrityError err, const Transaction
 }
 
 void Model::collapse_undo_actions() {
-    if (pending_undo_.size() < 2) return;  // nothing to collapse
+    if (pending_undo_actions_.size() < 2) return;  // nothing to collapse
 
-    // pending_undo_ is index-parallel to changes_: every push site (apply_
+    // pending_undo_actions_ is index-parallel to changes_: every push site (apply_
     // create/apply_update/clone_for_cascade_null/remove_raw) adds exactly
     // one of each, same id, same order -- see those functions' own
-    // pending_undo_.push_back calls, each immediately alongside a
+    // pending_undo_actions_.push_back calls, each immediately alongside a
     // changes_.push_back for the same id. changes_ itself is read here but
     // never modified -- see Change's own doc comment for why an id showing
     // up twice there is fine (a deliberate audit trail), unlike here.
-    assert(pending_undo_.size() == changes_.size() &&
-          "pending_undo_ must be index-parallel with changes_ when non-empty");
+    assert(pending_undo_actions_.size() == changes_.size() &&
+          "pending_undo_actions_ must be index-parallel with changes_ when non-empty");
 
     std::unordered_map<Id, std::size_t, IdHash> slot_of;  // Id -> its index in `out`
     std::vector<UndoAction> out;
     std::vector<bool> cancelled;
-    out.reserve(pending_undo_.size());
-    cancelled.reserve(pending_undo_.size());
+    out.reserve(pending_undo_actions_.size());
+    cancelled.reserve(pending_undo_actions_.size());
 
     for (std::size_t i = 0; i < changes_.size(); ++i) {
         const Id id = changes_[i].id;
         auto it = slot_of.find(id);
         if (it == slot_of.end()) {
             slot_of.emplace(id, out.size());
-            out.push_back(std::move(pending_undo_[i]));
+            out.push_back(std::move(pending_undo_actions_[i]));
             cancelled.push_back(false);
             continue;
         }
@@ -1848,7 +1848,7 @@ void Model::collapse_undo_actions() {
                     // out[slot] is a RestoreUpdate holding the true
                     // pre-transaction baseline (from the FIRST edit to this
                     // id this transaction). Promote it to a Recreate of
-                    // that SAME baseline -- not pending_undo_[i]'s own
+                    // that SAME baseline -- not pending_undo_actions_[i]'s own
                     // Recreate, which captured the value right before
                     // deletion and so already reflects this transaction's
                     // own prior edits. The id is unchanged from Updated
@@ -1862,10 +1862,10 @@ void Model::collapse_undo_actions() {
         }
     }
 
-    pending_undo_.clear();
+    pending_undo_actions_.clear();
     for (std::size_t i = 0; i < out.size(); ++i) {
         if (cancelled[i]) continue;
-        pending_undo_.push_back(std::move(out[i]));
+        pending_undo_actions_.push_back(std::move(out[i]));
     }
 }
 
@@ -2012,13 +2012,13 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
         // Already inside `max_undo_list_size_ != 0` -- make room first
         // (oldest entries first, same ordering list_undo() promises) so
         // this add never leaves the list over either configured cap.
-        if (keep_undo && !pending_undo_.empty()) {
+        if (keep_undo && !pending_undo_actions_.empty()) {
             // UndoEntry::approx_bytes for the entry about to be added --
-            // computed once, here, from pending_undo_'s final (collapsed)
+            // computed once, here, from pending_undo_actions_'s final (collapsed)
             // contents. See that member's own doc comment for exactly what
             // this counts (and doesn't).
             std::size_t new_bytes = 0;
-            for (const UndoAction& a : pending_undo_) {
+            for (const UndoAction& a : pending_undo_actions_) {
                 new_bytes += sizeof(UndoAction) + (a.previous_value ? a.previous_value->byte_size() : 0);
             }
 
@@ -2045,7 +2045,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
             touched.reserve(changes_.size());
             for (const Change& c : changes_) touched.push_back(c.id);
 
-            undo_list_.push_back({r->version, std::move(pending_undo_), std::move(touched),
+            undo_list_.push_back({r->version, std::move(pending_undo_actions_), std::move(touched),
                                   std::move(undo_name), std::move(undo_data), undo_txn_id, new_bytes});
             // Index the just-added entry under every id it touches, so a
             // LATER commit's conflict check (the lookup above) can find it
@@ -2054,7 +2054,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
             for (Id id : new_it->touched) undo_touch_index_[id] = new_it;
         }
     }
-    pending_undo_.clear();
+    pending_undo_actions_.clear();
 
     std::vector<Change> resolved = std::move(changes_);
 
@@ -2064,7 +2064,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     dirty_by_field_.clear();
     dirty_by_cached_field_.clear();
     dirty_by_cached_reference_.clear();
-    undo_.clear();         // committed: nothing to roll back to
+    txn_rollback_log_.clear();         // committed: nothing to roll back to
     txn_created_.clear();  // published objects are now owned by the spine
 
     return CommitResult{CommitStatus::Committed, pub,         std::move(resolved), std::nullopt,

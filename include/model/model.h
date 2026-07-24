@@ -1703,7 +1703,7 @@ public:
     /// commit is never added to the undo list (see UndoEntry/undo_list_).
     /// Not just "captured, then immediately discarded" -- the per-object
     /// pre-image capture (a clone() per changed/removed object; see
-    /// pending_undo_'s own comment) never happens at all, so this is the
+    /// pending_undo_actions_'s own comment) never happens at all, so this is the
     /// call to reach for when that extra clone cost matters and you know
     /// you'll never want to undo this particular commit. Existing
     /// undo_list_ entries are still pruned as usual if this commit
@@ -1719,7 +1719,7 @@ public:
     // O(items in the transaction) memory cost: every create logs its own
     // slot-write inverse (set_slot), its own slot-allocation inverse
     // (alloc_slot), one inverse per outgoing ref edge (add_out_refs), and a
-    // cheap per-id UndoAction (pending_undo_) -- none of it released until
+    // cheap per-id UndoAction (pending_undo_actions_) -- none of it released until
     // the WHOLE transaction resolves. (The four WHOLE-MAP-HANDLE indexes --
     // by_type_/by_field_/by_cached_field_/by_cached_reference_ -- log their
     // pre-attempt handle only ONCE per attempt per key touched, not once per
@@ -2333,7 +2333,7 @@ public:
     /// cap stays 0 (nothing else can ever add to undo_list_ while
     /// max_undo_list_size_ == 0 -- apply_transaction_contents() folds this
     /// cap into keep_undo before publish_now() is ever reached, so
-    /// pending_undo_ stays empty too), which is what lets publish_now()
+    /// pending_undo_actions_ stays empty too), which is what lets publish_now()
     /// skip its entire prune-and-append step outright when the cap is 0,
     /// instead of running the conflict-prune check (see undo_touch_index_)
     /// on every single commit for a list that's provably always empty
@@ -2584,7 +2584,7 @@ private:
     /// FIRST touch of that key (type tag / field tag) this attempt -- mirrors
     /// cow()'s dirty_ (first-touch-clones-the-chunk) trick, applied to the
     /// four whole-map-handle indexes instead of a Chunk. Why this is safe:
-    /// rollback_apply() replays log() closures in REVERSE (undo_.rbegin() ->
+    /// rollback_apply() replays log() closures in REVERSE (txn_rollback_log_.rbegin() ->
     /// rend()), and each closure OVERWRITES the map wholesale -- so of N
     /// captures taken across N edits to the same key in one attempt, only the
     /// FIRST (executed LAST during rollback) has any effect on the final
@@ -2621,7 +2621,7 @@ private:
     // reverse if that attempt fails; a successful try_commit() clears the log.
     // The log is proportional to the changes made, never to model size.
     //
-    // UndoOp (a closed tagged union, not std::function<void()>): profiling
+    // TxnRollbackOp (a closed tagged union, not std::function<void()>): profiling
     // basic_record_bench found this log's PUSH side -- not replay, which only
     // runs on the rare rollback path -- among the largest costs of a commit
     // in its own right: every alloc_slot()/set_slot()/changes_ push (i.e.
@@ -2631,7 +2631,7 @@ private:
     // prev_obj, prev_gen]) to exceed libstdc++'s small-object buffer and
     // heap-allocate -- allocated, then almost always simply discarded
     // wholesale on the (overwhelmingly common) successful-commit path
-    // (undo_.clear() below). A closed variant of small, POD-ish "what to
+    // (txn_rollback_log_.clear() below). A closed variant of small, POD-ish "what to
     // undo" structs removes that allocation entirely: pushing one is just
     // writing its fields into the vector's next slot, same as any other
     // value type.
@@ -2639,10 +2639,10 @@ private:
     // This does give up the ORIGINAL reason closures were chosen here (see
     // git history): a hand-written closure at the write site can't drift
     // from what it undoes, while a Kind/payload pair COULD, in principle,
-    // stop matching its apply_undo_op() case somewhere else in this file.
+    // stop matching its apply_rollback_op() case somewhere else in this file.
     // std::variant (rather than a raw union or an enum + void*) is what
     // keeps that risk small: every alternative is a distinct, named,
-    // strongly-typed struct, log()/apply_undo_op() are both exhaustively
+    // strongly-typed struct, log()/apply_rollback_op() are both exhaustively
     // checked by the compiler (a missing overload is a compile error, a
     // std::visit is never partial), and each Kind is still defined
     // immediately next to the handful of log() call sites that produce it.
@@ -2684,42 +2684,42 @@ private:
     struct GenericUndo {
         std::function<void()> fn;
     };
-    using UndoOp = std::variant<PushFreeSlot, DecExhaustedSlots, DecNextSlot, RestoreSlot,
+    using TxnRollbackOp = std::variant<PushFreeSlot, DecExhaustedSlots, DecNextSlot, RestoreSlot,
                                 ReferrersPopBack, ReferrersPushEdge, PopChanges, DeleteObject,
                                 PopRetired, PopFreeSlot, RestoreReferrersBucket, GenericUndo>;
 
     template <class Op>
     void log(Op op) {
-        undo_.emplace_back(std::move(op));
+        txn_rollback_log_.emplace_back(std::move(op));
     }
 
-    // One overload per UndoOp alternative -- see rollback_apply()'s use of
+    // One overload per TxnRollbackOp alternative -- see rollback_apply()'s use of
     // std::visit, which is exhaustive at compile time (a Kind added to the
     // variant above without a matching overload here is a compile error,
     // not a silent no-op).
-    void apply_undo_op(PushFreeSlot op) { free_slots_.push_back(op.slot); }
-    void apply_undo_op(DecExhaustedSlots) { --exhausted_slots_; }
-    void apply_undo_op(DecNextSlot) { --next_slot_; }
-    void apply_undo_op(RestoreSlot op) {
+    void apply_rollback_op(PushFreeSlot op) { free_slots_.push_back(op.slot); }
+    void apply_rollback_op(DecExhaustedSlots) { --exhausted_slots_; }
+    void apply_rollback_op(DecNextSlot) { --next_slot_; }
+    void apply_rollback_op(RestoreSlot op) {
         const std::uint32_t cc = op.slot >> kChunkBits, ii = op.slot & kChunkMask;
         Chunk* c2 = cow(cc);
         c2->obj[ii] = op.prev_obj;
         c2->gen[ii] = op.prev_gen;
     }
-    void apply_undo_op(ReferrersPopBack op) {
+    void apply_rollback_op(ReferrersPopBack op) {
         auto it = referrers_.find(op.key);
         if (it != referrers_.end()) {
             it->second.pop_back();  // exact inverse of the push_back it undoes
             if (it->second.empty()) referrers_.erase(it);
         }
     }
-    void apply_undo_op(ReferrersPushEdge op) { referrers_[op.key].push_back(op.edge); }
-    void apply_undo_op(PopChanges) { changes_.pop_back(); }
-    void apply_undo_op(DeleteObject op) { delete op.obj; }
-    void apply_undo_op(PopRetired) { retired_.pop_back(); }
-    void apply_undo_op(PopFreeSlot) { free_slots_.pop_back(); }
-    void apply_undo_op(RestoreReferrersBucket op) { referrers_[op.key] = std::move(op.saved); }
-    void apply_undo_op(GenericUndo op) { op.fn(); }
+    void apply_rollback_op(ReferrersPushEdge op) { referrers_[op.key].push_back(op.edge); }
+    void apply_rollback_op(PopChanges) { changes_.pop_back(); }
+    void apply_rollback_op(DeleteObject op) { delete op.obj; }
+    void apply_rollback_op(PopRetired) { retired_.pop_back(); }
+    void apply_rollback_op(PopFreeSlot) { free_slots_.pop_back(); }
+    void apply_rollback_op(RestoreReferrersBucket op) { referrers_[op.key] = std::move(op.saved); }
+    void apply_rollback_op(GenericUndo op) { op.fn(); }
 
     /// Point a slot at an object (or null) with a new generation, through
     /// cow(); logs the exact inverse (previous object + generation).
@@ -2759,7 +2759,7 @@ private:
     // apply_transaction_contents), and `pending` is the set of its values:
     // real ids minted this attempt whose slots may not be installed yet.
     // `keep_undo` (default true, so every pre-existing call site is
-    // unaffected) gates ONLY the pending_undo_ capture -- try_commit_
+    // unaffected) gates ONLY the pending_undo_actions_ capture -- try_commit_
     // without_undo() is the one caller that passes false, all the way down
     // this whole chain, so it skips the per-object clone() entirely rather
     // than capturing it and throwing it away.
@@ -2827,7 +2827,7 @@ private:
 
     /// The creates-then-updates-then-removes apply loop (see try_commit()'s
     /// phase-order comment for why that order matters), finishing with
-    /// collapse_undo_actions() (when keep_undo) so pending_undo_ has at most
+    /// collapse_undo_actions() (when keep_undo) so pending_undo_actions_ has at most
     /// one action per id before the caller ever sees it. Returns nullopt on
     /// success; the caller must then check changes_ and eventually publish
     /// or, on failure, pass the returned error to classify_apply_failure().
@@ -2838,9 +2838,9 @@ private:
     std::optional<IntegrityError> apply_transaction_contents(
         Transaction& txn, std::unordered_map<std::uint32_t, Id>& remap, bool keep_undo = true);
 
-    /// Collapses pending_undo_ so a given id has AT MOST ONE UndoAction, even
+    /// Collapses pending_undo_actions_ so a given id has AT MOST ONE UndoAction, even
     /// though changes_ (left untouched -- see Change's own doc comment) may
-    /// report that same id more than once. Multiple pending_undo_ entries for
+    /// report that same id more than once. Multiple pending_undo_actions_ entries for
     /// one id arise from ordinary sequences within a single transaction: a
     /// fresh create() immediately cascade-touched by removing something it
     /// points at (Remove, then RestoreUpdate or Recreate), an update()/
@@ -2855,7 +2855,7 @@ private:
     /// about the order actions run in, so leaving duplicates in is not safe
     /// even though they'd often cancel out by luck. Called once, from the
     /// tail of apply_transaction_contents() (guarded by keep_undo there, the
-    /// same way every push into pending_undo_ already is), right after the
+    /// same way every push into pending_undo_actions_ already is), right after the
     /// create/update/remove loop and before that function returns success --
     /// never mid-apply and never on a failed attempt, so it has no
     /// interaction with the log()-based rollback mechanism at all. Reads
@@ -2882,7 +2882,7 @@ private:
     /// scratch cleared. Always succeeds -- by the time it's called, nothing
     /// left to reject. Consumes changes_ (member scratch) into the result.
     /// `undo_name`/`undo_data`/`undo_txn_id` are copied onto this commit's
-    /// UndoEntry, if it gets one (see pending_undo_'s own comment) --
+    /// UndoEntry, if it gets one (see pending_undo_actions_'s own comment) --
     /// callers with no Transaction to draw them from (commit_bulk_without_undo(),
     /// which never produces undo data at all) pass empty/zero defaults.
     /// `keep_undo` gates only whether THIS commit gets added as a new entry
@@ -3128,7 +3128,7 @@ private:
     std::uint32_t next_slot_ = 0;            ///< high-water mark: next never-used slot
     std::size_t exhausted_slots_ = 0;        ///< see exhausted_slots() accessor
     std::vector<Change> changes_;  ///< scratch: this attempt's resolved changeset
-    std::vector<UndoAction> pending_undo_;  ///< scratch: this attempt's inverse, parallel to changes_ --
+    std::vector<UndoAction> pending_undo_actions_;  ///< scratch: this attempt's inverse, parallel to changes_ --
                                             ///< cleared on rollback (rollback_apply), moved into
                                             ///< undo_list_ on publish (publish_now)
     std::vector<std::pair<std::uint64_t, const ObjectBase*>> retired_;
@@ -3265,7 +3265,7 @@ private:
     // Undo log and the objects created this attempt (which rollback_apply()
     // must delete, since they were never published and nothing else owns them).
     // Scratch: cleared at the start of every try_commit() attempt.
-    std::vector<UndoOp> undo_;
+    std::vector<TxnRollbackOp> txn_rollback_log_;
     std::vector<const ObjectBase*> txn_created_;
 };
 
