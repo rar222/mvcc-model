@@ -2346,15 +2346,11 @@ void Model::add_out_refs_no_log(const ObjectBase* o) {
 // prior state. Reads the outer map through a reference (`auto&`, not
 // add_field_keys()'s `auto prev = ...` copy) since there is no "prev" to
 // hold onto -- one fewer PersistentMap handle copy per field per object.
-// Collisions are still the caller's problem, not detected here -- UNLIKE the
-// ordinary Transaction path (see validate_field_key_uniqueness()), which
-// now rejects a duplicate key as CommitStatus::Invalid instead of
-// overwriting it. commit_bulk_without_undo() has no undo log to unwind a
-// rejected batch against, so extending the same check here would mean a
-// second full validation pass over the whole batch upfront, same idea as
-// Pass 1's ref-integrity check just above -- not done today, so a bulk load
-// that violates define_keys()'s uniqueness contract still silently
-// overwrites the earlier entry.
+// Collisions can't reach here: commit_bulk_without_undo()'s Pass 1 already
+// rejected the whole batch as CommitStatus::Invalid if any define_keys()
+// value was claimed by more than one object in it, same as the ordinary
+// Transaction path's validate_field_key_uniqueness() -- so by the time this
+// runs, every key in the batch is already known unique.
 void Model::add_field_keys_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
@@ -2427,6 +2423,15 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     // validate() (interleaved with installation) has to happen upfront,
     // against the batch as a whole: after the wipe below, a non-null ref can
     // only ever resolve to another object in THIS SAME BATCH, by local index.
+    //
+    // Also checks define_keys() uniqueness within the batch, same idea:
+    // the wipe below empties by_field_ before install, so the ONLY collision
+    // that can ever happen post-wipe is two objects in this same batch
+    // claiming the same key -- no committed baseline to reconcile against,
+    // unlike validate_field_key_uniqueness(). `claims` is keyed by field then
+    // by key, storing the claiming object's own address purely as an
+    // identity token (same trick validate_field_key_uniqueness() uses).
+    std::unordered_map<const void*, std::unordered_map<std::string, const void*>> field_key_claims;
     for (const auto& obj : txn.objects_) {
         bool bad = false;
         obj->each_ref([&](const void*, const char*, Id target, bool nullable) {
@@ -2443,6 +2448,22 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
             return CommitResult{
                 CommitStatus::Invalid, Snapshot{}, {},
                 std::nullopt,          {},         IntegrityError{kUnmappedLocalMsg, Id{}}};
+        }
+
+        std::optional<IntegrityError> key_err;
+        obj->each_field_key([&](const void* field, std::string key) {
+            if (key_err) return;
+            auto& claims = field_key_claims[field];
+            const void* self = obj.get();
+            auto [it, inserted] = claims.try_emplace(std::move(key), self);
+            if (!inserted && it->second != self)
+                key_err = IntegrityError{"duplicate key '" + it->first +
+                                             "' claimed by more than one object within the same bulk load",
+                                         Id{}};
+        });
+        if (key_err) {
+            // Nothing mutated yet -- txn still owns every object untouched.
+            return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, *key_err};
         }
     }
 

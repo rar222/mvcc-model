@@ -240,6 +240,74 @@ TEST(bulk_load_rejects_a_null_non_nullable_ref) {
     CHECK_EQ(m.current_version(), before);
 }
 
+TEST(bulk_load_rejects_a_duplicate_define_keys_value_within_the_batch) {
+    Model m;
+    make_account(m, "survivor");
+    const std::uint64_t before = m.current_version();
+
+    BulkTransaction t = m.begin_bulk();
+    auto acc1 = std::make_unique<Account>();
+    acc1->name = "DUP";
+    t.create(std::move(acc1));
+    auto acc2 = std::make_unique<Account>();
+    acc2->name = "DUP";  // same define_keys() value as acc1, within the same batch
+    t.create(std::move(acc2));
+
+    CommitResult r = m.commit_bulk_without_undo(t);
+    CHECK(r.status == CommitStatus::Invalid);
+    CHECK_EQ(m.current_version(), before);  // no wipe, no publish -- rejected before any mutation
+    CHECK(m.snapshot().find_by_key<&Account::name>("survivor") != nullptr);
+}
+
+// The duplicate-key check is keyed by field TAG (identifies a (type, field)
+// pair), same as by_field_ itself -- so the same string value claimed on two
+// DIFFERENT types' define_keys() fields is not a collision at all. Widget's
+// computed_key() returns its `key` member unprefixed, so it can be made to
+// collide, string-for-string, with Account::name.
+TEST(bulk_load_allows_the_same_key_value_across_different_types) {
+    Model m;
+    BulkTransaction t = m.begin_bulk();
+    auto acc = std::make_unique<Account>();
+    acc->name = "DUP";
+    t.create(std::move(acc));
+    auto w = std::make_unique<Widget>();
+    w->key = "DUP";  // same string, but Widget::computed_key() is a different field tag
+    t.create(std::move(w));
+
+    CommitResult r = m.commit_bulk_without_undo(t);
+    CHECK(r.status == CommitStatus::Committed);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_by_key<&Account::name>("DUP") != nullptr);
+    CHECK(s.find_by_key<&Widget::computed_key>("DUP") != nullptr);
+}
+
+// Same idea within a single type: Gadget declares THREE define_keys()
+// fields (label, serial, computed_key). label and computed_key can be made
+// to hold the identical string across two different Gadgets without
+// colliding, because the claims map is keyed per-field, not per-type-per-
+// value -- label and computed_key are different field tags even though
+// both live on Gadget.
+TEST(bulk_load_allows_the_same_value_across_different_fields_of_the_same_type) {
+    Model m;
+    BulkTransaction t = m.begin_bulk();
+    auto g1 = std::make_unique<Gadget>();
+    g1->label = "gad:X";  // g1's label field == "gad:X"
+    g1->serial = 1;
+    t.create(std::move(g1));
+    auto g2 = std::make_unique<Gadget>();
+    g2->label = "X";  // g2's computed_key() ("gad:" + label) == "gad:X" too
+    g2->serial = 2;
+    t.create(std::move(g2));
+
+    CommitResult r = m.commit_bulk_without_undo(t);
+    CHECK(r.status == CommitStatus::Committed);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_by_key<&Gadget::label>("gad:X") != nullptr);
+    CHECK(s.find_by_key<&Gadget::computed_key>("gad:X") != nullptr);
+}
+
 TEST(bulk_load_rejects_a_reference_to_a_pre_wipe_real_id) {
     Model m;
     const Ref<Account> old_real = make_account(m, "pre_wipe");

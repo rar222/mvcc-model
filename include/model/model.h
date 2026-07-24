@@ -813,10 +813,11 @@ public:
 /// Each define_keys() field is assumed unique within its type; a create or
 /// update that would duplicate another live object's value is rejected as
 /// CommitStatus::Invalid instead of silently overwriting it (see
-/// Model::validate_field_key_uniqueness) -- EXCEPT commit_bulk_without_undo(),
-/// which has no rollback log to unwind a rejected batch against and keeps the
-/// old silent-overwrite behavior; see its own doc comment. For "give me
-/// every match, not just one," there are two MULTI-match families, declared
+/// Model::validate_field_key_uniqueness) -- commit_bulk_without_undo()
+/// enforces the same contract within the batch, upfront, since it has no
+/// rollback log to unwind a rejected batch against; see its own doc comment.
+/// For "give me every match, not just one," there are two MULTI-match
+/// families, declared
 /// with the same visitor shape and named the same way -- each define_X
 /// drives find_by_X and view_by_X, and in every family a field you did NOT
 /// declare is invisible to its lookup (empty result, same as find_by_key on
@@ -1784,24 +1785,15 @@ public:
     /// model's entire new content, in one atomic publish -- or, if any
     /// object's Ref<>/Opt<> fails to resolve WITHIN this batch (the model
     /// is empty afterward, so there is nothing else for a ref to resolve
-    /// against), rejects as CommitStatus::Invalid with NOTHING touched:
-    /// the whole batch is validated before any mutation begins, since
-    /// there is no rollback log to unwind a partial failure with. Never
-    /// returns Conflict (nothing else can be racing this, by the
+    /// against), or a define_keys() value is claimed by more than one
+    /// object in the batch, rejects as CommitStatus::Invalid with NOTHING
+    /// touched: the whole batch is validated before any mutation begins,
+    /// since there is no rollback log to unwind a partial failure with.
+    /// Never returns Conflict (nothing else can be racing this, by the
     /// exclusive-access precondition) or Vetoed (no hook runs). See the
     /// section comment above for the precondition this REQUIRES -- calling
     /// this while any other thread holds a Snapshot of this Model is
     /// undefined behavior, not a checked error.
-    ///
-    /// UNLIKE an ordinary Transaction (see define_keys()'s own doc comment
-    /// and Model::validate_field_key_uniqueness), a define_keys() value
-    /// duplicated within this batch is NOT rejected here -- only Ref<>/Opt<>
-    /// integrity is validated upfront. Extending that check to this path
-    /// would mean a second whole-batch validation pass, the same idea as
-    /// the ref-integrity one above; not done today, so a batch that
-    /// violates define_keys()'s uniqueness contract still silently
-    /// overwrites the earlier entry (see add_field_keys_no_log()'s own
-    /// comment in the .cpp).
     CommitResult commit_bulk_without_undo(BulkTransaction& txn);
 
     /// Install (or clear, with {}) the pre-commit hook. See PreCommitFn.
