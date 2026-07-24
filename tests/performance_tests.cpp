@@ -1516,7 +1516,7 @@ TEST(cached_reference_index_memory_overhead_is_present_but_bounded) {
     // itself, but large enough, combined with ASan's per-allocation redzone
     // overhead at this test's reduced n, to occasionally swamp the actual
     // cached-vs-uncached signal this check exists to measure. See
-    // bulk_load_avoids_the_single_transaction_undo_log_memory_blowup's own
+    // bulk_load_avoids_the_single_transaction_rollback_log_memory_blowup's own
     // comment for the same allocator-noise caveat on a different comparison.
     if (kAssertTimings) CHECK(cached_kb > uncached_kb);
     // A persistent map's FIXED per-tree overhead dominates at small n and
@@ -1564,7 +1564,7 @@ void seed_one_type_via_bulk_load(Model& m, int n) {
 
 }  // namespace
 
-TEST(bulk_load_avoids_the_single_transaction_undo_log_memory_blowup) {
+TEST(bulk_load_avoids_the_single_transaction_rollback_log_memory_blowup) {
     const int kN = scaled(200000);
     const long baseline_kb = measure_child_peak_kb([] { /* just process startup cost */ });
 

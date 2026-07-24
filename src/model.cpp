@@ -458,7 +458,7 @@ std::uint32_t Model::alloc_slot() {
     while (!free_slots_.empty()) {
         const std::uint32_t s = free_slots_.back();
         free_slots_.pop_back();
-        log(PushFreeSlot{s});  // undo the pop
+        log(PushFreeSlot{s});  // rolls back the pop
         const std::uint32_t c = s >> kChunkBits, i = s & kChunkMask;
         if (c < spine_.size() && spine_[c]->gen[i] >= kGenMax) {
             ++exhausted_slots_;  // permanently retired; never returned to circulation
@@ -480,11 +480,11 @@ std::uint32_t Model::alloc_slot() {
 void Model::set_slot(std::uint32_t slot, const ObjectBase* obj, std::uint32_t gen) {
     const std::uint32_t c = slot >> kChunkBits, i = slot & kChunkMask;
     Chunk* ch = cow(c);  // clones the chunk on first touch this attempt; see cow()'s own comment
-    // Captured before being overwritten, purely so the undo closure below can
+    // Captured before being overwritten, purely so the rollback closure below can
     // restore EXACTLY what was there -- not "the current baseline" (which
     // could itself have changed by the time rollback runs, if this slot were
     // touched more than once in one attempt), but the specific prior value
-    // this one write is undoing.
+    // this one write is rolling back.
     const ObjectBase* prev_obj = ch->obj[i];
     const std::uint32_t prev_gen = ch->gen[i];
     ch->obj[i] = obj;
@@ -675,7 +675,7 @@ void Model::drop_out_refs(const ObjectBase* o) {
             return e.from == from && e.field == field;
         });
         if (pos == v.end()) return;
-        const RefEdge edge = *pos;  // saved for the undo op -- `pos` itself won't survive the erase
+        const RefEdge edge = *pos;  // saved for the rollback op -- `pos` itself won't survive the erase
         v.erase(pos);
         log(ReferrersPushEdge{target.index, edge});
     });
@@ -729,31 +729,31 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
     });
 }
 
-// First-touch-this-attempt undo capture for the four whole-map-handle
+// First-touch-this-attempt rollback capture for the four whole-map-handle
 // indexes -- see log_by_type_once()'s doc comment in model.h for why only
 // the first touch of a given key needs to log anything.
 
 void Model::log_by_type_once(TypeTag tag) {
     if (!dirty_by_type_.insert(tag).second) return;
     auto prev = by_type_[tag];
-    // GenericUndo, not a dedicated Kind: this fires at most once per
+    // GenericRollback, not a dedicated Kind: this fires at most once per
     // DISTINCT type touched per attempt (bounded by #types, never by object
     // count), so it was never the cost the TxnRollbackOp conversion targets -- see
     // log()'s own doc comment.
-    log(GenericUndo{[this, tag, prev = std::move(prev)]() mutable { by_type_[tag] = std::move(prev); }});
+    log(GenericRollback{[this, tag, prev = std::move(prev)]() mutable { by_type_[tag] = std::move(prev); }});
 }
 
 void Model::log_by_field_once(const void* field) {
     if (!dirty_by_field_.insert(field).second) return;
     auto prev = by_field_[field];
-    log(GenericUndo{
+    log(GenericRollback{
         [this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); }});
 }
 
 void Model::log_by_cached_field_once(const void* field) {
     if (!dirty_by_cached_field_.insert(field).second) return;
     auto prev = by_cached_field_[field];
-    log(GenericUndo{[this, field, prev = std::move(prev)]() mutable {
+    log(GenericRollback{[this, field, prev = std::move(prev)]() mutable {
         by_cached_field_[field] = std::move(prev);
     }});
 }
@@ -761,7 +761,7 @@ void Model::log_by_cached_field_once(const void* field) {
 void Model::log_by_cached_reference_once(const void* field) {
     if (!dirty_by_cached_reference_.insert(field).second) return;
     auto prev = by_cached_reference_[field];
-    log(GenericUndo{[this, field, prev = std::move(prev)]() mutable {
+    log(GenericRollback{[this, field, prev = std::move(prev)]() mutable {
         by_cached_reference_[field] = std::move(prev);
     }});
 }
@@ -771,7 +771,7 @@ void Model::log_by_cached_reference_once(const void* field) {
 // key string -> the single Id currently holding it -- unique, unlike the
 // cached-field/cached-reference multimaps below. Every mutation captures the
 // prior per-field map as a whole (`prev`; cheap, since PersistentMap sharing
-// means this is a handle copy, not a deep copy) so the undo log can restore
+// means this is a handle copy, not a deep copy) so the rollback log can restore
 // it verbatim on rollback: a missed restore would leave by_field_ answering
 // find_by_key() with a value that never actually committed.
 
@@ -830,7 +830,7 @@ void Model::reconcile_field_keys(
                                      [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
-        // Same undo pattern as add_field_keys/drop_field_keys: capture the
+        // Same rollback pattern as add_field_keys/drop_field_keys: capture the
         // whole prior map (cheap -- persistent, structure-shared), once per
         // attempt (log_by_field_once), and restore it on rollback. Without
         // this, a vetoed/conflicted attempt leaves by_field_ permanently
@@ -857,7 +857,7 @@ void Model::reconcile_field_keys(
 // The cached-field (multimap) index. Buckets are persistent maps keyed by the
 // Id's own bytes -- never flat vectors, which would make each mutation
 // O(#duplicates of that value) -- and every mutation captures the prior OUTER
-// map for the undo log (a shared_ptr copy, same pattern as add_field_keys):
+// map for the rollback log (a shared_ptr copy, same pattern as add_field_keys):
 // a rollback that skipped these would leave the index claiming membership
 // that never committed.
 
@@ -868,7 +868,7 @@ void Model::add_cached_fields(const ObjectBase* o) {
         // string -> bucket); `bucket`, if this key already has other
         // holders, is the INNER set collecting every object currently
         // holding that value. log_by_cached_field_once captures the outer
-        // map's pre-attempt state, once, for the undo log.
+        // map's pre-attempt state, once, for the rollback log.
         //
         // try_emplace, not operator[], and BEFORE log_by_cached_field_once():
         // same ordering hazard as add_field_keys -- log_by_cached_field_once's
@@ -917,7 +917,7 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
         // log_by_cached_field_once captures the OUTER map's pre-attempt state
-        // (once) -- what the undo log restores wholesale on rollback. sub is
+        // (once) -- what the rollback log restores wholesale on rollback. sub is
         // written through directly across the two steps below (old value's
         // bucket shrinks/drops, new value's bucket grows) -- each
         // reassignment updates the map in place, so there's no separate
@@ -944,7 +944,7 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
 // The cached-reference (reverse multimap) index -- the read-side counterpart
 // of referrers_, opt-in per Ref<>/Opt<> field via define_cached_references().
 // Same persistent-bucket discipline as the cached-field trio above (never a
-// flat vector; every mutation undo-logged), keyed by the TARGET's Id bytes
+// flat vector; every mutation rollback-logged), keyed by the TARGET's Id bytes
 // instead of a field's value, storing the REFERRER's Id in each bucket.
 // each_cached_reference() already filters to just the declared fields, so
 // these never do anything for a field not opted in.
@@ -1307,8 +1307,8 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
     if (keep_undo) pending_undo_actions_.push_back({UndoAction::Kind::Remove, id, nullptr});
 
     // Never published, nothing else owns it: rollback_apply() deletes
-    // everything in txn_created_. Deliberately NOT logged as an undo op -- the
-    // rollback delete loop consumes this list directly, and a pop-undo would
+    // everything in txn_created_. Deliberately NOT logged as a rollback op -- the
+    // rollback delete loop consumes this list directly, and a pop-rollback would
     // empty it first.
     txn_created_.push_back(raw);
 
@@ -1321,7 +1321,7 @@ std::optional<Model::IntegrityError> Model::apply_update(
     ObjectBase* raw = clone.release();
 
     // Log the clone's deletion FIRST (before anything can fail), so in
-    // reverse replay it runs LAST -- after set_slot's undo has repointed the
+    // reverse replay it runs LAST -- after set_slot's rollback has repointed the
     // slot back at the baseline. Otherwise we'd free `raw` while the slot
     // still referenced it, and an early error return below would leak it.
     log(DeleteObject{raw});
@@ -1486,7 +1486,7 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
 
         // victim.index should have no remaining incoming edges (its referrers
         // were cascaded or nulled above), but if any survive, preserve them for
-        // undo. In practice this is empty; capture it to be exact.
+        // rollback. In practice this is empty; capture it to be exact.
         auto rit = referrers_.find(x.index);
         if (rit != referrers_.end()) {
             std::vector<RefEdge> saved = std::move(rit->second);
@@ -1567,7 +1567,7 @@ void Model::rollback_apply() {
     // mutation, so commit-lock-protected state returns to its last committed
     // shape. std::visit + apply_rollback_op's overload set is exhaustive at
     // compile time -- see TxnRollbackOp's own doc comment. Moving *it in (rather
-    // than visiting a reference) lets RestoreReferrersBucket/GenericUndo
+    // than visiting a reference) lets RestoreReferrersBucket/GenericRollback
     // move their payload out instead of copying it; every other alternative
     // is trivially-copyable-sized, so the move costs nothing extra there.
     for (auto it = txn_rollback_log_.rbegin(); it != txn_rollback_log_.rend(); ++it)
@@ -1693,7 +1693,7 @@ std::optional<Model::IntegrityError> Model::apply_transaction_contents(
     // table up front. A local id left unmapped after this pass can only be
     // a cancelled create (remove() of a local id nulls its entry here) or
     // a stray id from some other transaction -- both still rejected as
-    // Invalid by apply_create/apply_update. alloc_slot() is undo-logged,
+    // Invalid by apply_create/apply_update. alloc_slot() is rollback-logged,
     // so a rollback reclaims every slot minted here.
     //
     // `pending` (the minted ids) is what validate() accepts as targets in

@@ -814,7 +814,7 @@ public:
 /// update that would duplicate another live object's value is rejected as
 /// CommitStatus::Invalid instead of silently overwriting it (see
 /// Model::validate_field_key_uniqueness) -- EXCEPT commit_bulk_without_undo(),
-/// which has no undo log to unwind a rejected batch against and keeps the
+/// which has no rollback log to unwind a rejected batch against and keeps the
 /// old silent-overwrite behavior; see its own doc comment. For "give me
 /// every match, not just one," there are two MULTI-match families, declared
 /// with the same visitor shape and named the same way -- each define_X
@@ -1512,7 +1512,7 @@ using PreCommitFn = std::function<bool(Model&, const Transaction&, const std::ve
 /// -- conflict-checked against the changelog (which now includes every
 /// EARLIER pre-transaction this same phase already published) and, if it
 /// passes, published for real: its own version, its own changelog entry,
-/// its own subscriber Update. There is no undo once one of them succeeds
+/// its own subscriber Update. There is no rollback once one of them succeeds
 /// (CLAUDE.md invariant 3: published state is immutable) -- if a LATER
 /// pre-transaction in the same phase then fails, try_commit() returns
 /// CommitStatus::PrecommitConflict and skips the main transaction, but
@@ -1713,7 +1713,7 @@ public:
 
     // ---- bulk load (EXCLUSIVE ACCESS ONLY -- read this before using) -------
     //
-    // try_commit()'s per-object undo log -- log() every mutation's exact
+    // try_commit()'s per-object rollback log -- log() every mutation's exact
     // inverse, so a conflicted/invalid/vetoed attempt can unwind cleanly --
     // is what makes multi-writer OCC safe. It is also, unavoidably, an
     // O(items in the transaction) memory cost: every create logs its own
@@ -1731,7 +1731,7 @@ public:
     // per-object closures simultaneously -- measured at ~1.8x the
     // steady-state per-object cost of a bulk load (default build,
     // n=200,000; see performance_tests.cpp's
-    // bulk_load_avoids_the_single_transaction_undo_log_memory_blowup for the
+    // bulk_load_avoids_the_single_transaction_rollback_log_memory_blowup for the
     // up-to-date number). That is not a bug in try_commit(); it is the price
     // of a guarantee (clean rollback) that a genuine bulk load does not
     // need, because a bulk load either replaces the ENTIRE model or doesn't
@@ -1740,7 +1740,7 @@ public:
     // begin_bulk()/commit_bulk_without_undo() trade that guarantee away, deliberately
     // and only here, for exactly that case: wipe the whole Model and load a
     // fresh graph in one shot, at close to the steady-state per-object
-    // cost, with no per-object undo logging at all.
+    // cost, with no per-object rollback logging at all.
     //
     // THE PRECONDITION, and why it is load-bearing rather than advisory:
     // commit_bulk_without_undo() requires that NO OTHER THREAD is doing ANYTHING with
@@ -1786,7 +1786,7 @@ public:
     /// is empty afterward, so there is nothing else for a ref to resolve
     /// against), rejects as CommitStatus::Invalid with NOTHING touched:
     /// the whole batch is validated before any mutation begins, since
-    /// there is no undo log to unwind a partial failure with. Never
+    /// there is no rollback log to unwind a partial failure with. Never
     /// returns Conflict (nothing else can be racing this, by the
     /// exclusive-access precondition) or Vetoed (no hook runs). See the
     /// section comment above for the precondition this REQUIRES -- calling
@@ -2438,7 +2438,7 @@ private:
     Chunk* cow(std::uint32_t chunk_index);
 
     /// Pop the LIFO free list (retiring generation-exhausted slots as they
-    /// surface -- see Id's width note), else mint a fresh slot. Undo-logged.
+    /// surface -- see Id's width note), else mint a fresh slot. Rollback-logged.
     std::uint32_t alloc_slot();
 
     /// nullopt == valid. `pending`, when non-null, names real ids this
@@ -2547,7 +2547,7 @@ private:
 
     // Reverse-index (referrers_) maintenance: add/drop an object's whole
     // outgoing edge set (create/delete), or diff before->after (update).
-    // Every edit is undo-logged -- a rollback that missed one would leave a
+    // Every edit is rollback-logged -- a rollback that missed one would leave a
     // phantom or missing edge for a LATER cascade to resolve against.
     void add_out_refs(const ObjectBase* o);
     void drop_out_refs(const ObjectBase* o);
@@ -2580,7 +2580,7 @@ private:
     void drop_cached_references(const ObjectBase* o);
     void reconcile_cached_references(const ObjectBase* before, const ObjectBase* after);
 
-    /// Log this key's pre-attempt value into the undo log, but only on the
+    /// Log this key's pre-attempt value into the rollback log, but only on the
     /// FIRST touch of that key (type tag / field tag) this attempt -- mirrors
     /// cow()'s dirty_ (first-touch-clones-the-chunk) trick, applied to the
     /// four whole-map-handle indexes instead of a Chunk. Why this is safe:
@@ -2646,7 +2646,7 @@ private:
     // checked by the compiler (a missing overload is a compile error, a
     // std::visit is never partial), and each Kind is still defined
     // immediately next to the handful of log() call sites that produce it.
-    // GenericUndo (a std::function<void()> fallback) is kept for the four
+    // GenericRollback (a std::function<void()> fallback) is kept for the four
     // log_by_*_once() closures: those capture a whole PersistentMap/Set
     // `prev` by move and fire at most once per DISTINCT index touched per
     // attempt (see log_by_type_once's own comment) -- bounded by the number
@@ -2681,12 +2681,12 @@ private:
         std::uint32_t key;
         std::vector<RefEdge> saved;
     };
-    struct GenericUndo {
+    struct GenericRollback {
         std::function<void()> fn;
     };
     using TxnRollbackOp = std::variant<PushFreeSlot, DecExhaustedSlots, DecNextSlot, RestoreSlot,
                                 ReferrersPopBack, ReferrersPushEdge, PopChanges, DeleteObject,
-                                PopRetired, PopFreeSlot, RestoreReferrersBucket, GenericUndo>;
+                                PopRetired, PopFreeSlot, RestoreReferrersBucket, GenericRollback>;
 
     template <class Op>
     void log(Op op) {
@@ -2719,7 +2719,7 @@ private:
     void apply_rollback_op(PopRetired) { retired_.pop_back(); }
     void apply_rollback_op(PopFreeSlot) { free_slots_.pop_back(); }
     void apply_rollback_op(RestoreReferrersBucket op) { referrers_[op.key] = std::move(op.saved); }
-    void apply_rollback_op(GenericUndo op) { op.fn(); }
+    void apply_rollback_op(GenericRollback op) { op.fn(); }
 
     /// Point a slot at an object (or null) with a new generation, through
     /// cow(); logs the exact inverse (previous object + generation).
@@ -2736,12 +2736,12 @@ private:
     // index mutation itself -- see commit_bulk_without_undo()'s own comment for the
     // measured cost this avoids. Calling these from anywhere a failure
     // might need to be unwound is a correctness bug: nothing here is
-    // undo-able, on purpose.
+    // rollback-able, on purpose.
     //
     // Deliberately NOT merged into the logged versions behind a `bool
     // should_log` parameter, even though each pair's body is otherwise
     // identical: a stray `true` at the one call site that must never log
-    // would silently reintroduce the exact per-object undo-log retention
+    // would silently reintroduce the exact per-object rollback-log retention
     // this whole mechanism exists to avoid, with no signal at the call site
     // and nothing for the type system to catch. Separate names mean
     // "commit_bulk_without_undo() calls the _no_log ones" is a static, grep-able fact
@@ -3097,7 +3097,7 @@ private:
     std::unordered_set<std::uint32_t> dirty_;  ///< chunks already cloned THIS attempt (see cow());
                                                ///< cleared per attempt so publish stays immutable
     // First-touch-this-attempt tracking for the four whole-map-handle
-    // indexes' undo capture -- see log_by_type_once()'s doc comment. Same
+    // indexes' rollback capture -- see log_by_type_once()'s doc comment. Same
     // "attempt-scoped, cleared alongside dirty_" lifetime as dirty_ itself.
     std::unordered_set<TypeTag> dirty_by_type_;
     std::unordered_set<const void*> dirty_by_field_;
@@ -3133,7 +3133,7 @@ private:
                                             ///< undo_list_ on publish (publish_now)
     std::vector<std::pair<std::uint64_t, const ObjectBase*>> retired_;
     ///< ^ this attempt's retirees, same shape as reap_queue_: handed to the
-    ///< reaper on publish, drained back out by the undo log on rollback
+    ///< reaper on publish, drained back out by the rollback log on rollback
     PreCommitFn pre_commit_;  ///< empty = no hook; swapped only under commit_mu_ (set_pre_commit)
     std::deque<ChangelogEntry>
         changelog_;  ///< for try_commit()'s conflict check; see prune_changelog
@@ -3262,7 +3262,7 @@ private:
                                 ///< still holding the lock and invokes that copy only after
                                 ///< releasing it; see commit_main_locked() and PostCommitFn.
 
-    // Undo log and the objects created this attempt (which rollback_apply()
+    // Rollback log and the objects created this attempt (which rollback_apply()
     // must delete, since they were never published and nothing else owns them).
     // Scratch: cleared at the start of every try_commit() attempt.
     std::vector<TxnRollbackOp> txn_rollback_log_;
