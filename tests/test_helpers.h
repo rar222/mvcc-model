@@ -49,6 +49,13 @@ class Widget final : public model::Object<Widget> {
 public:
     std::string key;
     std::string computed_key() const { return key; }
+
+    /// Diagnostic only -- see example::Account::to_string()'s doc comment
+    /// for why `id` comes first.
+    std::string to_string() const {
+        return "Widget{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", key=" + key + "}";
+    }
+
     // no outgoing references, so no define_references() to declare
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
@@ -68,6 +75,13 @@ public:
     std::int64_t serial = 0;
 
     std::string computed_key() const { return "gad:" + label; }
+
+    /// Diagnostic only -- see example::Account::to_string()'s doc comment
+    /// for why `id` comes first.
+    std::string to_string() const {
+        return "Gadget{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
+               ", serial=" + std::to_string(serial) + "}";
+    }
 
     // no outgoing references, so no define_references() to declare
 
@@ -91,6 +105,17 @@ class Node final : public model::Object<Node> {
 public:
     std::string label;
     model::Opt<Node> parent;
+
+    /// Diagnostic only -- see example::Account::to_string()'s doc comment
+    /// for why `id` comes first and parent prints as raw index:gen instead
+    /// of being resolved.
+    std::string to_string() const {
+        const model::Id parent_id = parent.raw();
+        return "Node{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
+               ", parent=" +
+               (parent ? std::to_string(parent_id.index) + ":" + std::to_string(parent_id.gen) : "null") +
+               "}";
+    }
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
@@ -157,6 +182,18 @@ public:
     model::Ref<Account> owner;
     model::Opt<Record> related;
 
+    /// Diagnostic only -- see example::Account::to_string()'s doc comment
+    /// for why `id` comes first and owner/related print as raw index:gen
+    /// instead of being resolved.
+    std::string to_string() const {
+        auto ref_str = [](model::Id ref_id) {
+            return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
+        };
+        return "Record{id=" + ref_str(id) + ", label=" + label + ", value=" + std::to_string(value) +
+               ", flag=" + (flag ? "true" : "false") + ", owner=" + ref_str(owner.raw()) +
+               ", related=" + (related ? ref_str(related.raw()) : "null") + "}";
+    }
+
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
         v(model::field_tag<&Record::owner>(), "owner", s.owner);
@@ -196,6 +233,15 @@ class Link final : public model::Object<Link> {
 public:
     std::string label;
     model::Ref<Link> next;
+
+    /// Diagnostic only -- see example::Account::to_string()'s doc comment
+    /// for why `id` comes first and next prints as raw index:gen instead of
+    /// being resolved.
+    std::string to_string() const {
+        const model::Id next_id = next.raw();
+        return "Link{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
+               ", next=" + std::to_string(next_id.index) + ":" + std::to_string(next_id.gen) + "}";
+    }
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {

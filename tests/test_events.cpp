@@ -187,3 +187,89 @@ TEST(subscribing_after_shutdown_returns_a_subscription_that_immediately_reports_
     CHECK(!late->try_drain(u));
 }
 
+/// Prints one Change, resolved against the Snapshot pair that brackets it --
+/// `before` is the PREVIOUS Update's snapshot (null for the very first
+/// Update), `after` is this Change's own Update::snapshot. Structural only
+/// (CHECK that the object is where this ChangeKind says it should be, plus
+/// to_string() of whatever's found) -- the caller still owns any assertions
+/// about specific field values, since those are scenario-specific and this
+/// is generic over T.
+template <class T>
+void print_change(const Change& c, const Snapshot& before, const Snapshot& after) {
+    const Ref<T> r{c.id};
+    switch (c.kind) {
+        case ChangeKind::Created: {
+            const T* v = after.find(r);
+            CHECK(v != nullptr);
+            if (v) std::printf("create: after=%s\n", v->to_string().c_str());
+            break;
+        }
+        case ChangeKind::Updated: {
+            CHECK(static_cast<bool>(before));  // an Updated always has a prior Update to diff against
+            const T* b = before.find(r);
+            const T* a = after.find(r);
+            CHECK(b != nullptr);
+            CHECK(a != nullptr);
+            if (b && a) std::printf("update: before=%s after=%s\n", b->to_string().c_str(), a->to_string().c_str());
+            break;
+        }
+        case ChangeKind::Deleted: {
+            CHECK(static_cast<bool>(before));  // a Deleted always has a prior Update to diff against
+            const T* b = before.find(r);
+            CHECK(b != nullptr);
+            CHECK(after.find(r) == nullptr);  // gone as of THIS Update's snapshot
+            if (b) std::printf("delete: before=%s\n", b->to_string().c_str());
+            break;
+        }
+    }
+}
+
+// Update::snapshot is the state AFTER its own commit -- which means the
+// PREVIOUS Update's snapshot is exactly the state BEFORE the current one.
+// A subscriber that just remembers the last Update it saw can therefore
+// print before/after values for every ChangeKind without the model needing
+// to carry an old-value field on Change itself: after-only for a Created
+// (there is no "before"), before AND after for an Updated, before-only for
+// a Deleted (the object is already gone from the current snapshot).
+TEST(subscriber_prints_before_after_values_from_consecutive_snapshots) {
+    Model m;
+    auto sub = m.subscribe(/*depth=*/8);
+
+    const Ref<Account> a = make_account(m, "A1", 100);         // commit 1: Created
+    update_field(m, a, [](Account* p) { p->balance = 200; });  // commit 2: Updated
+    remove_and_commit(m, a);                                   // commit 3: Deleted
+
+    Snapshot prev;  // null until the first Update is drained
+    int seen_created = 0, seen_updated = 0, seen_deleted = 0;
+
+    Update u;
+    while (sub->try_drain(u)) {
+        for (const Change& c : *u.changes) {
+            if (c.tag != type_tag<Account>()) continue;
+            const Ref<Account> r{c.id};
+            print_change<Account>(c, prev, u.snapshot);
+
+            switch (c.kind) {
+                case ChangeKind::Created:
+                    CHECK_EQ(u.snapshot.find(r)->balance, std::int64_t{100});
+                    ++seen_created;
+                    break;
+                case ChangeKind::Updated:
+                    CHECK_EQ(prev.find(r)->balance, std::int64_t{100});
+                    CHECK_EQ(u.snapshot.find(r)->balance, std::int64_t{200});
+                    ++seen_updated;
+                    break;
+                case ChangeKind::Deleted:
+                    CHECK_EQ(prev.find(r)->balance, std::int64_t{200});
+                    ++seen_deleted;
+                    break;
+            }
+        }
+        prev = u.snapshot;
+    }
+
+    CHECK_EQ(seen_created, 1);
+    CHECK_EQ(seen_updated, 1);
+    CHECK_EQ(seen_deleted, 1);
+}
+

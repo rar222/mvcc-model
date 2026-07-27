@@ -20,6 +20,14 @@ public:
     std::string name;
     std::int64_t balance = 0;
 
+    /// Diagnostic only -- see include/example/types.h's Account::to_string()
+    /// doc comment for why `id` comes first and refs (none here) would print
+    /// as raw index:gen.
+    std::string to_string() const {
+        return "Account{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) +
+               ", name=" + name + ", balance=" + std::to_string(balance) + "}";
+    }
+
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
         v.key<&Account::name>(s.name, "name");
@@ -39,6 +47,18 @@ public:
     std::int64_t qty = 0;
 
     std::string computed_key() const { return "ord:" + code; }
+
+    /// Diagnostic only -- see include/example/types.h's Order::to_string()
+    /// doc comment for why `id` comes first and account/parent print as raw
+    /// index:gen instead of being resolved.
+    std::string to_string() const {
+        auto ref_str = [](model::Id ref_id) {
+            return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
+        };
+        return "Order{id=" + ref_str(id) + ", code=" + code + ", qty=" + std::to_string(qty) +
+               ", account=" + ref_str(account.raw()) +
+               ", parent=" + (parent ? ref_str(parent.raw()) : "null") + "}";
+    }
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {

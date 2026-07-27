@@ -14,9 +14,6 @@
 //   cmake --preset asan
 //   cmake --preset tsan
 
-#include "example/types.h"
-#include "model/model.h"
-
 #include <atomic>
 #include <cassert>
 #include <cstdio>
@@ -25,6 +22,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "example/types.h"
+#include "model/model.h"
 
 using namespace model;
 using namespace example;
@@ -48,42 +48,35 @@ Ref<T> pick_live(const Transaction& txn, std::vector<Ref<T>>& v, std::mt19937& r
     return Ref<T>{};
 }
 
-/// Print one Change from an Update's own (post-commit) Snapshot. A Deleted
-/// change's object is already gone from this Snapshot -- there is no way to
-/// find_raw() it -- but c.tag still says WHAT was deleted, straight off the
-/// Change itself, no Snapshot lookup needed. For Created/Updated,
-/// s.resolve(ord.account) is safe and never null: invariant 1 guarantees it
-/// resolves in ANY Snapshot that contains this Order, including one built on
-/// a different writer thread's commit than the one that created the Order.
-void print_change(const Snapshot& s, const Change& c) {
-    const char* kind = c.kind == ChangeKind::Created  ? "created"
-                       : c.kind == ChangeKind::Updated ? "updated"
-                                                        : "deleted";
-    const char* type = c.tag == type_tag<Account>() ? "Account" : c.tag == type_tag<Order>() ? "Order" : "?";
-
-    if (c.kind == ChangeKind::Deleted) {
-        std::printf("    %-7s %-7s id=%u.%u\n", kind, type, c.id.index, c.id.gen);
-        return;
-    }
-
-    const ObjectBase* o = s.find_raw(c.id);
-    if (!o) {  // coalesced batch: created then deleted again before we looked
-        std::printf("    %-7s %-7s id=%u.%u (superseded within this batch)\n", kind, type, c.id.index,
-                    c.id.gen);
-        return;
-    }
-
-    if (c.tag == type_tag<Account>()) {
-        const auto& a = *static_cast<const Account*>(o);
-        std::printf("    %-7s Account id=%u.%u name=%-10s balance=%lld\n", kind, c.id.index, c.id.gen,
-                    a.name.c_str(), static_cast<long long>(a.balance));
-    } else if (c.tag == type_tag<Order>()) {
-        const auto& ord = *static_cast<const Order*>(o);
-        const Account& acct = s.resolve(ord.account);  // never dangles inside s -- invariant 1
-        const Order* parent = s.resolve(ord.parent);    // null: never set, or cascaded away
-        std::printf("    %-7s Order   id=%u.%u code=%-8s qty=%-4lld account=%-10s parent=%s\n", kind,
-                    c.id.index, c.id.gen, ord.code.c_str(), static_cast<long long>(ord.qty),
-                    acct.name.c_str(), parent ? parent->code.c_str() : "(none)");
+/// Prints one Change, resolved against the Snapshot pair that brackets it --
+/// `before` is the PREVIOUS Update's snapshot (null for the very first
+/// Update), `after` is this Change's own Update::snapshot. Structural only
+/// (CHECK that the object is where this ChangeKind says it should be, plus
+/// to_string() of whatever's found) -- the caller still owns any assertions
+/// about specific field values, since those are scenario-specific and this
+/// is generic over T.
+template <class T>
+void print_change(const Change& c, const Snapshot& before, const Snapshot& after) {
+    const Ref<T> r{c.id};
+    switch (c.kind) {
+        case ChangeKind::Created: {
+            const T* v = after.find(r);
+            if (v) std::printf("create: after=%s\n", v->to_string().c_str());
+            break;
+        }
+        case ChangeKind::Updated: {
+            const T* b = before.find(r);
+            const T* a = after.find(r);
+            if (b && a)
+                std::printf("update: before=%s after=%s\n", b->to_string().c_str(),
+                            a->to_string().c_str());
+            break;
+        }
+        case ChangeKind::Deleted: {
+            const T* b = before.find(r);
+            if (b) std::printf("delete: before=%s\n", b->to_string().c_str());
+            break;
+        }
     }
 }
 
@@ -93,15 +86,26 @@ void print_change(const Snapshot& s, const Change& c) {
 /// changed since the last batch", the guarantee Subscription documents.
 void subscriber_thread(std::shared_ptr<Subscription> sub) {
     std::uint64_t batch = 0;
+    Snapshot prev;  // null until the first Update is drained
     Update u;
     while (sub->wait(u)) {
         ++batch;
         std::printf("[subscriber] batch %llu v%llu%s: %zu change(s)\n",
-                    static_cast<unsigned long long>(batch), static_cast<unsigned long long>(u.snapshot.version()),
+                    static_cast<unsigned long long>(batch),
+                    static_cast<unsigned long long>(u.snapshot.version()),
                     u.coalesced ? " (coalesced)" : "", u.changes->size());
-        for (const Change& c : *u.changes) print_change(u.snapshot, c);
+
+        for (const Change& c : *u.changes) {
+            if (c.tag == type_tag<Account>()) {
+                print_change<Account>(c, prev, u.snapshot);
+            } else if (c.tag == type_tag<Order>()) {
+                print_change<Order>(c, prev, u.snapshot);
+            }
+
+            prev = u.snapshot;
+        }
+        std::printf("[subscriber] done: %llu batches\n", static_cast<unsigned long long>(batch));
     }
-    std::printf("[subscriber] done: %llu batches\n", static_cast<unsigned long long>(batch));
 }
 
 /// One writer thread: loops begin() / ~10 random mutations / try_commit(),
@@ -109,8 +113,8 @@ void subscriber_thread(std::shared_ptr<Subscription> sub) {
 /// ones. Each thread owns its own copy of the seed id lists -- sharing a
 /// std::vector across writer threads without synchronization would itself be
 /// the bug this whole design exists to avoid at the object level.
-void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts, std::vector<Ref<Order>> orders,
-                   int target_commits) {
+void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts,
+                   std::vector<Ref<Order>> orders, int target_commits) {
     std::mt19937 rng(4000 + tid);
     int next_id = tid * 1'000'000;
     int commits_done = 0;
@@ -165,7 +169,8 @@ void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts, std::v
             for (const Ref<Account>& r : new_accounts) accounts.push_back(res.to_real(r));
             for (const Ref<Order>& r : new_orders) orders.push_back(res.to_real(r));
             std::printf("[writer %d] attempt %2d: COMMITTED v%llu (%zu changes)\n", tid, attempt,
-                        static_cast<unsigned long long>(res.snapshot.version()), res.changes.size());
+                        static_cast<unsigned long long>(res.snapshot.version()),
+                        res.changes.size());
         } else {
             // Conflict: this attempt's local overlay (including new_accounts/
             // new_orders) is discarded outright -- it was never installed
@@ -174,8 +179,10 @@ void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts, std::v
             // is installed in this demo, so Vetoed can't actually happen
             // here -- Conflict is the only failure mode reachable.)
             g_conflicts.fetch_add(1, std::memory_order_relaxed);
-            std::printf("[writer %d] attempt %2d: CONFLICT   (%s) on %zu id(s) -- retrying\n", tid, attempt,
-                        res.conflict->reason == ConflictReason::IdSetOverlap ? "IdSetOverlap" : "RefIntegrity",
+            std::printf("[writer %d] attempt %2d: CONFLICT   (%s) on %zu id(s) -- retrying\n", tid,
+                        attempt,
+                        res.conflict->reason == ConflictReason::IdSetOverlap ? "IdSetOverlap"
+                                                                             : "RefIntegrity",
                         res.conflict->ids.size());
         }
     }
@@ -238,8 +245,9 @@ int main() {
         const CommitResult r2 = m.try_commit(second);
         assert(r2.status == CommitStatus::Conflict);
         g_conflicts.fetch_add(1, std::memory_order_relaxed);
-        std::printf("guaranteed conflict: two txns from the same snapshot, same id -> %s\n\n",
-                    r2.conflict->reason == ConflictReason::IdSetOverlap ? "IdSetOverlap" : "RefIntegrity");
+        std::printf(
+            "guaranteed conflict: two txns from the same snapshot, same id -> %s\n\n",
+            r2.conflict->reason == ConflictReason::IdSetOverlap ? "IdSetOverlap" : "RefIntegrity");
     }
 
     auto sub = m.subscribe(/*queue_depth=*/8);
@@ -259,13 +267,15 @@ int main() {
     std::printf("\n[summary] %llu commits, %llu conflicts across both writers\n",
                 static_cast<unsigned long long>(g_committed.load()),
                 static_cast<unsigned long long>(g_conflicts.load()));
-    std::printf("[reclaim] after barrier: %zu still pinned, %zu backlog\n", still_pinned, m.reap_backlog());
+    std::printf("[reclaim] after barrier: %zu still pinned, %zu backlog\n", still_pinned,
+                m.reap_backlog());
 
     assert(g_conflicts.load() > 0 &&
-          "two writers racing ~10-change transactions on a 21-object seed pool should produce at "
-          "least one conflict -- if this never fires, the conflict path isn't actually being "
-          "exercised");
-    std::printf("\nno Ref ever dangled; every batch the subscriber printed was a fully consistent "
-               "snapshot.\n");
+           "two writers racing ~10-change transactions on a 21-object seed pool should produce at "
+           "least one conflict -- if this never fires, the conflict path isn't actually being "
+           "exercised");
+    std::printf(
+        "\nno Ref ever dangled; every batch the subscriber printed was a fully consistent "
+        "snapshot.\n");
     return 0;
 }

@@ -55,20 +55,8 @@ Ref<Order> make_order(Model& m, const std::string& code, Ref<Account> account, O
 
 std::string state_of(Model& m) {
     Snapshot s = m.snapshot();
-    std::map<std::string, std::string> rows;
-    s.for_each<Account>([&](const Account& a) {
-        rows["acc:" + a.name] = "A(" + a.name + "," + std::to_string(a.balance) + ")";
-    });
-    s.for_each<Order>([&](const Order& o) {
-        rows["ord:" + o.code] = "O(" + o.code + ",q=" + std::to_string(o.qty) +
-                                ",a=" + std::to_string(o.account.raw().index) + ":" +
-                                std::to_string(o.account.raw().gen) + ",p=" +
-                                (o.parent ? std::to_string(o.parent.raw().index) + ":" +
-                                                std::to_string(o.parent.raw().gen)
-                                          : "-") +
-                                ")";
-    });
-    std::string out = "v=" + std::to_string(s.version());
-    for (auto& [k, v] : rows) out += " " + v;
+    std::string out = "Snapshot Version=" + std::to_string(s.version());
+    s.for_each<Account>([&](const Account& a) { out.append(" "); out.append(a.to_string()); });
+    s.for_each<Order>([&](const Order& o) { out.append(" "); out.append(o.to_string()); });
     return out;
 }

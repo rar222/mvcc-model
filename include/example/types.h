@@ -60,6 +60,17 @@ public:
     std::string name;
     std::int64_t balance = 0;
 
+    /// Diagnostic only -- e.g. for a subscriber printing a changeset. `id`
+    /// (own index:gen) always comes first, so every type's to_string() is
+    /// grep-able by id the same way. Refs are printed as raw index:gen, not
+    /// resolved: a Ref<T>/Opt<T> has no snapshot pointer to resolve through
+    /// (see Ref<T>'s doc comment), and to_string() has no Snapshot parameter
+    /// to resolve one with anyway.
+    std::string to_string() const {
+        return "Account{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) +
+               ", name=" + name + ", balance=" + std::to_string(balance) + "}";
+    }
+
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
         v.key<&Account::name>(s.name, "name");
@@ -85,6 +96,18 @@ public:
     std::int64_t qty = 0;
 
     std::string computed_key() const { return "ord:" + code; }
+
+    /// Diagnostic only -- see Account::to_string()'s doc comment for why
+    /// `id` comes first and refs print as raw index:gen instead of being
+    /// resolved.
+    std::string to_string() const {
+        auto ref_str = [](model::Id ref_id) {
+            return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
+        };
+        return "Order{id=" + ref_str(id) + ", code=" + code + ", qty=" + std::to_string(qty) +
+               ", account=" + ref_str(account.raw()) +
+               ", parent=" + (parent ? ref_str(parent.raw()) : "null") + "}";
+    }
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
