@@ -450,6 +450,47 @@ TEST(for_each_view_by_scan_field_and_all_of_view_by_cached_field_bind_to_this_sn
     CHECK(s.all_of_view_by_scan_field<&Order::qty>(99, [](View<Order>) { return false; }));  // vacuous
 }
 
+// A single transaction that both retires an old match (update qty away from
+// 5) and installs a fresh one (create with qty 5) at once -- find_by_scan_field
+// and find_by_cached_field must land on the exact same surviving pair, not
+// just agree on count, proving the cached index's erase-on-reassign and
+// insert-on-create both take effect within one commit rather than one
+// lagging the other.
+TEST(scan_and_cached_field_agree_after_a_mutate_and_a_create_in_one_transaction) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o1 = make_order(m, "O1", a, Opt<Order>{}, 5);
+    const Ref<Order> o2 = make_order(m, "O2", a, Opt<Order>{}, 5);
+
+    Snapshot s0 = m.snapshot();
+    CHECK_EQ(s0.find_by_scan_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(s0.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
+
+    Transaction txn = m.begin();
+    txn.update(o1)->qty = 9;  // o1 drops out of the qty==5 match set
+    auto o3 = std::make_unique<Order>();
+    o3->code = "O3";
+    o3->account = a;
+    o3->qty = 5;  // o3 joins the qty==5 match set
+    const Ref<Order> local3 = txn.create(std::move(o3));
+    const CommitResult res = commit_ok(m, txn);
+    const Ref<Order> o3_real = res.to_real(local3);
+
+    Snapshot s1 = m.snapshot();
+    const auto scan = s1.find_by_scan_field<&Order::qty>(5);
+    const auto cached = s1.find_by_cached_field<&Order::qty>(5);
+    CHECK_EQ(scan.size(), std::size_t{2});
+    CHECK_EQ(cached.size(), std::size_t{2});
+
+    for (const auto& matches : {scan, cached}) {
+        std::vector<Id> ids;
+        for (const Order* o : matches) ids.push_back(o->id);
+        CHECK(std::find(ids.begin(), ids.end(), o2.raw()) != ids.end());
+        CHECK(std::find(ids.begin(), ids.end(), o3_real.raw()) != ids.end());
+        CHECK(std::find(ids.begin(), ids.end(), o1.raw()) == ids.end());
+    }
+}
+
 // find_referrers<Field> is a thin wrapper around for_each_referrer<Field> --
 // the count must land once per CALL to the public API, not once per object
 // for_each_referrer happens to visit internally.
