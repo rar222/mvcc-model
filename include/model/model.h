@@ -92,7 +92,9 @@ namespace model {
 struct Id {
     std::uint32_t index = 0;  ///< slot number in the spine (chunk = index >> kChunkBits);
                               ///< top bit set = LOCAL placeholder, see kLocalIdBit
-    std::uint32_t gen = 0;    ///< which lifetime of that slot; 0 means null
+    std::uint32_t gen = 0;    ///< which lifetime of that slot; 0 means null. it's what makes a 
+                              ///< stale Id from a deleted object fail to alias whatever new object
+                              ///< later lands in that same slot.
 
     explicit operator bool() const noexcept { return gen != 0; }  ///< non-null?
 

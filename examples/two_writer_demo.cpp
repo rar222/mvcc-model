@@ -101,11 +101,10 @@ void subscriber_thread(std::shared_ptr<Subscription> sub) {
             } else if (c.tag == type_tag<Order>()) {
                 print_change<Order>(c, prev, u.snapshot);
             }
-
-            prev = u.snapshot;
         }
-        std::printf("[subscriber] done: %llu batches\n", static_cast<unsigned long long>(batch));
+        prev = u.snapshot;
     }
+    std::printf("[subscriber] done: %llu batches\n", static_cast<unsigned long long>(batch));
 }
 
 /// One writer thread: loops begin() / ~10 random mutations / try_commit(),
@@ -141,7 +140,8 @@ void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts,
                 auto o = std::make_unique<Order>();
                 o->code = "T" + std::to_string(tid) + "-O" + std::to_string(next_id++);
                 o->account = acct;
-                o->qty = 1 + rng() % 100;
+                o->qty = 1 + rng() % 5000;
+                if (const Ref<Order> p = pick_live(txn, orders, rng)) o->parent = p;
                 new_orders.push_back(txn.create(std::move(o)));
 
             } else if (roll < 40) {  // create an account
@@ -150,9 +150,18 @@ void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts,
                 a->balance = rng() % 5000;
                 new_accounts.push_back(txn.create(std::move(a)));
 
-            } else if (roll < 75) {  // update an order
-                if (const Ref<Order> r = pick_live(txn, orders, rng))
-                    if (Order* o = txn.update(r)) o->qty = 1 + rng() % 100;
+            } else if (roll < 75) {  // update an order -- qty always, parent set/nulled sometimes
+                if (const Ref<Order> r = pick_live(txn, orders, rng)) {
+                    if (Order* o = txn.update(r)) {
+                        o->qty = 1 + rng() % 5000;
+                        const int parent_roll = rng() % 100;
+                        if (parent_roll < 30) {
+                            if (const Ref<Order> p = pick_live(txn, orders, rng); p && p != r) o->parent = p;
+                        } else if (parent_roll < 50) {
+                            o->parent.reset();
+                        }
+                    }
+                }
 
             } else if (roll < 90) {  // delete an order
                 if (const Ref<Order> r = pick_live(txn, orders, rng)) txn.remove(r);
