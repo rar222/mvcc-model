@@ -19,6 +19,25 @@
 using namespace model;
 
 
+// to_uint64()/from_uint64() round-trip index AND gen exactly, including the
+// edge values (0 and the top bit set) that would expose a truncated shift
+// or a swapped high/low half.
+TEST(id_to_uint64_and_from_uint64_round_trip) {
+    const Id a{7, 3};
+    CHECK(Id::from_uint64(a.to_uint64()) == a);
+
+    const Id zero{};
+    CHECK(Id::from_uint64(zero.to_uint64()) == zero);
+
+    const Id hi{0xFFFF'FFFFu, 0xFFFF'FFFFu};
+    CHECK(Id::from_uint64(hi.to_uint64()) == hi);
+
+    // gen occupies the HIGH 32 bits, index the low -- a swap would still
+    // round-trip for symmetric values above, but not for this one.
+    const Id asym{1, 2};
+    CHECK_EQ(asym.to_uint64(), (std::uint64_t{2} << 32) | std::uint64_t{1});
+}
+
 // Basic roundtrip: create+commit, then find both by Ref/Id and by a
 // define_keys()-declared field, and confirm a typed lookup distinguishes
 // two types even when one's key string looks like the other's.

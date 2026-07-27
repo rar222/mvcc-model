@@ -101,17 +101,38 @@ struct Id {
     /// dead, recycled since) and must never compare equal -- that's the
     /// whole reason gen exists (see the struct comment).
     friend bool operator==(Id, Id) noexcept = default;
+
+    /// Lossless pack into one 64-bit integer (gen in the high 32 bits, index
+    /// in the low 32) -- for handing an Id across an interface that only
+    /// understands a plain integer (logging, serialization, a C API's
+    /// opaque handle) without inventing a second packing scheme. Named
+    /// method, not a conversion operator: Id already has explicit operator
+    /// bool(), and an integer conversion operator would let Id slide into
+    /// arithmetic/comparisons/switch by accident everywhere else it's used.
+    /// This is also the exact layout IdHash relies on for its "perfect
+    /// hash" claim -- see IdHash::operator() below, which is defined in
+    /// terms of this rather than duplicating the packing.
+    std::uint64_t to_uint64() const noexcept {
+        return (static_cast<std::uint64_t>(gen) << 32) | index;
+    }
+
+    /// Inverse of to_uint64() -- reconstructs the exact Id (index AND gen)
+    /// from its packed form.
+    static Id from_uint64(std::uint64_t v) noexcept {
+        return Id{static_cast<std::uint32_t>(v), static_cast<std::uint32_t>(v >> 32)};
+    }
 };
 
 /// Hasher for the model's own unordered containers keyed by Id (a
 /// Transaction's remove_intents_, Subscription's coalescing merge, ...).
 struct IdHash {
     std::size_t operator()(Id id) const noexcept {
-        // Compute in uint64_t, NOT size_t: on a 32-bit size_t platform the
-        // old `size_t(gen) << 32` was a shift past the type's width -- UB.
-        // The full 64-bit pack is a perfect (collision-free) hash of Id.
-        const std::uint64_t h = (static_cast<std::uint64_t>(id.gen) << 32) | id.index;
-        if constexpr (sizeof(std::size_t) >= sizeof(std::uint64_t)) {
+        // id.to_uint64() computes in uint64_t, NOT size_t: on a 32-bit
+        // size_t platform the old `size_t(gen) << 32` was a shift past the
+        // type's width -- UB. The full 64-bit pack is a perfect
+        // (collision-free) hash of Id.
+        const std::uint64_t h = id.to_uint64();
+        if constexpr (is_perfect) {
             return static_cast<std::size_t>(h);  // 64-bit size_t: identical to before
         } else {
             // 32-bit size_t: fold, so gen still participates instead of
@@ -130,8 +151,10 @@ struct IdHash {
     /// this Hash can skip collision-chain storage entirely. Declaring this
     /// true when it isn't would silently corrupt Root::by_type and every
     /// other IdHash-keyed persistent map on a 32-bit platform the moment two
-    /// Ids' folded hashes coincided; that's why it's conditional on the
-    /// exact same test operator() itself branches on, not a bare `true`.
+    /// Ids' folded hashes coincided; that's why operator() branches on this
+    /// flag directly (complete-class context makes it visible there despite
+    /// being declared below), instead of each independently recomputing the
+    /// same size comparison and risking the two drifting apart.
     static constexpr bool is_perfect = sizeof(std::size_t) >= sizeof(std::uint64_t);
 };
 
