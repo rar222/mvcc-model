@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""Generate a full-coverage `extern template` header for every model::Object<T>
-type declared in an input header, in the style of include/example/types_extern.h.
+"""Generate a full-coverage pair of `extern template` header + explicit-
+instantiation source for every model::Object<T> type declared in an input
+header -- the same technique include/example/types_extern.h(/.cpp) used to
+demonstrate by hand, before CMakeLists.txt switched extern_template_demo
+over to generating them from example/types.h at build time (see the
+"extern_template_demo" section of CMakeLists.txt). Never committed: it's
+regenerated into the build directory on every configure, from whatever
+example/types.h currently says, so the two files can't drift out of sync
+with it the way a hand-maintained list eventually will.
 
-WHAT "FULL COVERAGE" MEANS HERE
---------------------------------
-types_extern.h (hand-written) only lists entry points that
-examples/extern_template_demo.cpp actually calls -- that's a deliberate
-choice (see its own header comment: "an unused entry here is pure
-maintenance cost with no compile-time benefit"). This script does the
-opposite: it emits EVERY entry point that is structurally reachable for
-each type, whether or not anything in your project currently calls it.
-That's a starting point for you to prune down to what's genuinely used --
-same as types_extern.h's own comment recommends -- not something to
-commit verbatim.
+WHAT "FULL COVERAGE" MEANS, AND ITS ACTUAL COST
+--------------------------------------------------
+This emits EVERY entry point that is structurally reachable for each type,
+not just ones something currently calls -- the opposite of a hand-curated
+list. That trade is fine for --mode header (an unused `extern template`
+DECLARATION costs the frontend a name lookup, nothing more -- measured:
+no difference outside noise). It is NOT free for --mode source: an unused
+explicit instantiation DEFINITION is still unconditionally emitted code in
+that one object file (measured on this project's own Account/Order: +22%
+.text for +37% more entries going from a hand-curated 52-entry list to
+this script's 71-entry full coverage of the same two types). That's a
+trade worth making for a demo binary; for a real project's real types
+consider using this script's output as a starting draft to prune by hand
+instead of wiring up the CMake generation step verbatim.
 
 WHAT IT DERIVES, AND FROM WHERE
 --------------------------------
@@ -43,13 +53,17 @@ per line, `v.key<&T::field>(...)` / `v.index<&T::field>(...)` /
 plain (non-templated-on-the-user-side) field types. It will silently
 produce wrong or incomplete output for anything outside that shape:
 macros, multiple inheritance, nested namespaces, key methods that take
-arguments, fields spread across multiple base classes, etc. Treat the
-output as a draft to review and prune, exactly like types_extern.h's own
-"check before adding more" rule -- never pipe this straight into a commit.
+arguments, fields spread across multiple base classes, etc. If you're
+adapting this for a project whose types don't fit that shape, verify the
+output (e.g. the way CMakeLists.txt does here: compile the generated
+--mode source file and check it builds clean) before trusting it.
 
 USAGE
 -----
-    python3 gen_extern_templates.py path/to/types.h [--namespace example] > types_extern_full.h
+    python3 gen_extern_templates.py path/to/types.h --namespace ns \\
+        --mode header --include-path types.h --output types_extern.h
+    python3 gen_extern_templates.py path/to/types.h --namespace ns \\
+        --mode source --include-path types_extern.h --output types_extern.cpp
 """
 
 import argparse
@@ -200,16 +214,12 @@ def qualify(ns: str, name: str) -> str:
     return f"{ns}::{name}" if ns else name
 
 
-def render(types: List[TypeInfo], ns: str, source_header: str) -> str:
+def render_entries(types: List[TypeInfo], ns: str) -> str:
+    """Body of the file: every `extern template ...;` line, keyed off
+    'extern template ' so render() can strip that prefix verbatim for the
+    definitions file -- same list, two spellings, one source of truth."""
     Q = lambda n: qualify(ns, n)  # noqa: E731
     out = []
-    out.append(f'// AUTO-GENERATED DRAFT by gen_extern_templates.py from "{source_header}".')
-    out.append('// Full structural coverage, NOT "genuinely called from more than one TU" --')
-    out.append('// prune this down before committing, same rule types_extern.h documents.')
-    out.append(f'#include "{source_header}"')
-    out.append('')
-    out.append('namespace model {')
-    out.append('')
 
     out.append('// ---- Object<T>: CRTP virtual overrides ----')
     for t in types:
@@ -303,16 +313,56 @@ def render(types: List[TypeInfo], ns: str, source_header: str) -> str:
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
             out.append(f'extern template std::vector<View<{T}>> View<{Y}>::find_referrers<&{T}::{fname}>() const;')
-    out.append('')
-    out.append('}  // namespace model')
-    return '\n'.join(out) + '\n'
+    return '\n'.join(out)
+
+
+def render(types: List[TypeInfo], ns: str, mode: str, include_line: str) -> str:
+    """mode='header': `extern template` declarations, #includes the source
+    header (types.h). mode='source': the matching `template` (explicit
+    instantiation) DEFINITIONS, #includes the generated header instead --
+    same entry list both times, satisfied from one call to render_entries()
+    so the two files can never drift apart from each other (only from
+    types.h itself, on the next regeneration)."""
+    entries = render_entries(types, ns)
+    if mode == 'source':
+        entries = entries.replace('extern template ', 'template ')
+        banner = (
+            f'// AUTO-GENERATED by gen_extern_templates.py from "{include_line}"\'s own\n'
+            '// header, in full-coverage mode. Do not edit -- edit example/types.h or\n'
+            '// scripts/gen_extern_templates.py and let CMake regenerate this.'
+        )
+    else:
+        banner = (
+            f'// AUTO-GENERATED by gen_extern_templates.py from "{include_line}", in\n'
+            '// full-coverage mode: every structurally reachable entry point, not just\n'
+            '// ones genuinely called -- see the script\'s own docstring for the tradeoff\n'
+            '// this makes against types_extern.h\'s original hand-curated version.\n'
+            '// Do not edit -- edit example/types.h or scripts/gen_extern_templates.py\n'
+            '// and let CMake regenerate this.'
+        )
+    return (
+        f'{banner}\n'
+        f'#include "{include_line}"\n'
+        '\n'
+        'namespace model {\n'
+        '\n'
+        f'{entries}\n'
+        '\n'
+        '}  // namespace model\n'
+    )
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('header', help='input header declaring one or more model::Object<T> types')
     ap.add_argument('--namespace', help='override auto-detected namespace')
-    ap.add_argument('--include-path', help='#include path to emit (default: the input path as given)')
+    ap.add_argument('--include-path', required=True,
+                     help='#include path to emit: the source header in --mode header, '
+                          'the generated header itself in --mode source')
+    ap.add_argument('--mode', choices=['header', 'source'], default='header',
+                     help="'header': extern template declarations (default). "
+                          "'source': matching explicit-instantiation definitions.")
+    ap.add_argument('--output', help='write to this file instead of stdout')
     args = ap.parse_args()
 
     with open(args.header) as f:
@@ -328,9 +378,13 @@ def main() -> int:
         print(f"warning: no `class/struct T : ... Object<T>` found in {args.header}", file=sys.stderr)
 
     ns = args.namespace or detect_namespace(text)
-    include_path = args.include_path or args.header
 
-    sys.stdout.write(render(types, ns, include_path))
+    rendered = render(types, ns, args.mode, args.include_path)
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(rendered)
+    else:
+        sys.stdout.write(rendered)
 
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)

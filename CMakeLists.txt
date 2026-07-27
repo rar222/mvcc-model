@@ -177,16 +177,46 @@ target_link_libraries(order_record_bench PRIVATE model)
 target_precompile_headers(order_record_bench REUSE_FROM model)
 
 # Demonstrates -- and measures -- explicit `extern template` instantiation
-# as a compile-time lever: include/example/types_extern.h declares ~50
-# Snapshot/Transaction/Model/BulkTransaction/View entry points for
-# Account/Order `extern`, and this target's types_extern.cpp is the one
-# place that actually instantiates them. See types_extern.h's comment for
-# the mechanism and extern_template_demo.cpp's comment for measured
-# numbers and when this technique is (and isn't) worth its maintenance
-# cost. Two source files, not REUSE_FROM model's PCH split further: the
+# as a compile-time lever: a generated example/types_extern.h declares
+# every Snapshot/Transaction/Model/BulkTransaction/View entry point
+# reachable for Account/Order `extern`, and a generated types_extern.cpp is
+# the one place that actually instantiates them. See
+# scripts/gen_extern_templates.py's own docstring for why these two files
+# are generated (from example/types.h, at configure/build time, never
+# committed) instead of hand-maintained -- in short: full coverage instead
+# of a hand-curated subset, so a field added to types.h can never silently
+# fall back to implicit instantiation because someone forgot to update a
+# checked-in list. See extern_template_demo.cpp's comment for measured
+# compile-time numbers and when this technique is (and isn't) worth it.
+# Two source files, not REUSE_FROM model's PCH split further: the
 # instantiation TU needs to be its own translation unit for the `extern
 # template` declarations to have anything to link against.
-add_executable(extern_template_demo examples/extern_template_demo.cpp examples/types_extern.cpp)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+set(EXTERN_TEMPLATE_GEN ${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_extern_templates.py)
+set(EXTERN_TEMPLATE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/include/example/types.h)
+set(EXTERN_TEMPLATE_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(EXTERN_TEMPLATE_H ${EXTERN_TEMPLATE_GEN_DIR}/example/types_extern.h)
+set(EXTERN_TEMPLATE_CPP ${EXTERN_TEMPLATE_GEN_DIR}/types_extern.cpp)
+
+add_custom_command(
+  OUTPUT ${EXTERN_TEMPLATE_H} ${EXTERN_TEMPLATE_CPP}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${EXTERN_TEMPLATE_GEN_DIR}/example
+  COMMAND ${Python3_EXECUTABLE} ${EXTERN_TEMPLATE_GEN} ${EXTERN_TEMPLATE_SRC}
+          --namespace example --mode header
+          --include-path example/types.h --output ${EXTERN_TEMPLATE_H}
+  COMMAND ${Python3_EXECUTABLE} ${EXTERN_TEMPLATE_GEN} ${EXTERN_TEMPLATE_SRC}
+          --namespace example --mode source
+          --include-path example/types_extern.h --output ${EXTERN_TEMPLATE_CPP}
+  DEPENDS ${EXTERN_TEMPLATE_SRC} ${EXTERN_TEMPLATE_GEN}
+  COMMENT "Generating extern template coverage for example/types.h"
+  VERBATIM
+)
+add_custom_target(generate_types_extern DEPENDS ${EXTERN_TEMPLATE_H} ${EXTERN_TEMPLATE_CPP})
+
+add_executable(extern_template_demo examples/extern_template_demo.cpp ${EXTERN_TEMPLATE_CPP})
+add_dependencies(extern_template_demo generate_types_extern)
+target_include_directories(extern_template_demo PRIVATE ${EXTERN_TEMPLATE_GEN_DIR})
 target_link_libraries(extern_template_demo PRIVATE model)
 target_precompile_headers(extern_template_demo REUSE_FROM model)
 
