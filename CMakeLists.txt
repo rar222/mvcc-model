@@ -176,6 +176,20 @@ add_executable(order_record_bench examples/order_record_bench.cpp)
 target_link_libraries(order_record_bench PRIVATE model)
 target_precompile_headers(order_record_bench REUSE_FROM model)
 
+# Demonstrates -- and measures -- explicit `extern template` instantiation
+# as a compile-time lever: include/example/types_extern.h declares ~50
+# Snapshot/Transaction/Model/BulkTransaction/View entry points for
+# Account/Order `extern`, and this target's types_extern.cpp is the one
+# place that actually instantiates them. See types_extern.h's comment for
+# the mechanism and extern_template_demo.cpp's comment for measured
+# numbers and when this technique is (and isn't) worth its maintenance
+# cost. Two source files, not REUSE_FROM model's PCH split further: the
+# instantiation TU needs to be its own translation unit for the `extern
+# template` declarations to have anything to link against.
+add_executable(extern_template_demo examples/extern_template_demo.cpp examples/types_extern.cpp)
+target_link_libraries(extern_template_demo PRIVATE model)
+target_precompile_headers(extern_template_demo REUSE_FROM model)
+
 # --- tests ------------------------------------------------------------------
 
 include(CTest)
@@ -249,4 +263,7 @@ set_tests_properties("stand_alone.demo" PROPERTIES TIMEOUT 300)
 
 add_test(NAME "stand_alone.two_writer_demo_integration" COMMAND two_writer_demo)
 set_tests_properties("stand_alone.two_writer_demo_integration" PROPERTIES TIMEOUT 300)
+
+add_test(NAME "stand_alone.extern_template_demo" COMMAND extern_template_demo)
+set_tests_properties("stand_alone.extern_template_demo" PROPERTIES TIMEOUT 300)
 
