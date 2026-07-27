@@ -5,16 +5,30 @@
 // measure. See types_extern.h's own comment for the mechanism.
 //
 // Measured (this file, gcc -O2 -g, ccache disabled, min of 8 runs):
-//   including example/types.h directly (implicit instantiation): ~2.9s
-//   including example/types_extern.h (this file's actual setup):  ~2.3s
-// About a 24% reduction for a TU that genuinely touches this much of the
-// API. A TU that only calls create/update/resolve -- most of this
-// project's other example/bench files -- has little to save this way: the
-// cost lives in the BREADTH of the API surface a TU actually calls, not in
-// its raw line count. Don't reach for this pattern below that bar; it's
-// pure maintenance cost (a new Field used in a new TU that isn't added to
-// types_extern.cpp just silently falls back to implicit instantiation,
-// which is safe but easy to mistake for "not working").
+//   including example/types.h directly (implicit instantiation): ~2.8s
+//   including example/types_extern.h (this file's actual setup):  ~1.1s
+// About a 59% reduction for a TU that genuinely touches this much of the
+// API. Even a minimal TU that only calls create/update/commit/resolve --
+// most of this project's other example/bench files -- now sees a real cut
+// too (~1.5s implicit vs. ~1.0s extern, min of 5 runs): types_extern.h also
+// carries `extern template class Object<Account>`/`Object<Order>` (the CRTP
+// base every user type derives from -- see its own comment), which pays off
+// the instant a TU constructs one at all, not just for TUs that call the
+// specific Snapshot/Transaction/Model/BulkTransaction/View entry points
+// below. (Transaction/BulkTransaction's non-template raw() helpers were
+// separately moved into src/model.cpp -- that's not an extern-template
+// effect, and it benefits implicit-instantiation TUs too, which is part of
+// why the implicit number above also dropped.) The remaining floor for a
+// TU that constructs an Account/Order at all is Account/Order's OWN vtable
+// (no key function, since neither declares a virtual of its own) -- fixable
+// the same way, but only by giving every user type an out-of-line
+// destructor, which changes example/types.h's "just derive from Object<T>"
+// contract for a few hundred bytes of payoff; deliberately not done.
+// Don't reach for the entry-point-listing part of this pattern below the
+// "genuinely touches this much of the API" bar; it's pure maintenance cost
+// (a new Field used in a new TU that isn't added to types_extern.cpp just
+// silently falls back to implicit instantiation, which is safe but easy to
+// mistake for "not working").
 
 #include "example/types_extern.h"
 

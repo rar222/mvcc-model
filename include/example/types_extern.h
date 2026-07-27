@@ -39,6 +39,19 @@
 
 namespace model {
 
+// ---- Object<T>: CRTP virtual overrides ----
+// Account/Order derive from Object<Derived> (model.h), whose clone()/
+// assign_from()/each_ref()/remap_refs()/remap_undo_refs() are all defined
+// inline in the class template -- there is no out-of-line "key function",
+// so ordinarily every TU that constructs an Account/Order at all (even one
+// that never calls a single entry point below) emits its own copy of the
+// vtable and all five overrides as vague-linkage symbols. This is the
+// single largest item in this file's measured savings -- bigger than every
+// Snapshot/Transaction entry point below combined -- because it's paid just
+// for *having* an Account/Order, not for using any particular API surface.
+extern template class Object<example::Account>;
+extern template class Object<example::Order>;
+
 // ---- Snapshot: Account ----
 extern template const example::Account& Snapshot::resolve<example::Account>(Ref<example::Account>) const noexcept;
 extern template const example::Account* Snapshot::find<example::Account>(Ref<example::Account>) const noexcept;

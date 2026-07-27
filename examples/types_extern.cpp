@@ -9,6 +9,10 @@
 
 namespace model {
 
+// ---- Object<T> ----
+template class Object<example::Account>;
+template class Object<example::Order>;
+
 // ---- Snapshot: Account ----
 template const example::Account& Snapshot::resolve<example::Account>(Ref<example::Account>) const noexcept;
 template const example::Account* Snapshot::find<example::Account>(Ref<example::Account>) const noexcept;

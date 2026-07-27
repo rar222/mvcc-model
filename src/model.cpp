@@ -1606,6 +1606,127 @@ Transaction Snapshot::begin(std::string name, std::any data) const {
     return lease_->m->begin(*this, std::move(name), std::move(data));
 }
 
+// ---------------------------------------------------------------------------
+// Transaction / BulkTransaction: raw helpers
+// ---------------------------------------------------------------------------
+// Not templates -- Transaction/BulkTransaction are concrete classes, so these
+// were previously defined in-class purely out of habit, not because they
+// need to be. Unlike Snapshot::find_raw (model.h's "Hot path -- keep
+// inlineable" section, the read path), these sit on the WRITE path -- 10-100
+// commits/sec per CLAUDE.md's target scale -- so moving them here, where
+// they're compiled and optimized exactly once instead of once per TU that
+// calls create/update/remove/peek, costs nothing worth measuring at that
+// rate. See examples/extern_template_demo.cpp's header comment for the
+// compile-time motivation.
+
+ObjectBase* BulkTransaction::update_raw(Id id) {
+    if (!is_local(id)) return nullptr;
+    const std::uint32_t idx = id.index & ~kLocalIdBit;
+    return idx < objects_.size() ? objects_[idx].get() : nullptr;
+}
+
+Id Transaction::create_raw(std::unique_ptr<ObjectBase> o) {
+    const Id local_id{kLocalIdBit | next_local_id_++, 1};
+    o->id = local_id;
+    const TypeTag tag = o->tag();
+    local_created_.push_back(std::move(o));
+    pending_changes_.push_back({local_id, ChangeKind::Created, tag});
+    return local_id;
+}
+
+ObjectBase* Transaction::update_raw(Id id) {
+    if (is_local(id)) {
+        const std::uint32_t idx = id.index & ~kLocalIdBit;
+        // Masked like peek_raw: a deferred-removed local can't be
+        // written to any more than a remove-intended real id can.
+        if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+            local_remove_intents_.end())
+            return nullptr;
+        return idx < local_created_.size() ? local_created_[idx].get() : nullptr;
+    }
+    if (remove_intents_.count(id)) return nullptr;
+    // local_updated_ is keyed by bare slot index (a transaction only ever
+    // clones ONE generation of a given slot -- whichever was alive at
+    // base()), so a lookup here must also check the clone's OWN id
+    // matches the FULL id requested, generation included. Without this,
+    // a caller asking about a stale generation of an already-updated
+    // slot (e.g. a handle recycled since base()) would get back the
+    // WRONG object instead of a correct "not found".
+    if (auto it = local_updated_.find(id.index); it != local_updated_.end())
+        return (it->second->id == id) ? it->second.get() : nullptr;
+
+    const ObjectBase* base_obj = base_.find_raw(id);
+    if (!base_obj) return nullptr;
+    auto clone = std::unique_ptr<ObjectBase>(base_obj->clone());
+    update_baseline_.try_emplace(id.index, base_obj);
+    ObjectBase* raw = clone.get();
+    local_updated_.emplace(id.index, std::move(clone));
+    pending_changes_.push_back({id, ChangeKind::Updated, raw->tag()});
+    return raw;
+}
+
+void Transaction::remove_raw(Id id) {
+    if (is_local(id)) {
+        const std::uint32_t idx = id.index & ~kLocalIdBit;
+        if (idx >= local_created_.size() || !local_created_[idx])
+            return;  // never created here, or already cancelled: nothing to do
+        if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+            local_remove_intents_.end())
+            return;  // already deferred: remove() is idempotent
+        if (locally_referenced(id)) {
+            local_remove_intents_.push_back(idx);
+            return;
+        }
+        local_created_[idx].reset();  // cancel locally
+        auto rm = [&](const Change& c) { return c.id == id; };
+        pending_changes_.erase(std::remove_if(pending_changes_.begin(), pending_changes_.end(), rm),
+                                pending_changes_.end());
+        return;
+    }
+    remove_intents_.insert(id);
+}
+
+const ObjectBase* Transaction::peek_raw(Id id) const {
+    if (is_local(id)) {
+        const std::uint32_t idx = id.index & ~kLocalIdBit;
+        // A deferred local remove masks its target exactly like a real
+        // remove intent does below -- "removed as far as this
+        // transaction can tell", even though the create still installs
+        // (and is then removed) at apply time.
+        if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+            local_remove_intents_.end())
+            return nullptr;
+        return idx < local_created_.size() ? local_created_[idx].get() : nullptr;
+    }
+    if (remove_intents_.count(id)) return nullptr;
+    // local_updated_ is keyed by bare slot index (a transaction only ever
+    // clones ONE generation of a given slot -- whichever was alive at
+    // base()), so a lookup here must also check the clone's OWN id
+    // matches the FULL id requested, generation included. Without this,
+    // a caller asking about a stale generation of an already-updated
+    // slot (e.g. a handle recycled since base()) would get back the
+    // WRONG object instead of a correct "not found".
+    if (auto it = local_updated_.find(id.index); it != local_updated_.end())
+        return (it->second->id == id) ? it->second.get() : nullptr;
+    return base_.find_raw(id);
+}
+
+bool Transaction::locally_referenced(Id local) const {
+    bool found = false;
+    auto scan = [&](const ObjectBase* o) {
+        if (!o || found || o->id == local) return;
+        o->each_ref([&](const void*, const char*, Id target, bool) {
+            if (target == local) found = true;
+        });
+    };
+    for (const auto& up : local_created_) scan(up.get());
+    for (const auto& [slot, up] : local_updated_) {
+        (void)slot;
+        scan(up.get());
+    }
+    return found;
+}
+
 std::vector<Change> Transaction::estimate_changes_with_cascades() const {
     // Creates and updates are already known exactly -- no estimation needed.
     std::vector<Change> out = pending_changes_;
