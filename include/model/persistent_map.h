@@ -689,20 +689,49 @@ class TrieCore {
     // is_leaf is indexed by idx, same as bitmap -- `pos` tracks the matching
     // position in `slots` alongside as occupied bits are found, the same
     // relationship popcount_below computes on demand elsewhere.
+    //
+    // A thin wrapper over each_in_short_circuit (f wrapped to always report
+    // "keep going") rather than a second copy of the walk -- the wrapper
+    // lambda's `return true` is a compile-time constant, so at -O2 (the
+    // default preset, see CMakeLists.txt) this compiles to the exact same
+    // code as the walk written out by hand: the `if (!true) return false`
+    // this introduces per entry/level folds away entirely. Same trick
+    // model.h's for_each_by_scan_field uses over its own short-circuiting
+    // sibling (scan_field_short_circuit) -- do not duplicate the traversal
+    // itself to "avoid the indirection"; there is nothing at runtime to avoid.
     template <class F>
     static void each_in(const Node* n, F& f) {
-        if (!n) return;
+        auto wrapped = [&](const auto& e) {
+            f(e);
+            return true;
+        };
+        each_in_short_circuit(n, wrapped);
+    }
+
+    // Same walk as each_in, but f returns bool (true = keep going, false =
+    // stop) and the walk itself actually stops the moment f says so --
+    // unlike a caller wrapping each_in in a "stop calling f once a flag
+    // flips" guard, which still pays for visiting every remaining entry.
+    // Needed for a real std::all_of/std::any_of over a trie-backed index
+    // (see model.h's all_of_by_scan_field/all_of_by_cached_field): a
+    // predicate that fails on the very first match should not force a scan
+    // of the other 999,999.
+    template <class F>
+    static bool each_in_short_circuit(const Node* n, F& f) {
+        if (!n) return true;
         std::uint32_t pos = 0;
         for (std::uint32_t idx = 0; idx < 32; ++idx) {
             const std::uint32_t b = bit(idx);
             if (!(n->bitmap & b)) continue;
             if (n->is_leaf & b) {
-                for (const Leaf* l = as_leaf(n->slots[pos]); l; l = l->next.get()) f(l->entry);
+                for (const Leaf* l = as_leaf(n->slots[pos]); l; l = l->next.get())
+                    if (!f(l->entry)) return false;
             } else {
-                each_in(as_node(n->slots[pos]), f);
+                if (!each_in_short_circuit(as_node(n->slots[pos]), f)) return false;
             }
             ++pos;
         }
+        return true;
     }
 
 public:
@@ -745,32 +774,6 @@ public:
     template <class F>
     void each_entry(F&& f) const {
         each_in(as_node(root_), f);
-    }
-
-    // Same walk as each_in, but f returns bool (true = keep going, false =
-    // stop) and the walk itself actually stops the moment f says so --
-    // unlike a caller wrapping each_in in a "stop calling f once a flag
-    // flips" guard, which still pays for visiting every remaining entry.
-    // Needed for a real std::all_of/std::any_of over a trie-backed index
-    // (see model.h's all_of_by_scan_field/all_of_by_cached_field): a
-    // predicate that fails on the very first match should not force a scan
-    // of the other 999,999.
-    template <class F>
-    static bool each_in_short_circuit(const Node* n, F& f) {
-        if (!n) return true;
-        std::uint32_t pos = 0;
-        for (std::uint32_t idx = 0; idx < 32; ++idx) {
-            const std::uint32_t b = bit(idx);
-            if (!(n->bitmap & b)) continue;
-            if (n->is_leaf & b) {
-                for (const Leaf* l = as_leaf(n->slots[pos]); l; l = l->next.get())
-                    if (!f(l->entry)) return false;
-            } else {
-                if (!each_in_short_circuit(as_node(n->slots[pos]), f)) return false;
-            }
-            ++pos;
-        }
-        return true;
     }
 
     template <class F>
