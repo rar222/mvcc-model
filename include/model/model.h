@@ -1355,14 +1355,10 @@ public:
                            F&& f) const;
 
     /// Same scan as for_each_referrer, collected into a vector.
+    /// Defined out-of-line (after Model) -- see find_by_scan_field's comment.
     template <auto Field>
     std::vector<const member_class_t<decltype(Field)>*> find_referrers(
-        Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
-        using ClassT = member_class_t<decltype(Field)>;
-        std::vector<const ClassT*> out;
-        for_each_referrer<Field>(target, [&](const ClassT& o) { out.push_back(&o); });
-        return out;
-    }
+        Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
 
     /// View-returning form of for_each_referrer.
     template <auto Field, class F>
@@ -3458,6 +3454,15 @@ void Snapshot::for_each_referrer(Ref<typename member_value_t<decltype(Field)>::t
     for_each<ClassT>([&](const ClassT& o) {
         if ((o.*Field).raw() == target.raw()) f(o);
     });
+}
+
+template <auto Field>
+std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_referrers(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    std::vector<const ClassT*> out;
+    for_each_referrer<Field>(target, [&](const ClassT& o) { out.push_back(&o); });
+    return out;
 }
 
 template <auto Field>
