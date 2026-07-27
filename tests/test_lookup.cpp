@@ -19,6 +19,28 @@
 using namespace model;
 
 
+// field_tag<Field> mints its identity from the (type, VALUE) pair of the
+// non-type template argument, not from the pointer-to-member's type alone.
+// Two distinct std::int64_t fields on the same class share the exact same
+// pointer-to-member TYPE (std::int64_t TwoFieldsSameType::*) but are
+// different VALUES of that type, so they must still resolve to two
+// different, stable addresses -- otherwise every same-typed field on a
+// class would collide in by_field_/by_type_ and one would silently shadow
+// the other.
+TEST(field_tag_is_keyed_by_value_not_just_pointer_to_member_type) {
+    struct TwoFieldsSameType {
+        std::int64_t a = 0;
+        std::int64_t b = 0;
+    };
+    const void* tag_a = model::field_tag<&TwoFieldsSameType::a>();
+    const void* tag_b = model::field_tag<&TwoFieldsSameType::b>();
+    CHECK(tag_a != tag_b);
+    // Stable: the same Field value, instantiated again (as if from a second
+    // call site), resolves to the identical address rather than a fresh one.
+    CHECK_EQ(tag_a, model::field_tag<&TwoFieldsSameType::a>());
+    CHECK_EQ(tag_b, model::field_tag<&TwoFieldsSameType::b>());
+}
+
 // Snapshot::for_each<T>() visits only objects of exactly that type, even
 // when other types coexist in the same model.
 TEST(for_each_is_type_filtered) {
