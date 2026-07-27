@@ -1693,7 +1693,9 @@ struct Update {
     /// construction (const), so sharing is safe even though each
     /// subscriber's queue is drained on its own thread.
     std::shared_ptr<const std::vector<Change>> changes;
-    bool coalesced = false;  ///< true if intermediate versions were folded away
+    bool coalesced = false;  ///< true if the reader fell behind and intermediate versions were
+                             ///< folded away as a result -- never true for a subscriber that
+                             ///< drains promptly enough to never overflow its queue
 };
 
 /// One bounded queue per subscriber, drained on the subscriber's own thread.
@@ -1708,7 +1710,26 @@ class Subscription {
 public:
     /// `depth` = max queued Updates before overflow coalesces. Deeper keeps
     /// more distinct intermediate versions for a slow consumer -- and pins
-    /// that many snapshots. Obtain via Model::subscribe(), not directly.
+    /// that many snapshots.
+    ///
+    /// depth=0 is a documented special mode, not just "a very small queue":
+    /// push()'s `q_.size() >= cap_` is trivially true when cap_ is 0, so
+    /// EVERY push runs through collapse(), including the first. A depth=0
+    /// subscriber therefore never sees a raw per-commit changeset -- every
+    /// delivery is "net effect since I last drained", uniformly, even the
+    /// intra-commit case (a same-transaction create-then-cascade-delete nets
+    /// to nothing here too, not just across separate commits). Update::
+    /// coalesced still tells the truth in this mode: it's false whenever the
+    /// consumer actually kept up (q_ was empty when collapse() ran) and true
+    /// only when it didn't -- collapse() is unconditional, but backlog isn't.
+    /// The cost: every commit now pays collapse()'s merge (two hash-map
+    /// builds) instead of the O(1) push_back a keeping-up consumer gets at
+    /// depth>=1 -- pick depth=0 for the "always net, never raw" guarantee
+    /// itself, not as a way to save memory over depth=1 (which already
+    /// collapses from the second undrained push onward, at no extra cost
+    /// while the consumer keeps up).
+    ///
+    /// Obtain via Model::subscribe(), not directly.
     explicit Subscription(std::size_t depth) : cap_(depth) {}
 
     bool wait(Update& out);       ///< blocks; false once the model shuts down
@@ -1718,12 +1739,17 @@ private:
     friend class Model;
 
     void push(Update u);         ///< called by try_commit() at publish; coalesces when full
-    void collapse(Update tail);  ///< the overflow path: merge queue + tail into ONE Update
+                                 ///< (or always, at depth=0 -- see the constructor's doc comment)
+    void collapse(Update tail);  ///< merge queue + tail into ONE Update; sets Update::coalesced
+                                 ///< to whether q_ actually had a backlog, not just "this ran"
     void close();                ///< Model::shutdown(): wake blocked wait()ers to return false
 
     std::mutex m_;                ///< guards everything below; never held while user code runs
     std::condition_variable cv_;  ///< signals wait(): queue non-empty, or closed
-    std::deque<Update> q_;        ///< pending deliveries, oldest first; length <= cap_
+    std::deque<Update> q_;        ///< pending deliveries, oldest first; length <= cap_, EXCEPT
+                                  ///< depth=0's floor of 1 entry once anything is pushed and not
+                                  ///< yet drained (collapse() always leaves exactly one) -- see
+                                  ///< the constructor's doc comment
     std::size_t cap_;             ///< the constructor's depth
     bool closed_ = false;         ///< set once by close(); wait() drains what's left, then false
 };
@@ -1758,8 +1784,10 @@ public:
     Snapshot snapshot();
 
     /// Register for change events; see Subscription for the queue/coalescing
-    /// contract and the queue_depth tradeoff. Subscribe BEFORE shutdown();
-    /// the returned object stays valid until dropped.
+    /// contract and the queue_depth tradeoff (queue_depth=0 is a documented
+    /// special mode: always-coalesced deliveries, see Subscription's
+    /// constructor). Subscribe BEFORE shutdown(); the returned object stays
+    /// valid until dropped.
     std::shared_ptr<Subscription> subscribe(std::size_t queue_depth = 8);
     void shutdown();  ///< wakes blocked subscribers so their threads can exit
 

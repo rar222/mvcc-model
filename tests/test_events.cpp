@@ -187,6 +187,59 @@ TEST(subscribing_after_shutdown_returns_a_subscription_that_immediately_reports_
     CHECK(!late->try_drain(u));
 }
 
+// depth=0 is a documented special mode (see Subscription's constructor doc
+// comment): push()'s `q_.size() >= cap_` is trivially true when cap_ is 0,
+// so EVERY push runs through collapse() -- even the very first, with nothing
+// queued yet. That must still report coalesced=false when nothing was
+// actually merged (a prompt drain between every commit) and coalesced=true
+// once a real backlog forms (several commits land before a drain) -- the
+// same bookkeeping bug this test would have caught if collapse() had kept
+// hardcoding coalesced=true regardless of whether q_ was empty going in.
+TEST(depth_zero_always_collapses_but_coalesced_still_means_actual_backlog) {
+    Model m;
+    auto sub = m.subscribe(/*depth=*/0);
+
+    // Draining between every commit: never a backlog, so never coalesced,
+    // even though every single delivery went through collapse().
+    for (int i = 0; i < 3; ++i) {
+        make_account(m, "A" + std::to_string(i));
+        Update u;
+        CHECK(sub->try_drain(u));
+        CHECK(!u.coalesced);
+        CHECK_EQ(u.changes->size(), std::size_t{1});
+        CHECK(!sub->try_drain(u));  // nothing else queued behind it
+    }
+
+    // Three commits land with no drain in between: a genuine backlog. Still
+    // exactly ONE Update on the queue (collapse() never lets it grow), and
+    // this time coalesced must be true.
+    const Ref<Account> a = make_account(m, "B0", 1);
+    update_field(m, a, [](Account* p) { p->balance = 2; });
+    const Ref<Account> b = make_account(m, "B1", 3);
+
+    Update u;
+    CHECK(sub->try_drain(u));
+    CHECK(u.coalesced);
+    CHECK(!sub->try_drain(u));  // collapse() always leaves exactly one entry
+
+    // Net effect, not per-commit history: a (Created, Updated) pair merges to
+    // one Created entry carrying the FINAL value -- same merge rule
+    // overflow_coalesces_instead_of_growing exercises at higher depths.
+    int mentions_a = 0, mentions_b = 0;
+    for (const Change& c : *u.changes) {
+        if (c.id == a.raw()) {
+            ++mentions_a;
+            CHECK(c.kind == ChangeKind::Created);
+            CHECK_EQ(u.snapshot.find(a)->balance, std::int64_t{2});
+        } else if (c.id == b.raw()) {
+            ++mentions_b;
+            CHECK(c.kind == ChangeKind::Created);
+        }
+    }
+    CHECK_EQ(mentions_a, 1);
+    CHECK_EQ(mentions_b, 1);
+}
+
 /// Prints one Change, resolved against the Snapshot pair that brackets it --
 /// `before` is the PREVIOUS Update's snapshot (null for the very first
 /// Update), `after` is this Change's own Update::snapshot. Structural only

@@ -146,6 +146,13 @@ void Subscription::push(Update u) {
     // queue grow" -- an unbounded queue pins every version behind it and every
     // object retired since). Coalesce into one Update instead of enqueuing a
     // new one.
+    //
+    // cap_==0 is a documented special case, not an edge case to guard
+    // against: q_.size() (0) >= cap_ (0) is trivially true, so THIS branch is
+    // taken on every push, including the very first -- see Subscription's own
+    // doc comment for what that mode is for. collapse() itself still reports
+    // coalesced accurately (false when q_ was empty going in), so a depth=0
+    // subscriber that keeps up perfectly still sees coalesced=false.
     if (q_.size() >= cap_)
         collapse(std::move(u));
     else
@@ -155,9 +162,10 @@ void Subscription::push(Update u) {
 }
 
 void Subscription::collapse(Update tail) {
-    // The overflow path for push(): instead of enqueuing `tail` as a new,
-    // distinct entry (which would exceed cap_), replay every Change from
-    // every Update ALREADY queued plus tail's own Changes through `apply`,
+    // The overflow path for push() (cap_>=1), or EVERY push (cap_==0, see
+    // push()'s comment): instead of enqueuing `tail` as a new, distinct entry
+    // (which would exceed cap_), replay every Change from every Update
+    // ALREADY queued plus tail's own Changes through `apply`,
     // producing one Change per Id that reflects only its NET effect across
     // the whole merged window (e.g. Created then Updated collapses to just
     // Created; Created then Deleted cancels out entirely -- see the switch
@@ -202,6 +210,14 @@ void Subscription::collapse(Update tail) {
         }
     };
 
+    // Captured before q_.clear() below, and BEFORE q_ is known to be empty:
+    // collapse() is called either because q_ was genuinely full (the normal
+    // overflow path, cap_>=1) or unconditionally on every push (cap_==0, see
+    // push()'s own comment) -- only the former is an actual backlog. A
+    // depth=0 subscriber that drains between every push always finds q_
+    // empty here, so this is false for it exactly as often as it should be.
+    const bool fell_behind = !q_.empty();
+
     // Oldest first: q_'s existing entries (already in arrival order), then
     // tail (the newest, about to overflow the queue) -- so `merged`'s final
     // state reflects the changes in the order they actually happened.
@@ -212,7 +228,7 @@ void Subscription::collapse(Update tail) {
     Update out;
     out.snapshot = std::move(tail.snapshot);  // the newest version -- every older Snapshot in the
                                               // queue is dropped along with q_ below
-    out.coalesced = true;  // tells the consumer this Update skipped intermediate versions
+    out.coalesced = fell_behind;  // see Update::coalesced's doc comment
     auto merged_changes = std::make_shared<std::vector<Change>>();
     merged_changes->reserve(merged.size());
     for (auto& [id, kind] : merged) merged_changes->push_back({id, kind, tags.at(id)});
