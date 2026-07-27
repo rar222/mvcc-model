@@ -217,18 +217,25 @@ def qualify(ns: str, name: str) -> str:
 def render_entries(types: List[TypeInfo], ns: str) -> str:
     """Body of the file: every `extern template ...;` line, keyed off
     'extern template ' so render() can strip that prefix verbatim for the
-    definitions file -- same list, two spellings, one source of truth."""
+    definitions file -- same list, two spellings, one source of truth.
+
+    Grouped type-first, category-second (everything for Account, then
+    everything for Order), not category-first like the original hand-
+    written types_extern.h -- so an entry for one type is never split
+    across a scroll past unrelated types."""
     Q = lambda n: qualify(ns, n)  # noqa: E731
     out = []
 
-    out.append('// ---- Object<T>: CRTP virtual overrides ----')
-    for t in types:
-        out.append(f'extern template class Object<{Q(t.name)}>;')
-    out.append('')
-
     for t in types:
         T = Q(t.name)
-        out.append(f'// ---- Snapshot: {t.name} ----')
+        out.append(f'// ==== {t.name} ====')
+        out.append('')
+
+        out.append('// -- Object<T>: CRTP virtual overrides --')
+        out.append(f'extern template class Object<{T}>;')
+        out.append('')
+
+        out.append('// -- Snapshot --')
         out.append(f'extern template const {T}& Snapshot::resolve<{T}>(Ref<{T}>) const noexcept;')
         out.append(f'extern template const {T}* Snapshot::resolve<{T}>(Opt<{T}>) const noexcept;')
         out.append(f'extern template const {T}* Snapshot::find<{T}>(Ref<{T}>) const noexcept;')
@@ -256,9 +263,7 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
         out.append(f'extern template std::optional<View<{T}>> Snapshot::view<{T}>(Ref<{T}>) const;')
         out.append('')
 
-    for t in types:
-        T = Q(t.name)
-        out.append(f'// ---- Transaction: {t.name} ----')
+        out.append('// -- Transaction --')
         out.append(f'extern template Ref<{T}> Transaction::create<{T}>(std::unique_ptr<{T}>);')
         out.append(f'extern template {T}* Transaction::update<{T}>(Ref<{T}>);')
         out.append(f'extern template {T}* Transaction::update<{T}>(Opt<{T}>);')
@@ -272,48 +277,34 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
         out.append(f'extern template const {T}* Transaction::peek_before<{T}>(Id) const;')
         out.append('')
 
-    out.append('// ---- Model ----')
-    for t in types:
-        T = Q(t.name)
+        out.append('// -- Model --')
         out.append(f'extern template const {T}* Model::peek_as<{T}>(Id) const;')
-    lookup_stats_fields = []  # (T-qualified, field) de-duped, in encounter order
-    seen = set()
-    for t in types:
-        T = Q(t.name)
+        seen_lookup_stats = set()  # scan+cached share fields (e.g. Order::computed_key); de-dup
         for fname in t.scan_fields + t.cached_fields:
-            key = (T, fname)
-            if key not in seen:
-                seen.add(key)
-                lookup_stats_fields.append(key)
-    for T, fname in lookup_stats_fields:
-        out.append(f'extern template LookupCounts Model::lookup_stats<&{T}::{fname}>() const;')
-    out.append('')
+            if fname not in seen_lookup_stats:
+                seen_lookup_stats.add(fname)
+                out.append(f'extern template LookupCounts Model::lookup_stats<&{T}::{fname}>() const;')
+        out.append('')
 
-    out.append('// ---- BulkTransaction ----')
-    for t in types:
-        T = Q(t.name)
+        out.append('// -- BulkTransaction --')
         out.append(f'extern template Ref<{T}> BulkTransaction::create<{T}>(std::unique_ptr<{T}>);')
-    for t in types:
-        T = Q(t.name)
         out.append(f'extern template {T}* BulkTransaction::update<{T}>(Ref<{T}>);')
         out.append(f'extern template {T}* BulkTransaction::update<{T}>(Opt<{T}>);')
-    out.append('')
+        out.append('')
 
-    out.append('// ---- View ----')
-    for t in types:
-        T = Q(t.name)
+        out.append('// -- View --')
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
             if kind == 'Ref':
                 out.append(f'extern template View<{Y}> View<{T}>::operator[]<{Y}>(Ref<{Y}> {T}::*) const noexcept;')
             else:
                 out.append(f'extern template std::optional<View<{Y}>> View<{T}>::operator[]<{Y}>(Opt<{Y}> {T}::*) const noexcept;')
-    for t in types:
-        T = Q(t.name)
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
             out.append(f'extern template std::vector<View<{T}>> View<{Y}>::find_referrers<&{T}::{fname}>() const;')
-    return '\n'.join(out)
+        out.append('')
+
+    return '\n'.join(out).rstrip('\n')
 
 
 def render(types: List[TypeInfo], ns: str, mode: str, include_line: str) -> str:
