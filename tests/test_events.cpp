@@ -65,6 +65,45 @@ TEST(overflow_coalesces_instead_of_growing) {
     CHECK_EQ(final_qty, 19);  // the latest state still arrives
 }
 
+// The Updated+Updated merge rule specifically: unlike overflow_coalesces_
+// instead_of_growing above (where `o`'s own Created is swept into the SAME
+// coalescing window, so the net kind there is Created, not Updated -- "Created
+// + Updated stays Created"), here `o` is created and drained FIRST, so every
+// change the subscriber sees after that starts from an existing Updated
+// entry. No amount of further coalescing may ever turn that back into
+// Created -- an object the subscriber already knows about only ever stays
+// Updated, no matter how many intermediate versions get folded away.
+TEST(repeated_updates_of_an_already_known_object_coalesce_to_updated_never_created) {
+    Model m;
+    auto sub = m.subscribe(/*depth=*/2);
+
+    const Ref<Order> o = make_order(m, "O1", make_account(m, "A1"));
+    Update drain;
+    while (sub->try_drain(drain)) {
+    }  // o's own Created is behind us now -- not part of the window below
+
+    for (int i = 0; i < 20; ++i) {  // never drained -- must overflow and coalesce
+        update_field(m, o, [&](Order* p) { p->qty = i; });
+    }
+
+    int mentions = 0;
+    bool saw_coalesced = false;
+    std::int64_t last_qty = -1;
+    Update u;
+    while (sub->try_drain(u)) {
+        if (u.coalesced) saw_coalesced = true;
+        for (const Change& c : *u.changes) {
+            if (c.id != o.raw()) continue;
+            ++mentions;
+            CHECK(c.kind == ChangeKind::Updated);
+        }
+        if (const Order* p = u.snapshot.find(o)) last_qty = p->qty;
+    }
+    CHECK(mentions >= 1);
+    CHECK(saw_coalesced);
+    CHECK_EQ(last_qty, std::int64_t{19});  // the last drained batch always carries the newest snapshot
+}
+
 // Subscription::collapse's create+delete cancellation: an object created
 // and deleted before the subscriber ever drains never appears in the
 // delivered changeset at all, not even as a no-op pair.
@@ -92,6 +131,37 @@ TEST(create_then_delete_between_drains_cancels_out) {
     }
     CHECK_EQ(mentions_o, 0);
     CHECK(mentions_a >= 1);
+}
+
+// The Updated+Deleted merge rule: unlike Created+Deleted above (which cancels
+// out entirely, because the object never existed as far as any subscriber
+// could tell), an object the subscriber already knows about that gets
+// updated and then deleted within the same coalescing window must still be
+// reported -- its deletion IS a real net effect other observers care about.
+// The merge collapses the pair down to a single Deleted entry, not two
+// entries and not zero.
+TEST(update_then_delete_in_one_coalescing_window_collapses_to_deleted_not_cancelled) {
+    Model m;
+    auto sub = m.subscribe(/*depth=*/1);
+
+    const Ref<Account> a = make_account(m, "A1", 1);
+    Update drain;
+    while (sub->try_drain(drain)) {
+    }  // a's own Created is behind us now -- not part of the window below
+
+    // depth=1: the update below is queued; the delete right after it is what
+    // overflows the queue and triggers collapse() against that queued update.
+    update_field(m, a, [](Account* p) { p->balance = 2; });
+    remove_and_commit(m, a);
+
+    Update u;
+    CHECK(sub->try_drain(u));
+    CHECK(u.coalesced);
+    CHECK_EQ(u.changes->size(), std::size_t{1});
+    CHECK((*u.changes)[0].id == a.raw());
+    CHECK((*u.changes)[0].kind == ChangeKind::Deleted);
+    CHECK(u.snapshot.find(a) == nullptr);  // gone as of this (merged) Update's snapshot
+    CHECK(!sub->try_drain(u));             // collapse() always leaves exactly one entry
 }
 
 // Real cross-thread producer/consumer: every other Subscription test above
