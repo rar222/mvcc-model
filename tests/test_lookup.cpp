@@ -465,6 +465,8 @@ TEST(scan_and_cached_field_agree_after_a_mutate_and_a_create_in_one_transaction)
     Snapshot s0 = m.snapshot();
     CHECK_EQ(s0.find_by_scan_field<&Order::qty>(5).size(), std::size_t{2});
     CHECK_EQ(s0.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK(s0.find(o1) != nullptr);  // baseline: o1's Id resolves, qty still 5
+    CHECK_EQ(s0.find(o1)->qty, std::int64_t{5});
 
     Transaction txn = m.begin();
     txn.update(o1)->qty = 9;  // o1 drops out of the qty==5 match set
@@ -477,6 +479,15 @@ TEST(scan_and_cached_field_agree_after_a_mutate_and_a_create_in_one_transaction)
     const Ref<Order> o3_real = res.to_real(local3);
 
     Snapshot s1 = m.snapshot();
+
+    // o1's own Id still resolves in s1 -- proving update() mutated the SAME
+    // logical object rather than deleting it and something else (e.g. o3)
+    // landing in a recycled slot. A remove+recreate would bump Id::gen and
+    // make o1.raw() a stale Id that find() rejects; see invariant 5.
+    const Order* o1_in_s1 = s1.find(o1);
+    CHECK(o1_in_s1 != nullptr);
+    CHECK_EQ(o1_in_s1->qty, std::int64_t{9});
+
     const auto scan = s1.find_by_scan_field<&Order::qty>(5);
     const auto cached = s1.find_by_cached_field<&Order::qty>(5);
     CHECK_EQ(scan.size(), std::size_t{2});
