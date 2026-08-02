@@ -5,8 +5,9 @@
 // nulled survivor) BEFORE Stage 2 wires up automatic capture into Model
 // itself. `TestUndoAction`/`apply_test_undo` below are a deliberately
 // temporary, test-local preview of Stage 2's real Model::UndoAction/
-// Model::apply_undo -- same shape, same two-pass algorithm -- so this file's
-// tests double as a spec for what Stage 2 has to reproduce automatically.
+// Model::take_undo reconstruction -- same shape, same two-pass algorithm --
+// so this file's tests double as a spec for what Stage 2 has to reproduce
+// automatically.
 
 #include <any>
 #include <atomic>
@@ -34,12 +35,13 @@ struct TestUndoAction {
     std::unique_ptr<ObjectBase> previous_value;
 };
 
-/// Preview of Stage 2's Model::apply_undo: mints every Recreate action's new
-/// local id first (mirrors the pre-mint pass), so victim-to-victim edges
-/// remap correctly regardless of visitation order, then applies every
-/// action against the fresh Transaction. Clones each action's snapshot
-/// again rather than consuming it, so the caller's `actions` survives a
-/// failed/conflicting attempt intact, exactly like the real apply_undo will.
+/// Preview of Stage 2's Model::take_undo reconstruction: mints every
+/// Recreate action's new local id first (mirrors the pre-mint pass), so
+/// victim-to-victim edges remap correctly regardless of visitation order,
+/// then applies every action against the fresh Transaction. Clones each
+/// action's snapshot again rather than consuming it, so the caller's
+/// `actions` survives a failed/conflicting attempt intact, exactly like the
+/// real take_undo() will.
 CommitResult apply_test_undo(Model& m, const std::vector<TestUndoAction>& actions) {
     Transaction inv = m.begin();
     std::unordered_map<Id, Id, IdHash> old_to_new;
@@ -227,8 +229,8 @@ TEST(undo_reconnects_a_multi_object_cascade_including_victim_to_victim_edges) {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2: Model's OWN automatic capture (list_undo/take_undo/clear_undo_list/
-// apply_undo), not the hand-built TestUndoAction preview above.
+// Stage 2: Model's OWN automatic capture (list_undo/take_undo/
+// clear_undo_list), not the hand-built TestUndoAction preview above.
 // ---------------------------------------------------------------------------
 
 // A pure create's own undo entry is a single Remove action -- no snapshot
@@ -240,11 +242,11 @@ TEST(undo_list_captures_a_pure_create_and_apply_undo_removes_it) {
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{1});
 
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
     CHECK(m.list_undo().empty());  // taken -- no longer listed
 
-    const CommitResult undo_res = m.apply_undo(*entry);
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
     CHECK(m.snapshot().find(a) == nullptr);
 }
@@ -261,10 +263,10 @@ TEST(undo_list_captures_a_pure_update_and_apply_undo_restores_the_old_value) {
 
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{1});
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
 
-    const CommitResult undo_res = m.apply_undo(*entry);
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
     CHECK_EQ(m.snapshot().find(a)->balance, std::int64_t{100});
 }
@@ -281,10 +283,10 @@ TEST(undo_list_captures_a_pure_remove_and_apply_undo_resurrects_with_a_new_id) {
 
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{1});
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
 
-    const CommitResult undo_res = m.apply_undo(*entry);
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
     const Account* revived = m.snapshot().find_by_key<&Account::name>("A1");
     CHECK(revived != nullptr);
@@ -314,9 +316,9 @@ TEST(undo_list_captures_a_real_cascade_and_apply_undo_reconnects_it) {
     // hub, mid1, mid2 (Recreate) + surv (RestoreUpdate, its parent nulled).
     CHECK_EQ(summaries.front().action_count, std::size_t{4});
 
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
-    const CommitResult undo_res = m.apply_undo(*entry);
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
 
     Snapshot post = m.snapshot();
@@ -363,10 +365,10 @@ TEST(apply_undo_of_a_same_transaction_create_then_cascade_delete_does_not_resurr
 
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{1});
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
 
-    const CommitResult undo_res = m.apply_undo(*entry);
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
 
     // The commit's net, externally-observable effect was "SURVIVOR exists,
@@ -401,10 +403,10 @@ TEST(apply_undo_of_a_same_transaction_update_then_cascade_delete_restores_the_tr
 
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{1});
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
 
-    const CommitResult undo_res = m.apply_undo(*entry);
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
 
     Snapshot post = m.snapshot();
@@ -417,8 +419,8 @@ TEST(apply_undo_of_a_same_transaction_update_then_cascade_delete_restores_the_tr
 
 // Try to break the conflict-invalidation rule: a later commit touching an
 // id an EARLIER undo entry depends on must drop that entry from the list --
-// otherwise take_undo()/apply_undo() could silently apply a stale
-// RestoreUpdate over a legitimate, newer change.
+// otherwise take_undo() could silently hand back a transaction that would
+// apply a stale RestoreUpdate over a legitimate, newer change.
 TEST(a_later_conflicting_commit_invalidates_an_earlier_undo_entry) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 100);
@@ -719,33 +721,41 @@ TEST(set_max_undo_list_size_and_memory_bytes_caps_both_apply) {
     CHECK_EQ(m.list_undo().size(), std::size_t{2});  // the tighter (byte) cap wins
 }
 
-// apply_undo is not a special-cased path: it just builds a Transaction and
-// calls try_commit(), so a stale entry -- one whose reconstruction would now
-// dangle -- reports Invalid exactly like any other build-time integrity
-// violation, publishes nothing, and never consumes the caller's entry (it
-// clones internally), so it's still usable afterward.
-TEST(apply_undo_reports_invalid_instead_of_resurrecting_a_dangling_reference) {
+// take_undo() is not a special-cased path: it just builds a Transaction the
+// caller commits themselves via an ordinary try_commit(), so a stale entry --
+// one whose reconstruction would now dangle -- reports Invalid exactly like
+// any other build-time integrity violation, and publishes nothing.
+//
+// `owner` must already be gone BEFORE take_undo() builds the reconstruction,
+// not just before the caller's try_commit(): take_undo() fixes the returned
+// Transaction's base() immediately (unlike the old two-call apply_undo(),
+// which built its Transaction fresh at commit time), and classify_apply_
+// failure() tells Invalid from Conflict/RefIntegrity by whether the dangling
+// target still existed at THAT base -- see take_undo_can_itself_report_
+// conflict_against_a_concurrent_commit below for the "still alive at base,
+// killed after" (Conflict) half of that split.
+TEST(take_undo_reports_invalid_instead_of_resurrecting_a_dangling_reference) {
     Model m;
     const Ref<Account> owner = make_account(m, "OWNER");
     const Ref<Order> o = make_order(m, "O1", owner);
     m.clear_undo_list();
 
-    remove_and_commit(m, o);  // captures o's Recreate action, referencing `owner`
-    auto entry = m.take_undo(m.list_undo().front().version);
-    CHECK(entry.has_value());
+    remove_and_commit(m, o);      // captures o's Recreate action, referencing `owner`
+    remove_and_commit(m, owner);  // owner is now ALSO gone, before take_undo() ever sees it
 
-    remove_and_commit(m, owner);  // owner is now ALSO gone
+    auto undo_txn = m.take_undo(m.list_undo().front().version);
+    CHECK(undo_txn.has_value());
 
-    const CommitResult undo_res = m.apply_undo(*entry);
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Invalid);  // resurrecting o would dangle
     CHECK(m.snapshot().find_by_key<&Order::computed_key>("ord:O1") == nullptr);  // nothing published
-    CHECK_EQ(entry->actions.size(), std::size_t{1});  // the caller's copy survives, untouched
 }
 
-// UndoEntry/UndoSummary copy the committing Transaction's name()/data() --
-// both through list_undo() (the copy-only path) and take_undo() (the
-// move-out path).
-TEST(undo_entry_and_summary_copy_the_committing_transactions_name_and_data) {
+// UndoSummary copies the committing Transaction's name()/data() -- what
+// list_undo() surfaces before a caller ever calls take_undo(). (take_undo()
+// itself takes its OWN, separate name/data -- to label the undo transaction
+// it hands back, not to read these back; see the test below.)
+TEST(undo_summary_copies_the_committing_transactions_name_and_data) {
     Model m;
     Transaction txn = m.begin("seed accounts", std::any(std::string("batch-7")));
     auto a = std::make_unique<Account>();
@@ -759,12 +769,20 @@ TEST(undo_entry_and_summary_copy_the_committing_transactions_name_and_data) {
     CHECK_EQ(summaries.front().name, std::string("seed accounts"));
     CHECK(summaries.front().data.has_value());
     CHECK_EQ(std::any_cast<std::string>(summaries.front().data), std::string("batch-7"));
+}
 
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
-    CHECK_EQ(entry->name, std::string("seed accounts"));
-    CHECK(entry->data.has_value());
-    CHECK_EQ(std::any_cast<std::string>(entry->data), std::string("batch-7"));
+// take_undo()'s own name/data params label the Transaction it hands back --
+// same params as Transaction::begin(), read back the same way.
+TEST(take_undo_labels_the_returned_transaction_with_its_own_name_and_data) {
+    Model m;
+    make_account(m, "A1");
+
+    auto undo_txn = m.take_undo(m.list_undo().front().version, "undo: seed accounts",
+                                 std::any(std::string("undo-batch-7")));
+    CHECK(undo_txn.has_value());
+    CHECK_EQ(undo_txn->name(), std::string("undo: seed accounts"));
+    CHECK(undo_txn->data().has_value());
+    CHECK_EQ(std::any_cast<std::string>(undo_txn->data()), std::string("undo-batch-7"));
 }
 
 // A plain, unlabeled begin() (the common case) produces an UndoEntry/
@@ -780,37 +798,42 @@ TEST(undo_entry_and_summary_default_to_empty_name_and_no_data) {
     CHECK(!summaries.front().data.has_value());
 }
 
-// apply_undo() is not special-cased in the capture pipeline: it just calls
-// try_commit() on an ordinary Transaction, so its OWN commit gets captured
-// exactly like any other -- meaning undoing something produces a fresh undo
-// entry of its own (an "undo of an undo" is a redo), and the chain can go
-// on indefinitely (create -> undo removes it -> undo-the-undo recreates it
-// with a NEW id -> ...).
+// take_undo() is not special-cased in the capture pipeline: committing the
+// Transaction it hands back is an ordinary try_commit(), so that commit gets
+// captured exactly like any other -- meaning undoing something produces a
+// fresh undo entry of its own (an "undo of an undo" is a redo), and the
+// chain can go on indefinitely (create -> undo removes it -> undo-the-undo
+// recreates it with a NEW id -> ...).
 TEST(applying_an_undo_produces_a_new_undo_entry_of_its_own) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 7);
 
-    auto create_entry = m.take_undo(m.list_undo().front().version);
-    CHECK(create_entry.has_value());
-    CHECK_EQ(create_entry->actions.size(), std::size_t{1});
-    CHECK(create_entry->actions.front().kind == Model::UndoAction::Kind::Remove);
+    auto undo1_txn = m.take_undo(m.list_undo().front().version);
+    CHECK(undo1_txn.has_value());
+    // Undoing a create is a remove -- no pending_changes() entry, just a
+    // remove intent.
+    CHECK_EQ(undo1_txn->remove_intents().size(), std::size_t{1});
+    CHECK(undo1_txn->pending_changes().empty());
 
-    const CommitResult undo1 = m.apply_undo(*create_entry);
+    const CommitResult undo1 = m.try_commit(*undo1_txn);
     CHECK(undo1.status == CommitStatus::Committed);
     CHECK(m.snapshot().find(a) == nullptr);  // A1 removed
 
-    // Undoing the create produced its OWN entry -- a Recreate action, the
-    // inverse of the Remove that just ran.
+    // Undoing the create produced its OWN entry -- a Recreate, the inverse
+    // of the Remove that just ran.
     const auto after_undo1 = m.list_undo();
     CHECK_EQ(after_undo1.size(), std::size_t{1});
-    auto remove_entry = m.take_undo(after_undo1.front().version);
-    CHECK(remove_entry.has_value());
-    CHECK_EQ(remove_entry->actions.size(), std::size_t{1});
-    CHECK(remove_entry->actions.front().kind == Model::UndoAction::Kind::Recreate);
+    auto undo2_txn = m.take_undo(after_undo1.front().version);
+    CHECK(undo2_txn.has_value());
+    // Undoing a remove is a Recreate -- one Created pending change, no
+    // remove intents.
+    CHECK_EQ(undo2_txn->pending_changes().size(), std::size_t{1});
+    CHECK(undo2_txn->pending_changes().front().kind == ChangeKind::Created);
+    CHECK(undo2_txn->remove_intents().empty());
 
-    // Applying THAT entry (undo-of-the-undo, i.e. redo) resurrects A1 --
-    // with a new id, per invariant 5 -- and produces yet another entry.
-    const CommitResult undo2 = m.apply_undo(*remove_entry);
+    // Applying THAT transaction (undo-of-the-undo, i.e. redo) resurrects A1
+    // -- with a new id, per invariant 5 -- and produces yet another entry.
+    const CommitResult undo2 = m.try_commit(*undo2_txn);
     CHECK(undo2.status == CommitStatus::Committed);
     const Account* revived = m.snapshot().find_by_key<&Account::name>("A1");
     CHECK(revived != nullptr);
@@ -912,10 +935,10 @@ TEST(run_pre_transaction_without_undo_commits_normally_but_adds_no_undo_entry) {
 
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{1});  // only MAIN's entry -- PRE's was suppressed
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
-    CHECK_EQ(entry->actions.size(), std::size_t{1});
-    const CommitResult undo_res = m.apply_undo(*entry);
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
+    CHECK_EQ(undo_txn->remove_intents().size(), std::size_t{1});
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
     CHECK(m.snapshot().find_by_key<&Account::name>("MAIN") == nullptr);  // MAIN undone
     CHECK(m.snapshot().find_by_key<&Account::name>("PRE") != nullptr);   // PRE unaffected -- never listed
@@ -992,12 +1015,11 @@ TEST(run_pre_transaction_captures_an_undo_entry_for_the_pre_transaction) {
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{2});
 
-    auto pre_entry = m.take_undo(pre_version);
-    CHECK(pre_entry.has_value());
-    CHECK_EQ(pre_entry->actions.size(), std::size_t{1});
-    CHECK(pre_entry->actions.front().kind == Model::UndoAction::Kind::Remove);
+    auto pre_undo_txn = m.take_undo(pre_version);
+    CHECK(pre_undo_txn.has_value());
+    CHECK_EQ(pre_undo_txn->remove_intents().size(), std::size_t{1});  // undoing a create is a remove
 
-    const CommitResult undo_res = m.apply_undo(*pre_entry);
+    const CommitResult undo_res = m.try_commit(*pre_undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
     // Only PRE's effect is reversed -- MAIN, committed separately by a
     // different call, is untouched by undoing PRE.
@@ -1005,20 +1027,21 @@ TEST(run_pre_transaction_captures_an_undo_entry_for_the_pre_transaction) {
     CHECK(m.snapshot().find_by_key<&Account::name>("MAIN") != nullptr);
 }
 
-// apply_undo() is not special-cased against concurrency: it is just
-// begin()+try_commit() (see its own doc comment), so a commit that lands
-// between its begin() (which fixes the reconstruction's base) and its own
-// check_id_overlap is exactly as real a race as any two writer threads
-// hammering try_commit() -- it is reported as an ordinary Conflict, not
-// silently absorbed or misclassified as Invalid. Simulated deterministically
-// via the pre-transactions hook: PreTransactionsFn runs at the very start of
-// ANY try_commit() attempt (including the one apply_undo() makes internally)
-// -- from apply_undo()'s reconstruction's perspective, a commit landing there
-// is indistinguishable from a different writer thread racing it (see
-// main_transaction_conflicts_with_a_pre_transaction_touching_the_same_object
-// in test_hooks.cpp, which establishes the same equivalence for an ordinary
-// transaction).
-TEST(apply_undo_can_itself_report_conflict_against_a_concurrent_commit) {
+// take_undo()'s returned Transaction is not special-cased against
+// concurrency: committing it is just an ordinary try_commit(), so a commit
+// that lands between take_undo() (which fixes the reconstruction's base) and
+// that try_commit()'s own check_id_overlap is exactly as real a race as any
+// two writer threads hammering try_commit() -- it is reported as an ordinary
+// Conflict, not silently absorbed or misclassified as Invalid. Simulated
+// deterministically via the pre-transactions hook: PreTransactionsFn runs at
+// the very start of ANY try_commit() attempt -- from the undo transaction's
+// perspective, a commit landing there is indistinguishable from a different
+// writer thread racing it (see main_transaction_conflicts_with_a_pre_
+// transaction_touching_the_same_object in test_hooks.cpp, which establishes
+// the same equivalence for an ordinary transaction). There is no retry here
+// -- see take_undo()'s own doc comment for why a Conflict on an already-taken
+// entry isn't a race worth automatically re-fighting.
+TEST(take_undo_can_itself_report_conflict_against_a_concurrent_commit) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 100);
     m.clear_undo_list();  // only interested in the update's own entry below
@@ -1026,12 +1049,12 @@ TEST(apply_undo_can_itself_report_conflict_against_a_concurrent_commit) {
     update_field(m, a, [](Account* p) { p->balance = 999; });
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{1});
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
 
-    // A "concurrent" commit that lands after apply_undo()'s begin() (fixing
-    // its base) but before its own conflict check -- touching the SAME
-    // object the taken entry's RestoreUpdate action targets.
+    // A "concurrent" commit that lands after take_undo() (fixing the
+    // reconstruction's base) but before the caller's own try_commit() --
+    // touching the SAME object the taken transaction's RestoreUpdate targets.
     m.set_pre_transactions([a](Model& model, const Transaction&) {
         Transaction concurrent = model.begin();
         concurrent.update(a)->balance = 555;
@@ -1039,7 +1062,7 @@ TEST(apply_undo_can_itself_report_conflict_against_a_concurrent_commit) {
         CHECK(r.status == CommitStatus::Committed);
     });
 
-    const CommitResult undo_res = m.apply_undo(*entry);
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Conflict);
     CHECK(undo_res.conflict.has_value());
     CHECK(undo_res.conflict->reason == ConflictReason::IdSetOverlap);
@@ -1078,13 +1101,13 @@ TEST(clear_undo_list_does_not_affect_an_already_taken_entrys_usability) {
     const Ref<Account> a = make_account(m, "A1");
     const auto summaries = m.list_undo();
     CHECK_EQ(summaries.size(), std::size_t{1});
-    auto entry = m.take_undo(summaries.front().version);
-    CHECK(entry.has_value());
+    auto undo_txn = m.take_undo(summaries.front().version);
+    CHECK(undo_txn.has_value());
     CHECK(m.list_undo().empty());  // already gone from the live list
 
     m.clear_undo_list();  // a no-op on the (already empty) live list here
 
-    const CommitResult undo_res = m.apply_undo(*entry);
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
     CHECK(m.snapshot().find(a) == nullptr);
 }
@@ -1109,9 +1132,9 @@ TEST(undo_entry_survives_an_unrelated_commit_that_touches_no_shared_id) {
         if (s.version == version_x) found_x = true;
     CHECK(found_x);
 
-    auto entry = m.take_undo(version_x);
-    CHECK(entry.has_value());
-    const CommitResult undo_res = m.apply_undo(*entry);
+    auto undo_txn = m.take_undo(version_x);
+    CHECK(undo_txn.has_value());
+    const CommitResult undo_res = m.try_commit(*undo_txn);
     CHECK(undo_res.status == CommitStatus::Committed);
     CHECK(m.snapshot().find(x) == nullptr);
     CHECK(m.snapshot().find_by_key<&Account::name>("Y") != nullptr);  // Y, untouched throughout
@@ -1132,7 +1155,7 @@ TEST(undo_entry_survives_an_unrelated_commit_that_touches_no_shared_id) {
 // takes the entry; a completely different thread applies it.
 TEST(a_different_thread_can_apply_another_threads_undo_entry) {
     Model m;
-    std::optional<Model::UndoEntry> entry;
+    std::optional<Transaction> undo_txn;
     CommitStatus write_status{};
 
     std::thread writer([&] {
@@ -1144,16 +1167,16 @@ TEST(a_different_thread_can_apply_another_threads_undo_entry) {
         write_status = res.status;
         if (res.status == CommitStatus::Committed) {
             auto taken = m.take_undo(res.snapshot.version());
-            if (taken.has_value()) entry = std::move(taken);
+            if (taken.has_value()) undo_txn = std::move(taken);
         }
     });
     writer.join();
     CHECK(write_status == CommitStatus::Committed);
-    CHECK(entry.has_value());
+    CHECK(undo_txn.has_value());
 
     CommitStatus undo_status{};
     std::thread undoer([&] {
-        const CommitResult undo_res = m.apply_undo(*entry);
+        const CommitResult undo_res = m.try_commit(*undo_txn);
         undo_status = undo_res.status;
     });
     undoer.join();
@@ -1210,15 +1233,15 @@ TEST(concurrent_conflicting_commits_prune_exactly_the_undo_entries_they_invalida
     // Every survivor can be taken and later applied without conflict --
     // proof that the survivors are genuinely independent of each other and
     // of everything that got pruned along the way.
-    std::vector<Model::UndoEntry> taken;
+    std::vector<Transaction> taken;
     for (const auto& s : summaries) {
-        auto entry = m.take_undo(s.version);
-        CHECK(entry.has_value());
-        if (entry.has_value()) taken.push_back(std::move(*entry));
+        auto undo_txn = m.take_undo(s.version);
+        CHECK(undo_txn.has_value());
+        if (undo_txn.has_value()) taken.push_back(std::move(*undo_txn));
     }
     CHECK(m.list_undo().empty());  // every survivor was taken
 
-    for (const auto& entry : taken) CHECK(m.apply_undo(entry).status == CommitStatus::Committed);
+    for (auto& undo_txn : taken) CHECK(m.try_commit(undo_txn).status == CommitStatus::Committed);
 
     for (int t = 0; t < kThreads; ++t)
         CHECK(m.snapshot().find_by_key<&Account::name>("PRIVATE" + std::to_string(t)) == nullptr);
@@ -1272,10 +1295,10 @@ TEST(each_writer_thread_can_undo_all_of_its_own_private_transactions_in_order) {
         undoers.emplace_back([&, t] {
             bool ok = true;
             for (std::uint64_t version : per_thread_versions[t]) {  // in commit order
-                auto entry = m.take_undo(version);
-                ok = ok && entry.has_value();
-                if (entry.has_value()) {
-                    const CommitResult res = m.apply_undo(*entry);
+                auto undo_txn = m.take_undo(version);
+                ok = ok && undo_txn.has_value();
+                if (undo_txn.has_value()) {
+                    const CommitResult res = m.try_commit(*undo_txn);
                     ok = ok && (res.status == CommitStatus::Committed);
                 }
             }

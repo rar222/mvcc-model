@@ -419,7 +419,7 @@ struct RefRemapper {
 
 /// The mirror image of RefRemapper: RefRemapper only ever rewrites LOCAL
 /// ids (the pre-mint pass); this rewrites OLD REAL ids that are themselves
-/// being recreated by THIS SAME undo application (see Model::apply_undo),
+/// being recreated by THIS SAME undo reconstruction (see Model::take_undo),
 /// leaving every other id -- still alive and unaffected -- completely
 /// untouched. Kept as its own type rather than generalizing RefRemapper,
 /// matching this codebase's own stated preference (see commit_bulk_without_undo()'s
@@ -667,7 +667,7 @@ public:
     /// Overwrite this object's own fields with `other`'s (Object<Derived>
     /// implements it via the copy-assignment operator -- the same
     /// copyability clone() already requires, just assigned instead of
-    /// constructed). Used by Model::apply_undo to restore a RestoreUpdate
+    /// constructed). Used by Model::take_undo to restore a RestoreUpdate
     /// action's captured pre-image onto a currently-live object generically,
     /// without knowing its concrete type. `other` must be the same concrete
     /// type as `this` -- same precondition tag()-checked casts everywhere
@@ -717,7 +717,7 @@ public:
     /// Same idea as remap_refs, via UndoRemapper instead of RefRemapper --
     /// a separate virtual because remap_refs() is hard-bound to that one
     /// concrete visitor type (unlike each_ref(), which takes a type-erased
-    /// std::function). Only ever called by Model::apply_undo. See
+    /// std::function). Only ever called by Model::take_undo. See
     /// UndoRemapper's own comment for why this exists.
     virtual void remap_undo_refs(const UndoRemapper&) {}
 
@@ -2290,8 +2290,8 @@ public:
 
     /// One committed transaction's full inverse recipe. `touched` is every
     /// id that commit's OWN changes_ mentioned (Created ∪ Updated ∪
-    /// Deleted) -- deliberately broader than just the ids apply_undo()
-    /// would need to act on, so a later commit touching ANY of them
+    /// Deleted) -- deliberately broader than just the ids take_undo()'s
+    /// reconstruction would need to act on, so a later commit touching ANY of them
     /// invalidates this entry (see the undo list's own comment, next to
     /// undo_list_, for why the broad reading was chosen over a narrower
     /// one that would only watch RestoreUpdate targets).
@@ -2318,15 +2318,15 @@ public:
         /// once (a same-transaction create-then-cascade-delete, or an
         /// update()/cascade-null followed by a cascade delete of the same
         /// object -- see Change's own doc comment for why changes_ itself is
-        /// allowed to report an id twice; actions never is). apply_undo()
-        /// doesn't care what order these run in (it pre-mints every
+        /// allowed to report an id twice; actions never is). take_undo()'s
+        /// reconstruction doesn't care what order these run in (it pre-mints every
         /// Recreate's new id in its own first pass before remapping
         /// anything) -- so no ordering is promised here.
         std::vector<UndoAction> actions;
 
         /// Every id this commit's OWN changes_ mentioned (Created ∪
         /// Updated ∪ Deleted) -- see the struct comment above for why this
-        /// is broader than just the ids apply_undo() would act on. A later
+        /// is broader than just the ids take_undo()'s reconstruction would act on. A later
         /// commit that touches ANY id in this set invalidates the whole
         /// entry (the loop in try_commit() that erases conflicting undo_list_
         /// entries), not just the actions that reference it.
@@ -2360,8 +2360,7 @@ public:
         /// `previous_value->byte_size()` for the ones that carry a clone
         /// (Remove actions don't -- see UndoAction::previous_value). Computed
         /// once, in publish_now(), at the same point `actions` reaches its
-        /// final (collapsed) contents -- NOT recomputed by take_undo() or
-        /// apply_undo(). Same "approximate, not exact" caveat as
+        /// final (collapsed) contents -- NOT recomputed by take_undo(). Same "approximate, not exact" caveat as
         /// ObjectBase::byte_size(): touched/name/data's own bytes aren't
         /// included, so this undercounts by their size. What
         /// set_max_undo_memory_bytes() budgets against.
@@ -2381,7 +2380,7 @@ public:
         /// comment for why it's the commit's PUBLISHED version (the same
         /// number CommitResult::snapshot.version() returned for this
         /// commit), not Transaction::id(). Pass this straight to
-        /// take_undo() to retrieve the full entry.
+        /// take_undo() to get back the Transaction that inverts it.
         std::uint64_t version;
 
         /// UndoEntry::actions.size(), so a caller can gauge an entry's
@@ -2410,16 +2409,31 @@ public:
     /// same as a pruned changelog_ entry.
     std::vector<UndoSummary> list_undo() const;
 
-    /// Removes and returns ownership of the entry for `version`, or
-    /// nullopt if no such entry is in the list (never committed with undo
-    /// data, already taken, or pruned by a later conflicting commit).
-    /// Ownership transfer, not a copy: UndoEntry holds move-only
-    /// unique_ptr<ObjectBase> clones. Once taken, this entry is the
-    /// caller's alone -- it will never be pruned out from under them (it's
-    /// no longer in undo_list_ to prune), and calling apply_undo() with it
-    /// is safe to retry as many times as they like (apply_undo clones
-    /// internally; it never consumes the entry it's given).
-    std::optional<UndoEntry> take_undo(std::uint64_t version);
+    /// Removes the entry for `version` from the list and builds -- but does
+    /// NOT commit -- the Transaction that inverts it: mints every Recreate
+    /// action's new local id up front (mirrors the pre-mint pass, so
+    /// victim-to-victim edges among resurrected objects remap correctly
+    /// regardless of order -- see UndoRemapper), then applies every action,
+    /// remapping each captured snapshot's own ref fields before writing it.
+    /// `name`/`data` label the returned Transaction (Transaction::begin()'s
+    /// own params). nullopt if no such entry is in the list (never
+    /// committed with undo data, already taken, or pruned by a later
+    /// conflicting commit).
+    ///
+    /// The caller commits it themselves via try_commit(), exactly like any
+    /// other Transaction -- which is what lets them label it, extend it
+    /// with more edits (e.g. to repair a reference before it would dangle),
+    /// or just inspect it first. There is deliberately no retry path if
+    /// that try_commit() reports Conflict: the entry is already gone from
+    /// undo_list_ by the time this returns, and reconstructing the exact
+    /// same edits against a fresher base would only mean overwriting
+    /// whatever just landed on the same id(s) -- not a race worth
+    /// automatically re-fighting, unlike an ordinary Transaction's retry
+    /// loop. (Invalid was never meaningfully retryable either way: it means
+    /// a referenced id is gone for good -- invariant 5 -- so the fix, if
+    /// there is one, is editing the returned Transaction before committing,
+    /// not retrying take_undo() itself.)
+    std::optional<Transaction> take_undo(std::uint64_t version, std::string name = "", std::any data = {});
 
     /// Drops every entry, to reclaim memory (per-entry snapshot clones are
     /// proportional to that commit's OWN change size, but a long-running
@@ -2500,20 +2514,6 @@ public:
             total_undo_bytes_ = 0;
         }
     }
-
-    /// Builds a fresh Transaction from `entry` and commits it: mints a new
-    /// local id for every Recreate action first (mirrors the pre-mint
-    /// pass, so victim-to-victim edges among resurrected objects remap
-    /// correctly regardless of order -- see UndoRemapper), then applies
-    /// every action, remapping each captured snapshot's own ref fields
-    /// (old real id -> new local id, for anything ALSO being recreated
-    /// this same call) before writing it. Takes `entry` by const reference
-    /// and clones every action's snapshot again rather than consuming it,
-    /// so a Conflict/Invalid result never destroys the caller's only copy
-    /// -- they can inspect what beat them (Model::snapshot()) and retry.
-    /// Not called from inside any hook: this calls begin()/try_commit()
-    /// itself, exactly like any other ordinary application code would.
-    CommitResult apply_undo(const UndoEntry& entry);
 
 private:
     friend struct Snapshot::Lease;
@@ -2960,11 +2960,11 @@ private:
     /// cascade-null followed by a cascade DELETE of that same object
     /// (RestoreUpdate, then Recreate), or several cascade-nulls of different
     /// fields on one referrer (RestoreUpdate, RestoreUpdate, ...). Naively
-    /// replaying every action apply_undo() would otherwise resurrect
+    /// replaying every action take_undo()'s reconstruction would otherwise resurrect
     /// something that was never actually visible (a Recreate outliving an
     /// earlier Remove) or restore an intermediate, WRONG value (a later
     /// action capturing this same transaction's own earlier edit instead of
-    /// the true pre-transaction baseline) -- apply_undo() makes no promise
+    /// the true pre-transaction baseline) -- take_undo() makes no promise
     /// about the order actions run in, so leaving duplicates in is not safe
     /// even though they'd often cancel out by luck. Called once, from the
     /// tail of apply_transaction_contents() (guarded by keep_undo there, the
@@ -3829,7 +3829,7 @@ public:
     /// Transaction generically across many object types, without a
     /// per-type dispatch table (same reasoning as Model::peek_raw
     /// alongside peek_as<T>). Returns the bare local Id instead of a typed
-    /// Ref<T>, since there is no T to name here. Used by Model::apply_undo
+    /// Ref<T>, since there is no T to name here. Used by Model::take_undo
     /// to recreate a cascade-deleted object without knowing its type.
     Id create_raw(std::unique_ptr<ObjectBase> o);
 
@@ -3851,7 +3851,7 @@ public:
     }
 
     /// Untyped counterpart of update<T> -- same reasoning as create_raw.
-    /// Used by Model::apply_undo, both for a just-recreated local object
+    /// Used by Model::take_undo, both for a just-recreated local object
     /// (remapping its own ref fields) and for restoring a still-real
     /// object's pre-image (RestoreUpdate actions). Also update<T>'s own
     /// body: local id -> the already-owned local_created_ entry (create()-

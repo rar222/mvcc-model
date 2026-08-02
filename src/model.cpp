@@ -2226,27 +2226,22 @@ std::vector<Model::UndoSummary> Model::list_undo() const {
     return out;
 }
 
-std::optional<Model::UndoEntry> Model::take_undo(std::uint64_t version) {
-    std::lock_guard lk(commit_mu_);
-    for (auto it = undo_list_.begin(); it != undo_list_.end(); ++it) {
-        if (it->version != version) continue;
-        untrack_undo_entry(*it);
-        UndoEntry taken = std::move(*it);
-        undo_list_.erase(it);
-        return taken;
+std::optional<Transaction> Model::take_undo(std::uint64_t version, std::string name, std::any data) {
+    std::optional<UndoEntry> taken;
+    {
+        std::lock_guard lk(commit_mu_);
+        for (auto it = undo_list_.begin(); it != undo_list_.end(); ++it) {
+            if (it->version != version) continue;
+            untrack_undo_entry(*it);
+            taken = std::move(*it);
+            undo_list_.erase(it);
+            break;
+        }
     }
-    return std::nullopt;
-}
+    if (!taken) return std::nullopt;
+    UndoEntry& entry = *taken;
 
-void Model::clear_undo_list() {
-    std::lock_guard lk(commit_mu_);
-    undo_list_.clear();
-    undo_touch_index_.clear();  // every entry it indexed is gone too
-    total_undo_bytes_ = 0;
-}
-
-CommitResult Model::apply_undo(const UndoEntry& entry) {
-    Transaction inv = begin();
+    Transaction inv = begin(std::move(name), std::move(data));
     std::unordered_map<Id, Id, IdHash> old_to_new;
     std::vector<Id> local(entry.actions.size());
 
@@ -2279,7 +2274,14 @@ CommitResult Model::apply_undo(const UndoEntry& entry) {
             }
         }
     }
-    return try_commit(inv);
+    return inv;
+}
+
+void Model::clear_undo_list() {
+    std::lock_guard lk(commit_mu_);
+    undo_list_.clear();
+    undo_touch_index_.clear();  // every entry it indexed is gone too
+    total_undo_bytes_ = 0;
 }
 
 CommitResult Model::commit_pretransaction_locked(Transaction& txn, bool keep_undo) {
