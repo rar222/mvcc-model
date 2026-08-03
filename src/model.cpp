@@ -81,8 +81,8 @@ const ObjectBase* Snapshot::find_by_key_raw(const void* field, const std::string
     return id ? find_raw(*id) : nullptr;
 }
 
-bool Snapshot::for_each_by_cached_field_raw(const void* field, const std::string& key,
-                                            const std::function<bool(Id)>& f) const {
+bool Snapshot::cached_field_short_circuit_raw(const void* field, const std::string& key,
+                                              const std::function<bool(Id)>& f) const {
     if (!root_) return true;  // default-constructed Snapshot: nothing to look up, vacuously complete
     // by_cached_field maps field-tag -> that field's own persistent multimap
     // of value -> set of every Id currently holding it -- same two-level
@@ -96,7 +96,7 @@ bool Snapshot::for_each_by_cached_field_raw(const void* field, const std::string
 
 std::vector<const ObjectBase*> Snapshot::find_by_cached_field_raw(const void* field, const std::string& key) const {
     std::vector<const ObjectBase*> out;
-    for_each_by_cached_field_raw(field, key, [&](Id id) {
+    cached_field_short_circuit_raw(field, key, [&](Id id) {
         // find_raw() re-checks the generation, same staleness guard as
         // find_by_key_raw -- a bucket entry surviving past its object's
         // removal (briefly, before reconciliation) can never alias a
@@ -105,6 +105,22 @@ std::vector<const ObjectBase*> Snapshot::find_by_cached_field_raw(const void* fi
         return true;  // collect every match, never stop early
     });
     return out;
+}
+
+void Snapshot::for_each_by_cached_field_raw(const void* field, const std::string& key,
+                                            const std::function<void(const ObjectBase&)>& f) const {
+    cached_field_short_circuit_raw(field, key, [&](Id id) {
+        if (const ObjectBase* o = find_raw(id)) f(*o);
+        return true;  // never stops early -- see this method's own doc comment
+    });
+}
+
+bool Snapshot::all_of_by_cached_field_raw(const void* field, const std::string& key,
+                                          const std::function<bool(const ObjectBase&)>& pred) const {
+    return cached_field_short_circuit_raw(field, key, [&](Id id) {
+        const ObjectBase* o = find_raw(id);
+        return !o || pred(*o);
+    });
 }
 
 struct Snapshot::Lease {

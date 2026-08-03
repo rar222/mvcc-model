@@ -1454,6 +1454,24 @@ public:
     /// same contract as find_by_key_raw.
     std::vector<const ObjectBase*> find_by_cached_field_raw(const void* field, const std::string& key) const;
 
+    /// Untyped counterpart of for_each_by_cached_field -- same relationship
+    /// find_by_cached_field_raw has to find_by_cached_field, just visiting
+    /// instead of collecting. Same naming convention as every other
+    /// for_each_* in this file: NEVER stops early, `f` is called for every
+    /// match. Use this over find_by_cached_field_raw when you don't need a
+    /// materialized vector; use all_of_by_cached_field_raw instead when you
+    /// DO want to stop early.
+    void for_each_by_cached_field_raw(const void* field, const std::string& key,
+                                      const std::function<void(const ObjectBase&)>& f) const;
+
+    /// Untyped counterpart of all_of_by_cached_field -- short-circuits:
+    /// `pred` returning false stops the walk immediately and this returns
+    /// false. Vacuously true if the field was never define_cached_fields()'d
+    /// or nothing currently holds `key`, same as every other lookup family's
+    /// empty-is-not-an-error contract.
+    bool all_of_by_cached_field_raw(const void* field, const std::string& key,
+                                    const std::function<bool(const ObjectBase&)>& pred) const;
+
 private:
     friend class Model;
     friend class Transaction;
@@ -1480,20 +1498,25 @@ private:
     template <auto Field, class F>
     bool scan_field_short_circuit(const member_value_t<decltype(Field)>& value, F&& f) const;
 
-    /// Shared, short-circuiting bucket walk behind for_each_by_cached_field<
-    /// Field>, all_of_by_cached_field<Field>, AND the public, untyped
-    /// find_by_cached_field_raw -- same relationship find_by_key_raw has to
-    /// find_by_key<Field> (see its own doc comment), just short-circuiting
-    /// and keyed by `Id` rather than a resolved object, so it can be a
-    /// single ordinary (non-template) method, defined once in model.cpp,
-    /// instead of duplicated per Field instantiation. `f` returns true to
-    /// keep going, false to stop early; this returns false iff `f` stopped
-    /// it (vacuously true if the field was never define_cached_fields()'d,
-    /// or nothing currently holds `key` -- same "undeclared/no-match is
-    /// empty, not an error" contract every lookup family in this file
-    /// shares).
-    bool for_each_by_cached_field_raw(const void* field, const std::string& key,
-                                      const std::function<bool(Id)>& f) const;
+    /// Shared, short-circuiting bucket walk behind EVERY cached-field lookup
+    /// in this file -- for_each_by_cached_field<Field>, all_of_by_cached_
+    /// field<Field>, find_by_cached_field_raw, for_each_by_cached_field_raw,
+    /// AND all_of_by_cached_field_raw. Same relationship find_by_key_raw has
+    /// to find_by_key<Field> (see its own doc comment), just short-
+    /// circuiting and keyed by `Id` rather than a resolved object, so it can
+    /// be a single ordinary (non-template) method, defined once in
+    /// model.cpp, instead of duplicated per Field instantiation. Named like
+    /// scan_field_short_circuit (its sibling for the scan family) rather
+    /// than "for_each_..." specifically because it DOES stop early -- the
+    /// public for_each_by_cached_field_raw above deliberately does not, to
+    /// match this file's for_each_* naming convention (see its own doc
+    /// comment). `f` returns true to keep going, false to stop early; this
+    /// returns false iff `f` stopped it (vacuously true if the field was
+    /// never define_cached_fields()'d, or nothing currently holds `key` --
+    /// same "undeclared/no-match is empty, not an error" contract every
+    /// lookup family in this file shares).
+    bool cached_field_short_circuit_raw(const void* field, const std::string& key,
+                                        const std::function<bool(Id)>& f) const;
 
     /// Generic ("any type, any field") counterpart of for_each_referrer<Field>:
     /// walks EVERY live object of EVERY type via by_type, and every one of
@@ -3500,7 +3523,7 @@ template <auto Field, class F>
 void Snapshot::for_each_by_cached_field(const member_value_t<decltype(Field)>& value, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
     record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-    for_each_by_cached_field_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
+    cached_field_short_circuit_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
         if (const ClassT* p = cast<ClassT>(find_raw(id))) f(*p);
         return true;  // for_each_by_cached_field never stops early
     });
@@ -3510,7 +3533,7 @@ template <auto Field, class Pred>
 bool Snapshot::all_of_by_cached_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const {
     using ClassT = member_class_t<decltype(Field)>;
     record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-    return for_each_by_cached_field_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
+    return cached_field_short_circuit_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
         const ClassT* p = cast<ClassT>(find_raw(id));
         return !p || pred(*p);
     });

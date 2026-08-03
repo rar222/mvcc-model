@@ -68,6 +68,26 @@ struct Labeled : virtual Entity {
     std::string description;
 };
 
+/// A pure TAG ANCHOR, not a mixin -- never instantiated, never inherited
+/// from, unrelated to Entity/Timestamped/Labeled and to ObjectBase. It
+/// exists solely so that &Keys::example_key is a stable, distinct
+/// pointer-to-member VALUE that field_tag<Field> can turn into an identity.
+/// FieldKeyReader::key<Field>(v, name) only ever uses Field for that --
+/// `fn(field_tag<Field>(), to_field_key(v))` -- the actual stored value
+/// comes from the separate `v` argument, so Field need not be a member of
+/// (or even related to) the type calling key<Field>(). That's what makes
+/// this legal: Asset and Gizmo can both register &Keys::example_key even
+/// though Keys shares no inheritance relationship with either -- unlike
+/// &Labeled::description above, where the shared tag was a side effect of a
+/// real (data-carrying) common base. Same read-side caveat as that one:
+/// find_by_cached_field<&Keys::example_key> still won't compile
+/// (member_class_t resolves to Keys, which isn't ObjectBase-derived) --
+/// find_by_cached_field_raw is still the only way to read it back. See
+/// finding_by_an_unrelated_tag_type_finds_both_asset_and_gizmo below.
+struct Keys {
+    std::string example_key;
+};
+
 /// Inherits Entity via TWO paths (Timestamped and Labeled) plus
 /// model::Object<Asset> -- three base classes, two unrelated inheritance
 /// graphs. owner is declared directly here (not in a mixin) specifically so
@@ -160,6 +180,14 @@ public:
         // finding_by_the_inherited_description_field_finds_both_types_in_
         // one_call below.
         v.key<&Labeled::description>(s.description, "base description");
+        // A SECOND shared-across-types tag, same description VALUE as the
+        // asset_description() entry above, but under &Keys::example_key --
+        // a tag with no inheritance relationship to Asset (or to Labeled)
+        // at all. Three independent Root::by_cached_field entries end up
+        // holding the same string, under three different tags: proof the
+        // sharing is about the TAG (an arbitrary NTTP identity), not about
+        // where the field happens to live or where the value came from.
+        v.key<&Keys::example_key>(s.asset_description(), "asset description");
     }
 };
 
@@ -220,6 +248,13 @@ public:
     static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
         v.key<&Gizmo::gizmo_description>(s.gizmo_description(), "description");
         v.key<&Labeled::description>(s.description, "base description");
+        // Same &Keys::example_key tag Asset registers above -- see Keys'
+        // own doc comment and Asset::define_cached_fields' comment on it.
+        // Gizmo shares no base with Keys (or, for that matter, with Asset
+        // beyond Timestamped/Labeled/Object<Derived>), which is the point:
+        // this tag's sharing comes from nothing but both types naming the
+        // same &Keys::example_key.
+        v.key<&Keys::example_key>(s.gizmo_description(), "gizmo description");
     }
 };
 
@@ -665,4 +700,126 @@ TEST(finding_by_the_inherited_description_field_finds_both_types_in_one_call) {
     CHECK(s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "NOPE").empty());
     // A field never touched by define_cached_fields() at all: empty, not an error.
     CHECK(s.find_by_cached_field_raw(model::field_tag<&Asset::value>(), "0").empty());
+}
+
+// The test above shares a tag through real inherited data (&Labeled::
+// description names a field both Asset and Gizmo actually store, via a
+// common base). This one shares a tag through NOTHING but the tag itself:
+// Keys is never instantiated, never inherited from, and has no relationship
+// to Asset, Gizmo, Labeled, or ObjectBase at all -- see Keys' own doc
+// comment. &Keys::example_key's only job is to be a distinct, stable
+// pointer-to-member VALUE that both types' define_cached_fields() happen to
+// name. That's sufficient: field_tag<Field> is an identity function of
+// Field alone, and FieldKeyReader::key<Field>(v, name) stores whatever `v`
+// the CALLER supplies under it, so Asset and Gizmo can feed it their own,
+// completely independent description values and still land in the same
+// Root::by_cached_field bucket.
+TEST(finding_by_an_unrelated_tag_type_finds_both_asset_and_gizmo) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "OWNER");
+    const Ref<Asset> a = make_asset(m, "A1", acc, /*created_at=*/0, "TAGGED");
+    const Ref<Gizmo> g = make_gizmo(m, "G1", Opt<Asset>{}, "TAGGED");
+    make_gizmo(m, "G2", Opt<Asset>{}, "UNTAGGED");  // different value: must not show up below
+
+    Snapshot s = m.snapshot();
+
+    const std::vector<const ObjectBase*> tagged =
+        s.find_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "TAGGED");
+    CHECK_EQ(tagged.size(), std::size_t{2});  // the Asset AND the Gizmo, one call
+
+    bool saw_asset = false, saw_gizmo = false;
+    for (const ObjectBase* o : tagged) {
+        if (o->id == a.raw()) {
+            CHECK(o->tag() == model::type_tag<Asset>());
+            saw_asset = true;
+        } else if (o->id == g.raw()) {
+            CHECK(o->tag() == model::type_tag<Gizmo>());
+            saw_gizmo = true;
+        }
+    }
+    CHECK(saw_asset);
+    CHECK(saw_gizmo);
+
+    // field_tag<&Keys::example_key>() and field_tag<&Labeled::description>()
+    // are two DIFFERENT (const void*) identities, so Root::by_cached_field
+    // holds two independent buckets -- not one bucket reachable under two
+    // spellings. Both happen to agree on membership here only because
+    // asset_description()/gizmo_description() read the SAME underlying
+    // `description` field this test also set directly -- a coincidence of
+    // THIS test's setup, not something the model enforces.
+    const std::vector<const ObjectBase*> via_labeled_tag =
+        s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "TAGGED");
+    CHECK_EQ(via_labeled_tag.size(), std::size_t{2});  // `a` and `g`, reached via the OTHER tag
+}
+
+// for_each_by_cached_field_raw is find_by_cached_field_raw's non-collecting
+// twin -- same shared &Keys::example_key tag, but visited instead of
+// materialized into a vector. Matches this file's for_each_* convention:
+// NEVER stops early, `f` runs for every match, regardless of what `f`
+// returns (it returns void here, nothing TO stop on).
+TEST(for_each_by_cached_field_raw_visits_every_match_across_types) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "OWNER");
+    const Ref<Asset> a = make_asset(m, "A1", acc, /*created_at=*/0, "TAGGED");
+    const Ref<Gizmo> g = make_gizmo(m, "G1", Opt<Asset>{}, "TAGGED");
+
+    Snapshot s = m.snapshot();
+
+    std::size_t visits = 0;
+    bool saw_asset = false, saw_gizmo = false;
+    s.for_each_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "TAGGED",
+                                   [&](const ObjectBase& o) {
+                                       ++visits;
+                                       if (o.id == a.raw()) saw_asset = true;
+                                       if (o.id == g.raw()) saw_gizmo = true;
+                                   });
+    CHECK_EQ(visits, std::size_t{2});
+    CHECK(saw_asset);
+    CHECK(saw_gizmo);
+
+    // Undeclared field / no match: visits nobody, doesn't crash.
+    visits = 0;
+    s.for_each_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "NOPE",
+                                   [&](const ObjectBase&) { ++visits; });
+    CHECK_EQ(visits, std::size_t{0});
+}
+
+// all_of_by_cached_field_raw is the short-circuiting sibling: unlike
+// for_each_by_cached_field_raw, `pred` returning false stops the walk
+// immediately, and the return value reports whether that happened.
+TEST(all_of_by_cached_field_raw_short_circuits_across_types) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "OWNER");
+    make_asset(m, "A1", acc, /*created_at=*/0, "TAGGED");
+    make_gizmo(m, "G1", Opt<Asset>{}, "TAGGED");
+
+    Snapshot s = m.snapshot();
+
+    // A predicate true for everything: the walk runs to completion, both
+    // matches visited, all_of reports true.
+    std::size_t visited_all = 0;
+    const bool all_true = s.all_of_by_cached_field_raw(
+        model::field_tag<&Keys::example_key>(), "TAGGED",
+        [&](const ObjectBase&) {
+            ++visited_all;
+            return true;
+        });
+    CHECK(all_true);
+    CHECK_EQ(visited_all, std::size_t{2});
+
+    // A predicate that stops on the FIRST match: the walk must not visit
+    // the second, and all_of must report false (it was stopped early).
+    std::size_t visited_short = 0;
+    const bool stopped = s.all_of_by_cached_field_raw(
+        model::field_tag<&Keys::example_key>(), "TAGGED",
+        [&](const ObjectBase&) {
+            ++visited_short;
+            return false;  // stop immediately
+        });
+    CHECK(!stopped);
+    CHECK_EQ(visited_short, std::size_t{1});  // never reached the second match
+
+    // Vacuously true: no match for this key, nothing to violate the predicate.
+    CHECK(s.all_of_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "NOPE",
+                                       [](const ObjectBase&) { return false; }));
 }
