@@ -2044,7 +2044,7 @@ public:
     // the WHOLE transaction resolves. (The four WHOLE-MAP-HANDLE indexes --
     // by_type_/by_field_/by_cached_field_/by_cached_reference_ -- log their
     // pre-attempt handle only ONCE per attempt per key touched, not once per
-    // object touching that key; see log_by_type_once()'s doc comment. That
+    // object touching that key; see logged_index_entry()'s doc comment. That
     // used to dominate this cost -- N objects of one type meant N separate
     // captures of the SAME by_type_ handle -- which is why this used to be
     // measured far higher than it is now.) Put 200,000 creates in one
@@ -2892,25 +2892,118 @@ private:
     void drop_cached_references(const ObjectBase* o);
     void reconcile_cached_references(const ObjectBase* before, const ObjectBase* after);
 
-    /// Log this key's pre-attempt value into the rollback log, but only on the
-    /// FIRST touch of that key (type tag / field tag) this attempt -- mirrors
-    /// cow()'s dirty_ (first-touch-clones-the-chunk) trick, applied to the
-    /// four whole-map-handle indexes instead of a Chunk. Why this is safe:
-    /// rollback_apply() replays log() closures in REVERSE (txn_rollback_log_.rbegin() ->
-    /// rend()), and each closure OVERWRITES the map wholesale -- so of N
-    /// captures taken across N edits to the same key in one attempt, only the
-    /// FIRST (executed LAST during rollback) has any effect on the final
-    /// restored state; every later capture is silently clobbered before
-    /// rollback finishes. Logging on every touch of a type/field a large
-    /// transaction edits thousands of times was therefore pure waste: one
-    /// closure (alloc + capture + eventual invocation) per touch, when the
-    /// attempt only ever needed the very first one. These dirty_by_*_ sets
-    /// are cleared alongside dirty_ at the end of every attempt
-    /// (rollback_apply()/publish_now()) -- same attempt-scoped lifetime.
-    void log_by_type_once(TypeTag tag);
-    void log_by_field_once(const void* field);
-    void log_by_cached_field_once(const void* field);
-    void log_by_cached_reference_once(const void* field);
+    /// The three trios above (out_refs/field_keys/cached_fields/
+    /// cached_references), called as one unit at each of apply_create's,
+    /// apply_update's, remove_raw's, and commit_bulk_without_undo's install
+    /// points -- see DESIGN.md's note that a new index family has to be
+    /// "wired into all four apply-phase sites" and get it right by hand at
+    /// each. These four wrappers are that wiring, done once.
+    ///
+    /// add_all_indexes(): a freshly created object's full index footprint
+    /// (apply_create, AFTER by_type_ is seeded/inserted separately -- that
+    /// one isn't part of this quartet, see apply_create's own code).
+    void add_all_indexes(const ObjectBase* o) {
+        add_out_refs(o);
+        add_field_keys(o);
+        add_cached_fields(o);
+        add_cached_references(o);
+    }
+
+    /// Same shape as add_all_indexes(), for commit_bulk_without_undo()'s
+    /// no-log install path -- kept a SEPARATELY named wrapper (not a
+    /// `bool should_log` flag threaded through one function) for the same
+    /// reason the individual add_*/add_*_no_log pairs already are: see
+    /// their own doc comments.
+    void add_all_indexes_no_log(const ObjectBase* o) {
+        add_out_refs_no_log(o);
+        add_field_keys_no_log(o);
+        add_cached_fields_no_log(o);
+        add_cached_references_no_log(o);
+    }
+
+    /// The value-indexed trio ONLY -- field_keys/cached_fields/
+    /// cached_references -- for remove_raw()'s drop path. Deliberately does
+    /// NOT include drop_out_refs(): that one runs EARLIER in remove_raw,
+    /// before the incoming-edge-bucket save and the by_type_ removal, and a
+    /// self-referencing victim makes that ordering observable (its own
+    /// outgoing edge lives in referrers_[victim.index], which the bucket
+    /// save reads). Call drop_out_refs() separately, first, same as today.
+    void drop_value_indexes(const ObjectBase* o) {
+        drop_field_keys(o);
+        drop_cached_fields(o);
+        drop_cached_references(o);
+    }
+
+    /// The full reconcile quartet, for apply_update() and remove_raw()'s
+    /// cascade-null branch alike. `old_field_keys_hint` forwards straight
+    /// through to reconcile_field_keys() -- see its own doc comment; every
+    /// caller except apply_update() passes nullptr.
+    void reconcile_all_indexes(
+        const ObjectBase* before, const ObjectBase* after,
+        const std::vector<std::pair<const void*, std::string>>* old_field_keys_hint = nullptr) {
+        reconcile_out_refs(before, after);
+        reconcile_field_keys(before, after, old_field_keys_hint);
+        reconcile_cached_fields(before, after);
+        reconcile_cached_references(before, after);
+    }
+
+    /// The entry for `key` in `index`, pool-seeded from node_pool_ the FIRST
+    /// time this exact key is ever touched -- via try_emplace, so a later
+    /// read/write through operator[] never accidentally default-constructs
+    /// an UNPOOLED entry first. `index` is one of the four whole-map-handle
+    /// indexes below (by_type_, by_field_, by_cached_field_,
+    /// by_cached_reference_) -- all `unordered_map<const void*, ...>`
+    /// (TypeTag is itself a `const void*` alias; see its own doc comment),
+    /// so one template covers every one of them regardless of their
+    /// differently-shaped PersistentMap/PersistentSet mapped_type. This is
+    /// the `_no_log` bulk-load path's half of the equivalent mutation;
+    /// logged_index_entry() below is the version that ALSO captures
+    /// rollback state.
+    template <class Index>
+    typename Index::mapped_type& seed_index_entry(Index& index, const void* key) {
+        return index.try_emplace(key, typename Index::mapped_type(&node_pool_)).first->second;
+    }
+
+    /// seed_index_entry() PLUS the once-per-attempt rollback capture of the
+    /// whole pre-attempt handle for `key` -- replaces what used to be four
+    /// separate, byte-for-byte identical functions (log_by_type_once/
+    /// log_by_field_once/log_by_cached_field_once/
+    /// log_by_cached_reference_once), each differing only in which INDEX
+    /// member and which DIRTY set it closed over. `dirty` is that index's
+    /// own first-touch-this-attempt set (e.g. dirty_by_field_ for
+    /// by_field_) -- mirrors cow()'s dirty_ (first-touch-clones-the-chunk)
+    /// trick, applied to a whole-map handle instead of a Chunk.
+    ///
+    /// Why only the FIRST touch of a key needs to log anything:
+    /// rollback_apply() replays log() closures in REVERSE
+    /// (txn_rollback_log_.rbegin() -> rend()), and each closure OVERWRITES
+    /// the map wholesale -- so of N captures taken across N edits to the
+    /// same key in one attempt, only the FIRST (executed LAST during
+    /// rollback) has any effect on the final restored state; every later
+    /// capture is silently clobbered before rollback finishes. Logging on
+    /// every touch of a type/field a large transaction edits thousands of
+    /// times was therefore pure waste: one closure (alloc + capture +
+    /// eventual invocation) per touch, when the attempt only ever needed
+    /// the very first one. These dirty_by_*_ sets are cleared alongside
+    /// dirty_ at the end of every attempt (clear_attempt_scratch()) -- same
+    /// attempt-scoped lifetime.
+    ///
+    /// MUST be called before the caller does anything else with `index[key]`
+    /// this attempt: seed_index_entry()'s try_emplace has to land BEFORE
+    /// this captures `prev`, or a caller that read the entry first would
+    /// already have default-constructed an unpooled value for try_emplace
+    /// to then silently keep instead of ever seeding the pool (a real bug
+    /// this ordering fixes -- measured, before the fix, as zero pool
+    /// allocations ever happening).
+    template <class Index, class Dirty>
+    typename Index::mapped_type& logged_index_entry(Index& index, Dirty& dirty, const void* key) {
+        auto& sub = seed_index_entry(index, key);
+        if (dirty.insert(key).second) {
+            log(GenericRollback{
+                [this, &index, key, prev = sub]() mutable { index[key] = std::move(prev); }});
+        }
+        return sub;
+    }
 
     /// Mark an object invisible from the NEXT version on; the reaper frees
     /// it once no live snapshot is older than that (invariant 4). Never
@@ -2938,7 +3031,7 @@ private:
     // runs on the rare rollback path -- among the largest costs of a commit
     // in its own right: every alloc_slot()/set_slot()/changes_ push (i.e.
     // every single create/update/remove, not just once per attempt like
-    // log_by_type_once et al.) built a std::function closure, and most of
+    // logged_index_entry et al.) built a std::function closure, and most of
     // those closures capture enough state (e.g. set_slot's [this, slot,
     // prev_obj, prev_gen]) to exceed libstdc++'s small-object buffer and
     // heap-allocate -- allocated, then almost always simply discarded
@@ -2958,14 +3051,14 @@ private:
     // checked by the compiler (a missing overload is a compile error, a
     // std::visit is never partial), and each Kind is still defined
     // immediately next to the handful of log() call sites that produce it.
-    // GenericRollback (a std::function<void()> fallback) is kept for the four
-    // log_by_*_once() closures: those capture a whole PersistentMap/Set
-    // `prev` by move and fire at most once per DISTINCT index touched per
-    // attempt (see log_by_type_once's own comment) -- bounded by the number
-    // of declared fields/types, never by object count -- so they were never
-    // the cost this change targets, and giving each of the four its own
-    // dedicated, differently-shaped Kind would add real complexity for a
-    // closure that was already cheap relative to model size.
+    // GenericRollback (a std::function<void()> fallback) is kept for
+    // logged_index_entry()'s closure: it captures a whole PersistentMap/Set
+    // `prev` by move and fires at most once per DISTINCT index touched per
+    // attempt (see its own comment) -- bounded by the number of declared
+    // fields/types, never by object count -- so it was never the cost this
+    // change targets, and giving each of the four whole-map-handle indexes
+    // its own dedicated, differently-shaped Kind would add real complexity
+    // for a closure that was already cheap relative to model size.
     struct PushFreeSlot {
         std::uint32_t slot;
     };
@@ -3419,8 +3512,8 @@ private:
     std::unordered_set<std::uint32_t> dirty_;  ///< chunks already cloned THIS attempt (see cow());
                                                ///< cleared per attempt so publish stays immutable
     // First-touch-this-attempt tracking for the four whole-map-handle
-    // indexes' rollback capture -- see log_by_type_once()'s doc comment. Same
-    // "attempt-scoped, cleared alongside dirty_" lifetime as dirty_ itself.
+    // indexes' rollback capture -- see logged_index_entry()'s doc comment.
+    // Same "attempt-scoped, cleared alongside dirty_" lifetime as dirty_ itself.
     std::unordered_set<TypeTag> dirty_by_type_;
     std::unordered_set<const void*> dirty_by_field_;
     std::unordered_set<const void*> dirty_by_cached_field_;
@@ -4311,6 +4404,31 @@ private:
     /// each_ref(), touching no shared state (invariant 10 intact). The
     /// victim's own fields are excluded: a self-loop dies with its owner.
     bool locally_referenced(Id local) const;
+
+    /// True if `idx` (a bare local index, kLocalIdBit already stripped) has
+    /// a DEFERRED local remove pending -- masked exactly like a real remove
+    /// intent. Shared by peek_raw/update_raw (via local_overlay(), below)
+    /// and remove_raw's own idempotency check -- purely the membership
+    /// test, never the decision of what a remove fans out to (that stays
+    /// remove_raw's alone; see CLAUDE.md invariant 8).
+    bool is_deferred_local_remove(std::uint32_t idx) const noexcept {
+        return std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
+              local_remove_intents_.end();
+    }
+
+    /// This transaction's own overlay entry for `id`: a local create (via
+    /// local_created_), an already-in-progress update clone (via
+    /// local_updated_), or null if masked by a pending remove() intent
+    /// (local or real). Shared by peek_raw (which stops here) and
+    /// update_raw (which, only when `resolved` comes back false, goes on to
+    /// clone base_'s value and install the overlay entry itself).
+    ///
+    /// `resolved` is true whenever the overlay already has a DEFINITIVE
+    /// answer -- found here, or masked -- so the caller must return null
+    /// itself rather than falling through to base_. It is false only for a
+    /// non-local id this transaction has never touched, the one case base_
+    /// still needs to be consulted.
+    ObjectBase* local_overlay(Id id, bool& resolved) const;
 
     /// True iff this transaction has asked for nothing at all -- the fast
     /// path both commit_pretransaction_locked() and try_commit_core() check

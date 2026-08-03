@@ -890,4 +890,34 @@ public:
     }
 };
 
+/// Add `v` to the persistent-SET bucket at `key` of a PersistentMap<K,
+/// PersistentSet<V, VHash>, Hash> multimap -- the shared two-level shape
+/// behind model.h's Root::by_cached_field and Root::by_cached_reference
+/// (an outer map keyed by field tag or value, an inner set of every
+/// currently-matching Id). Creates a `mem`-seeded bucket if this is the
+/// first holder of that key -- deliberately never a bare `{}`, which would
+/// start an UNPOOLED lineage for that one bucket (see PersistentMap's/
+/// PersistentSet's own EXPERIMENTAL pooling constructor comment above).
+template <class K, class Hash, class V, class VHash>
+PersistentMap<K, PersistentSet<V, VHash>, Hash> bucket_insert(
+    const PersistentMap<K, PersistentSet<V, VHash>, Hash>& m, const K& key, const V& v,
+    std::pmr::memory_resource* mem) {
+    const PersistentSet<V, VHash>* bucket = m.get(key);
+    return m.set(key, (bucket ? *bucket : PersistentSet<V, VHash>(mem)).insert(v));
+}
+
+/// Remove `v` from the bucket at `key`, dropping the bucket ENTIRELY once it
+/// empties -- so a value/target with no remaining holders leaves no
+/// tombstone entry behind, matching bucket_insert's counterpart obligation.
+/// A no-op (returns `m` unchanged) if `key` was never indexed at all, or
+/// its bucket never held `v`.
+template <class K, class Hash, class V, class VHash>
+PersistentMap<K, PersistentSet<V, VHash>, Hash> bucket_erase(
+    const PersistentMap<K, PersistentSet<V, VHash>, Hash>& m, const K& key, const V& v) {
+    const PersistentSet<V, VHash>* bucket = m.get(key);
+    if (!bucket) return m;
+    PersistentSet<V, VHash> nb = bucket->erase(v);
+    return nb.empty() ? m.erase(key) : m.set(key, nb);
+}
+
 }  // namespace model::pmap

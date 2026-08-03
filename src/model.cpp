@@ -60,6 +60,44 @@ struct IdLess {
     }
 };
 
+/// Shared plumbing behind BOTH the cached-field and cached-referrer _raw
+/// wrapper trios (find_*_raw / for_each_*_raw / all_of_*_raw): each pair
+/// differs only in WHICH short-circuiting primitive walks its underlying
+/// bucket (Snapshot::cached_field_short_circuit_raw vs
+/// Snapshot::cached_referrer_short_circuit_raw -- those two stay separate,
+/// ordinary methods, since templated callers in model.h call them directly
+/// by name), but once `walk` is bound to one of those (field/key or
+/// field/target already applied), the three collect/visit/short-circuit
+/// shapes built on top are identical. Kept file-local: nothing outside this
+/// TU's six wrapper methods needs them.
+using RawWalk = std::function<bool(const std::function<bool(Id)>&)>;
+
+std::vector<const ObjectBase*> collect_raw(const Snapshot& s, const RawWalk& walk) {
+    std::vector<const ObjectBase*> out;
+    walk([&](Id id) {
+        // find_raw() re-checks the generation, so a bucket entry surviving
+        // past its object's removal (briefly, before reconciliation) can
+        // never alias a recycled slot's new occupant.
+        if (const ObjectBase* o = s.find_raw(id)) out.push_back(o);
+        return true;  // collect every match, never stop early
+    });
+    return out;
+}
+
+void visit_raw(const Snapshot& s, const RawWalk& walk, const std::function<void(const ObjectBase&)>& f) {
+    walk([&](Id id) {
+        if (const ObjectBase* o = s.find_raw(id)) f(*o);
+        return true;  // never stops early -- see the public wrapper's own doc comment
+    });
+}
+
+bool all_of_raw(const Snapshot& s, const RawWalk& walk, const std::function<bool(const ObjectBase&)>& pred) {
+    return walk([&](Id id) {
+        const ObjectBase* o = s.find_raw(id);
+        return !o || pred(*o);
+    });
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -95,32 +133,24 @@ bool Snapshot::cached_field_short_circuit_raw(const void* field, const std::stri
 }
 
 std::vector<const ObjectBase*> Snapshot::find_by_cached_field_raw(const void* field, const std::string& key) const {
-    std::vector<const ObjectBase*> out;
-    cached_field_short_circuit_raw(field, key, [&](Id id) {
-        // find_raw() re-checks the generation, same staleness guard as
-        // find_by_key_raw -- a bucket entry surviving past its object's
-        // removal (briefly, before reconciliation) can never alias a
-        // recycled slot's new occupant.
-        if (const ObjectBase* o = find_raw(id)) out.push_back(o);
-        return true;  // collect every match, never stop early
+    return collect_raw(*this, [&](const std::function<bool(Id)>& f) {
+        return cached_field_short_circuit_raw(field, key, f);
     });
-    return out;
 }
 
 void Snapshot::for_each_by_cached_field_raw(const void* field, const std::string& key,
                                             const std::function<void(const ObjectBase&)>& f) const {
-    cached_field_short_circuit_raw(field, key, [&](Id id) {
-        if (const ObjectBase* o = find_raw(id)) f(*o);
-        return true;  // never stops early -- see this method's own doc comment
-    });
+    visit_raw(
+        *this,
+        [&](const std::function<bool(Id)>& g) { return cached_field_short_circuit_raw(field, key, g); }, f);
 }
 
 bool Snapshot::all_of_by_cached_field_raw(const void* field, const std::string& key,
                                           const std::function<bool(const ObjectBase&)>& pred) const {
-    return cached_field_short_circuit_raw(field, key, [&](Id id) {
-        const ObjectBase* o = find_raw(id);
-        return !o || pred(*o);
-    });
+    return all_of_raw(
+        *this,
+        [&](const std::function<bool(Id)>& g) { return cached_field_short_circuit_raw(field, key, g); },
+        pred);
 }
 
 bool Snapshot::cached_referrer_short_circuit_raw(const void* field, Id target,
@@ -138,30 +168,25 @@ bool Snapshot::cached_referrer_short_circuit_raw(const void* field, Id target,
 }
 
 std::vector<const ObjectBase*> Snapshot::find_cached_referrers_raw(const void* field, Id target) const {
-    std::vector<const ObjectBase*> out;
-    cached_referrer_short_circuit_raw(field, target, [&](Id id) {
-        // find_raw() re-checks the generation, same staleness guard every
-        // other _raw lookup in this file relies on.
-        if (const ObjectBase* o = find_raw(id)) out.push_back(o);
-        return true;  // collect every match, never stop early
+    return collect_raw(*this, [&](const std::function<bool(Id)>& f) {
+        return cached_referrer_short_circuit_raw(field, target, f);
     });
-    return out;
 }
 
 void Snapshot::for_each_cached_referrers_raw(const void* field, Id target,
                                              const std::function<void(const ObjectBase&)>& f) const {
-    cached_referrer_short_circuit_raw(field, target, [&](Id id) {
-        if (const ObjectBase* o = find_raw(id)) f(*o);
-        return true;  // never stops early -- see this method's own doc comment
-    });
+    visit_raw(
+        *this,
+        [&](const std::function<bool(Id)>& g) { return cached_referrer_short_circuit_raw(field, target, g); },
+        f);
 }
 
 bool Snapshot::all_of_cached_referrers_raw(const void* field, Id target,
                                            const std::function<bool(const ObjectBase&)>& pred) const {
-    return cached_referrer_short_circuit_raw(field, target, [&](Id id) {
-        const ObjectBase* o = find_raw(id);
-        return !o || pred(*o);
-    });
+    return all_of_raw(
+        *this,
+        [&](const std::function<bool(Id)>& g) { return cached_referrer_short_circuit_raw(field, target, g); },
+        pred);
 }
 
 struct Snapshot::Lease {
@@ -858,43 +883,6 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
     });
 }
 
-// First-touch-this-attempt rollback capture for the four whole-map-handle
-// indexes -- see log_by_type_once()'s doc comment in model.h for why only
-// the first touch of a given key needs to log anything.
-
-void Model::log_by_type_once(TypeTag tag) {
-    if (!dirty_by_type_.insert(tag).second) return;
-    auto prev = by_type_[tag];
-    // GenericRollback, not a dedicated Kind: this fires at most once per
-    // DISTINCT type touched per attempt (bounded by #types, never by object
-    // count), so it was never the cost the TxnRollbackOp conversion targets -- see
-    // log()'s own doc comment.
-    log(GenericRollback{[this, tag, prev = std::move(prev)]() mutable { by_type_[tag] = std::move(prev); }});
-}
-
-void Model::log_by_field_once(const void* field) {
-    if (!dirty_by_field_.insert(field).second) return;
-    auto prev = by_field_[field];
-    log(GenericRollback{
-        [this, field, prev = std::move(prev)]() mutable { by_field_[field] = std::move(prev); }});
-}
-
-void Model::log_by_cached_field_once(const void* field) {
-    if (!dirty_by_cached_field_.insert(field).second) return;
-    auto prev = by_cached_field_[field];
-    log(GenericRollback{[this, field, prev = std::move(prev)]() mutable {
-        by_cached_field_[field] = std::move(prev);
-    }});
-}
-
-void Model::log_by_cached_reference_once(const void* field) {
-    if (!dirty_by_cached_reference_.insert(field).second) return;
-    auto prev = by_cached_reference_[field];
-    log(GenericRollback{[this, field, prev = std::move(prev)]() mutable {
-        by_cached_reference_[field] = std::move(prev);
-    }});
-}
-
 // by_field_ maintenance: the define_keys() unique-key index (Root::by_field).
 // One persistent map PER FIELD (by_field_[field]), each mapping that field's
 // key string -> the single Id currently holding it -- unique, unlike the
@@ -907,27 +895,19 @@ void Model::log_by_cached_reference_once(const void* field) {
 void Model::add_field_keys(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
-        // try_emplace, not operator[], and BEFORE log_by_field_once(): the
-        // FIRST time this field is seen, seed it with node_pool_ -- see
-        // apply_create's identical by_type_ seeding for why the ordering
-        // matters (log_by_field_once's own by_field_[field] read would
-        // otherwise default-construct an unpooled entry first, and
-        // try_emplace would then find the key already present and silently
-        // keep it unpooled).
-        auto& sub =
-            by_field_.try_emplace(field, pmap::PersistentMap<std::string, Id, pmap::StringHash>(&node_pool_))
-                .first->second;
-        log_by_field_once(field);  // captures the pre-attempt value once; see its own doc comment
-        sub = sub.set(key, id);         // key is unique per field by construction (see
-                                        // define_keys' contract); a collision here is a
-                                        // caller bug, not something this layer detects
+        // logged_index_entry: pool-seeds by_field_[field] on first touch AND
+        // captures its pre-attempt value once, for the rollback log -- see
+        // its own doc comment in model.h.
+        auto& sub = logged_index_entry(by_field_, dirty_by_field_, field);
+        sub = sub.set(key, id);  // key is unique per field by construction (see
+                                 // define_keys' contract); a collision here is a
+                                 // caller bug, not something this layer detects
     });
 }
 
 void Model::drop_field_keys(const ObjectBase* o) {
     o->each_field_key([&](const void* field, std::string key) {
-        log_by_field_once(field);
-        auto& sub = by_field_[field];
+        auto& sub = logged_index_entry(by_field_, dirty_by_field_, field);
         sub = sub.erase(key);
     });
 }
@@ -959,13 +939,12 @@ void Model::reconcile_field_keys(
                                      [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
-        // Same rollback pattern as add_field_keys/drop_field_keys: capture the
-        // whole prior map (cheap -- persistent, structure-shared), once per
-        // attempt (log_by_field_once), and restore it on rollback. Without
-        // this, a vetoed/conflicted attempt leaves by_field_ permanently
-        // indexing values that never committed.
-        log_by_field_once(field);
-        auto& sub = by_field_[field];
+        // Same rollback pattern as add_field_keys/drop_field_keys: capture
+        // the whole prior map (cheap -- persistent, structure-shared), once
+        // per attempt (logged_index_entry), and restore it on rollback.
+        // Without this, a vetoed/conflicted attempt leaves by_field_
+        // permanently indexing values that never committed.
+        auto& sub = logged_index_entry(by_field_, dirty_by_field_, field);
         // Only erase the OLD key if we still hold it. local_updated_ is an
         // unordered_map -- apply order across objects in one transaction is
         // arbitrary -- so a same-transaction swap (this object vacates K
@@ -994,39 +973,21 @@ void Model::add_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_field([&](const void* field, std::string key) {
         // Two-level structure: by_cached_field_[field] is the OUTER map (key
-        // string -> bucket); `bucket`, if this key already has other
-        // holders, is the INNER set collecting every object currently
-        // holding that value. log_by_cached_field_once captures the outer
-        // map's pre-attempt state, once, for the rollback log.
-        //
-        // try_emplace, not operator[], and BEFORE log_by_cached_field_once():
-        // same ordering hazard as add_field_keys -- log_by_cached_field_once's
-        // own by_cached_field_[field] read would otherwise default-construct
-        // an unpooled entry first. See that function's comment.
-        auto& sub = by_cached_field_
-                       .try_emplace(field, pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
-                                                               pmap::StringHash>(&node_pool_))
-                       .first->second;
-        log_by_cached_field_once(field);
-        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
-        // Pool-seeded empty bucket, not `{}`: the first object ever to hold
-        // this particular value would otherwise start an unpooled lineage
-        // for that bucket, same as the outer map above.
-        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
+        // string -> bucket); logged_index_entry pool-seeds it on first touch
+        // and captures its pre-attempt state, once, for the rollback log.
+        // bucket_insert then does the same pool-seeded-first-holder dance
+        // one level down, for the INNER bucket (the set of every object
+        // currently holding `key`).
+        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field);
+        sub = pmap::bucket_insert(sub, key, id, &node_pool_);
     });
 }
 
 void Model::drop_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_field([&](const void* field, std::string key) {
-        log_by_cached_field_once(field);
-        auto& sub = by_cached_field_[field];
-        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
-        if (!bucket) return;  // nothing indexed under this key -- nothing to remove
-        auto nb = bucket->erase(id);  // nb: the bucket with just this id removed
-        // An emptied bucket is dropped outright, so a value with no remaining
-        // holders doesn't leave a tombstone entry behind.
-        sub = nb.empty() ? sub.erase(key) : sub.set(key, nb);
+        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field);
+        sub = pmap::bucket_erase(sub, key, id);
     });
 }
 
@@ -1045,28 +1006,20 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
                                      [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
 
-        // log_by_cached_field_once captures the OUTER map's pre-attempt state
-        // (once) -- what the rollback log restores wholesale on rollback. sub is
-        // written through directly across the two steps below (old value's
-        // bucket shrinks/drops, new value's bucket grows) -- each
-        // reassignment updates the map in place, so there's no separate
-        // "cur" to install at the end.
-        log_by_cached_field_once(field);
-        auto& sub = by_cached_field_[field];
-        if (it != old_keys.end()) {
-            // Remove this id from its OLD value's bucket (ob), unless that
-            // value was never actually indexed (e.g. this field just started
-            // returning a cacheable value).
-            if (const pmap::PersistentSet<Id, IdHash>* ob = sub.get(it->second)) {
-                auto nb = ob->erase(id);  // ob with this id removed
-                sub = nb.empty() ? sub.erase(it->second) : sub.set(it->second, nb);
-            }
-        }
-        // Add this id to its NEW value's bucket, creating that bucket if this
-        // is the first object ever to hold this particular value -- pool-
-        // seeded, not `{}` (see add_cached_fields's identical bucket seeding).
-        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(new_key);
-        sub = sub.set(new_key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
+        // logged_index_entry captures the OUTER map's pre-attempt state
+        // (once) -- what the rollback log restores wholesale on rollback.
+        // sub is written through directly across the two bucket_erase/
+        // bucket_insert steps below (old value's bucket shrinks/drops, new
+        // value's bucket grows) -- each reassignment updates the map in
+        // place, so there's no separate "cur" to install at the end.
+        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field);
+        // Remove this id from its OLD value's bucket, unless that value was
+        // never actually indexed (e.g. this field just started returning a
+        // cacheable value) -- bucket_erase is already a no-op in that case.
+        if (it != old_keys.end()) sub = pmap::bucket_erase(sub, it->second, id);
+        // Add this id to its NEW value's bucket, creating that bucket if
+        // this is the first object ever to hold this particular value.
+        sub = pmap::bucket_insert(sub, new_key, id, &node_pool_);
     });
 }
 
@@ -1082,19 +1035,8 @@ void Model::add_cached_references(const ObjectBase* o) {
     const Id id = o->id;  // the REFERRER -- the value stored in the bucket, not the bucket's key
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;  // Opt<> currently null: nothing to index
-        // try_emplace, not operator[], and BEFORE log_by_cached_reference_once():
-        // same ordering hazard as add_cached_fields -- see that function's
-        // comment.
-        auto& sub =
-            by_cached_reference_
-                .try_emplace(field, pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>(
-                                        &node_pool_))
-                .first->second;
-        log_by_cached_reference_once(field);
-        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
-        // Pool-seeded empty bucket, not `{}` -- see add_cached_fields's
-        // identical bucket seeding.
-        sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
+        auto& sub = logged_index_entry(by_cached_reference_, dirty_by_cached_reference_, field);
+        sub = pmap::bucket_insert(sub, target, id, &node_pool_);
     });
 }
 
@@ -1102,14 +1044,8 @@ void Model::drop_cached_references(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;
-        log_by_cached_reference_once(field);
-        auto& sub = by_cached_reference_[field];
-        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
-        if (!bucket) return;
-        auto nb = bucket->erase(id);
-        // An emptied bucket is dropped outright, so a target with no
-        // remaining referrers doesn't leave a tombstone entry behind.
-        sub = nb.empty() ? sub.erase(target) : sub.set(target, nb);
+        auto& sub = logged_index_entry(by_cached_reference_, dirty_by_cached_reference_, field);
+        sub = pmap::bucket_erase(sub, target, id);
     });
 }
 
@@ -1128,21 +1064,9 @@ void Model::reconcile_cached_references(const ObjectBase* before, const ObjectBa
         const Id old_target = (it != old_targets.end()) ? it->second : Id{};
         if (new_target == old_target) return;  // unchanged (incl. both still null)
 
-        log_by_cached_reference_once(field);
-        auto& sub = by_cached_reference_[field];
-        if (old_target) {
-            if (const pmap::PersistentSet<Id, IdHash>* ob = sub.get(old_target)) {
-                auto nb = ob->erase(id);
-                sub = nb.empty() ? sub.erase(old_target) : sub.set(old_target, nb);
-            }
-        }
-        if (new_target) {
-            // Pool-seeded empty bucket, not `{}` -- see add_cached_fields's
-            // identical bucket seeding.
-            const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(new_target);
-            sub = sub.set(new_target,
-                          (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
-        }
+        auto& sub = logged_index_entry(by_cached_reference_, dirty_by_cached_reference_, field);
+        if (old_target) sub = pmap::bucket_erase(sub, old_target, id);
+        if (new_target) sub = pmap::bucket_insert(sub, new_target, id, &node_pool_);
     });
 }
 
@@ -1399,29 +1323,16 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
 
     // Every object gets an (internal, Id-keyed) entry in its type's
     // enumeration index, unconditionally -- this is what for_each<T>() scans.
+    // logged_index_entry pool-seeds by_type_[tag] on first touch (so every
+    // Node/Leaf this and every later insert()/erase() allocates from
+    // node_pool_ instead of plain new/delete -- see its own comment in
+    // model.h for the ordering bug this fixes) and captures the pre-attempt
+    // value once, for the rollback log.
     const TypeTag tag = raw->tag();
-    // emplace, not operator[], and BEFORE log_by_type_once(): the FIRST time
-    // this tag is seen, seed it with node_pool_ so every Node/Leaf this (and
-    // every later) insert()/erase() on it allocates from the pool instead of
-    // plain new/delete -- see node_pool_'s own comment in model.h. This MUST
-    // run before log_by_type_once(), which itself reads by_type_[tag] via
-    // operator[] to capture the pre-attempt value for rollback -- doing that
-    // first would default-construct an UNPOOLED (mem_ == nullptr) entry
-    // first, and try_emplace() then silently keeps that already-present,
-    // unpooled value instead of seeding the pool at all (a real bug this
-    // ordering fixes: measured, before the fix, as zero pool allocations
-    // ever happening). A tag already present (either from an earlier
-    // create(), or from log_by_type_once() below) is left untouched by
-    // try_emplace() either way -- its existing, already-seeded value carries
-    // forward via insert()'s own copy of mem_ regardless.
-    auto& sub = by_type_.try_emplace(tag, pmap::PersistentSet<Id, IdHash>(&node_pool_)).first->second;
-    log_by_type_once(tag);
+    auto& sub = logged_index_entry(by_type_, dirty_by_type_, tag);
     sub = sub.insert(id);
 
-    add_out_refs(raw);
-    add_field_keys(raw);
-    add_cached_fields(raw);
-    add_cached_references(raw);
+    add_all_indexes(raw);
 
     changes_.push_back({id, ChangeKind::Created, tag});
     log(PopChanges{});
@@ -1495,10 +1406,7 @@ std::optional<Model::IntegrityError> Model::apply_update(
     // same-transaction "repoint away from X, then delete X" needs referrers_
     // already updated, or the repointed-away-from object would incorrectly
     // be dragged into X's cascade.
-    reconcile_out_refs(baseline, raw);
-    reconcile_field_keys(baseline, raw, old_field_keys_hint);
-    reconcile_cached_fields(baseline, raw);
-    reconcile_cached_references(baseline, raw);
+    reconcile_all_indexes(baseline, raw, old_field_keys_hint);
     return std::nullopt;
 }
 
@@ -1586,10 +1494,7 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
                 const ObjectBase* baseline = peek_raw(e.from);
                 if (ObjectBase* m = clone_for_cascade_null(e.from, keep_undo)) {
                     m->null_ref(e.field);
-                    reconcile_out_refs(baseline, m);
-                    reconcile_field_keys(baseline, m);
-                    reconcile_cached_fields(baseline, m);
-                    reconcile_cached_references(baseline, m);
+                    reconcile_all_indexes(baseline, m);
                 }
             } else {
                 work.push_back(e.from);  // dies with its target
@@ -1624,13 +1529,10 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
         }
 
         const TypeTag tag = victim->tag();
-        log_by_type_once(tag);
-        auto& sub = by_type_[tag];
+        auto& sub = logged_index_entry(by_type_, dirty_by_type_, tag);
         sub = sub.erase(x);
 
-        drop_field_keys(victim);
-        drop_cached_fields(victim);
-        drop_cached_references(victim);
+        drop_value_indexes(victim);
 
         set_slot(x.index, nullptr, x.gen);  // logs restore of victim + its gen
 
@@ -1767,17 +1669,21 @@ Id Transaction::create_raw(std::unique_ptr<ObjectBase> o) {
     return local_id;
 }
 
-ObjectBase* Transaction::update_raw(Id id) {
+ObjectBase* Transaction::local_overlay(Id id, bool& resolved) const {
     if (is_local(id)) {
+        resolved = true;  // local ids never exist in base_ -- nothing to fall through to either way
         const std::uint32_t idx = id.index & ~kLocalIdBit;
-        // Masked like peek_raw: a deferred-removed local can't be
-        // written to any more than a remove-intended real id can.
-        if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
-            local_remove_intents_.end())
-            return nullptr;
+        // A deferred local remove masks its target exactly like a real
+        // remove intent does below -- "removed as far as this transaction
+        // can tell", even though the create still installs (and is then
+        // removed) at apply time.
+        if (is_deferred_local_remove(idx)) return nullptr;
         return idx < local_created_.size() ? local_created_[idx].get() : nullptr;
     }
-    if (remove_intents_.count(id)) return nullptr;
+    if (remove_intents_.count(id)) {
+        resolved = true;
+        return nullptr;
+    }
     // local_updated_ is keyed by bare slot index (a transaction only ever
     // clones ONE generation of a given slot -- whichever was alive at
     // base()), so a lookup here must also check the clone's OWN id
@@ -1785,8 +1691,18 @@ ObjectBase* Transaction::update_raw(Id id) {
     // a caller asking about a stale generation of an already-updated
     // slot (e.g. a handle recycled since base()) would get back the
     // WRONG object instead of a correct "not found".
-    if (auto it = local_updated_.find(id.index); it != local_updated_.end())
+    if (auto it = local_updated_.find(id.index); it != local_updated_.end()) {
+        resolved = true;
         return (it->second->id == id) ? it->second.get() : nullptr;
+    }
+    resolved = false;  // not local, not masked, no overlay entry yet -- caller consults base_
+    return nullptr;
+}
+
+ObjectBase* Transaction::update_raw(Id id) {
+    bool resolved = false;
+    ObjectBase* overlay = local_overlay(id, resolved);
+    if (resolved) return overlay;
 
     const ObjectBase* base_obj = base_.find_raw(id);
     if (!base_obj) return nullptr;
@@ -1803,9 +1719,7 @@ void Transaction::remove_raw(Id id) {
         const std::uint32_t idx = id.index & ~kLocalIdBit;
         if (idx >= local_created_.size() || !local_created_[idx])
             return;  // never created here, or already cancelled: nothing to do
-        if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
-            local_remove_intents_.end())
-            return;  // already deferred: remove() is idempotent
+        if (is_deferred_local_remove(idx)) return;  // already deferred: remove() is idempotent
         if (locally_referenced(id)) {
             local_remove_intents_.push_back(idx);
             return;
@@ -1820,27 +1734,9 @@ void Transaction::remove_raw(Id id) {
 }
 
 const ObjectBase* Transaction::peek_raw(Id id) const {
-    if (is_local(id)) {
-        const std::uint32_t idx = id.index & ~kLocalIdBit;
-        // A deferred local remove masks its target exactly like a real
-        // remove intent does below -- "removed as far as this
-        // transaction can tell", even though the create still installs
-        // (and is then removed) at apply time.
-        if (std::find(local_remove_intents_.begin(), local_remove_intents_.end(), idx) !=
-            local_remove_intents_.end())
-            return nullptr;
-        return idx < local_created_.size() ? local_created_[idx].get() : nullptr;
-    }
-    if (remove_intents_.count(id)) return nullptr;
-    // local_updated_ is keyed by bare slot index (a transaction only ever
-    // clones ONE generation of a given slot -- whichever was alive at
-    // base()), so a lookup here must also check the clone's OWN id
-    // matches the FULL id requested, generation included. Without this,
-    // a caller asking about a stale generation of an already-updated
-    // slot (e.g. a handle recycled since base()) would get back the
-    // WRONG object instead of a correct "not found".
-    if (auto it = local_updated_.find(id.index); it != local_updated_.end())
-        return (it->second->id == id) ? it->second.get() : nullptr;
+    bool resolved = false;
+    ObjectBase* overlay = local_overlay(id, resolved);
+    if (resolved) return overlay;
     return base_.find_raw(id);
 }
 
@@ -2592,12 +2488,10 @@ void Model::add_out_refs_no_log(const ObjectBase* o) {
 void Model::add_field_keys_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
-        // try_emplace, not operator[]: see add_field_keys's identical seeding
-        // for why (no log_by_field_once ordering hazard on this bulk-load
-        // path, but still needs to seed the pool on first touch).
-        auto& sub =
-            by_field_.try_emplace(field, pmap::PersistentMap<std::string, Id, pmap::StringHash>(&node_pool_))
-                .first->second;
+        // seed_index_entry: see add_field_keys's identical seeding for why
+        // (no rollback capture needed on this bulk-load path, but still
+        // needs to seed the pool on first touch).
+        auto& sub = seed_index_entry(by_field_, field);
         sub = sub.set(key, id);
     });
 }
@@ -2609,15 +2503,11 @@ void Model::add_field_keys_no_log(const ObjectBase* o) {
 void Model::add_cached_fields_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_field([&](const void* field, std::string key) {
-        // try_emplace + pool-seeded bucket: see add_cached_fields's identical
-        // seeding (no log_by_cached_field_once ordering hazard on this
-        // bulk-load path, but still needs to seed the pool on first touch).
-        auto& sub = by_cached_field_
-                       .try_emplace(field, pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
-                                                               pmap::StringHash>(&node_pool_))
-                       .first->second;
-        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(key);
-        sub = sub.set(key, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
+        // seed_index_entry + pool-seeded bucket: see add_cached_fields's
+        // identical seeding (no rollback capture needed on this bulk-load
+        // path, but still needs to seed the pool on first touch).
+        auto& sub = seed_index_entry(by_cached_field_, field);
+        sub = pmap::bucket_insert(sub, key, id, &node_pool_);
     });
 }
 
@@ -2629,17 +2519,11 @@ void Model::add_cached_references_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_cached_reference([&](const void* field, const char*, Id target, bool) {
         if (!target) return;
-        // try_emplace + pool-seeded bucket: see add_cached_references's
-        // identical seeding (no log_by_cached_reference_once ordering
-        // hazard on this bulk-load path, but still needs to seed the pool
-        // on first touch).
-        auto& sub =
-            by_cached_reference_
-                .try_emplace(field, pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>(
-                                        &node_pool_))
-                .first->second;
-        const pmap::PersistentSet<Id, IdHash>* bucket = sub.get(target);
-        sub = sub.set(target, (bucket ? *bucket : pmap::PersistentSet<Id, IdHash>(&node_pool_)).insert(id));
+        // seed_index_entry + pool-seeded bucket: see add_cached_references's
+        // identical seeding (no rollback capture needed on this bulk-load
+        // path, but still needs to seed the pool on first touch).
+        auto& sub = seed_index_entry(by_cached_reference_, field);
+        sub = pmap::bucket_insert(sub, target, id, &node_pool_);
     });
 }
 
@@ -2759,17 +2643,13 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
         raw->id = id;
 
         set_slot_no_log(id.index, raw, id.gen);
-        // try_emplace, not operator[]: see apply_create's identical seeding
-        // for why (this path has no log_by_type_once ordering hazard --
-        // commit_bulk_without_undo never logs -- but still needs to seed
-        // the pool on first touch rather than default-constructing unpooled).
-        auto& sub =
-            by_type_.try_emplace(raw->tag(), pmap::PersistentSet<Id, IdHash>(&node_pool_)).first->second;
+        // seed_index_entry: see apply_create's identical seeding for why
+        // (this path has no rollback capture needed -- commit_bulk_without_
+        // undo never logs -- but still needs to seed the pool on first
+        // touch rather than default-constructing unpooled).
+        auto& sub = seed_index_entry(by_type_, raw->tag());
         sub = sub.insert(id);
-        add_out_refs_no_log(raw);
-        add_field_keys_no_log(raw);
-        add_cached_fields_no_log(raw);
-        add_cached_references_no_log(raw);
+        add_all_indexes_no_log(raw);
 
         changes_.push_back({id, ChangeKind::Created, raw->tag()});
     }
