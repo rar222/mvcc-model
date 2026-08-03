@@ -1437,6 +1437,23 @@ public:
     /// preferred entry point that calls this.
     const ObjectBase* find_by_key_raw(const void* field, const std::string& key) const;
 
+    /// Untyped counterpart of find_by_cached_field -- same "field
+    /// disambiguates the keyspace" reasoning as find_by_key_raw, but
+    /// multi-match: every currently-live object whose define_cached_fields()
+    /// value under `field` equals `key`, read straight out of
+    /// Root::by_cached_field's O(log n + matches) index (see
+    /// find_by_key_raw's own comment for the general shape this mirrors).
+    /// Covers the one case find_by_cached_field<Field> itself cannot: several
+    /// UNRELATED concrete types registering the IDENTICAL field tag (e.g.
+    /// several Object<Derived> types built on one shared, non-model mixin
+    /// base, each with its own define_cached_fields() entry naming that
+    /// mixin's field). find_by_cached_field<Field>'s return type is
+    /// `member_class_t<decltype(Field)>*` -- a single concrete type -- so it
+    /// can't express "could be any of several"; this returns every match
+    /// regardless of concrete type and leaves the tag() check to the caller,
+    /// same contract as find_by_key_raw.
+    std::vector<const ObjectBase*> find_by_cached_field_raw(const void* field, const std::string& key) const;
+
 private:
     friend class Model;
     friend class Transaction;
@@ -1462,6 +1479,21 @@ private:
     /// find_by_scan_field's comment for why (record_field_lookup).
     template <auto Field, class F>
     bool scan_field_short_circuit(const member_value_t<decltype(Field)>& value, F&& f) const;
+
+    /// Shared, short-circuiting bucket walk behind for_each_by_cached_field<
+    /// Field>, all_of_by_cached_field<Field>, AND the public, untyped
+    /// find_by_cached_field_raw -- same relationship find_by_key_raw has to
+    /// find_by_key<Field> (see its own doc comment), just short-circuiting
+    /// and keyed by `Id` rather than a resolved object, so it can be a
+    /// single ordinary (non-template) method, defined once in model.cpp,
+    /// instead of duplicated per Field instantiation. `f` returns true to
+    /// keep going, false to stop early; this returns false iff `f` stopped
+    /// it (vacuously true if the field was never define_cached_fields()'d,
+    /// or nothing currently holds `key` -- same "undeclared/no-match is
+    /// empty, not an error" contract every lookup family in this file
+    /// shares).
+    bool for_each_by_cached_field_raw(const void* field, const std::string& key,
+                                      const std::function<bool(Id)>& f) const;
 
     /// Generic ("any type, any field") counterpart of for_each_referrer<Field>:
     /// walks EVERY live object of EVERY type via by_type, and every one of
@@ -3468,13 +3500,9 @@ template <auto Field, class F>
 void Snapshot::for_each_by_cached_field(const member_value_t<decltype(Field)>& value, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
     record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-    if (!root_) return;
-    auto it = root_->by_cached_field.find(field_tag<Field>());
-    if (it == root_->by_cached_field.end()) return;
-    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(to_field_key(value));
-    if (!bucket) return;
-    bucket->for_each([&](Id id) {
+    for_each_by_cached_field_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
         if (const ClassT* p = cast<ClassT>(find_raw(id))) f(*p);
+        return true;  // for_each_by_cached_field never stops early
     });
 }
 
@@ -3482,12 +3510,7 @@ template <auto Field, class Pred>
 bool Snapshot::all_of_by_cached_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const {
     using ClassT = member_class_t<decltype(Field)>;
     record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-    if (!root_) return true;
-    auto it = root_->by_cached_field.find(field_tag<Field>());
-    if (it == root_->by_cached_field.end()) return true;  // vacuous: undeclared field, no matches
-    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(to_field_key(value));
-    if (!bucket) return true;  // vacuous: no matches
-    return bucket->for_each_short_circuit([&](Id id) {
+    return for_each_by_cached_field_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
         const ClassT* p = cast<ClassT>(find_raw(id));
         return !p || pred(*p);
     });

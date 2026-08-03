@@ -59,6 +59,13 @@ struct Timestamped : virtual Entity {
 
 struct Labeled : virtual Entity {
     std::string label;
+
+    /// Unlike label (unique, define_keys()), description is deliberately
+    /// NOT unique -- multiple objects, of the same OR different concrete
+    /// types, may legitimately share one. It only ever participates in the
+    /// two multi-match families (define_scan_fields()/define_cached_fields()),
+    /// never define_keys().
+    std::string description;
 };
 
 /// Inherits Entity via TWO paths (Timestamped and Labeled) plus
@@ -75,6 +82,14 @@ public:
     /// is declared on Asset, so &Asset::asset_key is a pointer-to-member of
     /// Asset, not of Labeled. That's what keeps it usable with find_by_key.
     std::string asset_key() const { return "asset:" + label; }
+
+    /// Same trick as asset_key(), for the SAME reason -- find_by_scan_field
+    /// and find_by_cached_field downcast via member_class_t<Field> exactly
+    /// like find_by_key does, so a Field naming description directly
+    /// (&Labeled::description) would hit the identical ill-formed
+    /// static_cast<const Labeled*>(ObjectBase*). A method declared on Asset
+    /// itself is what keeps &Asset::asset_description usable with both.
+    std::string asset_description() const { return description; }
 
     std::string to_string() const {
         auto ref_str = [](model::Id ref_id) {
@@ -107,6 +122,45 @@ public:
         // the typed find_by_key<Field>.
         v.key<&Labeled::label>(s.label, "label");
     }
+
+    /// Unindexed multi-match: find_by_scan_field<&Asset::asset_description>
+    /// does an O(#Asset objects) walk, checking each one's description --
+    /// legal even though the field itself lives in Labeled, since
+    /// asset_description() (not the raw field) is what's named here.
+    template <class Self>
+    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Asset::asset_description>(s.asset_description(), "description");
+        // The raw inherited field too, under its OWN tag -- same &Labeled::
+        // label / &Labeled::description split as define_keys() above. Safe
+        // to DECLARE here (writing never needs the member_class_t downcast,
+        // only find_by_scan_field<Field> reading it back does), but there is
+        // no way to READ it back across types afterward: find_by_scan_field
+        // always resolves to ONE ClassT (see model.h's scan_field_short_
+        // circuit -- it walks that type's own by_type bucket, there is no
+        // shared index behind a scan field the way by_cached_field is a real
+        // shared structure). Declared for symmetry with define_cached_fields
+        // below and to prove it doesn't collide with asset_description's
+        // entry (different tag, same underlying value) -- not queried
+        // directly by any test.
+        v.key<&Labeled::description>(s.description, "base description");
+    }
+
+    /// Indexed multi-match: same field, same value, this time backed by
+    /// Root::by_cached_field -- O(log n + matches) via
+    /// find_by_cached_field<&Asset::asset_description>.
+    template <class Self>
+    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Asset::asset_description>(s.asset_description(), "description");
+        // Unlike the scan-field case above, THIS one IS queryable across
+        // types afterward -- Root::by_cached_field is a genuine
+        // field-tag-keyed shared index, type-agnostic at the storage layer
+        // (it just holds Ids). find_by_cached_field<Field> still can't read
+        // it back across types (member_class_t<Field> forces one concrete
+        // type), but Snapshot::find_by_cached_field_raw can: see
+        // finding_by_the_inherited_description_field_finds_both_types_in_
+        // one_call below.
+        v.key<&Labeled::description>(s.description, "base description");
+    }
 };
 
 /// A second type sharing the SAME diamond mixins (proving the pattern is
@@ -118,6 +172,7 @@ public:
     model::Opt<Asset> linked;  ///< nullable: deleting the asset nulls this instead of killing Gizmo
 
     std::string gizmo_key() const { return "giz:" + label; }
+    std::string gizmo_description() const { return description; }  // see Asset::asset_description()
 
     std::string to_string() const {
         const model::Id linked_id = linked.raw();
@@ -147,24 +202,47 @@ public:
         // on the other.
         v.key<&Labeled::label>(s.label, "label");
     }
+
+    // Same reasoning as Asset::define_scan_fields/define_cached_fields
+    // above -- own tag (&Gizmo::gizmo_description), because
+    // &Labeled::description would fail to compile through find_by_scan_field/
+    // find_by_cached_field's member_class_t downcast. Plus the SAME raw
+    // &Labeled::description entry Asset also registers -- see Asset's own
+    // comments on why the scan one is declaration-only (no cross-type read
+    // path exists) while the cached one is genuinely queryable across types.
+    template <class Self>
+    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Gizmo::gizmo_description>(s.gizmo_description(), "description");
+        v.key<&Labeled::description>(s.description, "base description");
+    }
+
+    template <class Self>
+    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
+        v.key<&Gizmo::gizmo_description>(s.gizmo_description(), "description");
+        v.key<&Labeled::description>(s.description, "base description");
+    }
 };
 
-Ref<Asset> make_asset(Model& m, const std::string& label, Ref<Account> owner, std::int64_t created_at = 0) {
+Ref<Asset> make_asset(Model& m, const std::string& label, Ref<Account> owner, std::int64_t created_at = 0,
+                     const std::string& description = "") {
     Transaction txn = m.begin();
     auto a = std::make_unique<Asset>();
     a->label = label;
     a->owner = owner;
     a->created_at = created_at;
+    a->description = description;
     const Ref<Asset> local = txn.create(std::move(a));
     const CommitResult res = commit_ok(m, txn);
     return res.to_real(local);
 }
 
-Ref<Gizmo> make_gizmo(Model& m, const std::string& label, Opt<Asset> linked = Opt<Asset>{}) {
+Ref<Gizmo> make_gizmo(Model& m, const std::string& label, Opt<Asset> linked = Opt<Asset>{},
+                     const std::string& description = "") {
     Transaction txn = m.begin();
     auto g = std::make_unique<Gizmo>();
     g->label = label;
     g->linked = linked;
+    g->description = description;
     const Ref<Gizmo> local = txn.create(std::move(g));
     const CommitResult res = commit_ok(m, txn);
     return res.to_real(local);
@@ -465,4 +543,126 @@ TEST(update_through_diamond_base_fields_reconciles_together) {
 
     CHECK(s.find_by_key<&Asset::asset_key>("asset:NEW") != nullptr);
     CHECK(s.find_by_key<&Asset::asset_key>("asset:OLD") == nullptr);  // old index entry gone
+}
+
+// description (declared once, in Labeled, exactly like label) is deliberately
+// NOT unique -- unlike label's define_keys() entry, duplicates across
+// several Assets, several Gizmos, or a mix of both are all fine, no
+// CommitStatus::Invalid anywhere. Unlike the label/find_by_key_raw story,
+// there's no single shared index to query for this field: find_by_scan_field
+// does an O(#ClassT) walk of ONE type's own by_type bucket (see
+// scan_field_short_circuit's use of for_each_short_circuit<ClassT> in
+// model.h), so "scanning across types" isn't one call -- it's one call PER
+// type, same field name, same value, same underlying (Labeled-declared) data.
+TEST(scan_field_over_inherited_description_matches_across_types_and_allows_duplicates) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "OWNER");
+    const Ref<Asset> a1 = make_asset(m, "A1", acc, /*created_at=*/0, "SHARED");
+    const Ref<Asset> a2 = make_asset(m, "A2", acc, /*created_at=*/0, "SHARED");  // same description, same type
+    const Ref<Gizmo> g = make_gizmo(m, "G1", Opt<Asset>{}, "SHARED");            // same description, other type
+
+    Snapshot s = m.snapshot();
+
+    const auto assets = s.find_by_scan_field<&Asset::asset_description>("SHARED");
+    CHECK_EQ(assets.size(), std::size_t{2});  // duplicates within ONE type: both a1 and a2
+    bool saw_a1 = false, saw_a2 = false;
+    for (const Asset* ap : assets) {
+        if (ap->id == a1.raw()) saw_a1 = true;
+        if (ap->id == a2.raw()) saw_a2 = true;
+    }
+    CHECK(saw_a1);
+    CHECK(saw_a2);
+
+    const auto gizmos = s.find_by_scan_field<&Gizmo::gizmo_description>("SHARED");
+    CHECK_EQ(gizmos.size(), std::size_t{1});  // the SAME value, matched on the OTHER type too
+    CHECK_EQ(gizmos.front()->id, g.raw());
+
+    CHECK(s.find_by_scan_field<&Asset::asset_description>("NOPE").empty());
+}
+
+// Same story, through the INDEXED family instead: Root::by_cached_field
+// backs find_by_cached_field, but same per-type-tag rule as scan (see
+// Asset::asset_description()'s doc comment) -- "matches across types" is
+// demonstrated the same way, one call per type, same shared field.
+TEST(cached_field_over_inherited_description_matches_across_types_and_allows_duplicates) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "OWNER");
+    const Ref<Asset> a1 = make_asset(m, "A1", acc, /*created_at=*/0, "SHARED");
+    const Ref<Asset> a2 = make_asset(m, "A2", acc, /*created_at=*/0, "SHARED");
+    const Ref<Gizmo> g1 = make_gizmo(m, "G1", Opt<Asset>{}, "SHARED");
+    const Ref<Gizmo> g2 = make_gizmo(m, "G2", Opt<Asset>{}, "OTHER");
+
+    Snapshot s = m.snapshot();
+
+    const auto assets = s.find_by_cached_field<&Asset::asset_description>("SHARED");
+    CHECK_EQ(assets.size(), std::size_t{2});
+    bool saw_a1 = false, saw_a2 = false;
+    for (const Asset* ap : assets) {
+        if (ap->id == a1.raw()) saw_a1 = true;
+        if (ap->id == a2.raw()) saw_a2 = true;
+    }
+    CHECK(saw_a1);
+    CHECK(saw_a2);
+
+    const auto gizmos_shared = s.find_by_cached_field<&Gizmo::gizmo_description>("SHARED");
+    CHECK_EQ(gizmos_shared.size(), std::size_t{1});
+    CHECK_EQ(gizmos_shared.front()->id, g1.raw());
+
+    const auto gizmos_other = s.find_by_cached_field<&Gizmo::gizmo_description>("OTHER");
+    CHECK_EQ(gizmos_other.size(), std::size_t{1});
+    CHECK_EQ(gizmos_other.front()->id, g2.raw());
+
+    CHECK(s.find_by_cached_field<&Asset::asset_description>("OTHER").empty());  // OTHER belongs to a Gizmo, not an Asset
+}
+
+// The two tests above prove the field works identically on both types, but
+// each still needed ONE CALL PER TYPE (find_by_cached_field<&Asset::...> and
+// find_by_cached_field<&Gizmo::...> separately) -- because that API's return
+// type, member_class_t<Field>, is pinned to a single concrete class. This
+// test is the genuine "at the same time" version: BOTH Asset and Gizmo
+// register &Labeled::description under the SAME tag (see their
+// define_cached_fields() above), so Root::by_cached_field holds one shared
+// bucket for it, and Snapshot::find_by_cached_field_raw -- the untyped
+// sibling of find_by_key_raw, added specifically for this case -- reads that
+// bucket back as a single vector<const ObjectBase*>, type-erased, with a1,
+// a2, AND g1 all coming back from ONE call.
+TEST(finding_by_the_inherited_description_field_finds_both_types_in_one_call) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "OWNER");
+    const Ref<Asset> a1 = make_asset(m, "A1", acc, /*created_at=*/0, "SHARED");
+    const Ref<Asset> a2 = make_asset(m, "A2", acc, /*created_at=*/0, "SHARED");
+    const Ref<Gizmo> g1 = make_gizmo(m, "G1", Opt<Asset>{}, "SHARED");
+    const Ref<Gizmo> g2 = make_gizmo(m, "G2", Opt<Asset>{}, "OTHER");  // different value: must NOT show up
+
+    Snapshot s = m.snapshot();
+
+    const std::vector<const ObjectBase*> shared =
+        s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "SHARED");
+    CHECK_EQ(shared.size(), std::size_t{3});  // a1, a2, AND g1 -- one call, two concrete types
+
+    bool saw_a1 = false, saw_a2 = false, saw_g1 = false;
+    for (const ObjectBase* o : shared) {
+        if (o->id == a1.raw()) {
+            CHECK(o->tag() == model::type_tag<Asset>());
+            saw_a1 = true;
+        } else if (o->id == a2.raw()) {
+            CHECK(o->tag() == model::type_tag<Asset>());
+            saw_a2 = true;
+        } else if (o->id == g1.raw()) {
+            CHECK(o->tag() == model::type_tag<Gizmo>());
+            saw_g1 = true;
+        }
+    }
+    CHECK(saw_a1);
+    CHECK(saw_a2);
+    CHECK(saw_g1);
+
+    const std::vector<const ObjectBase*> other =
+        s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "OTHER");
+    CHECK_EQ(other.size(), std::size_t{1});
+    CHECK_EQ(other.front()->id, g2.raw());
+
+    CHECK(s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "NOPE").empty());
+    // A field never touched by define_cached_fields() at all: empty, not an error.
+    CHECK(s.find_by_cached_field_raw(model::field_tag<&Asset::value>(), "0").empty());
 }

@@ -81,6 +81,32 @@ const ObjectBase* Snapshot::find_by_key_raw(const void* field, const std::string
     return id ? find_raw(*id) : nullptr;
 }
 
+bool Snapshot::for_each_by_cached_field_raw(const void* field, const std::string& key,
+                                            const std::function<bool(Id)>& f) const {
+    if (!root_) return true;  // default-constructed Snapshot: nothing to look up, vacuously complete
+    // by_cached_field maps field-tag -> that field's own persistent multimap
+    // of value -> set of every Id currently holding it -- same two-level
+    // shape as by_field/find_by_key_raw above, just multi-match per value.
+    auto it = root_->by_cached_field.find(field);
+    if (it == root_->by_cached_field.end()) return true;  // never define_cached_fields()'d: vacuous
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key);
+    if (!bucket) return true;  // no live object currently holds this exact value: vacuous
+    return bucket->for_each_short_circuit(f);
+}
+
+std::vector<const ObjectBase*> Snapshot::find_by_cached_field_raw(const void* field, const std::string& key) const {
+    std::vector<const ObjectBase*> out;
+    for_each_by_cached_field_raw(field, key, [&](Id id) {
+        // find_raw() re-checks the generation, same staleness guard as
+        // find_by_key_raw -- a bucket entry surviving past its object's
+        // removal (briefly, before reconciliation) can never alias a
+        // recycled slot's new occupant.
+        if (const ObjectBase* o = find_raw(id)) out.push_back(o);
+        return true;  // collect every match, never stop early
+    });
+    return out;
+}
+
 struct Snapshot::Lease {
     Model* m;
     std::uint64_t v;
