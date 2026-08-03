@@ -241,6 +241,7 @@ add_executable(model_tests
     tests/test_bulk_load.cpp
     tests/test_concurrency_stress.cpp
     tests/test_undo.cpp
+    tests/test_inheritance.cpp
 )
 target_link_libraries(model_tests PRIVATE model)
 target_precompile_headers(model_tests REUSE_FROM model)
