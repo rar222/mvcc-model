@@ -1732,8 +1732,17 @@ public:
     /// Obtain via Model::subscribe(), not directly.
     explicit Subscription(std::size_t depth) : cap_(depth) {}
 
-    bool wait(Update& out);       ///< blocks; false once the model shuts down
-    bool try_drain(Update& out);  ///< non-blocking
+    /// Blocks until an Update is available or the model shuts down; nullopt
+    /// only in the latter case (closed, and nothing left queued).
+    std::optional<Update> wait_for_update();
+    /// Non-blocking: nullopt if nothing is queued right now.
+    std::optional<Update> poll_for_update();
+    /// True once Model::shutdown() has closed this subscription. A snapshot
+    /// in time, not a substitute for the nullopt returned by wait_for_update()/
+    /// poll_for_update() -- those two remain the authoritative signal for
+    /// whether a given call's result is real data; this is for code that
+    /// wants to check status without waiting or consuming.
+    bool is_closed() const;
 
 private:
     friend class Model;
@@ -1742,16 +1751,16 @@ private:
                                  ///< (or always, at depth=0 -- see the constructor's doc comment)
     void collapse(Update tail);  ///< merge queue + tail into ONE Update; sets Update::coalesced
                                  ///< to whether q_ actually had a backlog, not just "this ran"
-    void close();                ///< Model::shutdown(): wake blocked wait()ers to return false
+    void close();                ///< Model::shutdown(): wake blocked wait_for_update()ers to return nullopt
 
-    std::mutex m_;                ///< guards everything below; never held while user code runs
-    std::condition_variable cv_;  ///< signals wait(): queue non-empty, or closed
+    mutable std::mutex m_;        ///< guards everything below; never held while user code runs
+    std::condition_variable cv_;  ///< signals wait_for_update(): queue non-empty, or closed
     std::deque<Update> q_;        ///< pending deliveries, oldest first; length <= cap_, EXCEPT
                                   ///< depth=0's floor of 1 entry once anything is pushed and not
                                   ///< yet drained (collapse() always leaves exactly one) -- see
                                   ///< the constructor's doc comment
     std::size_t cap_;             ///< the constructor's depth
-    bool closed_ = false;         ///< set once by close(); wait() drains what's left, then false
+    bool closed_ = false;         ///< set once by close(); wait_for_update() drains what's left, then nullopt
 };
 
 // ---------------------------------------------------------------------------

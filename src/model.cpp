@@ -112,7 +112,7 @@ void Snapshot::record_field_lookup(const std::type_info& type, const void* field
 // Subscription
 // ---------------------------------------------------------------------------
 
-bool Subscription::wait(Update& out) {
+std::optional<Update> Subscription::wait_for_update() {
     std::unique_lock lk(m_);  // unique_lock, not lock_guard: cv_.wait() must be able to unlock
                               // while blocked and re-lock before returning
     // Woken by either push() (work arrived) or close() (shutdown) -- the
@@ -121,21 +121,26 @@ bool Subscription::wait(Update& out) {
     // sleep instead of returning garbage.
     cv_.wait(lk, [&] { return !q_.empty() || closed_; });
     if (q_.empty())
-        return false;  // woke because closed_, not because work arrived: no more events, ever
-    out =
+        return std::nullopt;  // woke because closed_, not because work arrived: no more events, ever
+    Update out =
         std::move(q_.front());  // move out, not copy: an Update carries a Snapshot (pins a version)
                                 // and a full Change vector -- no reason to duplicate either
     q_.pop_front();
-    return true;
+    return out;
 }
 
-bool Subscription::try_drain(Update& out) {
+std::optional<Update> Subscription::poll_for_update() {
     std::lock_guard lk(m_);
     if (q_.empty())
-        return false;  // non-blocking: nothing queued right now, caller decides what to do
-    out = std::move(q_.front());
+        return std::nullopt;  // non-blocking: nothing queued right now, caller decides what to do
+    Update out = std::move(q_.front());
     q_.pop_front();
-    return true;
+    return out;
+}
+
+bool Subscription::is_closed() const {
+    std::lock_guard lk(m_);
+    return closed_;
 }
 
 void Subscription::push(Update u) {
@@ -157,8 +162,8 @@ void Subscription::push(Update u) {
         collapse(std::move(u));
     else
         q_.push_back(std::move(u));
-    cv_.notify_one();  // wakes at most one blocked wait() -- there is always at most one consumer
-                       // per queue entry to hand off, so notify_one (not notify_all) is correct
+    cv_.notify_one();  // wakes at most one blocked wait_for_update() -- there is always at most one
+                       // consumer per queue entry to hand off, so notify_one (not notify_all) is correct
 }
 
 void Subscription::collapse(Update tail) {
@@ -242,8 +247,8 @@ void Subscription::collapse(Update tail) {
 
 void Subscription::close() {
     std::lock_guard lk(m_);
-    closed_ = true;    // wait()'s predicate re-checks this: any blocked or future wait() call
-                       // returns false instead of hanging forever
+    closed_ = true;    // wait_for_update()'s predicate re-checks this: any blocked or future call
+                       // returns nullopt instead of hanging forever
     cv_.notify_all();  // notify_all, not notify_one: every blocked consumer thread (there may be
                        // several) must wake up and observe closed_, not just one of them
 }

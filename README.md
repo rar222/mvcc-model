@@ -132,9 +132,8 @@ if (auto d = v[&Order::parent]) (*d)[&Order::account]->name;
 
 // 4. Subscribers: unchanged.
 auto sub = m.subscribe(/*queue_depth=*/8);
-model::Update u;
-while (sub->wait(u)) {
-    for (const model::Change& c : u.changes) { /* c.id, c.kind */ }
+while (auto u = sub->wait_for_update()) {
+    for (const model::Change& c : *u->changes) { /* c.id, c.kind */ }
 }
 ```
 

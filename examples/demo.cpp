@@ -94,11 +94,10 @@ void reader_thread(Model& m, int tid) {
 
 void subscriber_thread(std::shared_ptr<Subscription> sub) {
     std::uint64_t created = 0, updated = 0, deleted = 0, coalesced = 0, batches = 0;
-    Update u;
-    while (sub->wait(u)) {
+    while (auto u = sub->wait_for_update()) {
         ++batches;
-        if (u.coalesced) ++coalesced;
-        for (const Change& c : *u.changes) {
+        if (u->coalesced) ++coalesced;
+        for (const Change& c : *u->changes) {
             switch (c.kind) {
                 case ChangeKind::Created: ++created; break;
                 case ChangeKind::Updated: ++updated; break;

@@ -87,22 +87,21 @@ void print_change(const Change& c, const Snapshot& before, const Snapshot& after
 void subscriber_thread(std::shared_ptr<Subscription> sub) {
     std::uint64_t batch = 0;
     Snapshot prev;  // null until the first Update is drained
-    Update u;
-    while (sub->wait(u)) {
+    while (auto u = sub->wait_for_update()) {
         ++batch;
         std::printf("[subscriber] batch %llu v%llu%s: %zu change(s)\n",
                     static_cast<unsigned long long>(batch),
-                    static_cast<unsigned long long>(u.snapshot.version()),
-                    u.coalesced ? " (coalesced)" : "", u.changes->size());
+                    static_cast<unsigned long long>(u->snapshot.version()),
+                    u->coalesced ? " (coalesced)" : "", u->changes->size());
 
-        for (const Change& c : *u.changes) {
+        for (const Change& c : *u->changes) {
             if (c.tag == type_tag<Account>()) {
-                print_change<Account>(c, prev, u.snapshot);
+                print_change<Account>(c, prev, u->snapshot);
             } else if (c.tag == type_tag<Order>()) {
-                print_change<Order>(c, prev, u.snapshot);
+                print_change<Order>(c, prev, u->snapshot);
             }
         }
-        prev = u.snapshot;
+        prev = u->snapshot;
     }
     std::printf("[subscriber] done: %llu batches\n", static_cast<unsigned long long>(batch));
 }

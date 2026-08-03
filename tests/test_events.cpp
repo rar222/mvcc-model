@@ -27,14 +27,14 @@ TEST(subscriber_gets_a_changeset_per_commit) {
 
     const Ref<Account> a = make_account(m, "A1");
 
-    Update u;
-    CHECK(sub->try_drain(u));
-    CHECK_EQ(u.changes->size(), std::size_t{1});
-    CHECK_EQ((*u.changes)[0].id, a.raw());
-    CHECK((*u.changes)[0].kind == ChangeKind::Created);
-    CHECK(!u.coalesced);
-    CHECK(u.snapshot.find(a) != nullptr);
-    CHECK(!sub->try_drain(u));
+    auto u = sub->poll_for_update();
+    CHECK(u.has_value());
+    CHECK_EQ(u->changes->size(), std::size_t{1});
+    CHECK_EQ((*u->changes)[0].id, a.raw());
+    CHECK((*u->changes)[0].kind == ChangeKind::Created);
+    CHECK(!u->coalesced);
+    CHECK(u->snapshot.find(a) != nullptr);
+    CHECK(!sub->poll_for_update().has_value());
 }
 
 // Exceeding a subscriber's queue depth coalesces intermediate updates
@@ -54,11 +54,10 @@ TEST(overflow_coalesces_instead_of_growing) {
     int batches = 0;
     bool saw_coalesced = false;
     std::int64_t final_qty = -1;
-    Update u;
-    while (sub->try_drain(u)) {
+    while (auto u = sub->poll_for_update()) {
         ++batches;
-        if (u.coalesced) saw_coalesced = true;
-        if (const Order* p = u.snapshot.find(o)) final_qty = p->qty;
+        if (u->coalesced) saw_coalesced = true;
+        if (const Order* p = u->snapshot.find(o)) final_qty = p->qty;
     }
     CHECK(batches <= 3);  // bounded, not 22
     CHECK(saw_coalesced);
@@ -78,8 +77,7 @@ TEST(repeated_updates_of_an_already_known_object_coalesce_to_updated_never_creat
     auto sub = m.subscribe(/*depth=*/2);
 
     const Ref<Order> o = make_order(m, "O1", make_account(m, "A1"));
-    Update drain;
-    while (sub->try_drain(drain)) {
+    while (sub->poll_for_update()) {
     }  // o's own Created is behind us now -- not part of the window below
 
     for (int i = 0; i < 20; ++i) {  // never drained -- must overflow and coalesce
@@ -89,15 +87,14 @@ TEST(repeated_updates_of_an_already_known_object_coalesce_to_updated_never_creat
     int mentions = 0;
     bool saw_coalesced = false;
     std::int64_t last_qty = -1;
-    Update u;
-    while (sub->try_drain(u)) {
-        if (u.coalesced) saw_coalesced = true;
-        for (const Change& c : *u.changes) {
+    while (auto u = sub->poll_for_update()) {
+        if (u->coalesced) saw_coalesced = true;
+        for (const Change& c : *u->changes) {
             if (c.id != o.raw()) continue;
             ++mentions;
             CHECK(c.kind == ChangeKind::Updated);
         }
-        if (const Order* p = u.snapshot.find(o)) last_qty = p->qty;
+        if (const Order* p = u->snapshot.find(o)) last_qty = p->qty;
     }
     CHECK(mentions >= 1);
     CHECK(saw_coalesced);
@@ -113,8 +110,7 @@ TEST(create_then_delete_between_drains_cancels_out) {
 
     const Ref<Account> a = make_account(m, "A1");
 
-    Update drain;
-    while (sub->try_drain(drain)) {
+    while (sub->poll_for_update()) {
     }
 
     const Ref<Order> o = make_order(m, "O1", a);
@@ -122,9 +118,8 @@ TEST(create_then_delete_between_drains_cancels_out) {
     update_field(m, a, [](Account* p) { p->balance = 5; });
 
     int mentions_o = 0, mentions_a = 0;
-    Update u;
-    while (sub->try_drain(u)) {
-        for (const Change& c : *u.changes) {
+    while (auto u = sub->poll_for_update()) {
+        for (const Change& c : *u->changes) {
             if (c.id == o.raw()) ++mentions_o;
             if (c.id == a.raw()) ++mentions_a;
         }
@@ -145,8 +140,7 @@ TEST(update_then_delete_in_one_coalescing_window_collapses_to_deleted_not_cancel
     auto sub = m.subscribe(/*depth=*/1);
 
     const Ref<Account> a = make_account(m, "A1", 1);
-    Update drain;
-    while (sub->try_drain(drain)) {
+    while (sub->poll_for_update()) {
     }  // a's own Created is behind us now -- not part of the window below
 
     // depth=1: the update below is queued; the delete right after it is what
@@ -154,19 +148,19 @@ TEST(update_then_delete_in_one_coalescing_window_collapses_to_deleted_not_cancel
     update_field(m, a, [](Account* p) { p->balance = 2; });
     remove_and_commit(m, a);
 
-    Update u;
-    CHECK(sub->try_drain(u));
-    CHECK(u.coalesced);
-    CHECK_EQ(u.changes->size(), std::size_t{1});
-    CHECK((*u.changes)[0].id == a.raw());
-    CHECK((*u.changes)[0].kind == ChangeKind::Deleted);
-    CHECK(u.snapshot.find(a) == nullptr);  // gone as of this (merged) Update's snapshot
-    CHECK(!sub->try_drain(u));             // collapse() always leaves exactly one entry
+    auto u = sub->poll_for_update();
+    CHECK(u.has_value());
+    CHECK(u->coalesced);
+    CHECK_EQ(u->changes->size(), std::size_t{1});
+    CHECK((*u->changes)[0].id == a.raw());
+    CHECK((*u->changes)[0].kind == ChangeKind::Deleted);
+    CHECK(u->snapshot.find(a) == nullptr);  // gone as of this (merged) Update's snapshot
+    CHECK(!sub->poll_for_update().has_value());  // collapse() always leaves exactly one entry
 }
 
 // Real cross-thread producer/consumer: every other Subscription test above
-// calls push()/try_drain()/collapse() synchronously, in one thread -- never
-// the actual wait()/shutdown() wake-up path that's the entire point of the
+// calls push()/poll_for_update()/collapse() synchronously, in one thread -- never
+// the actual wait_for_update()/shutdown() wake-up path that's the entire point of the
 // blocking API. Here a genuinely slow consumer thread (a deliberate sleep
 // per item) forces the writer to overflow a small queue and coalesce under
 // real timing pressure, not a manually-triggered one; and shutdown() must
@@ -178,10 +172,9 @@ TEST(a_slow_subscriber_thread_wakes_from_wait_after_shutdown_and_sees_coalescing
     std::atomic<int> updates_seen{0};
     std::atomic<bool> saw_coalesced{false};
     std::thread consumer([&] {
-        Update u;
-        while (sub->wait(u)) {
+        while (auto u = sub->wait_for_update()) {
             updates_seen.fetch_add(1, std::memory_order_relaxed);
-            if (u.coalesced) saw_coalesced = true;
+            if (u->coalesced) saw_coalesced = true;
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(2));  // deliberately the bottleneck
         }
@@ -190,7 +183,7 @@ TEST(a_slow_subscriber_thread_wakes_from_wait_after_shutdown_and_sees_coalescing
     constexpr int kCommits = 50;
     for (int i = 0; i < kCommits; ++i) make_account(m, "A" + std::to_string(i));
 
-    m.shutdown();  // must wake the consumer -- wait() drains whatever's left, then returns false
+    m.shutdown();  // must wake the consumer -- wait_for_update() drains whatever's left, then returns nullopt
     consumer.join();
 
     CHECK(updates_seen.load() > 0);
@@ -213,11 +206,11 @@ TEST(multiple_independent_subscribers_receive_independent_coalescing_streams) {
 
         // Drained every commit -- never allowed to build up, so it must never
         // coalesce and must see exactly this commit's own one-object changeset.
-        Update u;
-        CHECK(fast->try_drain(u));
-        CHECK(!u.coalesced);
-        CHECK_EQ(u.changes->size(), std::size_t{1});
-        CHECK(!fast->try_drain(u));  // nothing else queued behind it
+        auto u = fast->poll_for_update();
+        CHECK(u.has_value());
+        CHECK(!u->coalesced);
+        CHECK_EQ(u->changes->size(), std::size_t{1});
+        CHECK(!fast->poll_for_update().has_value());  // nothing else queued behind it
     }
 
     // `slow` was never drained during the loop above (queue depth 2, 20
@@ -226,10 +219,9 @@ TEST(multiple_independent_subscribers_receive_independent_coalescing_streams) {
     // having drained every single one of the same 20 commits cleanly.
     int batches = 0;
     bool saw_coalesced = false;
-    Update u;
-    while (slow->try_drain(u)) {
+    while (auto u = slow->poll_for_update()) {
         ++batches;
-        if (u.coalesced) saw_coalesced = true;
+        if (u->coalesced) saw_coalesced = true;
     }
     CHECK(batches <= 3);   // bounded, not 20
     CHECK(saw_coalesced);  // the slow subscriber's queue actually overflowed
@@ -250,11 +242,43 @@ TEST(subscribing_after_shutdown_returns_a_subscription_that_immediately_reports_
     auto late = m.subscribe(/*queue_depth=*/4);
     m.shutdown();  // shutdown() is repeatable: closes whatever is registered NOW, `late` included
 
-    // closed_ is true and the queue is empty, so wait()'s predicate is
-    // already satisfied -- this returns false immediately, no blocking.
-    Update u;
-    CHECK(!late->wait(u));
-    CHECK(!late->try_drain(u));
+    // closed_ is true and the queue is empty, so wait_for_update()'s predicate
+    // is already satisfied -- this returns nullopt immediately, no blocking.
+    CHECK(late->is_closed());
+    CHECK(!late->wait_for_update().has_value());
+    CHECK(!late->poll_for_update().has_value());
+}
+
+// poll_for_update() returning nullopt is ambiguous by itself: "nothing
+// queued right now" and "closed, nothing will ever arrive again" look
+// identical to a caller that only inspects the return value. is_closed()
+// is what disambiguates them for a non-blocking poller: drain everything
+// queued first (shutdown() doesn't discard a backlog, only wait_for_update()
+// gets that for free via its predicate), and only once poll_for_update()
+// comes back empty does is_closed() tell the loop whether to stop for good
+// or come back later.
+TEST(poll_for_update_loop_uses_is_closed_to_know_when_to_stop_polling) {
+    Model m;
+    auto sub = m.subscribe(/*depth=*/8);
+
+    make_account(m, "A1");
+    make_account(m, "A2");
+    m.shutdown();  // closes sub, but the two queued Updates are still there to drain
+
+    int seen = 0;
+    for (;;) {
+        if (auto u = sub->poll_for_update()) {
+            ++seen;
+            continue;
+        }
+        // Queue's empty now. A real poller would sleep and retry here if
+        // !is_closed() -- more could still arrive. Once is_closed() is true,
+        // an empty poll means "never again", so this is the only correct
+        // place to stop.
+        CHECK(sub->is_closed());
+        break;
+    }
+    CHECK_EQ(seen, 2);
 }
 
 // depth=0 is a documented special mode (see Subscription's constructor doc
@@ -273,11 +297,11 @@ TEST(depth_zero_always_collapses_but_coalesced_still_means_actual_backlog) {
     // even though every single delivery went through collapse().
     for (int i = 0; i < 3; ++i) {
         make_account(m, "A" + std::to_string(i));
-        Update u;
-        CHECK(sub->try_drain(u));
-        CHECK(!u.coalesced);
-        CHECK_EQ(u.changes->size(), std::size_t{1});
-        CHECK(!sub->try_drain(u));  // nothing else queued behind it
+        auto u = sub->poll_for_update();
+        CHECK(u.has_value());
+        CHECK(!u->coalesced);
+        CHECK_EQ(u->changes->size(), std::size_t{1});
+        CHECK(!sub->poll_for_update().has_value());  // nothing else queued behind it
     }
 
     // Three commits land with no drain in between: a genuine backlog. Still
@@ -287,20 +311,20 @@ TEST(depth_zero_always_collapses_but_coalesced_still_means_actual_backlog) {
     update_field(m, a, [](Account* p) { p->balance = 2; });
     const Ref<Account> b = make_account(m, "B1", 3);
 
-    Update u;
-    CHECK(sub->try_drain(u));
-    CHECK(u.coalesced);
-    CHECK(!sub->try_drain(u));  // collapse() always leaves exactly one entry
+    auto u = sub->poll_for_update();
+    CHECK(u.has_value());
+    CHECK(u->coalesced);
+    CHECK(!sub->poll_for_update().has_value());  // collapse() always leaves exactly one entry
 
     // Net effect, not per-commit history: a (Created, Updated) pair merges to
     // one Created entry carrying the FINAL value -- same merge rule
     // overflow_coalesces_instead_of_growing exercises at higher depths.
     int mentions_a = 0, mentions_b = 0;
-    for (const Change& c : *u.changes) {
+    for (const Change& c : *u->changes) {
         if (c.id == a.raw()) {
             ++mentions_a;
             CHECK(c.kind == ChangeKind::Created);
-            CHECK_EQ(u.snapshot.find(a)->balance, std::int64_t{2});
+            CHECK_EQ(u->snapshot.find(a)->balance, std::int64_t{2});
         } else if (c.id == b.raw()) {
             ++mentions_b;
             CHECK(c.kind == ChangeKind::Created);
@@ -365,21 +389,20 @@ TEST(subscriber_prints_before_after_values_from_consecutive_snapshots) {
     Snapshot prev;  // null until the first Update is drained
     int seen_created = 0, seen_updated = 0, seen_deleted = 0;
 
-    Update u;
-    while (sub->try_drain(u)) {
-        for (const Change& c : *u.changes) {
+    while (auto u = sub->poll_for_update()) {
+        for (const Change& c : *u->changes) {
             if (c.tag != type_tag<Account>()) continue;
             const Ref<Account> r{c.id};
-            print_change<Account>(c, prev, u.snapshot);
+            print_change<Account>(c, prev, u->snapshot);
 
             switch (c.kind) {
                 case ChangeKind::Created:
-                    CHECK_EQ(u.snapshot.find(r)->balance, std::int64_t{100});
+                    CHECK_EQ(u->snapshot.find(r)->balance, std::int64_t{100});
                     ++seen_created;
                     break;
                 case ChangeKind::Updated:
                     CHECK_EQ(prev.find(r)->balance, std::int64_t{100});
-                    CHECK_EQ(u.snapshot.find(r)->balance, std::int64_t{200});
+                    CHECK_EQ(u->snapshot.find(r)->balance, std::int64_t{200});
                     ++seen_updated;
                     break;
                 case ChangeKind::Deleted:
@@ -388,7 +411,7 @@ TEST(subscriber_prints_before_after_values_from_consecutive_snapshots) {
                     break;
             }
         }
-        prev = u.snapshot;
+        prev = u->snapshot;
     }
 
     CHECK_EQ(seen_created, 1);
