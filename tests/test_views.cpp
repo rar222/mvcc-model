@@ -220,6 +220,22 @@ TEST(for_each_and_all_of_cached_referrers_match_find_cached_referrers) {
     // Vacuously true for an account with no orders at all.
     CHECK(s.all_of_cached_referrers<&Order::account>(make_account(m, "LONELY"),
                                                      [](const Order&) { return false; }));
+
+    // Bad input: Order::parent is declared in define_references() (so it
+    // cascades/nulls correctly) but deliberately NOT in define_cached_
+    // references() -- see tests/test_types.h. for_each_cached_referrers and
+    // all_of_cached_referrers must treat it the same "undeclared is
+    // invisible" way find_cached_referrers already does: zero visits, and
+    // vacuously true (nothing to violate a predicate that never runs).
+    const Ref<Order> hub = make_order(m, "HUB", a1);
+    make_order(m, "CHILD", a1, hub);  // parent = hub, but NOT cache-indexed
+    Snapshot s2 = m.snapshot();
+
+    std::size_t undeclared_visits = 0;
+    s2.for_each_cached_referrers<&Order::parent>(hub, [&](const Order&) { ++undeclared_visits; });
+    CHECK_EQ(undeclared_visits, std::size_t{0});
+    CHECK(s2.all_of_cached_referrers<&Order::parent>(hub, [](const Order&) { return false; }));
+    CHECK(s2.find_cached_referrers<&Order::parent>(hub).empty());  // the leaf it's built on agrees
 }
 
 // View-returning forms of for_each_cached_referrers/all_of_cached_referrers,
@@ -240,11 +256,34 @@ TEST(view_forms_of_cached_referrers_bind_to_this_snapshot) {
     });
     CHECK_EQ(seen, 2);
 
+    // all_of_view_cached_referrers: true when everything satisfies the
+    // predicate, false (and genuinely stopped, not just a different bool)
+    // when something doesn't.
     CHECK(s.all_of_view_cached_referrers<&Order::account>(a, [](View<Order> v) { return v->qty > 0; }));
+    int checked = 0;
+    const bool stopped = s.all_of_view_cached_referrers<&Order::account>(a, [&](View<Order>) {
+        ++checked;
+        return false;
+    });
+    CHECK(!stopped);
+    CHECK_EQ(checked, 1);
 
     const auto views = s.view_cached_referrers<&Order::account>(a);
     CHECK_EQ(views.size(), std::size_t{2});
     for (const auto& v : views) CHECK_EQ(v[&Order::account]->name, std::string("A1"));
+
+    // Bad input: an uncached field (Order::parent, same as above) is
+    // invisible to every view form here too -- empty/zero-visit/vacuously
+    // true, not a crash and not a silent fallback to the scan.
+    const Ref<Order> hub = make_order(m, "HUB", a);
+    make_order(m, "CHILD", a, hub);
+    Snapshot s2 = m.snapshot();
+
+    int undeclared_seen = 0;
+    s2.for_each_view_cached_referrers<&Order::parent>(hub, [&](View<Order>) { ++undeclared_seen; });
+    CHECK_EQ(undeclared_seen, 0);
+    CHECK(s2.all_of_view_cached_referrers<&Order::parent>(hub, [](View<Order>) { return false; }));
+    CHECK(s2.view_cached_referrers<&Order::parent>(hub).empty());
 }
 
 // Untyped counterpart of find_cached_referrers/for_each_cached_referrers/
@@ -288,8 +327,17 @@ TEST(cached_referrer_raw_trio_matches_the_typed_forms) {
 
     // Undeclared field / no referrers: empty and vacuously true, not an error.
     CHECK(s.find_cached_referrers_raw(model::field_tag<&Order::parent>(), a.raw()).empty());
+    std::size_t undeclared_visits = 0;
+    s.for_each_cached_referrers_raw(model::field_tag<&Order::parent>(), a.raw(),
+                                    [&](const ObjectBase&) { ++undeclared_visits; });
+    CHECK_EQ(undeclared_visits, std::size_t{0});
     CHECK(s.all_of_cached_referrers_raw(model::field_tag<&Order::parent>(), a.raw(),
                                         [](const ObjectBase&) { return false; }));
+
+    // A target Id that was never even created, on a DECLARED field: also
+    // empty/vacuous, not a crash -- a stale/never-existent Id is a legal
+    // input, not an error condition.
+    CHECK(s.find_cached_referrers_raw(tag, Id{}).empty());
 }
 
 // A cascade-deleted referrer is dropped from its own outgoing bucket in

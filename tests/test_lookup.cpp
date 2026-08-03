@@ -192,9 +192,36 @@ TEST(all_of_referrer_and_all_of_view_referrer_short_circuit) {
     // Vacuously true: an account with no orders violates nothing.
     CHECK(s.all_of_referrer<&Order::account>(make_account(m, "LONELY"), [](const Order&) { return false; }));
 
-    // View form: same short-circuit contract, through a View<Order> instead.
+    // View form: same short-circuit contract, through a View<Order> instead
+    // -- including that it genuinely stops (not just a different boolean).
     CHECK(s.all_of_view_referrer<&Order::account>(a, [](View<Order> v) { return v->qty > 0; }));
     CHECK(!s.all_of_view_referrer<&Order::account>(a, [](View<Order> v) { return v->qty > 1; }));
+
+    int checked_view = 0;
+    const bool stopped_view = s.all_of_view_referrer<&Order::account>(a, [&](View<Order>) {
+        ++checked_view;
+        return false;
+    });
+    CHECK(!stopped_view);
+    CHECK_EQ(checked_view, 1);
+
+    CHECK(s.all_of_view_referrer<&Order::account>(make_account(m, "LONELY2"),
+                                                  [](View<Order>) { return false; }));
+}
+
+// The View-returning referrer API's "no referrers" case -- for_each_view_
+// referrer/view_referrers must visit/return nothing, not crash or return a
+// stale/garbage view, for a target that genuinely has none.
+TEST(view_referrer_forms_are_empty_for_an_unreferenced_target) {
+    Model m;
+    const Ref<Account> lonely = make_account(m, "LONELY");
+    Snapshot s = m.snapshot();
+
+    int seen = 0;
+    s.for_each_view_referrer<&Order::account>(lonely, [&](View<Order>) { ++seen; });
+    CHECK_EQ(seen, 0);
+
+    CHECK(s.view_referrers<&Order::account>(lonely).empty());
 }
 
 // find_by_key works for both a string field and an arithmetic field, and

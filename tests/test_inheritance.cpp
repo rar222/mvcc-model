@@ -750,6 +750,10 @@ TEST(finding_by_an_unrelated_tag_type_finds_both_asset_and_gizmo) {
     const std::vector<const ObjectBase*> via_labeled_tag =
         s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "TAGGED");
     CHECK_EQ(via_labeled_tag.size(), std::size_t{2});  // `a` and `g`, reached via the OTHER tag
+
+    // Bad input: a value nothing holds under this tag -- empty, not an
+    // error, and NOT the "UNTAGGED" Gizmo leaking in some other way.
+    CHECK(s.find_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "NOPE").empty());
 }
 
 // for_each_by_cached_field_raw is find_by_cached_field_raw's non-collecting
