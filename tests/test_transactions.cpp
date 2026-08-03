@@ -599,3 +599,183 @@ TEST(pre_transactions_pre_commit_and_post_commit_all_see_the_same_transaction_id
     m.set_post_commit({});
 }
 
+// Snapshot::begin() is equivalent to Model::begin(snapshot), just callable
+// straight off a Snapshot the caller already holds -- and, unlike
+// Model::begin(), it stays pinned to THAT snapshot's version even after the
+// model has moved on, exactly like Model::begin(older_snapshot) would.
+TEST(snapshot_begin_starts_a_transaction_pinned_to_that_snapshots_version_not_latest) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 100);
+    Snapshot s = m.snapshot();
+    make_account(m, "A2");  // advances the model past s
+
+    CHECK(s.version() < m.current_version());
+
+    Transaction txn = s.begin("from snapshot", std::any(std::int64_t{9}));
+    CHECK_EQ(txn.base_version(), s.version());
+    CHECK(txn.base_version() < m.current_version());
+    CHECK_EQ(txn.name(), std::string("from snapshot"));
+    CHECK_EQ(std::any_cast<std::int64_t>(txn.data()), std::int64_t{9});
+    CHECK(txn.base().find(a) != nullptr);
+
+    // s itself is untouched by minting a Transaction off it.
+    CHECK_EQ(s.version(), txn.base_version());
+
+    // txn.base() is a COPY of s (Transaction's constructor takes Snapshot by
+    // value), so it shares s's own Lease via the shared_ptr rather than
+    // registering a second one -- debug_live_versions() reports s's version
+    // with refcount 1 the whole time, not 2, which is exactly why copying a
+    // Snapshot is documented as cheap.
+    {
+        const auto versions = m.debug_live_versions();
+        int count_at_sver = 0;
+        for (const auto& [ver, cnt] : versions)
+            if (ver == s.version()) count_at_sver = cnt;
+        CHECK_EQ(count_at_sver, 1);
+    }
+
+    txn.update(a)->balance = 5;
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+    CHECK_EQ(m.snapshot().find(a)->balance, 5);
+}
+
+// Transaction::peek_before<T>: the pre-edit baseline for an id this
+// transaction update()'d with a REAL id, and null on every documented case
+// where there is no such baseline to show.
+TEST(transaction_peek_before_returns_the_pre_edit_baseline_and_null_in_every_documented_case) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 100);
+
+    Transaction txn = m.begin();
+    txn.update(a)->balance = 999;
+    CHECK_EQ(txn.peek_before<Account>(a.raw())->balance, std::int64_t{100});
+    CHECK_EQ(txn.peek(a)->balance, std::int64_t{999});
+
+    // (1) An id never update()'d this transaction: nothing to show.
+    const Ref<Account> untouched = make_account(m, "A2", 1);
+    CHECK(txn.peek_before<Account>(untouched.raw()) == nullptr);
+
+    // (2) A local create has nothing to show as "before" either.
+    auto fresh = std::make_unique<Account>();
+    fresh->name = "FRESH";
+    const Ref<Account> local = txn.create(std::move(fresh));
+    txn.update(local)->balance = 1;
+    CHECK(txn.peek_before<Account>(local.raw()) == nullptr);
+
+    // (3) Wrong T: the tag() check rejects it even though the slot is real
+    // and was genuinely update()'d.
+    CHECK(txn.peek_before<Order>(a.raw()) == nullptr);
+
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+
+    // (4) A stale generation of the same slot: remove the old occupant,
+    // recycle its slot into a brand-new Order, update() the NEW one, and
+    // confirm peek_before against the OLD id (dead generation, same index)
+    // is null rather than aliasing the new object's baseline.
+    const Ref<Order> o1 = make_order(m, "O1", a);
+    const std::uint32_t slot = o1.raw().index;
+    remove_and_commit(m, o1);
+    const Ref<Order> o2 = make_order(m, "O2", a);
+    CHECK_EQ(o2.raw().index, slot);
+    CHECK(o2.raw().gen != o1.raw().gen);
+
+    Transaction txn2 = m.begin();
+    txn2.update(o2)->qty = 42;
+    CHECK(txn2.peek_before<Order>(o1.raw()) == nullptr);  // stale generation of the SAME slot
+    CHECK_EQ(txn2.peek_before<Order>(o2.raw())->qty, std::int64_t{1});
+}
+
+// Transaction::peek_as<T>: a safe typed read from an untyped Id (e.g. one
+// pulled straight out of pending_changes()), null for a type mismatch or a
+// masked/dead id -- distinct from Model::peek_as<T>, which reads committed
+// state rather than this transaction's own pending overlay.
+TEST(transaction_peek_as_reads_an_untyped_id_typed_and_returns_null_for_mismatch_or_masked) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+
+    Transaction txn = m.begin();
+    auto o = std::make_unique<Order>();
+    o->code = "O1";
+    o->account = a;
+    const Ref<Order> o_local = txn.create(std::move(o));
+    txn.update(a)->balance = 7;
+
+    for (const Change& c : txn.pending_changes()) {
+        const bool is_order_id = (c.id == o_local.raw());
+        const Order* as_order = txn.peek_as<Order>(c.id);
+        const Account* as_account = txn.peek_as<Account>(c.id);
+        CHECK((as_order != nullptr) == is_order_id);
+        CHECK((as_account != nullptr) == !is_order_id);
+    }
+
+    const Ref<Order> o_removed = make_order(m, "O2", a);
+    Transaction txn2 = m.begin();
+    txn2.remove(o_removed);
+    CHECK(txn2.peek_as<Order>(o_removed.raw()) == nullptr);  // masked by its own remove() intent
+
+    CHECK(txn2.peek_as<Account>(Id{}) == nullptr);  // never-existent id
+}
+
+// Opt<T> overloads of Snapshot::find, Transaction::exists/peek/update/
+// remove, and BulkTransaction::update -- each should behave exactly like its
+// Ref<T> sibling for a set Opt, and degrade to a clean null/false/no-op for
+// a null Opt (never an assert-fire the way resolve(Ref<T>) would give).
+TEST(opt_overloads_of_find_exists_peek_update_remove_behave_like_their_ref_siblings) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> p = make_order(m, "P1", a);
+    const Ref<Order> c = make_order(m, "C1", a, p);
+
+    Snapshot s = m.snapshot();
+    const Opt<Order> par = s.find(c)->parent;
+    CHECK(par);
+    CHECK(s.find(par) != nullptr);
+    CHECK_EQ(s.find(par)->code, std::string("P1"));
+    CHECK(s.find(Opt<Order>{}) == nullptr);  // null Opt -> null, not a resolve()-style assert
+
+    Transaction txn = m.begin();
+    CHECK(txn.exists(par));
+    CHECK_EQ(txn.peek(par)->code, std::string("P1"));
+    txn.update(par)->qty = 7;
+    CHECK_EQ(txn.peek(par)->qty, std::int64_t{7});
+    CHECK(!txn.exists(Opt<Order>{}));
+    CHECK(txn.peek(Opt<Order>{}) == nullptr);
+    CHECK(txn.update(Opt<Order>{}) == nullptr);
+
+    txn.remove(par);
+    CHECK(!txn.exists(par));  // masked locally by its own remove() intent
+    CHECK(m.try_commit(txn).status == CommitStatus::Committed);
+    CHECK(m.snapshot().find(par) == nullptr);
+
+    // BulkTransaction::update(Opt<T>). A separate Model: commit_bulk_
+    // without_undo() requires exclusive access (no live Snapshot), and both
+    // `s` and `txn` above still pin one via their own Snapshot members.
+    Model m2;
+    BulkTransaction bt = m2.begin_bulk();
+    auto acc = std::make_unique<Account>();
+    acc->name = "BULK-A";
+    const Ref<Account> bulk_a = bt.create(std::move(acc));
+    const Opt<Account> bulk_a_opt(bulk_a);
+    Account* updated = bt.update(bulk_a_opt);
+    CHECK(updated != nullptr);
+    updated->balance = 55;
+    const CommitResult bres = m2.commit_bulk_without_undo(bt);
+    CHECK(bres.status == CommitStatus::Committed);
+    CHECK_EQ(m2.snapshot().find(bres.to_real(bulk_a))->balance, std::int64_t{55});
+}
+
+// Model::begin(Snapshot, name, data): every other call site in this file
+// passes only the base snapshot -- this covers the name/data parameters of
+// THAT specific overload (as opposed to Model::begin(name, data), covered
+// above).
+TEST(model_begin_with_snapshot_also_accepts_name_and_data) {
+    Model m;
+    make_account(m, "A1");
+    Snapshot s = m.snapshot();
+
+    Transaction txn = m.begin(s, "labeled", std::any(std::string("payload")));
+    CHECK_EQ(txn.base_version(), s.version());
+    CHECK_EQ(txn.name(), std::string("labeled"));
+    CHECK_EQ(std::any_cast<std::string>(txn.data()), std::string("payload"));
+}
+

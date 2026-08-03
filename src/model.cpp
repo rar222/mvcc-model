@@ -547,20 +547,10 @@ void Model::shutdown() {
 }
 
 const ObjectBase* Model::peek_raw(Id id) const {
-    if (!id) return nullptr;  // Id{} (default-constructed): never a valid handle, by construction
-    // Slot index splits into (chunk index, offset within chunk) via a shift
-    // and a mask, rather than division/modulo, because kChunkSize is a power
-    // of two -- see Chunk's own doc comment for why chunking exists at all
-    // (bounding a single COW clone's cost).
-    const std::uint32_t c = id.index >> kChunkBits;
-    const std::uint32_t i = id.index & kChunkMask;
-    if (c >= spine_.size()) return nullptr;  // never allocated: chunk doesn't exist yet
-    if (spine_[c]->gen[i] != id.gen)
-        return nullptr;        // slot was recycled since this Id was
-                               // minted -- id.gen names a specific
-                               // occupant, not just a slot (invariant 5)
-    return spine_[c]->obj[i];  // may itself be nullptr if the slot is currently empty (removed,
-                               // generation bumped, no create yet) -- caller must still check
+    // Same generation-checked slot lookup Snapshot::find_raw uses, against
+    // spine_ (commit_mu_-protected, possibly mid-commit) instead of an
+    // immutable published Root::spine -- see slot_lookup's own doc comment.
+    return slot_lookup(spine_, id);
 }
 
 Chunk* Model::cow(std::uint32_t c) {
@@ -1721,6 +1711,10 @@ void Model::rollback_apply() {
     changes_.clear();  // any survivors were popped by the log; clear defensively
     pending_undo_actions_.clear();  // not log()-replayed like changes_ -- see its own comment; a blunt
                             // clear is correct either way, since a failed attempt keeps nothing
+    clear_attempt_scratch();
+}
+
+void Model::clear_attempt_scratch() {
     dirty_.clear();
     dirty_by_type_.clear();
     dirty_by_field_.clear();
@@ -2042,14 +2036,9 @@ CommitResult Model::classify_apply_failure(IntegrityError err, const Transaction
     // local id, which have no target to check and are always genuine
     // transaction-building bugs -- those reject as Invalid.)
     if (err.bad_target && txn.base().find_raw(err.bad_target)) {
-        return CommitResult{CommitStatus::Conflict,
-                            Snapshot{},
-                            {},
-                            ConflictInfo{ConflictReason::RefIntegrity, {err.bad_target}},
-                            {},
-                            std::nullopt};
+        return CommitResult::conflicted(ConflictReason::RefIntegrity, {err.bad_target});
     }
-    return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, std::move(err)};
+    return CommitResult::invalid(std::move(err));
 }
 
 void Model::collapse_undo_actions() {
@@ -2133,12 +2122,7 @@ std::optional<CommitResult> Model::check_and_apply(Transaction& txn,
                                                    std::unordered_map<std::uint32_t, Id>& remap,
                                                    bool keep_undo) {
     if (std::vector<Id> overlap = check_id_overlap(txn); !overlap.empty()) {
-        return CommitResult{CommitStatus::Conflict,
-                            Snapshot{},
-                            {},
-                            ConflictInfo{ConflictReason::IdSetOverlap, std::move(overlap)},
-                            {},
-                            std::nullopt};
+        return CommitResult::conflicted(ConflictReason::IdSetOverlap, std::move(overlap));
     }
     if (auto err = apply_transaction_contents(txn, remap, keep_undo)) {
         return classify_apply_failure(std::move(*err), txn);
@@ -2319,16 +2303,11 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     std::vector<Change> resolved = std::move(changes_);
 
     changes_.clear();
-    dirty_.clear();        // next attempt re-COWs each chunk it touches
-    dirty_by_type_.clear();
-    dirty_by_field_.clear();
-    dirty_by_cached_field_.clear();
-    dirty_by_cached_reference_.clear();
+    clear_attempt_scratch();  // next attempt re-COWs each chunk it touches
     txn_rollback_log_.clear();         // committed: nothing to roll back to
     txn_created_.clear();  // published objects are now owned by the spine
 
-    return CommitResult{CommitStatus::Committed, pub,         std::move(resolved), std::nullopt,
-                        std::move(remap),        std::nullopt};
+    return CommitResult::committed(pub, std::move(resolved), std::move(remap));
 }
 
 // ---------------------------------------------------------------------------
@@ -2410,8 +2389,7 @@ void Model::clear_undo_list() {
 CommitResult Model::commit_pretransaction_locked(Transaction& txn, bool keep_undo) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
-    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty())
-        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
+    if (txn.is_empty()) return CommitResult::committed(txn.base_);
 
     std::unordered_map<std::uint32_t, Id> remap;  // local Id::index -> real Id, this attempt only
     if (auto failure = check_and_apply(txn, remap, keep_undo)) return std::move(*failure);
@@ -2420,8 +2398,7 @@ CommitResult Model::commit_pretransaction_locked(Transaction& txn, bool keep_und
         // Everything in txn had already been applied by an earlier
         // try_commit() on this same Transaction (or every local create was
         // locally cancelled) -- a no-op success, not a fresh publish.
-        return CommitResult{
-            CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
+        return CommitResult::committed(snapshot());
     }
 
     return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo, txn.id());
@@ -2498,8 +2475,7 @@ CommitResult Model::commit_main_locked(Transaction& txn, bool keep_undo) {
         // Everything in txn had already been applied by an earlier
         // try_commit() on this same Transaction (or every local create was
         // locally cancelled) -- a no-op success, not a fresh publish.
-        return CommitResult{
-            CommitStatus::Committed, snapshot(), {}, std::nullopt, {}, std::nullopt};
+        return CommitResult::committed(snapshot());
     }
 
     // Runs after apply, not before: it sees the FULLY resolved changeset,
@@ -2509,7 +2485,7 @@ CommitResult Model::commit_main_locked(Transaction& txn, bool keep_undo) {
     // -fno-exceptions, so a throw is std::terminate, not an error path.)
     if (pre_commit_ && !pre_commit_(*this, txn, changes_)) {
         rollback_apply();
-        return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
+        return CommitResult::vetoed();
     }
 
     return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo, txn.id());
@@ -2534,9 +2510,9 @@ void Model::record_commit_outcome(CommitStatus status) noexcept {
 CommitResult Model::try_commit_core(Transaction& txn, bool keep_undo) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
 
-    if (txn.local_created_.empty() && txn.local_updated_.empty() && txn.remove_intents_.empty()) {
+    if (txn.is_empty()) {
         record_commit_outcome(CommitStatus::Committed);
-        return CommitResult{CommitStatus::Committed, txn.base_, {}, std::nullopt, {}, std::nullopt};
+        return CommitResult::committed(txn.base_);
     }
 
     // post_commit_copy: post_commit_ read out (a std::function copy, cheap)
@@ -2707,9 +2683,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
         });
         if (bad) {
             // Nothing mutated yet -- txn still owns every object untouched.
-            return CommitResult{
-                CommitStatus::Invalid, Snapshot{}, {},
-                std::nullopt,          {},         IntegrityError{kUnmappedLocalMsg, Id{}}};
+            return CommitResult::invalid(IntegrityError{kUnmappedLocalMsg, Id{}});
         }
 
         std::optional<IntegrityError> key_err;
@@ -2725,7 +2699,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
         });
         if (key_err) {
             // Nothing mutated yet -- txn still owns every object untouched.
-            return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, *key_err};
+            return CommitResult::invalid(*key_err);
         }
     }
 
@@ -2744,11 +2718,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     for (auto& ch : spine_)
         for (std::uint32_t i = 0; i < kChunkSize; ++i) delete ch->obj[i];  // delete(nullptr): no-op
     spine_.clear();
-    dirty_.clear();
-    dirty_by_type_.clear();
-    dirty_by_field_.clear();
-    dirty_by_cached_field_.clear();
-    dirty_by_cached_reference_.clear();
+    clear_attempt_scratch();
     by_type_.clear();
     by_field_.clear();
     by_cached_field_.clear();

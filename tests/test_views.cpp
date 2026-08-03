@@ -572,3 +572,52 @@ TEST(cascade_delete_removes_an_object_from_every_lookup_family_it_participates_i
     CHECK(s.find_by_cached_field<&Order::qty>(5).empty());
 }
 
+// The one hole in an otherwise-complete family: for_each_view_by_scan_field
+// and every OTHER view/all_of variant on cached/scan fields are covered
+// elsewhere in this file -- this is for_each_view_by_cached_field itself,
+// visiting every match (never stopping early) with each one bound to `s`.
+TEST(for_each_view_by_cached_field_visits_every_match_and_binds_views_to_this_snapshot) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, {}, 5);
+    make_order(m, "O2", a, {}, 5);
+    make_order(m, "O3", a, {}, 7);
+    Snapshot s = m.snapshot();
+
+    int hits = 0;
+    s.for_each_view_by_cached_field<&Order::qty>(5, [&](View<Order> v) {
+        CHECK_EQ(v->qty, std::int64_t{5});
+        CHECK_EQ(v[&Order::account]->name, std::string("A1"));
+        ++hits;
+    });
+    CHECK_EQ(hits, 2);
+
+    // An undeclared value and a value with no matches both visit nobody.
+    int no_hits = 0;
+    s.for_each_view_by_cached_field<&Order::qty>(99, [&](View<Order>) { ++no_hits; });
+    CHECK_EQ(no_hits, 0);
+
+    // Delegates to for_each_by_cached_field, so it records a lookup exactly
+    // like every other entry point in this family.
+    const LookupCounts before = m.lookup_stats<&Order::qty>();
+    s.for_each_view_by_cached_field<&Order::qty>(7, [](View<Order>) {});
+    CHECK_EQ(m.lookup_stats<&Order::qty>().cached_calls, before.cached_calls + 1);
+}
+
+// View<T>::operator* dereferences to the same object operator-> reaches
+// through -- every other test in this file uses v->field exclusively, so
+// operator* itself is otherwise only ever exercised incidentally (inside
+// Snapshot::find_all_view's own pred(*v), never asserted directly).
+TEST(view_operator_star_dereferences_to_the_same_object_as_operator_arrow) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a, {}, 5);
+    Snapshot s = m.snapshot();
+
+    std::optional<View<Order>> v = s.view(o);
+    CHECK(v.has_value());
+    const Order& via_star = **v;
+    CHECK_EQ(&via_star, v->operator->());
+    CHECK_EQ(via_star.qty, std::int64_t{5});
+}
+

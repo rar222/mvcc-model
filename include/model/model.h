@@ -1000,6 +1000,24 @@ struct Chunk {
                                              ///< whose Id::gen mismatches is stale, not found
 };
 
+/// spine[index >> kChunkBits]->obj[index & kChunkMask], generation-checked
+/// (invariant 5): null for an out-of-range chunk, an empty slot, or a slot
+/// whose generation no longer matches (recycled since this Id was minted).
+/// Shared by Snapshot::find_raw (against an immutable published Root::spine)
+/// and Model::peek_raw (against the commit_mu_-protected spine_ mid-commit) --
+/// same lookup, different spine and different synchronization contract, which
+/// stays entirely the CALLER's responsibility; this function takes no lock.
+inline const ObjectBase* slot_lookup(const std::vector<std::shared_ptr<const Chunk>>& spine,
+                                     Id id) noexcept {
+    if (!id) return nullptr;
+    const std::uint32_t c = id.index >> kChunkBits;
+    const std::uint32_t i = id.index & kChunkMask;
+    if (c >= spine.size()) return nullptr;
+    const Chunk& ch = *spine[c];
+    if (ch.gen[i] != id.gen) return nullptr;  // slot was recycled since this Id was minted
+    return ch.obj[i];
+}
+
 /// One published, immutable version of the whole model -- everything a
 /// Snapshot can see, in one struct. try_commit() builds a fresh Root per
 /// commit and swaps it in atomically (Model::root_); nothing in a published
@@ -3112,6 +3130,16 @@ private:
 
     void rollback_apply();  // unwinds one failed try_commit() apply attempt
 
+    /// Clears every THIS-ATTEMPT scratch set (dirty_ and its four by_*
+    /// dirty-tracking siblings) so the next attempt starts with none of them
+    /// marked touched -- called from rollback_apply() (a failed attempt),
+    /// publish_now() (a succeeded one), and commit_bulk_without_undo()'s
+    /// exclusive wipe. A missed clear here would leak a stale "already
+    /// cloned/touched this attempt" mark into the NEXT attempt -- silent
+    /// index-maintenance corruption, not a crash -- so every site uses this
+    /// instead of re-listing the five clears by hand.
+    void clear_attempt_scratch();
+
     // ---- shared by try_commit() and run_pre_transaction() -----------
     // Both publish a Transaction as a real, independent commit while already
     // holding commit_mu_; apply_transaction_contents/classify_apply_failure/
@@ -3845,6 +3873,30 @@ struct CommitResult {
         auto it = local_remap.find(local.raw().index);
         return Ref<T>(it == local_remap.end() ? Id{} : it->second);
     }
+    /// Factories for the five shapes try_commit()'s various exit points
+    /// construct -- replacing a positional 6-field aggregate literal
+    /// (`{status, snapshot, changes, conflict, remap, error}`) at each of
+    /// them, which compiles silently even mis-ordered and has to be re-edited
+    /// at every call site if a field is ever added or reordered. Named after
+    /// the CommitStatus each produces; not exhaustive (PrecommitConflict is
+    /// always an existing CommitResult with its status field overwritten,
+    /// never built fresh -- see commit_main_locked()).
+    static CommitResult committed(Snapshot s, std::vector<Change> changes = {},
+                                  std::unordered_map<std::uint32_t, Id> remap = {}) {
+        return CommitResult{CommitStatus::Committed, std::move(s), std::move(changes), std::nullopt,
+                            std::move(remap), std::nullopt};
+    }
+    static CommitResult conflicted(ConflictReason reason, std::vector<Id> ids) {
+        return CommitResult{CommitStatus::Conflict, Snapshot{}, {},
+                            ConflictInfo{reason, std::move(ids)}, {}, std::nullopt};
+    }
+    static CommitResult invalid(Model::IntegrityError err) {
+        return CommitResult{CommitStatus::Invalid, Snapshot{}, {}, std::nullopt, {}, std::move(err)};
+    }
+    static CommitResult vetoed() {
+        return CommitResult{CommitStatus::Vetoed, Snapshot{}, {}, std::nullopt, {}, std::nullopt};
+    }
+
     /// Opt<T> form. Null passes through as null.
     template <class T>
     Opt<T> to_real(Opt<T> local) const {
@@ -4260,6 +4312,17 @@ private:
     /// victim's own fields are excluded: a self-loop dies with its owner.
     bool locally_referenced(Id local) const;
 
+    /// True iff this transaction has asked for nothing at all -- the fast
+    /// path both commit_pretransaction_locked() and try_commit_core() check
+    /// before touching commit_mu_-protected state. Deliberately excludes
+    /// local_remove_intents_: a DEFERRED local remove only ever exists
+    /// alongside the live local create it targets (see remove_raw), so
+    /// local_created_ being empty already implies local_remove_intents_ is
+    /// too -- listing it here as well would just restate that.
+    bool is_empty() const noexcept {
+        return local_created_.empty() && local_updated_.empty() && remove_intents_.empty();
+    }
+
     Model* model_ = nullptr;  ///< where try_commit() applies this; asserted against
                               ///< cross-model misuse in try_commit()
     Snapshot base_;  ///< pins base_version_ in Model::live_, same as any reader's snapshot
@@ -4293,13 +4356,8 @@ private:
 // ---------------------------------------------------------------------------
 
 inline const ObjectBase* Snapshot::find_raw(Id id) const noexcept {
-    if (!id || !root_) return nullptr;
-    const std::uint32_t c = id.index >> kChunkBits;
-    const std::uint32_t i = id.index & kChunkMask;
-    if (c >= root_->spine.size()) return nullptr;
-    const Chunk& ch = *root_->spine[c];
-    if (ch.gen[i] != id.gen) return nullptr;  // slot was recycled
-    return ch.obj[i];
+    if (!root_) return nullptr;
+    return slot_lookup(root_->spine, id);
 }
 
 // ---------------------------------------------------------------------------

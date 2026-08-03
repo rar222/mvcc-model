@@ -489,3 +489,111 @@ TEST(a_large_cascade_does_not_block_forever_and_reclaims) {
     CHECK_EQ(m.wait_for_reclamation(), std::size_t{0});
 }
 
+// Snapshot::find_raw is the untyped, generation-checked lookup every typed
+// find()/resolve() is built on -- exercised here directly, on every one of
+// its documented null branches, rather than only through a typed wrapper
+// that would mask the untyped return.
+TEST(find_raw_is_generation_checked_and_null_for_absent_or_stale_ids) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_raw(a.raw()) != nullptr);
+    CHECK(s.find_raw(a.raw())->tag() == type_tag<Account>());
+    CHECK(s.find_raw(o.raw())->tag() == type_tag<Order>());
+
+    CHECK(s.find_raw(Id{}) == nullptr);                              // default-constructed Id
+    CHECK(s.find_raw(Id{999999, 1}) == nullptr);                     // index past the spine
+    CHECK(s.find_raw(Id{a.raw().index, a.raw().gen + 1}) == nullptr);  // stale generation, same slot
+    CHECK(Snapshot{}.find_raw(a.raw()) == nullptr);                  // null Snapshot: nothing to see
+
+    // The documented use case: dispatch on tag() with no typed Snapshot
+    // access at all, e.g. walking a heterogeneous CommitResult::changes.
+    Transaction txn = m.begin();
+    auto o2 = std::make_unique<Order>();
+    o2->code = "O2";
+    o2->account = a;
+    txn.create(std::move(o2));
+    const CommitResult res = commit_ok(m, txn);
+    bool saw_order = false;
+    for (const Change& c : res.changes) {
+        if (c.kind != ChangeKind::Created) continue;
+        const ObjectBase* obj = m.snapshot().find_raw(c.id);
+        CHECK(obj != nullptr);
+        if (obj->tag() == type_tag<Order>()) saw_order = true;
+    }
+    CHECK(saw_order);
+}
+
+// for_each_short_circuit<T> is the primitive every all_of_by_scan_field/
+// all_of_referrer/etc. is built on -- checked directly here for its own
+// documented contract: `f` returning false actually stops the underlying
+// by_type walk (not just further calls to f), and the return value reports
+// whether the walk ran to completion.
+TEST(for_each_short_circuit_stops_the_underlying_walk_and_reports_completion) {
+    Model m;
+    for (int i = 0; i < 5; ++i) make_account(m, "A" + std::to_string(i));
+    Snapshot s = m.snapshot();
+
+    int n = 0;
+    const bool ran_to_completion =
+        s.for_each_short_circuit<Account>([&](const Account&) {
+            ++n;
+            return true;
+        });
+    CHECK(ran_to_completion);
+    CHECK_EQ(n, 5);
+
+    n = 0;
+    const bool stopped_early = s.for_each_short_circuit<Account>([&](const Account&) {
+        ++n;
+        return n < 2;  // stop after the second visit
+    });
+    CHECK(!stopped_early);
+    CHECK_EQ(n, 2);
+
+    // A type with no live objects: vacuously runs to completion.
+    CHECK(s.for_each_short_circuit<Order>([](const Order&) { return false; }));
+
+    // A default-constructed Snapshot: the `!root_` early return, also
+    // vacuously true.
+    CHECK(Snapshot{}.for_each_short_circuit<Account>([](const Account&) { return false; }));
+}
+
+// is_local(Id) is the free predicate every branch on kLocalIdBit in this
+// file's own tests already relies on implicitly -- pinned here directly,
+// including the exact bit boundary, so a future change to kLocalIdBit's
+// value would be caught here first.
+TEST(is_local_identifies_a_transaction_scoped_placeholder_id_by_its_top_bit) {
+    Model m;
+    Transaction txn = m.begin();
+    auto a = std::make_unique<Account>();
+    a->name = "A1";
+    const Ref<Account> local = txn.create(std::move(a));
+    CHECK(is_local(local.raw()));
+
+    const CommitResult res = m.try_commit(txn);
+    CHECK(res.status == CommitStatus::Committed);
+    const Ref<Account> real = res.to_real(local);
+    CHECK(!is_local(real.raw()));
+
+    CHECK(!is_local(Id{}));                      // null id
+    CHECK(!is_local(real.raw()));                // an ordinary, already-real handle
+    CHECK(is_local(Id{kLocalIdBit, 1}));         // exactly the boundary bit
+    CHECK(!is_local(Id{kLocalIdBit - 1, 1}));    // one below it: an ordinary (huge) real index
+
+    // BulkTransaction::create() mints local ids the same way. A separate
+    // Model: commit_bulk_without_undo() requires exclusive access (no live
+    // Snapshot), and `res` above still pins one via its own snapshot member.
+    Model m2;
+    BulkTransaction bt = m2.begin_bulk();
+    auto a2 = std::make_unique<Account>();
+    a2->name = "A2";
+    const Ref<Account> bulk_local = bt.create(std::move(a2));
+    CHECK(is_local(bulk_local.raw()));
+    const CommitResult bres = m2.commit_bulk_without_undo(bt);
+    CHECK(bres.status == CommitStatus::Committed);
+    CHECK(!is_local(bres.to_real(bulk_local).raw()));
+}
+

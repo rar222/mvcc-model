@@ -433,3 +433,125 @@ TEST(cascade_delete_works_correctly_on_bulk_loaded_data) {
     CHECK(s.find(real_g)->parent.raw() == Id{});  // nulled, not cascaded
 }
 
+// commit_bulk_without_undo() installs through a SEPARATE, no-log path
+// (add_cached_fields_no_log/add_cached_references_no_log) that has to seed
+// Root::by_cached_field/by_cached_reference identically to the ordinary
+// apply_create path -- otherwise a bulk-loaded model would look normal for
+// find_by_key/cascade but silently have empty cached indexes. This checks
+// every lookup family (key, scan, cached-field, cached-referrer) against
+// bulk-loaded data, then confirms a cascade over that same data empties the
+// buckets cleanly (no tombstones), exactly like the Transaction-built
+// equivalent in test_views.cpp.
+TEST(commit_bulk_without_undo_populates_cached_field_scan_field_and_cached_referrer_indexes) {
+    Model m;
+    BulkTransaction t = m.begin_bulk();
+    auto acc = std::make_unique<Account>();
+    acc->name = "A1";
+    const Ref<Account> a = t.create(std::move(acc));
+
+    auto o1 = std::make_unique<Order>();
+    o1->code = "O1";
+    o1->account = a;
+    o1->qty = 5;
+    const Ref<Order> ord1 = t.create(std::move(o1));
+
+    auto o2 = std::make_unique<Order>();
+    o2->code = "O2";
+    o2->account = a;
+    o2->qty = 5;
+    t.create(std::move(o2));
+
+    auto o3 = std::make_unique<Order>();
+    o3->code = "O3";
+    o3->account = a;
+    o3->qty = 7;
+    o3->parent = ord1;  // Opt<Order>::parent is deliberately NOT cached -- see Order's own comment
+    t.create(std::move(o3));
+
+    const CommitResult r = m.commit_bulk_without_undo(t);
+    CHECK(r.status == CommitStatus::Committed);
+    const Ref<Account> real_a = r.to_real(a);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_by_key<&Account::name>("A1") != nullptr);
+    CHECK(s.find_by_key<&Order::computed_key>("ord:O1") != nullptr);
+
+    CHECK_EQ(s.find_by_scan_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(s.find_by_scan_field<&Order::qty>(7).size(), std::size_t{1});
+
+    CHECK_EQ(s.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(s.find_by_cached_field<&Order::qty>(7).size(), std::size_t{1});
+    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:O1").size(), std::size_t{1});
+
+    CHECK_EQ(s.find_cached_referrers<&Order::account>(real_a).size(), std::size_t{3});
+    // account is cached, parent is not -- find_referrers (the uncached scan)
+    // still finds the parent edge, but find_cached_referrers must not.
+    CHECK_EQ(s.find_referrers<&Order::account>(real_a).size(), std::size_t{3});
+
+    // Removing the hub cascades through the non-nullable account edges,
+    // taking every Order down with it -- and every bucket above must end up
+    // empty, not holding a stale entry for a now-dead id.
+    remove_and_commit(m, real_a);
+    Snapshot after = m.snapshot();
+    CHECK(after.find_by_scan_field<&Order::qty>(5).empty());
+    CHECK(after.find_by_scan_field<&Order::qty>(7).empty());
+    CHECK(after.find_by_cached_field<&Order::qty>(5).empty());
+    CHECK(after.find_by_cached_field<&Order::qty>(7).empty());
+    CHECK(after.find_by_cached_field<&Order::computed_key>("ord:O1").empty());
+    CHECK(after.find_cached_referrers<&Order::account>(real_a).empty());
+}
+
+// commit_bulk_without_undo() is documented to skip PreCommitFn/
+// PreTransactionsFn/PostCommitFn entirely and to leave the undo list
+// untouched (model.h: "do NOT fire for a bulk commit") -- unlike an ordinary
+// try_commit(), which always produces exactly one new undo entry. Checked
+// together since both are about what a bulk commit deliberately does NOT do.
+TEST(commit_bulk_without_undo_never_fires_hooks_and_leaves_the_undo_list_untouched) {
+    Model m;
+    // Two ordinary commits FIRST, before any hook is installed, so there's
+    // an existing undo list a bulk load must leave completely alone --
+    // installing the hooks first would count these two toward the very
+    // counters this test checks stay at zero across the bulk load.
+    make_account(m, "PRE1");
+    make_account(m, "PRE2");
+    CHECK_EQ(m.list_undo().size(), std::size_t{2});
+    const Model::Diagnostics before_bulk = m.diagnostics();
+
+    int pre_transactions_calls = 0, pre_commit_calls = 0, post_commit_calls = 0;
+    m.set_pre_transactions([&](Model&, const Transaction&) { ++pre_transactions_calls; });
+    m.set_pre_commit([&](Model&, const Transaction&, const std::vector<Change>&) {
+        ++pre_commit_calls;
+        return true;
+    });
+    m.set_post_commit([&](Model&, const Transaction&, const CommitResult&) { ++post_commit_calls; });
+
+    BulkTransaction t = m.begin_bulk();
+    auto acc = std::make_unique<Account>();
+    acc->name = "BULK";
+    t.create(std::move(acc));
+    CHECK(m.commit_bulk_without_undo(t).status == CommitStatus::Committed);
+
+    CHECK_EQ(pre_transactions_calls, 0);
+    CHECK_EQ(pre_commit_calls, 0);
+    CHECK_EQ(post_commit_calls, 0);
+    // The bulk wipe clears undo_list_ outright (see its own doc comment) --
+    // the two pre-existing entries are gone, not merely "not added to."
+    CHECK(m.list_undo().empty());
+    // commits_succeeded_ (part of the SAME counter family before_bulk read)
+    // is untouched: a bulk load is excluded from ordinary commit accounting.
+    CHECK_EQ(m.diagnostics().commits_succeeded, before_bulk.commits_succeeded);
+
+    // Hooks and undo both work normally again on the very next ordinary
+    // commit -- the bulk path's exclusion is scoped to itself only.
+    const Ref<Account> after_bulk = make_account(m, "AFTER");
+    CHECK_EQ(pre_transactions_calls, 1);
+    CHECK_EQ(pre_commit_calls, 1);
+    CHECK_EQ(post_commit_calls, 1);
+    CHECK_EQ(m.list_undo().size(), std::size_t{1});
+    CHECK(m.snapshot().find(after_bulk) != nullptr);
+
+    m.set_pre_transactions({});
+    m.set_pre_commit({});
+    m.set_post_commit({});
+}
+

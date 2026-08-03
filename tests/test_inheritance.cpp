@@ -827,3 +827,75 @@ TEST(all_of_by_cached_field_raw_short_circuits_across_types) {
     CHECK(s.all_of_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "NOPE",
                                        [](const ObjectBase&) { return false; }));
 }
+
+// lookup_stats_raw is the only way to read a field's counts when the tag is
+// shared across several unrelated concrete types (exactly this file's
+// fixtures) -- lookup_stats<Field> can't express "which type" beyond
+// member_class_t<Field>. It must agree with the typed API for the type that
+// tag actually belongs to, and stay a SEPARATE, zero counter for any other
+// (type, field) pair -- even one sharing the identical field tag.
+TEST(lookup_stats_raw_reads_the_untyped_key_and_stays_independent_per_declaring_type) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "OWNER");
+    make_asset(m, "A1", acc, /*created_at=*/0, "SHARED");
+    make_gizmo(m, "G1", Opt<Asset>{}, "SHARED");
+    Snapshot s = m.snapshot();
+
+    (void)s.find_by_cached_field<&Asset::asset_description>("SHARED");
+    (void)s.find_by_scan_field<&Asset::asset_description>("SHARED");
+
+    const LookupCounts via_typed = m.lookup_stats<&Asset::asset_description>();
+    CHECK_EQ(via_typed.cached_calls, std::uint64_t{1});
+    CHECK_EQ(via_typed.uncached_calls, std::uint64_t{1});
+
+    const LookupCounts via_raw =
+        m.lookup_stats_raw(typeid(Asset), model::field_tag<&Asset::asset_description>());
+    CHECK_EQ(via_raw.cached_calls, via_typed.cached_calls);
+    CHECK_EQ(via_raw.uncached_calls, via_typed.uncached_calls);
+
+    // The case the typed API cannot express at all: same FIELD TAG value
+    // conceptually shared across types via &Keys::example_key elsewhere in
+    // this file, but here the SAME &Asset::asset_description tag queried
+    // under a DIFFERENT declaring type it was never looked up through --
+    // FieldLookupKey is keyed on (type, field) together, so this stays its
+    // own untouched {0,0}, not aliased onto Asset's counts above.
+    const LookupCounts via_wrong_type =
+        m.lookup_stats_raw(typeid(Gizmo), model::field_tag<&Asset::asset_description>());
+    CHECK_EQ(via_wrong_type.cached_calls, std::uint64_t{0});
+    CHECK_EQ(via_wrong_type.uncached_calls, std::uint64_t{0});
+
+    // A (type, field) pair never looked up at all: also {0,0}.
+    const LookupCounts never_looked_up =
+        m.lookup_stats_raw(typeid(Asset), model::field_tag<&Asset::value>());
+    CHECK_EQ(never_looked_up.cached_calls, std::uint64_t{0});
+    CHECK_EQ(never_looked_up.uncached_calls, std::uint64_t{0});
+}
+
+// The _raw cached-field/cached-referrer lookup families deliberately carry
+// no record_field_lookup() call (see src/model.cpp) -- the ONLY read path
+// for a tag shared across unrelated concrete types via &Keys::example_key,
+// so this asymmetry is otherwise structurally invisible to any test. Pinned
+// here explicitly as a decision, not an accident: many _raw calls against a
+// tag must leave lookup_stats_raw for EVERY (type, field) pair touching that
+// same underlying value at {0,0}.
+TEST(the_raw_cached_lookup_family_does_not_record_lookup_stats) {
+    Model m;
+    const Ref<Account> acc = make_account(m, "OWNER");
+    make_asset(m, "A1", acc, /*created_at=*/0, "TAGGED");
+    make_gizmo(m, "G1", Opt<Asset>{}, "TAGGED");
+    Snapshot s = m.snapshot();
+
+    for (int i = 0; i < 5; ++i) {
+        (void)s.find_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "TAGGED");
+        s.for_each_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "TAGGED",
+                                       [](const ObjectBase&) {});
+        (void)s.all_of_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "TAGGED",
+                                           [](const ObjectBase&) { return true; });
+    }
+
+    CHECK_EQ(m.lookup_stats_raw(typeid(Asset), model::field_tag<&Keys::example_key>()).cached_calls,
+             std::uint64_t{0});
+    CHECK_EQ(m.lookup_stats_raw(typeid(Gizmo), model::field_tag<&Keys::example_key>()).cached_calls,
+             std::uint64_t{0});
+    CHECK(m.lookup_diagnostics().stats.empty());  // nothing was ever recorded, for ANY field
+}

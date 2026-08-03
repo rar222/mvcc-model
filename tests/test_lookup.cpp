@@ -627,6 +627,55 @@ TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too)
     CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, std::uint64_t{2});
 }
 
+// record_field_lookup() fires from EIGHT entry points, not just the four
+// find_* ones exercised above: for_each_by_scan_field/all_of_by_scan_field,
+// for_each_by_cached_field/all_of_by_cached_field, for_each_referrer/
+// all_of_referrer, and for_each_cached_referrers/all_of_cached_referrers.
+// The regression above (for_each_view_referrer once silently skipped it via
+// an independent re-walk) shows exactly this class of bug is real -- this
+// test pins all eight, one call each, including that a short-circuited
+// all_of_* still records exactly one call even though it stops after the
+// first match.
+TEST(lookup_stats_records_a_call_from_every_for_each_and_all_of_entry_point_once_each) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    make_order(m, "O2", a, Opt<Order>{}, 5);
+    Snapshot s = m.snapshot();
+
+    const LookupCounts qty0 = m.lookup_stats<&Order::qty>();
+    s.for_each_by_scan_field<&Order::qty>(5, [](const Order&) {});
+    CHECK_EQ(m.lookup_stats<&Order::qty>().uncached_calls, qty0.uncached_calls + 1);
+
+    s.all_of_by_scan_field<&Order::qty>(5, [](const Order&) { return true; });
+    CHECK_EQ(m.lookup_stats<&Order::qty>().uncached_calls, qty0.uncached_calls + 2);
+
+    s.for_each_by_cached_field<&Order::qty>(5, [](const Order&) {});
+    CHECK_EQ(m.lookup_stats<&Order::qty>().cached_calls, qty0.cached_calls + 1);
+
+    s.all_of_by_cached_field<&Order::qty>(5, [](const Order&) { return true; });
+    CHECK_EQ(m.lookup_stats<&Order::qty>().cached_calls, qty0.cached_calls + 2);
+
+    const LookupCounts acct0 = m.lookup_stats<&Order::account>();
+    s.for_each_referrer<&Order::account>(a, [](const Order&) {});
+    CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, acct0.uncached_calls + 1);
+
+    s.all_of_referrer<&Order::account>(a, [](const Order&) { return true; });
+    CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, acct0.uncached_calls + 2);
+
+    s.for_each_cached_referrers<&Order::account>(a, [](const Order&) {});
+    CHECK_EQ(m.lookup_stats<&Order::account>().cached_calls, acct0.cached_calls + 1);
+
+    int visits = 0;
+    const bool stopped = s.all_of_cached_referrers<&Order::account>(a, [&](const Order&) {
+        ++visits;
+        return false;  // stop after the first match
+    });
+    CHECK(!stopped);
+    CHECK_EQ(visits, 1);
+    CHECK_EQ(m.lookup_stats<&Order::account>().cached_calls, acct0.cached_calls + 2);
+}
+
 // Two DISTINCT Models must not share counts, even for the identical field --
 // each Model's field_lookup_counts_ is its own map, keyed within that Model
 // only.

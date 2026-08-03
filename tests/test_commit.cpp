@@ -384,11 +384,17 @@ TEST(diagnostics_reports_object_population_storage_and_indexes) {
     CHECK_EQ(d.version, m.current_version());
     CHECK_EQ(d.live_object_count, std::size_t{2});
     CHECK_EQ(d.live_by_type.size(), std::size_t{2});
+    std::size_t saw_account = 0, saw_order = 0;
     for (const auto& tc : d.live_by_type) {
         CHECK_EQ(tc.live_count, std::size_t{1});  // one Account, one Order
-        CHECK(tc.type_name.find("Account") != std::string::npos ||
-              tc.type_name.find("Order") != std::string::npos);
+        // Tight, not a loose ||: exactly one entry must name each type --
+        // a build that (bug) reported the SAME name for both types would
+        // still pass a plain "Account" || "Order" check on both entries.
+        if (tc.type_name.find("Account") != std::string::npos) ++saw_account;
+        if (tc.type_name.find("Order") != std::string::npos) ++saw_order;
     }
+    CHECK_EQ(saw_account, std::size_t{1});
+    CHECK_EQ(saw_order, std::size_t{1});
     CHECK(d.chunk_count >= std::size_t{1});
     CHECK(d.slots_allocated >= std::size_t{2});
 
@@ -453,6 +459,53 @@ TEST(diagnostics_retained_commit_history_tracks_the_changelog) {
         CHECK(version <= d.version);
         CHECK(change_count >= std::size_t{1});
     }
+}
+
+// transactions_begun counts Transactions MINTED via begin(), committed or
+// not -- deliberately not a commit count (that's what the commits_* fields
+// above are for). Every begin() overload feeds the same next_txn_id_
+// counter, including Snapshot::begin() and a Transaction dropped without
+// ever being committed.
+TEST(diagnostics_transactions_begun_counts_every_begin_committed_or_not) {
+    Model m;
+    CHECK_EQ(m.diagnostics().transactions_begun, std::uint64_t{0});
+
+    Transaction t1 = m.begin();
+    Transaction t2 = m.begin();
+    { Transaction t3 = m.begin(); }  // dropped, never committed -- still counted
+    CHECK_EQ(m.diagnostics().transactions_begun, std::uint64_t{3});
+
+    CHECK(m.try_commit(t1).status == CommitStatus::Committed);  // empty commit -- still just a mint
+    CHECK_EQ(m.diagnostics().transactions_begun, std::uint64_t{3});  // committing mints nothing new
+
+    Snapshot s = m.snapshot();
+    Transaction t4 = s.begin();  // routes through the same counter
+    CHECK_EQ(m.diagnostics().transactions_begun, std::uint64_t{4});
+    CHECK(t2.id() < m.diagnostics().transactions_begun);
+    CHECK_EQ(t4.id(), m.diagnostics().transactions_begun);  // ids are minted sequentially from 1
+}
+
+// ObjectBase::type() -- reached in every test only transitively, via
+// Diagnostics::TypeCount::type_name. Checked directly here: it demangles to
+// something containing the type's own name, differs across types (as an
+// address, not just as a string), and is stable (the SAME address) across
+// two different instances of the same type -- the function-local static
+// Object<Derived>::type() computes once per Derived, not once per object.
+TEST(object_base_type_reports_a_readable_per_type_name_and_is_stable_across_instances) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Order> o = make_order(m, "O1", a1);
+    Snapshot s = m.snapshot();
+
+    const char* account_type = s.find(a1)->type();
+    CHECK(std::string(account_type).find("Account") != std::string::npos);
+    const char* order_type = s.find(o)->type();
+    CHECK(std::string(order_type).find("Order") != std::string::npos);
+    CHECK(account_type != order_type);  // different types: different addresses
+
+    CHECK_EQ(s.find(a1)->type(), s.find(a2)->type());  // same type, two instances: SAME address
+    CHECK_EQ(account_type, s.find(a1)->type());
 }
 
 // Drives every CommitStatus at least once and checks each lands in its own
