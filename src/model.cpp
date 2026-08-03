@@ -253,6 +253,15 @@ void Subscription::close() {
                        // several) must wake up and observe closed_, not just one of them
 }
 
+void Subscription::force_close() {
+    std::lock_guard lk(m_);
+    closed_ = true;
+    q_.clear();  // drops every pinned Update (and its Snapshot's Lease) right here, while the
+                // Model behind it is still alive to release_version() into -- unlike close(),
+                // which leaves the backlog for a caller that's still going to drain it
+    cv_.notify_all();
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -272,6 +281,32 @@ Model::Model() {
 }
 
 Model::~Model() {
+    // An undrained Subscription is the sneaky way to pin a Snapshot without any
+    // Snapshot-shaped variable in sight -- it's buried inside a queued Update, so
+    // a caller can easily forget it's there. Rather than document that as one more
+    // thing the caller must remember to drain, force_close() every Subscription
+    // here: it drops the backlog immediately, releasing each pinned Snapshot's
+    // Lease while this Model is still fully alive to release_version() into (see
+    // Subscription::force_close() and Snapshot::Lease::~Lease()). This must run
+    // BEFORE anything below, and before the live_ assert right after it.
+    {
+        std::lock_guard lk(subs_mu_);
+        for (auto& s : subs_) s->force_close();
+    }
+
+    // What's left is the caller's own responsibility -- a stray Snapshot or an
+    // open Transaction's base(), held directly, with no Subscription in the
+    // picture to force-close on their behalf. Assert it here, loudly, rather
+    // than let a violation surface later -- and non-deterministically -- as
+    // Snapshot::Lease::~Lease() dereferencing this Model after it's already
+    // been freed.
+    {
+        std::lock_guard lk(ver_mu_);
+        assert(live_.empty() &&
+               "~Model(): a Snapshot or Transaction::base() is still live -- every "
+               "one must be dropped before the Model is destroyed");
+    }
+
     // Stop the reaper and join it FIRST, before touching anything it might
     // also be touching (reap_queue_): joining guarantees reaper_loop() has
     // fully returned, so there is no concurrent access to race against below.

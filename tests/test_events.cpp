@@ -281,6 +281,52 @@ TEST(poll_for_update_loop_uses_is_closed_to_know_when_to_stop_polling) {
     CHECK_EQ(seen, 2);
 }
 
+// force_close() is the discard-the-backlog counterpart to shutdown()/close():
+// where close() (via shutdown()) leaves queued Updates for a caller that
+// still intends to drain them, force_close() drops them immediately. It's
+// what ~Model() itself now calls on every Subscription before doing anything
+// else (see model_destruction_force_closes_an_undrained_subscription_
+// without_crashing below) -- exercised here directly and synchronously so the
+// immediate-discard behavior itself is pinned down, independent of ~Model().
+TEST(force_close_discards_the_backlog_immediately_instead_of_leaving_it_to_drain) {
+    Model m;
+    auto sub = m.subscribe(/*depth=*/8);
+
+    make_account(m, "A1");
+    make_account(m, "A2");  // two Updates queued, neither drained yet
+
+    sub->force_close();
+
+    CHECK(sub->is_closed());
+    // Unlike plain close()/shutdown() (see poll_for_update_loop_uses_is_closed_
+    // to_know_when_to_stop_polling above, where the same setup leaves 2 to
+    // drain), the backlog is already gone -- the very first poll is nullopt.
+    CHECK(!sub->poll_for_update().has_value());
+    CHECK(!sub->wait_for_update().has_value());  // closed either way, so this doesn't block
+}
+
+// ~Model() must not require the caller to drain or even close every
+// Subscription first -- an undrained Subscription is exactly the "pins a
+// Snapshot with no Snapshot-shaped variable in sight" footgun, easy to
+// forget. So ~Model() force_close()s every Subscription itself (see
+// Subscription::force_close()) before it does anything else. `sub` here is
+// deliberately never drained, closed, or dropped before `m` is, and it
+// outlives `m`: that's only safe because ~Model() already force-closed it
+// and released the backlog's pinned Snapshots before `m`'s storage went
+// away.
+TEST(model_destruction_force_closes_an_undrained_subscription_without_crashing) {
+    std::shared_ptr<Subscription> sub;
+    {
+        Model m;
+        sub = m.subscribe(/*depth=*/8);
+        make_account(m, "A1");
+        make_account(m, "A2");  // left queued, deliberately never drained
+    }  // ~Model() runs here
+
+    CHECK(sub->is_closed());
+    CHECK(!sub->poll_for_update().has_value());
+}
+
 // depth=0 is a documented special mode (see Subscription's constructor doc
 // comment): push()'s `q_.size() >= cap_` is trivially true when cap_ is 0,
 // so EVERY push runs through collapse() -- even the very first, with nothing

@@ -1744,6 +1744,18 @@ public:
     /// wants to check status without waiting or consuming.
     bool is_closed() const;
 
+    /// Immediately closes AND drops every Update still queued -- unlike the
+    /// close() Model::shutdown() uses internally (which wakes blocked waiters
+    /// but preserves the backlog for a caller that intends to keep draining),
+    /// this discards it right here. Each dropped Update releases the Snapshot
+    /// it was pinning (and that Snapshot's Lease, which needs its Model still
+    /// alive to release into -- see Snapshot::Lease::~Lease()) before this
+    /// call returns. The tool for a caller that is about to destroy the Model
+    /// and does not intend to drain the rest: ~Model() asserts every
+    /// Subscription's queue is already empty, and this is how to make that
+    /// true without actually consuming the backlog.
+    void force_close();
+
 private:
     friend class Model;
 
@@ -1774,9 +1786,14 @@ private:
 class Model {
 public:
     Model();   ///< starts at version 1 (empty), spawns the reaper thread
-    ~Model();  ///< joins the reaper, frees everything. Every Snapshot,
-               ///< Transaction, Subscription, and View must already be gone
-               ///< -- a Lease releasing against a destroyed Model is UB.
+    ~Model();  ///< force_close()s every Subscription first (dropping any undrained
+               ///< backlog safely, while the Model is still alive -- see
+               ///< Subscription::force_close()), then joins the reaper and frees
+               ///< everything. Every Snapshot, Transaction, and View must still
+               ///< already be gone -- a Lease releasing against a destroyed Model
+               ///< is UB, and unlike a Subscription's queue, ~Model() has no way to
+               ///< reach and drop those itself. Asserted, not just documented: see
+               ///< ~Model()'s own assert on live_.
 
     // Not copyable (owns a thread, mutexes, and every object's identity) and
     // not movable either: Snapshots/Transactions hold interior pointers back
