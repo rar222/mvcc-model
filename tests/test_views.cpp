@@ -185,6 +185,113 @@ TEST(find_cached_referrers_matches_the_slow_scan_and_tracks_updates_and_is_versi
     CHECK_EQ(m.snapshot().find_cached_referrers<&Order::account>(a2).size(), std::size_t{1});
 }
 
+// for_each_cached_referrers/all_of_cached_referrers are find_cached_
+// referrers' for_each/all_of siblings -- previously missing entirely (only
+// find_cached_referrers existed, as a leaf with no shared primitive). Now
+// find_cached_referrers<Field> is itself built on for_each_cached_referrers<
+// Field>, matching find_by_cached_field's three-tier shape.
+TEST(for_each_and_all_of_cached_referrers_match_find_cached_referrers) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    make_order(m, "O1", a1);
+    make_order(m, "O2", a1);
+    make_order(m, "O3", a2);
+    Snapshot s = m.snapshot();
+
+    std::vector<Id> visited;
+    s.for_each_cached_referrers<&Order::account>(a1, [&](const Order& o) { visited.push_back(o.id); });
+    CHECK_EQ(visited.size(), std::size_t{2});
+    for (const Order* o : s.find_cached_referrers<&Order::account>(a1))
+        CHECK(std::find(visited.begin(), visited.end(), o->id) != visited.end());
+
+    // all_of: true when every referrer satisfies the predicate...
+    CHECK(s.all_of_cached_referrers<&Order::account>(a1, [](const Order& o) { return o.qty > 0; }));
+    // ...and genuinely short-circuits (stops after the first violation,
+    // rather than just skipping further calls to the predicate).
+    int checked = 0;
+    const bool result = s.all_of_cached_referrers<&Order::account>(a1, [&](const Order&) {
+        ++checked;
+        return false;  // fail immediately
+    });
+    CHECK(!result);
+    CHECK_EQ(checked, 1);
+
+    // Vacuously true for an account with no orders at all.
+    CHECK(s.all_of_cached_referrers<&Order::account>(make_account(m, "LONELY"),
+                                                     [](const Order&) { return false; }));
+}
+
+// View-returning forms of for_each_cached_referrers/all_of_cached_referrers,
+// and view_cached_referrers rebuilt on top of for_each_view_cached_referrers
+// (single-pass, not find_cached_referrers followed by a second wrap-in-View
+// loop) -- see view_cached_referrers' own doc comment.
+TEST(view_forms_of_cached_referrers_bind_to_this_snapshot) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a);
+    make_order(m, "O2", a);
+    Snapshot s = m.snapshot();
+
+    int seen = 0;
+    s.for_each_view_cached_referrers<&Order::account>(a, [&](View<Order> v) {
+        CHECK_EQ(v->account, a);
+        ++seen;
+    });
+    CHECK_EQ(seen, 2);
+
+    CHECK(s.all_of_view_cached_referrers<&Order::account>(a, [](View<Order> v) { return v->qty > 0; }));
+
+    const auto views = s.view_cached_referrers<&Order::account>(a);
+    CHECK_EQ(views.size(), std::size_t{2});
+    for (const auto& v : views) CHECK_EQ(v[&Order::account]->name, std::string("A1"));
+}
+
+// Untyped counterpart of find_cached_referrers/for_each_cached_referrers/
+// all_of_cached_referrers -- same relationship the cached-FIELD raw trio has
+// to find_by_cached_field, since Root::by_cached_reference has the identical
+// field-tag-keyed shape as Root::by_cached_field (see cached_referrer_short_
+// circuit_raw's own doc comment). Exercised here with a single type
+// (Order::account) for correctness; the "several unrelated types share one
+// tag" scenario itself is already proven for cached FIELDS in test_
+// inheritance.cpp -- this is the identical mechanism, just for references.
+TEST(cached_referrer_raw_trio_matches_the_typed_forms) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o1 = make_order(m, "O1", a);
+    const Ref<Order> o2 = make_order(m, "O2", a);
+    Snapshot s = m.snapshot();
+
+    const void* tag = model::field_tag<&Order::account>();
+
+    const std::vector<const ObjectBase*> found = s.find_cached_referrers_raw(tag, a.raw());
+    CHECK_EQ(found.size(), std::size_t{2});
+    bool saw_o1 = false, saw_o2 = false;
+    for (const ObjectBase* o : found) {
+        CHECK(o->tag() == model::type_tag<Order>());
+        if (o->id == o1.raw()) saw_o1 = true;
+        if (o->id == o2.raw()) saw_o2 = true;
+    }
+    CHECK(saw_o1);
+    CHECK(saw_o2);
+
+    std::size_t visits = 0;
+    s.for_each_cached_referrers_raw(tag, a.raw(), [&](const ObjectBase&) { ++visits; });
+    CHECK_EQ(visits, std::size_t{2});
+
+    int checked = 0;
+    CHECK(!s.all_of_cached_referrers_raw(tag, a.raw(), [&](const ObjectBase&) {
+        ++checked;
+        return false;
+    }));
+    CHECK_EQ(checked, 1);  // stopped after the first, didn't visit the second
+
+    // Undeclared field / no referrers: empty and vacuously true, not an error.
+    CHECK(s.find_cached_referrers_raw(model::field_tag<&Order::parent>(), a.raw()).empty());
+    CHECK(s.all_of_cached_referrers_raw(model::field_tag<&Order::parent>(), a.raw(),
+                                        [](const ObjectBase&) { return false; }));
+}
+
 // A cascade-deleted referrer is dropped from its own outgoing bucket in
 // Root::by_cached_reference, leaving no tombstone once the bucket empties.
 TEST(find_cached_referrers_tracks_cascade_delete) {

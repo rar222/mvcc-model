@@ -92,7 +92,7 @@ int main() {
     assert(s.find_by_cached_field<&Order::computed_key>("ord:O1").size() == 1);
     assert(s.view_by_cached_field<&Order::qty>(5).size() == 1);
     assert(s.find_referrers<&Order::account>(acct).size() == 1);
-    assert(s.find_referrers_view<&Order::account>(acct).size() == 1);
+    assert(s.view_referrers<&Order::account>(acct).size() == 1);
     assert(s.find_cached_referrers<&Order::account>(acct).size() == 1);
     assert(s.view_cached_referrers<&Order::account>(acct).size() == 1);
 

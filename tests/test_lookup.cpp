@@ -166,6 +166,37 @@ TEST(find_referrers_answers_who_points_at_me) {
     CHECK_EQ(view_children.size(), std::size_t{2});
 }
 
+// all_of_referrer/all_of_view_referrer -- previously missing entirely (only
+// the scan/cached-field families had an all_of_* sibling; the referrer
+// family didn't). Both are built on the same referrer_short_circuit
+// for_each_referrer itself now delegates to, so this also checks the walk
+// genuinely stops early rather than just skipping further predicate calls.
+TEST(all_of_referrer_and_all_of_view_referrer_short_circuit) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, /*qty=*/1);
+    make_order(m, "O2", a, Opt<Order>{}, /*qty=*/2);
+    Snapshot s = m.snapshot();
+
+    CHECK(s.all_of_referrer<&Order::account>(a, [](const Order& o) { return o.qty > 0; }));
+    CHECK(!s.all_of_referrer<&Order::account>(a, [](const Order& o) { return o.qty > 1; }));
+
+    int checked = 0;
+    const bool stopped = s.all_of_referrer<&Order::account>(a, [&](const Order&) {
+        ++checked;
+        return false;  // fail on the very first referrer visited
+    });
+    CHECK(!stopped);
+    CHECK_EQ(checked, 1);  // never reached the second
+
+    // Vacuously true: an account with no orders violates nothing.
+    CHECK(s.all_of_referrer<&Order::account>(make_account(m, "LONELY"), [](const Order&) { return false; }));
+
+    // View form: same short-circuit contract, through a View<Order> instead.
+    CHECK(s.all_of_view_referrer<&Order::account>(a, [](View<Order> v) { return v->qty > 0; }));
+    CHECK(!s.all_of_view_referrer<&Order::account>(a, [](View<Order> v) { return v->qty > 1; }));
+}
+
 // find_by_key works for both a string field and an arithmetic field, and
 // returns null for an undeclared field or a value that was never set.
 TEST(find_by_key_looks_up_define_keys_declared_fields) {
@@ -542,6 +573,31 @@ TEST(lookup_stats_counts_find_referrers_once_not_once_per_visited_object) {
 
     (void)s.find_cached_referrers<&Order::account>(a);
     CHECK_EQ(m.lookup_stats<&Order::account>().cached_calls, std::uint64_t{1});
+}
+
+// Regression: for_each_view_referrer/view_referrers must ALSO record a
+// lookup. A prior version of for_each_view_referrer (then still named
+// for_each_referrer_view) re-walked for_each_view<ClassT> and re-checked the
+// match itself instead of delegating to for_each_referrer<Field> -- so it
+// never called record_field_lookup, and every lookup made through the
+// View-returning referrer API was silently invisible to lookup_stats().
+// Delegating (see for_each_view_referrer's own doc comment) fixes that.
+TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a);
+    make_order(m, "O2", a);
+    Snapshot s = m.snapshot();
+
+    auto va = s.view(a);
+    int seen = 0;
+    va->for_each_referrer<&Order::account>([&](View<Order>) { ++seen; });
+    CHECK_EQ(seen, 2);
+    CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, std::uint64_t{1});
+
+    const auto found = s.view(*s.find(a)).find_referrers<&Order::account>();
+    CHECK_EQ(found.size(), std::size_t{2});
+    CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, std::uint64_t{2});
 }
 
 // Two DISTINCT Models must not share counts, even for the identical field --

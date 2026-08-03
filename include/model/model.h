@@ -1350,11 +1350,22 @@ public:
     /// not a runtime static_assert. Works on ANY Ref<>/Opt<> field, declared
     /// cached or not -- for one queried often enough to be worth an index,
     /// declare it in define_cached_references() and use
-    /// find_cached_referrers instead.
+    /// find_cached_referrers instead. NEVER stops early -- see
+    /// all_of_referrer for the short-circuiting sibling.
     /// Defined out-of-line (after Model) -- see find_by_scan_field's comment.
     template <auto Field, class F>
     void for_each_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
                            F&& f) const;
+
+    /// std::all_of over the same matches as for_each_referrer/find_referrers:
+    /// true if `pred(const ClassT&)` holds for every referrer, vacuously true
+    /// if there are none. Genuinely short-circuits -- built on the same
+    /// referrer_short_circuit for_each_referrer itself is built on (see
+    /// find_by_scan_field's comment for why this whole family is defined
+    /// out-of-line).
+    template <auto Field, class Pred>
+    bool all_of_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                        Pred&& pred) const;
 
     /// Same scan as for_each_referrer, collected into a vector.
     /// Defined out-of-line (after Model) -- see find_by_scan_field's comment.
@@ -1362,15 +1373,49 @@ public:
     std::vector<const member_class_t<decltype(Field)>*> find_referrers(
         Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
 
-    /// View-returning form of for_each_referrer.
+    /// View-returning form of for_each_referrer. Named for_each_view_referrer
+    /// (not for_each_referrer_view) to match this file's "view_" goes right
+    /// after the verb, before the rest of the name" convention -- the same
+    /// one for_each_view_by_scan_field/for_each_view_by_cached_field follow.
     template <auto Field, class F>
-    void for_each_referrer_view(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+    void for_each_view_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
                                 F&& f) const;
 
-    /// View-returning form of find_referrers.
+    /// View-returning form of all_of_referrer.
+    template <auto Field, class Pred>
+    bool all_of_view_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                             Pred&& pred) const;
+
+    /// View-returning form of find_referrers. Named view_referrers (not
+    /// find_referrers_view) to match view_by_key/view_by_scan_field/
+    /// view_by_cached_field/view_cached_referrers: "view_" replaces "find_"
+    /// as a PREFIX everywhere else in this file: only this one used to be a
+    /// suffix.
     template <auto Field>
-    std::vector<View<member_class_t<decltype(Field)>>> find_referrers_view(
+    std::vector<View<member_class_t<decltype(Field)>>> view_referrers(
         Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
+
+    /// INDEXED counterpart of for_each_referrer: O(log n + #matches) instead
+    /// of O(#ClassT objects), backed by Root::by_cached_reference. Only works
+    /// for a field declared in define_cached_references() -- empty
+    /// otherwise, same "undeclared is invisible" rule as find_by_cached_field
+    /// (there is no silent fallback to the scan; call for_each_referrer by
+    /// name for that). NEVER stops early -- see all_of_cached_referrers for
+    /// the short-circuiting sibling. find_cached_referrers itself is defined
+    /// in terms of this -- see for_each_by_scan_field's comment (the
+    /// scan/cached-field counterpart of the same idea).
+    template <auto Field, class F>
+    void for_each_cached_referrers(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                   F&& f) const;
+
+    /// std::all_of over the same matches as for_each_cached_referrers.
+    /// Genuinely short-circuits, same as all_of_referrer -- see its comment;
+    /// here the bucket itself is a pmap::PersistentSet, so this calls
+    /// PersistentSet::for_each_short_circuit directly on it (same shape as
+    /// all_of_by_cached_field).
+    template <auto Field, class Pred>
+    bool all_of_cached_referrers(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                Pred&& pred) const;
 
     /// INDEXED counterpart of find_referrers: O(log n + #matches) instead of
     /// O(#ClassT objects), backed by Root::by_cached_reference. Only works
@@ -1383,10 +1428,40 @@ public:
     std::vector<const member_class_t<decltype(Field)>*> find_cached_referrers(
         Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
 
+    /// View-returning form of for_each_cached_referrers.
+    template <auto Field, class F>
+    void for_each_view_cached_referrers(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                        F&& f) const;
+
+    /// View-returning form of all_of_cached_referrers.
+    template <auto Field, class Pred>
+    bool all_of_view_cached_referrers(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                     Pred&& pred) const;
+
     /// View-returning form of find_cached_referrers.
     template <auto Field>
     std::vector<View<member_class_t<decltype(Field)>>> view_cached_referrers(
         Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
+
+    /// Untyped counterpart of find_cached_referrers -- same relationship
+    /// find_by_cached_field_raw has to find_by_cached_field (see its own doc
+    /// comment): Root::by_cached_reference is a field-tag-keyed persistent
+    /// multimap, just like Root::by_cached_field, so the same "several
+    /// UNRELATED concrete types registering the identical field tag" case
+    /// applies here too. `target` is the untyped Id being referenced (a
+    /// Ref<T>/Opt<T>::raw()); the return is every referencing object,
+    /// regardless of concrete type, tag() left for the caller to check.
+    std::vector<const ObjectBase*> find_cached_referrers_raw(const void* field, Id target) const;
+
+    /// Untyped counterpart of for_each_cached_referrers -- visits, never
+    /// collects, never stops early. See find_cached_referrers_raw.
+    void for_each_cached_referrers_raw(const void* field, Id target,
+                                       const std::function<void(const ObjectBase&)>& f) const;
+
+    /// Untyped counterpart of all_of_cached_referrers -- short-circuits, same
+    /// contract as all_of_by_cached_field_raw. See find_cached_referrers_raw.
+    bool all_of_cached_referrers_raw(const void* field, Id target,
+                                     const std::function<bool(const ObjectBase&)>& pred) const;
 
     // ---- views ------------------------------------------------------------
     //
@@ -1517,6 +1592,31 @@ private:
     /// lookup family in this file shares).
     bool cached_field_short_circuit_raw(const void* field, const std::string& key,
                                         const std::function<bool(Id)>& f) const;
+
+    /// Shared, short-circuiting scan implementation behind BOTH
+    /// for_each_referrer<Field> and all_of_referrer<Field> -- same role
+    /// scan_field_short_circuit plays for the scan-field family, just
+    /// walking for_each_short_circuit<ClassT> with a reference-equality
+    /// match (`(o.*Field).raw() == target.raw()`) instead of a value
+    /// comparison, and with no define_references()-declared check: unlike a
+    /// scan field, for_each_referrer works on ANY Ref<>/Opt<> field (see its
+    /// own doc comment). Defined out-of-line alongside its callers -- see
+    /// find_by_scan_field's comment for why (record_field_lookup).
+    template <auto Field, class F>
+    bool referrer_short_circuit(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                F&& f) const;
+
+    /// Shared, short-circuiting bucket walk behind EVERY cached-referrer
+    /// lookup in this file -- for_each_cached_referrers<Field>, all_of_
+    /// cached_referrers<Field>, find_cached_referrers_raw, for_each_cached_
+    /// referrers_raw, AND all_of_cached_referrers_raw. Same relationship
+    /// cached_field_short_circuit_raw has to the cached-FIELD family (see its
+    /// own doc comment) -- Root::by_cached_reference has the identical
+    /// two-level shape as Root::by_cached_field (field-tag -> persistent map
+    /// keyed by, here, the target Id instead of a value string), so this is
+    /// that same primitive with a `Id` key instead of a `std::string` one.
+    bool cached_referrer_short_circuit_raw(const void* field, Id target,
+                                           const std::function<bool(Id)>& f) const;
 
     /// Generic ("any type, any field") counterpart of for_each_referrer<Field>:
     /// walks EVERY live object of EVERY type via by_type, and every one of
@@ -3549,13 +3649,28 @@ std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_by_cached_fie
 }
 
 template <auto Field, class F>
-void Snapshot::for_each_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
-                                 F&& f) const {
+bool Snapshot::referrer_short_circuit(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
     record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
-    for_each<ClassT>([&](const ClassT& o) {
-        if ((o.*Field).raw() == target.raw()) f(o);
+    return for_each_short_circuit<ClassT>([&](const ClassT& o) {
+        return (o.*Field).raw() != target.raw() || f(o);
     });
+}
+
+template <auto Field, class F>
+void Snapshot::for_each_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                 F&& f) const {
+    referrer_short_circuit<Field>(target, [&](const auto& o) {
+        f(o);
+        return true;  // for_each_referrer never stops early
+    });
+}
+
+template <auto Field, class Pred>
+bool Snapshot::all_of_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                              Pred&& pred) const {
+    return referrer_short_circuit<Field>(target, std::forward<Pred>(pred));
 }
 
 template <auto Field>
@@ -3567,20 +3682,34 @@ std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_referrers(
     return out;
 }
 
+template <auto Field, class F>
+void Snapshot::for_each_cached_referrers(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    cached_referrer_short_circuit_raw(field_tag<Field>(), target.raw(), [&](Id id) {
+        if (const ClassT* p = cast<ClassT>(find_raw(id))) f(*p);
+        return true;  // for_each_cached_referrers never stops early
+    });
+}
+
+template <auto Field, class Pred>
+bool Snapshot::all_of_cached_referrers(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target, Pred&& pred) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    return cached_referrer_short_circuit_raw(field_tag<Field>(), target.raw(), [&](Id id) {
+        const ClassT* p = cast<ClassT>(find_raw(id));
+        return !p || pred(*p);
+    });
+}
+
 template <auto Field>
 std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_cached_referrers(
     Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
     using ClassT = member_class_t<decltype(Field)>;
     std::vector<const ClassT*> out;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-    if (!root_) return out;
-    auto it = root_->by_cached_reference.find(field_tag<Field>());
-    if (it == root_->by_cached_reference.end()) return out;
-    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target.raw());
-    if (!bucket) return out;
-    bucket->for_each([&](Id id) {
-        if (const ClassT* p = cast<ClassT>(find_raw(id))) out.push_back(p);
-    });
+    for_each_cached_referrers<Field>(target, [&](const ClassT& o) { out.push_back(&o); });
     return out;
 }
 
@@ -4237,13 +4366,13 @@ public:
     /// `acct.for_each_referrer<&Order::account>(f)`.
     template <auto Field, class F>
     void for_each_referrer(F&& f) const {
-        s_->for_each_referrer_view<Field>(Ref<T>(o_->id), std::forward<F>(f));
+        s_->for_each_view_referrer<Field>(Ref<T>(o_->id), std::forward<F>(f));
     }
 
     /// Same scan as for_each_referrer, collected into a vector of views.
     template <auto Field>
     std::vector<View<member_class_t<decltype(Field)>>> find_referrers() const {
-        return s_->find_referrers_view<Field>(Ref<T>(o_->id));
+        return s_->view_referrers<Field>(Ref<T>(o_->id));
     }
 
 private:
@@ -4330,29 +4459,64 @@ std::vector<View<T>> Snapshot::find_all_view(Pred&& pred) const {
 }
 
 template <auto Field, class F>
-void Snapshot::for_each_referrer_view(
+void Snapshot::for_each_view_referrer(
     Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
+    // Delegates to for_each_referrer<Field> rather than re-walking
+    // for_each_view<ClassT> and re-checking `(o.*Field).raw() == target.raw()`
+    // independently (a prior version of this function did that, and as a
+    // result never called record_field_lookup -- every lookup made through
+    // the View-returning referrer API was silently invisible to
+    // Model::lookup_stats(). Delegating, the same way for_each_view_by_
+    // scan_field/for_each_view_by_cached_field already delegate to their
+    // non-view siblings, fixes both at once: one copy of the match logic,
+    // and record_field_lookup fires exactly where for_each_referrer<Field>
+    // already calls it.
     using ClassT = member_class_t<decltype(Field)>;
-    for_each_view<ClassT>([&](View<ClassT> v) {
-        if (((*v).*Field).raw() == target.raw()) f(v);
-    });
+    for_each_referrer<Field>(target, [&](const ClassT& o) { f(View<ClassT>(*this, o)); });
+}
+
+template <auto Field, class Pred>
+bool Snapshot::all_of_view_referrer(Ref<typename member_value_t<decltype(Field)>::target_type> target,
+                                   Pred&& pred) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    return all_of_referrer<Field>(target, [&](const ClassT& o) { return pred(View<ClassT>(*this, o)); });
 }
 
 template <auto Field>
-std::vector<View<member_class_t<decltype(Field)>>> Snapshot::find_referrers_view(
+std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_referrers(
     Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
     using ClassT = member_class_t<decltype(Field)>;
     std::vector<View<ClassT>> out;
-    for_each_referrer_view<Field>(target, [&](View<ClassT> v) { out.push_back(v); });
+    for_each_view_referrer<Field>(target, [&](View<ClassT> v) { out.push_back(v); });
     return out;
+}
+
+template <auto Field, class F>
+void Snapshot::for_each_view_cached_referrers(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    for_each_cached_referrers<Field>(target, [&](const ClassT& o) { f(View<ClassT>(*this, o)); });
+}
+
+template <auto Field, class Pred>
+bool Snapshot::all_of_view_cached_referrers(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target, Pred&& pred) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    return all_of_cached_referrers<Field>(
+        target, [&](const ClassT& o) { return pred(View<ClassT>(*this, o)); });
 }
 
 template <auto Field>
 std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_cached_referrers(
     Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
+    // Single-pass through for_each_view_cached_referrers, NOT find_cached_
+    // referrers followed by a second loop wrapping each raw pointer in a
+    // View (a prior version did that -- one vector<const ClassT*>, then a
+    // second vector<View<ClassT>> built from it). Matches every other
+    // view_by_X: build the View vector directly off the for_each sibling.
     using ClassT = member_class_t<decltype(Field)>;
     std::vector<View<ClassT>> out;
-    for (const ClassT* p : find_cached_referrers<Field>(target)) out.push_back(View<ClassT>(*this, *p));
+    for_each_view_cached_referrers<Field>(target, [&](View<ClassT> v) { out.push_back(v); });
     return out;
 }
 

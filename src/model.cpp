@@ -123,6 +123,47 @@ bool Snapshot::all_of_by_cached_field_raw(const void* field, const std::string& 
     });
 }
 
+bool Snapshot::cached_referrer_short_circuit_raw(const void* field, Id target,
+                                                 const std::function<bool(Id)>& f) const {
+    if (!root_) return true;  // default-constructed Snapshot: nothing to look up, vacuously complete
+    // by_cached_reference maps field-tag -> that field's own persistent
+    // multimap of TARGET id -> set of every REFERRER id currently pointing
+    // there -- same two-level shape as by_cached_field/cached_field_short_
+    // circuit_raw above, just keyed by Id instead of a value string.
+    auto it = root_->by_cached_reference.find(field);
+    if (it == root_->by_cached_reference.end()) return true;  // never define_cached_references()'d: vacuous
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target);
+    if (!bucket) return true;  // nothing currently references this target: vacuous
+    return bucket->for_each_short_circuit(f);
+}
+
+std::vector<const ObjectBase*> Snapshot::find_cached_referrers_raw(const void* field, Id target) const {
+    std::vector<const ObjectBase*> out;
+    cached_referrer_short_circuit_raw(field, target, [&](Id id) {
+        // find_raw() re-checks the generation, same staleness guard every
+        // other _raw lookup in this file relies on.
+        if (const ObjectBase* o = find_raw(id)) out.push_back(o);
+        return true;  // collect every match, never stop early
+    });
+    return out;
+}
+
+void Snapshot::for_each_cached_referrers_raw(const void* field, Id target,
+                                             const std::function<void(const ObjectBase&)>& f) const {
+    cached_referrer_short_circuit_raw(field, target, [&](Id id) {
+        if (const ObjectBase* o = find_raw(id)) f(*o);
+        return true;  // never stops early -- see this method's own doc comment
+    });
+}
+
+bool Snapshot::all_of_cached_referrers_raw(const void* field, Id target,
+                                           const std::function<bool(const ObjectBase&)>& pred) const {
+    return cached_referrer_short_circuit_raw(field, target, [&](Id id) {
+        const ObjectBase* o = find_raw(id);
+        return !o || pred(*o);
+    });
+}
+
 struct Snapshot::Lease {
     Model* m;
     std::uint64_t v;

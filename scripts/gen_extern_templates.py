@@ -255,7 +255,7 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
-            out.append(f'extern template std::vector<View<{T}>> Snapshot::find_referrers_view<&{T}::{fname}>(Ref<{Y}>) const;')
+            out.append(f'extern template std::vector<View<{T}>> Snapshot::view_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             if fname in t.cached_ref_fields:
                 out.append(f'extern template std::vector<const {T}*> Snapshot::find_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
                 out.append(f'extern template std::vector<View<{T}>> Snapshot::view_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
