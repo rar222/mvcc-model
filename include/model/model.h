@@ -885,7 +885,7 @@ public:
 ///
 /// (define_cached_fields is declared identically; a field may appear in more
 /// than one family.) The fully undeclared escape hatch remains the
-/// Snapshot::find_all() predicate scan.
+/// Snapshot::find_by_predicate() predicate scan.
 ///
 /// A FOURTH family, structurally different (it indexes by TARGET, not by
 /// value, and only applies to Ref<>/Opt<> fields already listed in
@@ -1050,7 +1050,7 @@ struct Root {
     std::vector<std::shared_ptr<const Chunk>> spine;
 
     /// One persistent SET per type: every Id of that type. This is what makes
-    /// for_each<T>() (and everything built on it: find_all, find_referrers,
+    /// for_each<T>() (and everything built on it: find_by_predicate, find_referrers,
     /// ...) O(#T objects) instead of a full spine scan. Keyed by TypeTag
     /// rather than a type-name string: the same address-comparison the rest
     /// of the model already uses for type checks (see type_tag<T>()), so no
@@ -1715,9 +1715,13 @@ public:
     /// `pred` returns true. There is no index behind this *filter* -- unlike
     /// find_by_key, it is O(number of T objects) by design. Reach for
     /// find_by_key when you have the exact indexed value instead of a
-    /// predicate.
+    /// predicate. Named find_by_predicate, not find_all, to match this
+    /// file's find_by_X convention (find_by_key/find_by_scan_field/find_by_
+    /// cached_field) -- `pred` is required, so this is a FILTERED scan, not
+    /// "give me everything" (that's range<T>()/for_each<T>(), which take no
+    /// predicate at all).
     template <class T, class Pred>
-    std::vector<const T*> find_all(Pred&& pred) const {
+    std::vector<const T*> find_by_predicate(Pred&& pred) const {
         std::vector<const T*> out;
         for_each<T>([&](const T& o) {
             if (pred(o)) out.push_back(&o);
@@ -1725,9 +1729,12 @@ public:
         return out;
     }
 
-    /// Same slow scan as find_all, but returns View<T>s bound to this snapshot.
+    /// Same slow scan as find_by_predicate, but returns View<T>s bound to
+    /// this snapshot. Named view_by_predicate to match view_by_key/view_by_
+    /// scan_field/view_by_cached_field/view_cached_referrers' "view_"-
+    /// prefix convention.
     template <class T, class Pred>
-    std::vector<View<T>> find_all_view(Pred&& pred) const;
+    std::vector<View<T>> view_by_predicate(Pred&& pred) const;
 
     /// Range-based-for support for for_each_referrer/all_of_referrer/
     /// find_referrers -- ReferrerRange<Field> walks the WHOLE by_type[ClassT]
@@ -5308,7 +5315,7 @@ void Snapshot::for_each_view(F&& f) const {
 }
 
 template <class T, class Pred>
-std::vector<View<T>> Snapshot::find_all_view(Pred&& pred) const {
+std::vector<View<T>> Snapshot::view_by_predicate(Pred&& pred) const {
     std::vector<View<T>> out;
     for_each_view<T>([&](View<T> v) {
         if (pred(*v)) out.push_back(v);

@@ -607,7 +607,7 @@ TEST(for_each_view_by_cached_field_visits_every_match_and_binds_views_to_this_sn
 // View<T>::operator* dereferences to the same object operator-> reaches
 // through -- every other test in this file uses v->field exclusively, so
 // operator* itself is otherwise only ever exercised incidentally (inside
-// Snapshot::find_all_view's own pred(*v), never asserted directly).
+// Snapshot::view_by_predicate's own pred(*v), never asserted directly).
 TEST(view_operator_star_dereferences_to_the_same_object_as_operator_arrow) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");

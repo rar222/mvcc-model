@@ -153,25 +153,25 @@ TEST(external_keys_are_scoped_per_type_not_global) {
     CHECK(s.find_by_key<&Widget::computed_key>("ord:X") != nullptr);
 }
 
-// find_all()/find_all_view() run a predicate scan restricted to one
-// type, in both the raw-pointer and the View-returning forms.
-TEST(find_all_runs_an_arbitrary_predicate_over_one_type) {
+// find_by_predicate()/view_by_predicate() run a predicate scan restricted to
+// one type, in both the raw-pointer and the View-returning forms.
+TEST(find_by_predicate_runs_an_arbitrary_predicate_over_one_type) {
     Model m;
     make_account(m, "A1", 50);
     make_account(m, "A2", 150);
     make_account(m, "A3", 250);
 
     Snapshot s = m.snapshot();
-    const auto rich = s.find_all<Account>([](const Account& a) { return a.balance >= 100; });
+    const auto rich = s.find_by_predicate<Account>([](const Account& a) { return a.balance >= 100; });
     CHECK_EQ(rich.size(), std::size_t{2});
     for (const Account* a : rich) CHECK(a->balance >= 100);
 
     const auto rich_views =
-        s.find_all_view<Account>([](const Account& a) { return a.balance >= 100; });
+        s.view_by_predicate<Account>([](const Account& a) { return a.balance >= 100; });
     CHECK_EQ(rich_views.size(), std::size_t{2});
     for (const View<Account>& v : rich_views) CHECK(v->balance >= 100);
 
-    const auto none = s.find_all<Account>([](const Account&) { return false; });
+    const auto none = s.find_by_predicate<Account>([](const Account&) { return false; });
     CHECK(none.empty());
 }
 
