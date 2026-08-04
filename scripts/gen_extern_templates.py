@@ -59,6 +59,150 @@ adapting this for a project whose types don't fit that shape, verify the
 output (e.g. the way CMakeLists.txt does here: compile the generated
 --mode source file and check it builds clean) before trusting it.
 
+HOW TO CHECK IF THIS SCRIPT IS MISSING A SYMBOL
+--------------------------------------------------
+This script only has full coverage of model.h's entry points if every
+function templated on JUST `<class T>` or `<auto Field>` (no `Pred`/`F`
+functor parameter -- those are excluded on purpose, see render_entries()'s
+docstring) is present in render_entries() below, AND every class template
+one of those functions hands back (ScanFieldRange<Field>,
+CachedBucketRange<ClassT>, ReferrerRange<Field>, and their View siblings)
+has its own `extern template class ...;` line too -- covering the
+FUNCTION that returns a range is not enough; the range's own
+begin()/end()/iterator::operator++ etc. are a separate template entity
+that gets implicitly re-instantiated in every calling TU if its class
+was never explicitly instantiated anywhere. A source-level grep for
+"does render_entries() mention this name" cannot see that second kind of
+gap -- it only shows up in what the compiler actually had to emit. So
+trust compiled output, not source text (see CLAUDE.md's "Working style
+in this repo" for when this check is required, not just suggested):
+
+    # Build extern_template_demo, then ask its own object file what it
+    # actually had to define for itself. Filter on nm's type column, not on
+    # NAME: a Range<Field> leak's demangled name always embeds the concrete
+    # type as part of Field (e.g. "Snapshot::ScanFieldRange<&example::
+    # Account::name>::..."), so excluding lines that mention "example::"
+    # would silently hide exactly the gap this check exists to catch --
+    # tried that, don't. `u` alongside `W`/`V` catches GNU_UNIQUE too: the
+    # linkage a C++17 `inline` variable or non-template inline function
+    # gets, a different but equally-real "this TU had to define its own
+    # copy" signal (a plain `$2=="W"` filter would miss it):
+    cmake --build --preset default --target extern_template_demo
+    nm -C --defined-only \\
+        build/default/CMakeFiles/extern_template_demo.dir/examples/extern_template_demo.cpp.o \\
+      | awk '$2=="W" || $2=="V" || $2=="u"' | grep 'model::' | sort -u
+
+    # Expected output: only the inherent floor this technique can't remove --
+    # destructors/vtable/typeinfo of the concrete user types and Model's own
+    # movable-only types (Account/Order/CommitResult/Snapshot/Transaction --
+    # not template entry points at all, see extern_template_demo.cpp's own
+    # "Measured" comment on why), std:: library template instantiations
+    # (std::_Vector_base<...>::~_Vector_base, std::make_unique<T>),
+    # model::type_tag<T>()::anchor ('u' -- this is why 'u' is in the filter
+    # at all: type_tag<T>() and Snapshot::cast<T> are tiny one-liners called
+    # from deep inside the *Range<Field> iterator machinery, e.g.
+    # advance_to_match() -> cast<ClassT>() -> type_tag<ClassT>(); the
+    # optimizer fully inlines that chain into main()'s hot range-for loops
+    # -- desirable, it's the whole reason range-for beats a callback here.
+    # cast<T> is pure logic and leaves no trace once inlined; type_tag<T>()
+    # leaves exactly one thing behind, its `static const char anchor`,
+    # because that variable's ADDRESS is the return value and must stay
+    # ODR-unique, so it needs real storage even after the call around it is
+    # gone. Adding an extern template line for type_tag<T>/cast<T> would
+    # NOT change this -- extern template only suppresses generating an
+    # out-of-line copy of code that ISN'T inlined; it has no effect on code
+    # the optimizer inlines away regardless. Not a gap, just what inlining
+    # a hot path looks like in nm output), and
+    # model::pmap::detail::TrieCore<Id, Id, IdHash, IdentityKeyOf<Id>>
+    # (PersistentSet<Id, IdHash>'s implementation) -- NOT out of scope
+    # because it's "a different header's templates" in some vague sense,
+    # but for a sharper reason: unlike ScanFieldRange<Field> and friends,
+    # this one is never parameterized on the user type T at all -- every
+    # Snapshot-side range walks Ids through the exact same
+    # PersistentSet<Id, IdHash>, regardless of whether the objects being
+    # iterated are Account or Order. It doesn't fit this script's per-T
+    # loop -- and if render_entries() tried to emit it once per type
+    # anyway, that would be a DUPLICATE EXPLICIT INSTANTIATION (a compile
+    # error in --mode source): the exact same specialization instantiated
+    # twice in one program. Leaving it as an ordinary implicit (weak)
+    # instantiation is correct here, not a gap -- if its repeated
+    # per-TU compile cost across the whole project (not just this demo)
+    # ever mattered enough to fix, the right place is one hand-written
+    # `extern template class ...;` for it in model.h + one explicit
+    # instantiation in src/model.cpp (which already holds "all of the
+    # implementation" per CLAUDE.md), not a line generated per-T here.
+    #
+    # NONE of the above should be a Snapshot::/Transaction::/Model::/
+    # BulkTransaction::/CommitResult::/View:: entry point this script
+    # targets. If one shows up here -- most often a `*Range<...>` class
+    # member, since it's easy to add the function and forget the class --
+    # that's proof it (or its underlying class template) needs a
+    # render_entries() line: a class needs its own
+    # `extern template class Snapshot::ScanFieldRange<...>;`-style line,
+    # alongside the function's own `extern template ...` line, not instead
+    # of it.
+    #
+    # OPTIONAL: to browse a TU's full contents rather than hunt for a
+    # specific leak, name-based filtering is fine -- unlike above, you're
+    # not trying to catch a Field-parameterized symbol here, just skimming:
+    #   nm -C --defined-only <object file> \\
+    #     | grep 'model::' | grep -vE 'example:|std:' | sort -u
+    # Run against generated/types_extern.cpp.o (not the caller) this turns
+    # up model::detail::g_field_name_mu, model::detail::register_field_name,
+    # and model::detail::field_names() -- an inline global mutex, a plain
+    # (non-template) inline function, and an inline function wrapping a
+    # function-local static, none of them templates at all, so none of
+    # them are things this script could ever "cover" with an extern
+    # template line in the first place. They land in types_extern.cpp.o
+    # correctly, PULLED IN TRANSITIVELY: they're only ever called from
+    # inside Object<T>'s own virtual-dispatch bodies (via define_keys()/
+    # define_cached_fields()/define_cached_references()), so explicitly
+    # instantiating `class Object<T>` (render_entries()'s very first line
+    # for every type) forces the compiler to instantiate everything those
+    # bodies call, too -- confirm they're absent from the CALLER
+    # (extern_template_demo.cpp.o) with the main, type-column-filtered
+    # command above, which is what actually proves there's no leak.
+    # Why filter on W/V and not "any defined symbol": explicit instantiation
+    # of an inline-defined member (the normal case here -- these are
+    # one-liners in the class body) does NOT turn its linkage strong; it
+    # stays vague/weak per the C++ ABI either way, so multiple identical weak
+    # copies across TUs are legal and the linker folds them. The signal isn't
+    # weak-vs-strong, it's DEFINED-in-the-caller-AT-ALL: a correctly
+    # `extern template`-covered entry point has NO defined copy here -- it's
+    # an undefined reference ('U'), resolved from generated/types_extern.cpp.o's
+    # own (weak) definition at link time instead.
+    #
+    # But "the caller has zero defined copies" is ALSO exactly what you'd see
+    # if extern_template_demo.cpp simply never called that particular
+    # function at all -- an absence in the caller doesn't by itself
+    # distinguish "correctly resolved via extern template" from "never
+    # exercised, so who knows."
+    #
+    # Confirm the other side too: that types_extern.cpp.o -- the one dedicated 
+    # explicit-instantiation TU -- actually DOES define these symbols (a 
+    # positive-existence check, independent of whether the demo happens to exercise
+    # every one of them).
+    # If this were 0, the `extern template class ...;` lines aren't
+    # producing real code at all (e.g. a typo'd or silently-dropped
+    # instantiation) -- a bug the caller-side check alone can't reveal if
+    # the caller also never references the symbol:
+    nm -C --defined-only \\
+        build/default/CMakeFiles/extern_template_demo.dir/generated/types_extern.cpp.o \\
+      | grep 'model::Snapshot::.*Range<' | wc -l
+
+    # Expected output: some large non-zero count -- 187 right now, across
+    # both Account and Order's six range/view-range families, now that the
+    # `extern template class Snapshot::ScanFieldRange<...>;`-style lines in
+    # render_entries() exist. That 187 is only true as of THIS fix, and
+    # will keep drifting as types.h grows more scan/cached/ref fields --
+    # don't treat the number itself as the thing to check. Before this fix
+    # (i.e. if render_entries() only covered the range_by_scan_field-style
+    # FUNCTIONS and not the range CLASSES they return), this same command
+    # would have read 0: the class templates would never have been
+    # explicitly instantiated anywhere, only implicitly (and invisibly to
+    # this check) instantiated in extern_template_demo.cpp.o itself. Zero
+    # here is the failure signal, not the count.
+
 USAGE
 -----
     python3 gen_extern_templates.py path/to/types.h --namespace ns \\
@@ -251,18 +395,36 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_by_scan_field<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template Snapshot::ScanFieldRange<&{T}::{fname}> Snapshot::range_by_scan_field<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template Snapshot::ScanFieldViewRange<&{T}::{fname}> Snapshot::range_view_by_scan_field<&{T}::{fname}>({arg}) const;')
+            # Class-template instantiations, not just the function that hands
+            # one back: without these, begin()/end()/iterator::operator++ etc.
+            # get implicitly (weakly) re-instantiated in every TU that
+            # range-for's the result -- invisible to a source-level grep for
+            # "does render_entries() mention range_by_scan_field", only
+            # visible by inspecting compiled objects (nm -C --defined-only,
+            # look for a defined 'W'/'V' symbol under this class in a caller
+            # TU instead of types_extern.cpp.o). See this file's docstring.
+            out.append(f'extern template class Snapshot::ScanFieldRange<&{T}::{fname}>;')
+            out.append(f'extern template class Snapshot::ScanFieldViewRange<&{T}::{fname}>;')
         for fname in t.cached_fields:
             arg = f'const {t.member_types[fname]}&'
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_by_cached_field<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_by_cached_field<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range_by_cached_field<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view_by_cached_field<&{T}::{fname}>({arg}) const;')
+            # CachedBucketRange<T>/CachedBucketViewRange<T> class instantiation
+            # itself is emitted once, type-uniformly, alongside range<T>/
+            # range_view<T> below -- ClassT is just T here, same specialization
+            # range_cached_referrers and range()/range_view() also return, so
+            # instantiating it again per-field would be a duplicate explicit
+            # instantiation (an error in --mode source).
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template Snapshot::ReferrerRange<&{T}::{fname}> Snapshot::range_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template Snapshot::ReferrerViewRange<&{T}::{fname}> Snapshot::range_view_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
+            out.append(f'extern template class Snapshot::ReferrerRange<&{T}::{fname}>;')
+            out.append(f'extern template class Snapshot::ReferrerViewRange<&{T}::{fname}>;')
             if fname in t.cached_ref_fields:
                 out.append(f'extern template std::vector<const {T}*> Snapshot::find_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
                 out.append(f'extern template std::vector<View<{T}>> Snapshot::view_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
@@ -272,6 +434,13 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
         out.append(f'extern template std::optional<View<{T}>> Snapshot::view<{T}>(Ref<{T}>) const;')
         out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range<{T}>() const;')
         out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view<{T}>() const;')
+        # One instantiation each covers every use of CachedBucketRange<T>/
+        # CachedBucketViewRange<T> for this T: range_by_cached_field,
+        # range_cached_referrers, and range()/range_view() above all return
+        # this same specialization (ClassT is always T, never the field's
+        # own type).
+        out.append(f'extern template class Snapshot::CachedBucketRange<{T}>;')
+        out.append(f'extern template class Snapshot::CachedBucketViewRange<{T}>;')
         out.append('')
 
         out.append('// -- Transaction --')
