@@ -3184,7 +3184,7 @@ private:
     // this whole chain, so it skips the per-object clone() entirely rather
     // than capturing it and throwing it away.
     std::optional<IntegrityError> apply_create(std::unique_ptr<ObjectBase> o,
-                                               std::unordered_map<std::uint32_t, Id>& remap,
+                                               const std::unordered_map<std::uint32_t, Id>& remap,
                                                const std::vector<Id>& pending, bool keep_undo = true);
     /// `old_field_keys_hint`, when non-null, is the target's baseline
     /// define_keys() field/value list, ALREADY computed by
@@ -3194,7 +3194,7 @@ private:
     /// any caller (there are none today besides apply_transaction_contents's
     /// own update loop) that hasn't already computed it.
     std::optional<IntegrityError> apply_update(
-        std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap,
+        std::unique_ptr<ObjectBase> clone, const std::unordered_map<std::uint32_t, Id>& remap,
         const std::vector<std::pair<const void*, std::string>>* old_field_keys_hint = nullptr,
         bool keep_undo = true);
     /// Cascade BFS, called from try_commit()'s apply phase. `work` is EVERY
@@ -4079,11 +4079,11 @@ public:
     /// (unlike Transaction::update()). Null if `r` isn't a local id minted
     /// by this same batch, or is out of range.
     template <class T>
-    T* update(Ref<T> r) {
+    T* update(Ref<T> r) const {
         return static_cast<T*>(update_raw(r.raw()));
     }
     template <class T>
-    T* update(Opt<T> r) {
+    T* update(Opt<T> r) const {
         return static_cast<T*>(update_raw(r.raw()));
     }
 
@@ -4092,8 +4092,11 @@ public:
     /// low bits (see create()), so this is a direct bounds-checked lookup
     /// -- no clone-on-first-touch bookkeeping like Transaction::update_raw(),
     /// because every entry here is already a local, not-yet-installed
-    /// object owned outright by this batch.
-    ObjectBase* update_raw(Id id);
+    /// object owned outright by this batch. const: a bounds-checked read of
+    /// objects_, never a write (unlike Transaction::update_raw()) -- the
+    /// returned pointer is mutable regardless, since unique_ptr<T>::get()
+    /// doesn't propagate constness to the pointee.
+    ObjectBase* update_raw(Id id) const;
 
     /// How many objects are pending. Diagnostic; commit_bulk_without_undo() doesn't need
     /// it, but a caller sanity-checking a large generated batch might.

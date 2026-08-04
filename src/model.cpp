@@ -730,7 +730,7 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
             if (err) return;  // keep the FIRST violation, same convention as validate()
             auto& plan = plans[field];
             const void* self = obj.get();
-            auto [it, inserted] = plan.claims.try_emplace(key, self);
+            auto [it, inserted] = plan.claims.try_emplace(std::move(key), self);
             if (!inserted && it->second != self)
                 err = IntegrityError{"duplicate key '" + it->first +
                                      "' claimed by more than one object within the same transaction",
@@ -760,7 +760,7 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
             auto& plan = plans[field];
             if (oldit != obj_old_keys.end()) plan.vacated.insert(oldit->second);
             const void* self = clone.get();
-            auto [it, inserted] = plan.claims.try_emplace(new_key, self);
+            auto [it, inserted] = plan.claims.try_emplace(std::move(new_key), self);
             if (!inserted && it->second != self)
                 err = IntegrityError{"duplicate key '" + it->first +
                                      "' claimed by more than one object within the same transaction",
@@ -1291,7 +1291,7 @@ std::string Model::LookupDiagnostics::to_string() const {
 // ---------------------------------------------------------------------------
 
 std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectBase> o,
-                                                          std::unordered_map<std::uint32_t, Id>& remap,
+                                                          const std::unordered_map<std::uint32_t, Id>& remap,
                                                           const std::vector<Id>& pending,
                                                           bool keep_undo) {
     const std::uint32_t local_index = o->id.index;  // still local; the remap key
@@ -1356,7 +1356,7 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
 }
 
 std::optional<Model::IntegrityError> Model::apply_update(
-    std::unique_ptr<ObjectBase> clone, std::unordered_map<std::uint32_t, Id>& remap,
+    std::unique_ptr<ObjectBase> clone, const std::unordered_map<std::uint32_t, Id>& remap,
     const std::vector<std::pair<const void*, std::string>>* old_field_keys_hint, bool keep_undo) {
     ObjectBase* raw = clone.release();
 
@@ -1654,7 +1654,7 @@ Transaction Snapshot::begin(std::string name, std::any data) const {
 // rate. See examples/extern_template_demo.cpp's header comment for the
 // compile-time motivation.
 
-ObjectBase* BulkTransaction::update_raw(Id id) {
+ObjectBase* BulkTransaction::update_raw(Id id) const {
     if (!is_local(id)) return nullptr;
     const std::uint32_t idx = id.index & ~kLocalIdBit;
     return idx < objects_.size() ? objects_[idx].get() : nullptr;

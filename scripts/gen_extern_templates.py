@@ -288,8 +288,8 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
 
         out.append('// -- BulkTransaction --')
         out.append(f'extern template Ref<{T}> BulkTransaction::create<{T}>(std::unique_ptr<{T}>);')
-        out.append(f'extern template {T}* BulkTransaction::update<{T}>(Ref<{T}>);')
-        out.append(f'extern template {T}* BulkTransaction::update<{T}>(Opt<{T}>);')
+        out.append(f'extern template {T}* BulkTransaction::update<{T}>(Ref<{T}>) const;')
+        out.append(f'extern template {T}* BulkTransaction::update<{T}>(Opt<{T}>) const;')
         out.append('')
 
         out.append('// -- View --')
