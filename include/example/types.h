@@ -19,7 +19,7 @@
 //   define_cached_references()  optional: zero or more Ref<>/Opt<> fields -- ALREADY listed
 //                           in define_references() -- for INDEXED "who points at this?"
 //                           lookup (find_cached_referrers; O(log n + matches) instead of
-//                           for_each_referrer's always-available O(#objects) scan). Same
+//                           for_each_referrers's always-available O(#objects) scan). Same
 //                           cost model as define_cached_fields; declare only what's queried
 //                           often.
 //
@@ -117,7 +117,7 @@ public:
 
     /// account is the classic hot reverse lookup ("every Order for this
     /// Account") -- worth the index. parent is deliberately left OUT: it's
-    /// queried rarely enough that for_each_referrer<&Order::parent>(...)'s
+    /// queried rarely enough that for_each_referrers<&Order::parent>(...)'s
     /// O(#orders) scan is the better trade (zero write-side cost) -- the same
     /// "index only what's worth it" tradeoff define_cached_fields() and
     /// define_scan_fields() apply to plain fields, above. Both account and

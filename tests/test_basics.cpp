@@ -526,19 +526,19 @@ TEST(find_raw_is_generation_checked_and_null_for_absent_or_stale_ids) {
     CHECK(saw_order);
 }
 
-// for_each_short_circuit<T> is the primitive every all_of_by_scan_field/
-// all_of_referrer/etc. is built on -- checked directly here for its own
-// documented contract: `f` returning false actually stops the underlying
-// by_type walk (not just further calls to f), and the return value reports
-// whether the walk ran to completion.
-TEST(for_each_short_circuit_stops_the_underlying_walk_and_reports_completion) {
+// all_of<T> is the primitive every all_of_by_scan_field/all_of_referrers/
+// etc. is built on -- checked directly here for its own documented
+// contract: `f` returning false actually stops the underlying by_type walk
+// (not just further calls to f), and the return value reports whether the
+// walk ran to completion.
+TEST(all_of_stops_the_underlying_walk_and_reports_completion) {
     Model m;
     for (int i = 0; i < 5; ++i) make_account(m, "A" + std::to_string(i));
     Snapshot s = m.snapshot();
 
     int n = 0;
     const bool ran_to_completion =
-        s.for_each_short_circuit<Account>([&](const Account&) {
+        s.all_of<Account>([&](const Account&) {
             ++n;
             return true;
         });
@@ -546,7 +546,7 @@ TEST(for_each_short_circuit_stops_the_underlying_walk_and_reports_completion) {
     CHECK_EQ(n, 5);
 
     n = 0;
-    const bool stopped_early = s.for_each_short_circuit<Account>([&](const Account&) {
+    const bool stopped_early = s.all_of<Account>([&](const Account&) {
         ++n;
         return n < 2;  // stop after the second visit
     });
@@ -554,11 +554,11 @@ TEST(for_each_short_circuit_stops_the_underlying_walk_and_reports_completion) {
     CHECK_EQ(n, 2);
 
     // A type with no live objects: vacuously runs to completion.
-    CHECK(s.for_each_short_circuit<Order>([](const Order&) { return false; }));
+    CHECK(s.all_of<Order>([](const Order&) { return false; }));
 
     // A default-constructed Snapshot: the `!root_` early return, also
     // vacuously true.
-    CHECK(Snapshot{}.for_each_short_circuit<Account>([](const Account&) { return false; }));
+    CHECK(Snapshot{}.all_of<Account>([](const Account&) { return false; }));
 }
 
 // is_local(Id) is the free predicate every branch on kLocalIdBit in this

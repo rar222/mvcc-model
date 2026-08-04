@@ -367,7 +367,7 @@ int main() {
 
     std::printf(
         "=== READS: \"every item pointing at this Bucket?\" ===\n"
-        "for_each_referrer's O(#items) scan vs. find_cached_referrers' O(log n + matches).\n\n");
+        "for_each_referrers's O(#items) scan vs. find_cached_referrers' O(log n + matches).\n\n");
     std::printf("%12s  %10s  %14s  %14s  %10s\n", "items/type", "matches", "scan (us)", "indexed (us)",
                "speedup");
     for (const Result& r : results) {

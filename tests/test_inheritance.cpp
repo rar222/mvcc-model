@@ -586,7 +586,7 @@ TEST(update_through_diamond_base_fields_reconciles_together) {
 // CommitStatus::Invalid anywhere. Unlike the label/find_by_key_raw story,
 // there's no single shared index to query for this field: find_by_scan_field
 // does an O(#ClassT) walk of ONE type's own by_type bucket (see
-// scan_field_short_circuit's use of for_each_short_circuit<ClassT> in
+// scan_field_short_circuit's use of all_of<ClassT> in
 // model.h), so "scanning across types" isn't one call -- it's one call PER
 // type, same field name, same value, same underlying (Labeled-declared) data.
 TEST(scan_field_over_inherited_description_matches_across_types_and_allows_duplicates) {

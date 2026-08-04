@@ -175,7 +175,7 @@ TEST(find_by_predicate_runs_an_arbitrary_predicate_over_one_type) {
     CHECK(none.empty());
 }
 
-// The unindexed reverse-lookup family (for_each_referrer/find_referrers
+// The unindexed reverse-lookup family (for_each_referrers/find_referrers
 // and their View forms) correctly reports every referrer of a target
 // across both Ref<> and Opt<> fields, and empty for an unreferenced one.
 TEST(find_referrers_answers_who_points_at_me) {
@@ -206,7 +206,7 @@ TEST(find_referrers_answers_who_points_at_me) {
 
     auto va1 = s.view(a1);
     int seen = 0;
-    va1->for_each_referrer<&Order::account>([&](View<Order> v) {
+    va1->for_each_referrers<&Order::account>([&](View<Order> v) {
         CHECK(v->account == a1);
         ++seen;
     });
@@ -216,23 +216,23 @@ TEST(find_referrers_answers_who_points_at_me) {
     CHECK_EQ(view_children.size(), std::size_t{2});
 }
 
-// all_of_referrer/all_of_view_referrer -- previously missing entirely (only
+// all_of_referrers/all_of_view_referrers -- previously missing entirely (only
 // the scan/cached-field families had an all_of_* sibling; the referrer
 // family didn't). Both are built on the same referrer_short_circuit
-// for_each_referrer itself now delegates to, so this also checks the walk
+// for_each_referrers itself now delegates to, so this also checks the walk
 // genuinely stops early rather than just skipping further predicate calls.
-TEST(all_of_referrer_and_all_of_view_referrer_short_circuit) {
+TEST(all_of_referrers_and_all_of_view_referrers_short_circuit) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, /*qty=*/1);
     make_order(m, "O2", a, Opt<Order>{}, /*qty=*/2);
     Snapshot s = m.snapshot();
 
-    CHECK(s.all_of_referrer<&Order::account>(a, [](const Order& o) { return o.qty > 0; }));
-    CHECK(!s.all_of_referrer<&Order::account>(a, [](const Order& o) { return o.qty > 1; }));
+    CHECK(s.all_of_referrers<&Order::account>(a, [](const Order& o) { return o.qty > 0; }));
+    CHECK(!s.all_of_referrers<&Order::account>(a, [](const Order& o) { return o.qty > 1; }));
 
     int checked = 0;
-    const bool stopped = s.all_of_referrer<&Order::account>(a, [&](const Order&) {
+    const bool stopped = s.all_of_referrers<&Order::account>(a, [&](const Order&) {
         ++checked;
         return false;  // fail on the very first referrer visited
     });
@@ -240,46 +240,46 @@ TEST(all_of_referrer_and_all_of_view_referrer_short_circuit) {
     CHECK_EQ(checked, 1);  // never reached the second
 
     // Vacuously true: an account with no orders violates nothing.
-    CHECK(s.all_of_referrer<&Order::account>(make_account(m, "LONELY"), [](const Order&) { return false; }));
+    CHECK(s.all_of_referrers<&Order::account>(make_account(m, "LONELY"), [](const Order&) { return false; }));
 
     // View form: same short-circuit contract, through a View<Order> instead
     // -- including that it genuinely stops (not just a different boolean).
-    CHECK(s.all_of_view_referrer<&Order::account>(a, [](View<Order> v) { return v->qty > 0; }));
-    CHECK(!s.all_of_view_referrer<&Order::account>(a, [](View<Order> v) { return v->qty > 1; }));
+    CHECK(s.all_of_view_referrers<&Order::account>(a, [](View<Order> v) { return v->qty > 0; }));
+    CHECK(!s.all_of_view_referrers<&Order::account>(a, [](View<Order> v) { return v->qty > 1; }));
 
     int checked_view = 0;
-    const bool stopped_view = s.all_of_view_referrer<&Order::account>(a, [&](View<Order>) {
+    const bool stopped_view = s.all_of_view_referrers<&Order::account>(a, [&](View<Order>) {
         ++checked_view;
         return false;
     });
     CHECK(!stopped_view);
     CHECK_EQ(checked_view, 1);
 
-    CHECK(s.all_of_view_referrer<&Order::account>(make_account(m, "LONELY2"),
+    CHECK(s.all_of_view_referrers<&Order::account>(make_account(m, "LONELY2"),
                                                   [](View<Order>) { return false; }));
 }
 
 // The View-returning referrer API's "no referrers" case -- for_each_view_
 // referrer/view_referrers must visit/return nothing, not crash or return a
 // stale/garbage view, for a target that genuinely has none.
-TEST(view_referrer_forms_are_empty_for_an_unreferenced_target) {
+TEST(view_referrers_forms_are_empty_for_an_unreferenced_target) {
     Model m;
     const Ref<Account> lonely = make_account(m, "LONELY");
     Snapshot s = m.snapshot();
 
     int seen = 0;
-    s.for_each_view_referrer<&Order::account>(lonely, [&](View<Order>) { ++seen; });
+    s.for_each_view_referrers<&Order::account>(lonely, [&](View<Order>) { ++seen; });
     CHECK_EQ(seen, 0);
 
     CHECK(s.view_referrers<&Order::account>(lonely).empty());
 }
 
-// range_referrer/range_view_referrer: additive range-based-for form of
-// find_referrers/for_each_referrer/all_of_referrer -- works on ANY Ref<>/
+// range_referrers/range_view_referrers: additive range-based-for form of
+// find_referrers/for_each_referrers/all_of_referrers -- works on ANY Ref<>/
 // Opt<> field, declared cached (account) or not (parent), same as the
 // callback forms; must visit the exact same matches, and `break` must
 // short-circuit the underlying walk.
-TEST(range_referrer_visits_the_same_matches_as_find_referrers) {
+TEST(range_referrers_visits_the_same_matches_as_find_referrers) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
     const Ref<Account> a2 = make_account(m, "A2");
@@ -290,28 +290,28 @@ TEST(range_referrer_visits_the_same_matches_as_find_referrers) {
     Snapshot s = m.snapshot();
 
     int a1_hits = 0;
-    for (const Order& o : s.range_referrer<&Order::account>(a1)) {
+    for (const Order& o : s.range_referrers<&Order::account>(a1)) {
         CHECK(o.account == a1);
         ++a1_hits;
     }
     CHECK_EQ(a1_hits, 2);
 
     int child_hits = 0;
-    for (const Order& o : s.range_referrer<&Order::parent>(p)) {
+    for (const Order& o : s.range_referrers<&Order::parent>(p)) {
         CHECK(o.parent == p);
         ++child_hits;
     }
     CHECK_EQ(child_hits, 2);
 
     int view_hits = 0;
-    for (View<Order> v : s.range_view_referrer<&Order::account>(a1)) {
+    for (View<Order> v : s.range_view_referrers<&Order::account>(a1)) {
         CHECK(v->account == a1);
         ++view_hits;
     }
     CHECK_EQ(view_hits, 2);
 
     int seen_before_break = 0;
-    for (const Order& o : s.range_referrer<&Order::account>(a1)) {
+    for (const Order& o : s.range_referrers<&Order::account>(a1)) {
         (void)o;
         ++seen_before_break;
         break;
@@ -321,7 +321,7 @@ TEST(range_referrer_visits_the_same_matches_as_find_referrers) {
     const Ref<Account> lonely = make_account(m, "LONELY");
     s = m.snapshot();
     int none = 0;
-    for (const Order& o : s.range_referrer<&Order::account>(lonely)) {
+    for (const Order& o : s.range_referrers<&Order::account>(lonely)) {
         (void)o;
         ++none;
     }
@@ -882,9 +882,9 @@ TEST(scan_and_cached_field_agree_after_a_mutate_and_a_create_in_one_transaction)
     }
 }
 
-// find_referrers<Field> is a thin wrapper around for_each_referrer<Field> --
+// find_referrers<Field> is a thin wrapper around for_each_referrers<Field> --
 // the count must land once per CALL to the public API, not once per object
-// for_each_referrer happens to visit internally.
+// for_each_referrers happens to visit internally.
 TEST(lookup_stats_counts_find_referrers_once_not_once_per_visited_object) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -902,13 +902,13 @@ TEST(lookup_stats_counts_find_referrers_once_not_once_per_visited_object) {
     CHECK_EQ(m.lookup_stats<&Order::account>().cached_calls, std::uint64_t{1});
 }
 
-// Regression: for_each_view_referrer/view_referrers must ALSO record a
-// lookup. A prior version of for_each_view_referrer (then still named
+// Regression: for_each_view_referrers/view_referrers must ALSO record a
+// lookup. A prior version of for_each_view_referrers (then still named
 // for_each_referrer_view) re-walked for_each_view<ClassT> and re-checked the
-// match itself instead of delegating to for_each_referrer<Field> -- so it
+// match itself instead of delegating to for_each_referrers<Field> -- so it
 // never called register_field_lookup, and every lookup made through the
 // View-returning referrer API was silently invisible to lookup_stats().
-// Delegating (see for_each_view_referrer's own doc comment) fixes that.
+// Delegating (see for_each_view_referrers's own doc comment) fixes that.
 TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -918,7 +918,7 @@ TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too)
 
     auto va = s.view(a);
     int seen = 0;
-    va->for_each_referrer<&Order::account>([&](View<Order>) { ++seen; });
+    va->for_each_referrers<&Order::account>([&](View<Order>) { ++seen; });
     CHECK_EQ(seen, 2);
     CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, std::uint64_t{1});
 
@@ -929,9 +929,9 @@ TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too)
 
 // register_field_lookup() fires from EIGHT entry points, not just the four
 // find_* ones exercised above: for_each_by_scan_field/all_of_by_scan_field,
-// for_each_by_cached_field/all_of_by_cached_field, for_each_referrer/
-// all_of_referrer, and for_each_cached_referrers/all_of_cached_referrers.
-// The regression above (for_each_view_referrer once silently skipped it via
+// for_each_by_cached_field/all_of_by_cached_field, for_each_referrers/
+// all_of_referrers, and for_each_cached_referrers/all_of_cached_referrers.
+// The regression above (for_each_view_referrers once silently skipped it via
 // an independent re-walk) shows exactly this class of bug is real -- this
 // test pins all eight, one call each, including that a short-circuited
 // all_of_* still records exactly one call even though it stops after the
@@ -957,10 +957,10 @@ TEST(lookup_stats_records_a_call_from_every_for_each_and_all_of_entry_point_once
     CHECK_EQ(m.lookup_stats<&Order::qty>().cached_calls, qty0.cached_calls + 2);
 
     const LookupCounts acct0 = m.lookup_stats<&Order::account>();
-    s.for_each_referrer<&Order::account>(a, [](const Order&) {});
+    s.for_each_referrers<&Order::account>(a, [](const Order&) {});
     CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, acct0.uncached_calls + 1);
 
-    s.all_of_referrer<&Order::account>(a, [](const Order&) { return true; });
+    s.all_of_referrers<&Order::account>(a, [](const Order&) { return true; });
     CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, acct0.uncached_calls + 2);
 
     s.for_each_cached_referrers<&Order::account>(a, [](const Order&) {});
@@ -1110,7 +1110,7 @@ TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
 
 // Same named/unnamed split as the two tests above, but through the
 // REFERENCE-field entry point (RefIndexReader::index(), feeding
-// find_cached_referrers/for_each_referrer) rather than the value-field one
+// find_cached_referrers/for_each_referrers) rather than the value-field one
 // (FieldKeyReader::key(), feeding find_by_cached_field/find_by_scan_field) --
 // a genuinely different code path in register_field_lookup's callers, and one
 // with a real unnamed field sitting in test_types.h already: Order::account
@@ -1128,7 +1128,7 @@ TEST(lookup_diagnostics_shows_names_for_reference_fields_too) {
     Snapshot s = m.snapshot();
 
     (void)s.find_cached_referrers<&Order::account>(a);
-    s.for_each_referrer<&Order::parent>(parent_order, [](const Order&) {});
+    s.for_each_referrers<&Order::parent>(parent_order, [](const Order&) {});
 
     const std::string report = m.lookup_diagnostics().to_string();
     CHECK(report.find("Order::account") != std::string::npos);   // named
