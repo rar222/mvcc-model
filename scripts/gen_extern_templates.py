@@ -30,9 +30,10 @@ Two kinds of entry points exist in model.h, and they need different
 information:
 
 1. Type-uniform entry points (resolve/find/create/update/remove/exists/
-   peek/peek_as/peek_before/view, both Ref<T> and Opt<T> overloads where
-   both exist) -- same set for every T that derives model::Object<T>,
-   independent of T's fields. These need nothing but the list of types.
+   peek/peek_as/peek_before/view/range/range_view/to_real, both Ref<T> and
+   Opt<T> overloads where both exist) -- same set for every T that derives
+   model::Object<T>, independent of T's fields. These need nothing but the
+   list of types.
 
 2. Field-dependent entry points -- these need each type's define_keys() /
    define_scan_fields() / define_cached_fields() / define_references() /
@@ -248,19 +249,29 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
             arg = f'const {t.member_types[fname]}&'
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_by_scan_field<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_by_scan_field<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template Snapshot::ScanFieldRange<&{T}::{fname}> Snapshot::range_by_scan_field<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template Snapshot::ScanFieldViewRange<&{T}::{fname}> Snapshot::range_view_by_scan_field<&{T}::{fname}>({arg}) const;')
         for fname in t.cached_fields:
             arg = f'const {t.member_types[fname]}&'
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_by_cached_field<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_by_cached_field<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range_by_cached_field<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view_by_cached_field<&{T}::{fname}>({arg}) const;')
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
+            out.append(f'extern template Snapshot::ReferrerRange<&{T}::{fname}> Snapshot::range_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
+            out.append(f'extern template Snapshot::ReferrerViewRange<&{T}::{fname}> Snapshot::range_view_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             if fname in t.cached_ref_fields:
                 out.append(f'extern template std::vector<const {T}*> Snapshot::find_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
                 out.append(f'extern template std::vector<View<{T}>> Snapshot::view_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
+                out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
+                out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
         out.append(f'extern template View<{T}> Snapshot::view<{T}>(const {T}&) const noexcept;')
         out.append(f'extern template std::optional<View<{T}>> Snapshot::view<{T}>(Ref<{T}>) const;')
+        out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range<{T}>() const;')
+        out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view<{T}>() const;')
         out.append('')
 
         out.append('// -- Transaction --')
@@ -284,6 +295,11 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
             if fname not in seen_lookup_stats:
                 seen_lookup_stats.add(fname)
                 out.append(f'extern template LookupCounts Model::lookup_stats<&{T}::{fname}>() const;')
+        out.append('')
+
+        out.append('// -- CommitResult --')
+        out.append(f'extern template Ref<{T}> CommitResult::to_real<{T}>(Ref<{T}>) const;')
+        out.append(f'extern template Opt<{T}> CommitResult::to_real<{T}>(Opt<{T}>) const;')
         out.append('')
 
         out.append('// -- BulkTransaction --')

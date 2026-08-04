@@ -71,6 +71,9 @@ int main() {
     assert(r.status == CommitStatus::Committed);
     acct = r.to_real(acct);
     ord = r.to_real(ord);
+    Opt<Order> maybe_ord = ord;
+    maybe_ord = r.to_real(maybe_ord);  // Opt<T> overload -- passes through, not itself local here
+    assert(maybe_ord && maybe_ord.raw() == ord.raw());
 
     Snapshot s = m.snapshot();
     const Account& a2 = s.resolve(acct);
@@ -95,6 +98,65 @@ int main() {
     assert(s.view_referrers<&Order::account>(acct).size() == 1);
     assert(s.find_cached_referrers<&Order::account>(acct).size() == 1);
     assert(s.view_cached_referrers<&Order::account>(acct).size() == 1);
+
+    // range_* siblings: same lookup families, range-for instead of a vector
+    // (see types_extern.h's coverage -- these are template<auto Field>/
+    // template<class T>, no Pred/F, so (unlike for_each_*/all_of_*) they're
+    // structurally enumerable and belong in the generated extern coverage).
+    {
+        int n = 0;
+        for (const Account& x : s.range_by_scan_field<&Account::name>("Widgets Inc")) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (View<Account> x : s.range_view_by_scan_field<&Account::name>("Widgets Inc")) { (void)x; ++n; }
+        assert(n == 1);
+    }
+    {
+        int n = 0;
+        for (const Order& x : s.range_by_scan_field<&Order::qty>(5)) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (const Order& x : s.range_by_scan_field<&Order::computed_key>("ord:O1")) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (View<Order> x : s.range_view_by_scan_field<&Order::qty>(5)) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (const Order& x : s.range_by_cached_field<&Order::qty>(5)) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (const Order& x : s.range_by_cached_field<&Order::computed_key>("ord:O1")) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (View<Order> x : s.range_view_by_cached_field<&Order::qty>(5)) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (const Order& x : s.range_referrers<&Order::account>(acct)) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (View<Order> x : s.range_view_referrers<&Order::account>(acct)) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (const Order& x : s.range_cached_referrers<&Order::account>(acct)) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (View<Order> x : s.range_view_cached_referrers<&Order::account>(acct)) { (void)x; ++n; }
+        assert(n == 1);
+    }
+    {
+        int n = 0;
+        for (const Account& x : s.range<Account>()) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (View<Account> x : s.range_view<Account>()) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (const Order& x : s.range<Order>()) { (void)x; ++n; }
+        assert(n == 1);
+        n = 0;
+        for (View<Order> x : s.range_view<Order>()) { (void)x; ++n; }
+        assert(n == 1);
+    }
 
     if (const Account* ap = s.find(acct)) {
         View<Account> av = s.view(*ap);

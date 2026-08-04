@@ -181,6 +181,19 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
   `CommitStatus::Invalid` (or fail an assert) than publish a broken graph to readers.
 - Comments explain **why**, not what. If a comment would just restate the code, don't
   write it.
+- **A new template entry point on `Snapshot`/`Transaction`/`Model`/`BulkTransaction`/
+  `CommitResult`/`View` templated only on `<class T>` or `<auto Field>` (no `Pred`/`F`
+  functor parameter) must be added to `scripts/gen_extern_templates.py`'s
+  `render_entries()`, and exercised with a real call in `examples/extern_template_demo.cpp`**
+  — a declaration alone doesn't prove the generated `extern template` matches actual usage.
+  When adding one, also grep the rest of `model.h` for sibling entry points in the same
+  family that might already be missing rather than fixing only the one that prompted the
+  change — `CommitResult::to_real<T>` was found missing this way after the `range_*` family
+  was added. Functions templated on an unbounded caller type (`for_each_*`/`all_of_*`/
+  `find_by_predicate`/`view_by_predicate`, all taking `Pred`/`F`) are correctly excluded:
+  there's no fixed `Pred` set to enumerate. After changing the generator or the demo, rebuild
+  `extern_template_demo` and run `ctest --preset default` to confirm it still compiles,
+  links, and passes.
 
 ## Known scope boundaries (not TODOs to silently "fix")
 
