@@ -132,6 +132,15 @@ bool Snapshot::cached_field_short_circuit_raw(const void* field, const std::stri
     return bucket->for_each_short_circuit(f);
 }
 
+pmap::PersistentSet<Id, IdHash> Snapshot::cached_field_bucket_raw(const void* field,
+                                                                  const std::string& key) const {
+    if (!root_) return {};
+    auto it = root_->by_cached_field.find(field);
+    if (it == root_->by_cached_field.end()) return {};
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key);
+    return bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{};
+}
+
 std::vector<const ObjectBase*> Snapshot::find_by_cached_field_raw(const void* field, const std::string& key) const {
     return collect_raw(*this, [&](const std::function<bool(Id)>& f) {
         return cached_field_short_circuit_raw(field, key, f);
@@ -165,6 +174,14 @@ bool Snapshot::cached_referrer_short_circuit_raw(const void* field, Id target,
     const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target);
     if (!bucket) return true;  // nothing currently references this target: vacuous
     return bucket->for_each_short_circuit(f);
+}
+
+pmap::PersistentSet<Id, IdHash> Snapshot::cached_referrer_bucket_raw(const void* field, Id target) const {
+    if (!root_) return {};
+    auto it = root_->by_cached_reference.find(field);
+    if (it == root_->by_cached_reference.end()) return {};
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target);
+    return bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{};
 }
 
 std::vector<const ObjectBase*> Snapshot::find_cached_referrers_raw(const void* field, Id target) const {

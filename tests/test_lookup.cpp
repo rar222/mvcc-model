@@ -510,6 +510,125 @@ TEST(all_of_by_scan_field_and_all_of_by_cached_field_match_std_all_of_semantics)
     CHECK_EQ(calls, 1);
 }
 
+// range_by_cached_field: additive range-based-for form of find_by_cached_
+// field/for_each_by_cached_field/all_of_by_cached_field -- must visit the
+// exact same matches as for_each_by_cached_field, and `break` must short-
+// circuit (stop the underlying bucket walk, not just skip further loop
+// bodies) the same way all_of_by_cached_field's pred returning false does.
+TEST(range_by_cached_field_visits_the_same_matches_as_for_each_by_cached_field) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    make_order(m, "O2", a, Opt<Order>{}, 5);
+    make_order(m, "O3", a, Opt<Order>{}, 7);
+    Snapshot s = m.snapshot();
+
+    int range_hits = 0;
+    for (const Order& o : s.range_by_cached_field<&Order::qty>(5)) {
+        CHECK_EQ(o.qty, std::int64_t{5});
+        ++range_hits;
+    }
+    CHECK_EQ(range_hits, 2);
+
+    // No matches for this value: empty range, no special-casing at the call
+    // site -- same "undeclared/no-match is empty" contract as find_by_cached_
+    // field.
+    int no_match_hits = 0;
+    for (const Order& o : s.range_by_cached_field<&Order::qty>(99)) {
+        (void)o;
+        ++no_match_hits;
+    }
+    CHECK_EQ(no_match_hits, 0);
+
+    // break stops the walk itself, not just further loop bodies -- exactly
+    // what all_of_by_cached_field's early return false gives you.
+    int seen_before_break = 0;
+    for (const Order& o : s.range_by_cached_field<&Order::qty>(5)) {
+        (void)o;
+        ++seen_before_break;
+        break;
+    }
+    CHECK_EQ(seen_before_break, 1);
+}
+
+// range_view_by_cached_field: same matches, View<Order> bound to `s`.
+TEST(range_view_by_cached_field_binds_views_to_this_snapshot) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    make_order(m, "O2", a, Opt<Order>{}, 5);
+    Snapshot s = m.snapshot();
+
+    int hits = 0;
+    for (View<Order> v : s.range_view_by_cached_field<&Order::qty>(5)) {
+        CHECK_EQ(v->qty, std::int64_t{5});
+        ++hits;
+    }
+    CHECK_EQ(hits, 2);
+}
+
+// range_cached_referrers/range_view_cached_referrers: same bucket
+// (Root::by_cached_reference) find_cached_referrers/for_each_cached_
+// referrers already read, via range-based for instead of a callback.
+TEST(range_cached_referrers_visits_the_same_matches_as_find_cached_referrers) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    make_order(m, "O1", a1);
+    make_order(m, "O2", a1);
+    make_order(m, "O3", a2);
+    Snapshot s = m.snapshot();
+
+    const auto expected = s.find_cached_referrers<&Order::account>(a1);
+    CHECK_EQ(expected.size(), std::size_t{2});
+
+    int hits = 0;
+    for (const Order& o : s.range_cached_referrers<&Order::account>(a1)) {
+        CHECK(o.account == a1);
+        ++hits;
+    }
+    CHECK_EQ(hits, static_cast<int>(expected.size()));
+
+    int view_hits = 0;
+    for (View<Order> v : s.range_view_cached_referrers<&Order::account>(a1)) {
+        CHECK(v->account == a1);
+        ++view_hits;
+    }
+    CHECK_EQ(view_hits, static_cast<int>(expected.size()));
+
+    // An account referenced by nothing: empty range.
+    const Ref<Account> lonely = make_account(m, "LONELY");
+    s = m.snapshot();
+    int lonely_hits = 0;
+    for (const Order& o : s.range_cached_referrers<&Order::account>(lonely)) {
+        (void)o;
+        ++lonely_hits;
+    }
+    CHECK_EQ(lonely_hits, 0);
+}
+
+// range_by_cached_field/range_cached_referrers must record a cached lookup
+// call the same way find_by_cached_field/find_cached_referrers do -- see
+// LookupCounts' own doc comment: it exists to let a caller decide, from
+// ACTUAL usage, whether a cached field/reference is worth its write-side
+// cost. A range-for call site that didn't count here would make that
+// diagnostic silently undercount usage for anyone who switched to it.
+TEST(range_by_cached_field_and_range_cached_referrers_record_lookup_stats) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    make_order(m, "O1", a, Opt<Order>{}, 5);
+    Snapshot s = m.snapshot();
+
+    for (const Order& o : s.range_by_cached_field<&Order::qty>(5)) (void)o;
+    for (const Order& o : s.range_by_cached_field<&Order::qty>(5)) (void)o;
+    const LookupCounts qty_counts = m.lookup_stats<&Order::qty>();
+    CHECK_EQ(qty_counts.cached_calls, std::uint64_t{2});
+
+    for (const Order& o : s.range_cached_referrers<&Order::account>(a)) (void)o;
+    const LookupCounts account_counts = m.lookup_stats<&Order::account>();
+    CHECK_EQ(account_counts.cached_calls, std::uint64_t{1});
+}
+
 // View-returning forms of the same two functions.
 TEST(for_each_view_by_scan_field_and_all_of_view_by_cached_field_bind_to_this_snapshot) {
     Model m;

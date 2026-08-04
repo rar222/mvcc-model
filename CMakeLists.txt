@@ -119,6 +119,14 @@ add_executable(cached_reference_bench examples/cached_reference_bench.cpp)
 target_link_libraries(cached_reference_bench PRIVATE model)
 target_precompile_headers(cached_reference_bench REUSE_FROM model)
 
+# range_by_cached_field/range_cached_referrers (range-based for) vs.
+# for_each_by_cached_field/for_each_cached_referrers (callback, never stops
+# early) vs. all_of_by_cached_field/all_of_cached_referrers stopping after
+# the first match vs. visiting every match -- across a population sweep.
+add_executable(range_vs_callback_bench examples/range_vs_callback_bench.cpp)
+target_link_libraries(range_vs_callback_bench PRIVATE model)
+target_precompile_headers(range_vs_callback_bench REUSE_FROM model)
+
 # 1,000,000 creates as one single-threaded Transaction vs. as 4 threads each
 # building+committing their own 250,000-create Transaction -- the single
 # transaction wins, because apply is serialized behind commit_mu_ (invariant
