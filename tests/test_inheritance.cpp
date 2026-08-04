@@ -872,7 +872,7 @@ TEST(lookup_stats_raw_reads_the_untyped_key_and_stays_independent_per_declaring_
 }
 
 // The _raw cached-field/cached-referrer lookup families deliberately carry
-// no record_field_lookup() call (see src/model.cpp) -- the ONLY read path
+// no register_field_lookup() call (see src/model.cpp) -- the ONLY read path
 // for a tag shared across unrelated concrete types via &Keys::example_key,
 // so this asymmetry is otherwise structurally invisible to any test. Pinned
 // here explicitly as a decision, not an accident: many _raw calls against a

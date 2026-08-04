@@ -184,6 +184,12 @@ pmap::PersistentSet<Id, IdHash> Snapshot::cached_referrer_bucket_raw(const void*
     return bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{};
 }
 
+pmap::PersistentSet<Id, IdHash> Snapshot::type_bucket_raw(TypeTag tag) const {
+    if (!root_) return {};
+    auto it = root_->by_type.find(tag);
+    return it != root_->by_type.end() ? it->second : pmap::PersistentSet<Id, IdHash>{};
+}
+
 std::vector<const ObjectBase*> Snapshot::find_cached_referrers_raw(const void* field, Id target) const {
     return collect_raw(*this, [&](const std::function<bool(Id)>& f) {
         return cached_referrer_short_circuit_raw(field, target, f);
@@ -228,9 +234,9 @@ struct Snapshot::Lease {
 // for_each_referrer/find_cached_referrers) can reach without also failing
 // their own `!root_` check first -- but checking here too costs nothing and
 // doesn't rely on call-site discipline to stay safe.
-void Snapshot::record_field_lookup(const std::type_info& type, const void* field,
+void Snapshot::register_field_lookup(const std::type_info& type, const void* field,
                                    bool cached) const {
-    if (lease_) lease_->m->record_field_lookup(type, field, cached);
+    if (lease_) lease_->m->register_field_lookup(type, field, cached);
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,7 +1220,7 @@ Model::Diagnostics Model::diagnostics() const {
 // Field lookup stats
 // ---------------------------------------------------------------------------
 
-void Model::record_field_lookup(const std::type_info& type, const void* field,
+void Model::register_field_lookup(const std::type_info& type, const void* field,
                                 bool cached) const {
     const FieldLookupKey key{&type, field};
     {

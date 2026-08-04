@@ -1121,7 +1121,7 @@ struct LookupCounts {
 };
 
 /// Identifies one looked-up field: its declaring type (captured as
-/// `typeid(ClassT)` at the call site -- see Model::record_field_lookup) plus
+/// `typeid(ClassT)` at the call site -- see Model::register_field_lookup) plus
 /// the field itself (`field_tag<Field>()`). At namespace scope, not nested
 /// in Model, because it's also the key type of Model::LookupDiagnostics::
 /// stats -- a PUBLIC-facing shape -- and there's nothing Model-specific
@@ -1135,7 +1135,7 @@ struct FieldLookupKey {
 
 /// Hasher for FieldLookupKey. Unlike IdHash, this makes no collision-free
 /// claim and needs none: it only keys field_lookup_counts_, a diagnostics-
-/// only map (see Model::record_field_lookup) that is never on a hot path
+/// only map (see Model::register_field_lookup) that is never on a hot path
 /// and never affects correctness -- an occasional bucket collision just
 /// costs one extra comparison, not a wrong answer. A plain XOR-of-hashes
 /// combination is enough for that; no `is_perfect` opt-in (see
@@ -1234,6 +1234,168 @@ public:
     std::optional<View<member_class_t<decltype(Field)>>> view_by_key(
         const member_value_t<decltype(Field)>& value) const;
 
+    // -----------------------------------------------------------------------
+    // Range-based-for support for the UNCACHED, O(#ClassT objects) scan
+    // families (by_scan_field, referrer): range_by_scan_field below returns
+    // a ScanFieldRange<Field>; range_referrer (declared near for_each_
+    // referrer) returns a ReferrerRange<Field>. Both are additive --
+    // for_each_by_scan_field/all_of_by_scan_field/find_by_scan_field (and
+    // the referrer siblings) are untouched. Unlike CachedBucketRange (an
+    // O(log n + matches) bucket, already exactly the match set), these walk
+    // the WHOLE by_type[ClassT] population and filter per element -- the
+    // O(n) cost is unavoidable no matter which of for_each_*/all_of_*/
+    // range_* touches it; range-for adds the same modest per-element tax
+    // CachedBucketRange does (see the mvcc-model session that measured a
+    // bare PersistentSet range-for at ~1.1x a callback's cost), just on top
+    // of an already O(n) walk instead of an O(matches) one -- expect the
+    // relative overhead of switching to range-for here to matter LESS in
+    // absolute terms than on the bucket-backed families for the same
+    // population, precisely because the per-element filter/resolve cost
+    // already dominates both forms equally.
+    template <auto Field>
+    class ScanFieldRange {
+    public:
+        using ClassT = member_class_t<decltype(Field)>;
+        using Value = member_value_t<decltype(Field)>;
+
+        class iterator {
+        public:
+            using iterator_category = std::forward_iterator_tag;
+            using value_type = ClassT;
+            using difference_type = std::ptrdiff_t;
+            using pointer = const ClassT*;
+            using reference = const ClassT&;
+
+            reference operator*() const { return *ptr_; }
+            pointer operator->() const { return ptr_; }
+            iterator& operator++() {
+                ++it_;
+                advance_to_match();
+                return *this;
+            }
+            friend bool operator==(const iterator& a, const iterator& b) noexcept {
+                return a.it_ == b.it_;
+            }
+            friend bool operator!=(const iterator& a, const iterator& b) noexcept { return !(a == b); }
+
+        private:
+            friend class ScanFieldRange;
+            iterator() = default;
+            iterator(const Snapshot* s, pmap::PersistentSet<Id, IdHash>::iterator it,
+                     pmap::PersistentSet<Id, IdHash>::iterator end, Value value)
+                : s_(s), it_(it), end_(end), value_(std::move(value)) {
+                advance_to_match();
+            }
+            void advance_to_match() {
+                for (; it_ != end_; ++it_) {
+                    const ClassT* p = cast<ClassT>(s_->find_raw(*it_));
+                    if (p && matches(*p)) {
+                        ptr_ = p;
+                        return;
+                    }
+                }
+                ptr_ = nullptr;
+            }
+            // Field is either a data member or a nullary const method -- the
+            // same two shapes scan_field_short_circuit's own comparison
+            // handles (see that function).
+            bool matches(const ClassT& o) const {
+                if constexpr (std::is_member_object_pointer_v<decltype(Field)>) {
+                    return o.*Field == value_;
+                } else {
+                    return (o.*Field)() == value_;
+                }
+            }
+            const Snapshot* s_ = nullptr;
+            pmap::PersistentSet<Id, IdHash>::iterator it_{};
+            pmap::PersistentSet<Id, IdHash>::iterator end_{};
+            Value value_{};
+            const ClassT* ptr_ = nullptr;
+        };
+
+        iterator begin() const { return iterator(s_, bucket_.begin(), bucket_.end(), value_); }
+        iterator end() const { return iterator(s_, bucket_.end(), bucket_.end(), value_); }
+
+    private:
+        friend class Snapshot;
+        ScanFieldRange(const Snapshot* s, pmap::PersistentSet<Id, IdHash> bucket, Value value)
+            : s_(s), bucket_(std::move(bucket)), value_(std::move(value)) {}
+        const Snapshot* s_ = nullptr;
+        pmap::PersistentSet<Id, IdHash> bucket_;
+        Value value_;
+    };
+
+    /// View-returning counterpart of ScanFieldRange -- see CachedBucketViewRange's
+    /// own doc comment for why iterator::operator* is declared here but
+    /// defined out-of-line, after View<T> is complete.
+    template <auto Field>
+    class ScanFieldViewRange {
+    public:
+        using ClassT = member_class_t<decltype(Field)>;
+        using Value = member_value_t<decltype(Field)>;
+
+        class iterator {
+        public:
+            using iterator_category = std::forward_iterator_tag;
+            using value_type = View<ClassT>;
+            using difference_type = std::ptrdiff_t;
+            using reference = View<ClassT>;
+
+            reference operator*() const;
+            iterator& operator++() {
+                ++it_;
+                advance_to_match();
+                return *this;
+            }
+            friend bool operator==(const iterator& a, const iterator& b) noexcept {
+                return a.it_ == b.it_;
+            }
+            friend bool operator!=(const iterator& a, const iterator& b) noexcept { return !(a == b); }
+
+        private:
+            friend class ScanFieldViewRange;
+            iterator() = default;
+            iterator(const Snapshot* s, pmap::PersistentSet<Id, IdHash>::iterator it,
+                     pmap::PersistentSet<Id, IdHash>::iterator end, Value value)
+                : s_(s), it_(it), end_(end), value_(std::move(value)) {
+                advance_to_match();
+            }
+            void advance_to_match() {
+                for (; it_ != end_; ++it_) {
+                    const ClassT* p = cast<ClassT>(s_->find_raw(*it_));
+                    if (p && matches(*p)) {
+                        ptr_ = p;
+                        return;
+                    }
+                }
+                ptr_ = nullptr;
+            }
+            bool matches(const ClassT& o) const {
+                if constexpr (std::is_member_object_pointer_v<decltype(Field)>) {
+                    return o.*Field == value_;
+                } else {
+                    return (o.*Field)() == value_;
+                }
+            }
+            const Snapshot* s_ = nullptr;
+            pmap::PersistentSet<Id, IdHash>::iterator it_{};
+            pmap::PersistentSet<Id, IdHash>::iterator end_{};
+            Value value_{};
+            const ClassT* ptr_ = nullptr;
+        };
+
+        iterator begin() const { return iterator(s_, bucket_.begin(), bucket_.end(), value_); }
+        iterator end() const { return iterator(s_, bucket_.end(), bucket_.end(), value_); }
+
+    private:
+        friend class Snapshot;
+        ScanFieldViewRange(const Snapshot* s, pmap::PersistentSet<Id, IdHash> bucket, Value value)
+            : s_(s), bucket_(std::move(bucket)), value_(std::move(value)) {}
+        const Snapshot* s_ = nullptr;
+        pmap::PersistentSet<Id, IdHash> bucket_;
+        Value value_;
+    };
+
     /// UNINDEXED multi-match lookup: every object whose `Field` -- declared
     /// via define_scan_fields() -- currently equals `value`. Named like
     /// find_by_key: `s.find_by_scan_field<&Order::qty>(5)`, and `Field` may
@@ -1248,7 +1410,7 @@ public:
     /// rule. For a field queried often enough to deserve an index, declare
     /// it in define_cached_fields() and use find_by_cached_field instead.
     /// Defined out-of-line (after Model) so its body can call
-    /// Model::record_field_lookup() for LookupCounts -- see that method's
+    /// Model::register_field_lookup() for LookupCounts -- see that method's
     /// doc comment for why this can't be inline here.
     template <auto Field>
     std::vector<const member_class_t<decltype(Field)>*> find_by_scan_field(
@@ -1283,6 +1445,21 @@ public:
     /// View-returning form of all_of_by_scan_field.
     template <auto Field, class Pred>
     bool all_of_view_by_scan_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const;
+
+    /// Range-based-for form of find_by_scan_field/for_each_by_scan_field/
+    /// all_of_by_scan_field: `for (const Order& o : s.range_by_scan_field<
+    /// &Order::qty>(5)) { ... }`. Same O(#ClassT objects) walk as those
+    /// three (see ScanFieldRange's own doc comment for the cost note), no
+    /// vector allocation, `break` short-circuits for free. Empty for a
+    /// `value` nothing currently holds, or a field never define_scan_
+    /// fields()'d. Defined out-of-line (after Model) -- see find_by_scan_
+    /// field's comment (register_field_lookup).
+    template <auto Field>
+    ScanFieldRange<Field> range_by_scan_field(const member_value_t<decltype(Field)>& value) const;
+
+    /// View-returning form of range_by_scan_field.
+    template <auto Field>
+    ScanFieldViewRange<Field> range_view_by_scan_field(const member_value_t<decltype(Field)>& value) const;
 
     // -----------------------------------------------------------------------
     // Range-based-for support for the two BUCKET-backed lookup families
@@ -1475,7 +1652,7 @@ public:
     /// caller sees an empty range, no special-casing needed. See this
     /// section's own top comment for why this exists only for the two
     /// bucket-backed families. Defined out-of-line (after Model) -- see
-    /// find_by_scan_field's comment (record_field_lookup).
+    /// find_by_scan_field's comment (register_field_lookup).
     template <auto Field>
     CachedBucketRange<member_class_t<decltype(Field)>> range_by_cached_field(
         const member_value_t<decltype(Field)>& value) const;
@@ -1496,6 +1673,25 @@ public:
             if (const T* p = cast<T>(find_raw(id))) f(*p);
         });
     }
+
+    /// Range-based-for form of for_each<T>: `for (const Order& o :
+    /// s.range<Order>()) { ... }`. Same O(#T objects) walk, no vector
+    /// allocation, `break` short-circuits for free. Reuses
+    /// CachedBucketRange<T> -- it's the exact same shape (resolve an Id out
+    /// of a pmap::PersistentSet<Id, IdHash>, cast<T>, skip a mismatch) as
+    /// every other bucket-backed range in this file; by_type[T] just IS a
+    /// bucket that already holds exactly the matches (every live Id of type
+    /// T), same as a by_cached_field/by_cached_reference bucket does for its
+    /// one value/target.
+    template <class T>
+    CachedBucketRange<T> range() const {
+        return CachedBucketRange<T>(this, type_bucket_raw(type_tag<T>()));
+    }
+
+    /// View-returning form of range<T>. Declared here, defined out-of-line
+    /// (after View) -- see for_each_view<T>'s own placement for why.
+    template <class T>
+    CachedBucketViewRange<T> range_view() const;
 
     /// Short-circuiting counterpart of for_each<T>: `f` returns bool (true =
     /// keep going, false = stop), and this returns whether the walk ran to
@@ -1532,6 +1728,139 @@ public:
     /// Same slow scan as find_all, but returns View<T>s bound to this snapshot.
     template <class T, class Pred>
     std::vector<View<T>> find_all_view(Pred&& pred) const;
+
+    /// Range-based-for support for for_each_referrer/all_of_referrer/
+    /// find_referrers -- ReferrerRange<Field> walks the WHOLE by_type[ClassT]
+    /// population, same O(#ClassT objects) cost, filtering by `(o.*Field).
+    /// raw() == target.raw()` per element instead of ScanFieldRange's value
+    /// comparison. No "declared" check (unlike ScanFieldRange/define_scan_
+    /// fields()): for_each_referrer already works on ANY Ref<>/Opt<> field,
+    /// declared or not -- see its own doc comment. See ScanFieldRange's own
+    /// comment for the cost note this shares.
+    template <auto Field>
+    class ReferrerRange {
+    public:
+        using ClassT = member_class_t<decltype(Field)>;
+
+        class iterator {
+        public:
+            using iterator_category = std::forward_iterator_tag;
+            using value_type = ClassT;
+            using difference_type = std::ptrdiff_t;
+            using pointer = const ClassT*;
+            using reference = const ClassT&;
+
+            reference operator*() const { return *ptr_; }
+            pointer operator->() const { return ptr_; }
+            iterator& operator++() {
+                ++it_;
+                advance_to_match();
+                return *this;
+            }
+            friend bool operator==(const iterator& a, const iterator& b) noexcept {
+                return a.it_ == b.it_;
+            }
+            friend bool operator!=(const iterator& a, const iterator& b) noexcept { return !(a == b); }
+
+        private:
+            friend class ReferrerRange;
+            iterator() = default;
+            iterator(const Snapshot* s, pmap::PersistentSet<Id, IdHash>::iterator it,
+                     pmap::PersistentSet<Id, IdHash>::iterator end, Id target)
+                : s_(s), it_(it), end_(end), target_(target) {
+                advance_to_match();
+            }
+            void advance_to_match() {
+                for (; it_ != end_; ++it_) {
+                    const ClassT* p = cast<ClassT>(s_->find_raw(*it_));
+                    if (p && (p->*Field).raw() == target_) {
+                        ptr_ = p;
+                        return;
+                    }
+                }
+                ptr_ = nullptr;
+            }
+            const Snapshot* s_ = nullptr;
+            pmap::PersistentSet<Id, IdHash>::iterator it_{};
+            pmap::PersistentSet<Id, IdHash>::iterator end_{};
+            Id target_{};
+            const ClassT* ptr_ = nullptr;
+        };
+
+        iterator begin() const { return iterator(s_, bucket_.begin(), bucket_.end(), target_); }
+        iterator end() const { return iterator(s_, bucket_.end(), bucket_.end(), target_); }
+
+    private:
+        friend class Snapshot;
+        ReferrerRange(const Snapshot* s, pmap::PersistentSet<Id, IdHash> bucket, Id target)
+            : s_(s), bucket_(std::move(bucket)), target_(target) {}
+        const Snapshot* s_ = nullptr;
+        pmap::PersistentSet<Id, IdHash> bucket_;
+        Id target_{};
+    };
+
+    /// View-returning counterpart of ReferrerRange -- see CachedBucketViewRange's
+    /// own doc comment for why iterator::operator* is declared here but
+    /// defined out-of-line, after View<T> is complete.
+    template <auto Field>
+    class ReferrerViewRange {
+    public:
+        using ClassT = member_class_t<decltype(Field)>;
+
+        class iterator {
+        public:
+            using iterator_category = std::forward_iterator_tag;
+            using value_type = View<ClassT>;
+            using difference_type = std::ptrdiff_t;
+            using reference = View<ClassT>;
+
+            reference operator*() const;
+            iterator& operator++() {
+                ++it_;
+                advance_to_match();
+                return *this;
+            }
+            friend bool operator==(const iterator& a, const iterator& b) noexcept {
+                return a.it_ == b.it_;
+            }
+            friend bool operator!=(const iterator& a, const iterator& b) noexcept { return !(a == b); }
+
+        private:
+            friend class ReferrerViewRange;
+            iterator() = default;
+            iterator(const Snapshot* s, pmap::PersistentSet<Id, IdHash>::iterator it,
+                     pmap::PersistentSet<Id, IdHash>::iterator end, Id target)
+                : s_(s), it_(it), end_(end), target_(target) {
+                advance_to_match();
+            }
+            void advance_to_match() {
+                for (; it_ != end_; ++it_) {
+                    const ClassT* p = cast<ClassT>(s_->find_raw(*it_));
+                    if (p && (p->*Field).raw() == target_) {
+                        ptr_ = p;
+                        return;
+                    }
+                }
+                ptr_ = nullptr;
+            }
+            const Snapshot* s_ = nullptr;
+            pmap::PersistentSet<Id, IdHash>::iterator it_{};
+            pmap::PersistentSet<Id, IdHash>::iterator end_{};
+            Id target_{};
+            const ClassT* ptr_ = nullptr;
+        };
+
+        iterator begin() const { return iterator(s_, bucket_.begin(), bucket_.end(), target_); }
+        iterator end() const { return iterator(s_, bucket_.end(), bucket_.end(), target_); }
+
+    private:
+        friend class Snapshot;
+        ReferrerViewRange(const Snapshot* s, pmap::PersistentSet<Id, IdHash> bucket, Id target)
+            : s_(s), bucket_(std::move(bucket)), target_(target) {}
+        const Snapshot* s_ = nullptr;
+        pmap::PersistentSet<Id, IdHash> bucket_;
+        Id target_{};
+    };
 
     /// Slow scan: every object whose `Field` currently points at `target`,
     /// i.e. "who references this?" for an arbitrary Ref<U>/Opt<U> field. This
@@ -1590,6 +1919,23 @@ public:
     std::vector<View<member_class_t<decltype(Field)>>> view_referrers(
         Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
 
+    /// Range-based-for form of find_referrers/for_each_referrer/all_of_
+    /// referrer: `for (const Order& o : s.range_referrer<&Order::account>(
+    /// acct)) { ... }`. Same O(#ClassT objects) walk as those three (see
+    /// ReferrerRange's own doc comment for the cost note), no vector
+    /// allocation, `break` short-circuits for free. Works on ANY Ref<>/
+    /// Opt<> field, declared cached or not -- same as for_each_referrer.
+    /// Defined out-of-line (after Model) -- see find_by_scan_field's comment
+    /// (register_field_lookup).
+    template <auto Field>
+    ReferrerRange<Field> range_referrer(
+        Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
+
+    /// View-returning form of range_referrer.
+    template <auto Field>
+    ReferrerViewRange<Field> range_view_referrer(
+        Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
+
     /// INDEXED counterpart of for_each_referrer: O(log n + #matches) instead
     /// of O(#ClassT objects), backed by Root::by_cached_reference. Only works
     /// for a field declared in define_cached_references() -- empty
@@ -1646,7 +1992,7 @@ public:
     /// (O(log n + matches), no allocation, `break` short-circuits, empty
     /// range for an undeclared field or an unreferenced target). Defined
     /// out-of-line (after Model) -- see find_by_scan_field's comment
-    /// (record_field_lookup).
+    /// (register_field_lookup).
     template <auto Field>
     CachedBucketRange<member_class_t<decltype(Field)>> range_cached_referrers(
         Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
@@ -1778,11 +2124,47 @@ private:
         return static_cast<const T*>(o);
     }
 
+    /// Whether `o` declares Field via define_scan_fields() (checked by tag,
+    /// via each_scan_field). Factored out to ONE place so scan_field_short_
+    /// circuit's own inline once-per-scan check and range_by_scan_field/
+    /// range_view_by_scan_field's upfront check (see scan_field_is_declared
+    /// below) can't drift apart on what "declared" means -- there is
+    /// exactly one definition of it in this file.
+    template <auto Field>
+    static bool declares_scan_field(const ObjectBase& o) {
+        bool declared = false;
+        o.each_scan_field([&](const void* field, std::string) {
+            if (field == field_tag<Field>()) declared = true;
+        });
+        return declared;
+    }
+
+    /// Whether Field is declared via define_scan_fields() for ClassT,
+    /// checked by asking any ONE live object of that type -- define_scan_
+    /// fields() is static per type, so one answer speaks for the whole
+    /// population (same assumption scan_field_short_circuit's own inline
+    /// check makes). False (vacuously) if ClassT currently has no live
+    /// objects to ask. What range_by_scan_field/range_view_by_scan_field use
+    /// to decide whether their bucket should be the real by_type[ClassT]
+    /// population or empty -- an undeclared field must behave exactly like
+    /// find_by_key/find_by_cached_field's "undeclared is invisible" rule,
+    /// not just skip the value filter.
+    template <auto Field>
+    bool scan_field_is_declared() const {
+        using ClassT = member_class_t<decltype(Field)>;
+        bool declared = false;
+        for_each_short_circuit<ClassT>([&](const ClassT& o) {
+            declared = declares_scan_field<Field>(o);
+            return false;  // stop after the first object
+        });
+        return declared;
+    }
+
     /// Shared, short-circuiting scan implementation behind BOTH
     /// for_each_by_scan_field (wraps `f` to always report "keep going") and
     /// all_of_by_scan_field (passes `pred` straight through, so a false
     /// genuinely stops the walk). Defined out-of-line alongside them -- see
-    /// find_by_scan_field's comment for why (record_field_lookup).
+    /// find_by_scan_field's comment for why (register_field_lookup).
     template <auto Field, class F>
     bool scan_field_short_circuit(const member_value_t<decltype(Field)>& value, F&& f) const;
 
@@ -1825,7 +2207,7 @@ private:
     /// comparison, and with no define_references()-declared check: unlike a
     /// scan field, for_each_referrer works on ANY Ref<>/Opt<> field (see its
     /// own doc comment). Defined out-of-line alongside its callers -- see
-    /// find_by_scan_field's comment for why (record_field_lookup).
+    /// find_by_scan_field's comment for why (register_field_lookup).
     template <auto Field, class F>
     bool referrer_short_circuit(Ref<typename member_value_t<decltype(Field)>::target_type> target,
                                 F&& f) const;
@@ -1846,6 +2228,15 @@ private:
     /// field_bucket_raw has to cached_field_short_circuit_raw -- see its own
     /// doc comment.
     pmap::PersistentSet<Id, IdHash> cached_referrer_bucket_raw(const void* field, Id target) const;
+
+    /// Returns a copy of by_type[tag] (Root::by_type -- every live Id of
+    /// that type), or an empty PersistentSet if the type has never had an
+    /// object created (by_type has no entry for a tag until the first
+    /// create). What range<T>/ScanFieldRange/ReferrerRange (range<T>,
+    /// range_by_scan_field, range_referrer) are built on -- same "hand back
+    /// the bucket itself, not a walk-then-return" reason cached_field_
+    /// bucket_raw exists.
+    pmap::PersistentSet<Id, IdHash> type_bucket_raw(TypeTag tag) const;
 
     /// Generic ("any type, any field") counterpart of for_each_referrer<Field>:
     /// walks EVERY live object of EVERY type via by_type, and every one of
@@ -1876,7 +2267,7 @@ private:
         }
     }
 
-    /// Forwards to the OWNING Model's Model::record_field_lookup(), if this
+    /// Forwards to the OWNING Model's Model::register_field_lookup(), if this
     /// Snapshot has an owner (a default-constructed Snapshot's lease_ is
     /// null, and never reaches any of the four call sites that use this --
     /// each already returns early on `!root_`, which is null together with
@@ -1885,7 +2276,7 @@ private:
     /// this same Model* for release_version() (see Lease), so this adds no
     /// new lifetime requirement. Defined out-of-line: Model must be a
     /// complete type to call through lease_->m.
-    void record_field_lookup(const std::type_info& type, const void* field, bool cached) const;
+    void register_field_lookup(const std::type_info& type, const void* field, bool cached) const;
 
     std::shared_ptr<const Root> root_;  ///< the immutable version everything above reads;
                                         ///< shared with the Model and other snapshots
@@ -2622,7 +3013,7 @@ public:
     /// Records one call to a cached-or-not field-lookup function -- called
     /// only from Snapshot::find_by_scan_field/find_by_cached_field/
     /// for_each_referrer/find_cached_referrers (via Snapshot::
-    /// record_field_lookup), never directly. Public because Snapshot is not
+    /// register_field_lookup), never directly. Public because Snapshot is not
     /// a friend and there is no reason to make it one for this: the method
     /// is safe to call from anywhere, on any live Model, from any thread.
     ///
@@ -2644,7 +3035,7 @@ public:
     /// the entry already exists, and exclusively only to insert a field
     /// never seen before on this Model -- see the .cpp for why that split
     /// is safe.
-    void record_field_lookup(const std::type_info& type, const void* field, bool cached) const;
+    void register_field_lookup(const std::type_info& type, const void* field, bool cached) const;
 
     /// This field's cached-vs-uncached call counts, for the life of this
     /// Model -- zero if Field was never looked up via find_by_scan_field/
@@ -2666,7 +3057,7 @@ public:
 
     /// Every field looked up at least once, for the life of this Model, each
     /// labeled with its declaring type's demangled name (see
-    /// record_field_lookup's comment on why demangling happens here and
+    /// register_field_lookup's comment on why demangling happens here and
     /// nowhere hotter). Order is unspecified; LookupDiagnostics::to_string()
     /// sorts it for display. Deliberately NOT part of Model::Diagnostics/
     /// diagnostics(): that call is documented as a bounded, point-in-time
@@ -3650,7 +4041,7 @@ private:
     // ---- field lookup stats -------------------------------------------------
     // Entirely independent of everything above: not touched by try_commit(),
     // not part of published state, never read back into a decision the model
-    // itself makes. See record_field_lookup()'s doc comment for the design
+    // itself makes. See register_field_lookup()'s doc comment for the design
     // (a shared_mutex, held shared on the steady-state path) and why it
     // replaced an earlier thread_local-plus-flush design.
 
@@ -3660,7 +4051,7 @@ private:
     /// The atomic mirror of the public LookupCounts: one instance per
     /// looked-up field, held inside field_lookup_counts_. Split into atomics
     /// (rather than storing LookupCounts directly) is what lets the
-    /// steady-state increment in record_field_lookup() take field_lookup_mu_
+    /// steady-state increment in register_field_lookup() take field_lookup_mu_
     /// only SHARED -- concurrent lookups bump their own counter without
     /// serializing against each other, only against a never-seen-before
     /// field's insert. LookupCounts itself stays a plain (non-atomic) value
@@ -3897,8 +4288,8 @@ private:
 
 // ---------------------------------------------------------------------------
 // Snapshot lookup functions -- defined here, not in the class body, because
-// each needs Model::record_field_lookup(), and Model isn't a complete type
-// until the closing brace above. Snapshot::record_field_lookup ITSELF is
+// each needs Model::register_field_lookup(), and Model isn't a complete type
+// until the closing brace above. Snapshot::register_field_lookup ITSELF is
 // defined in model.cpp, not here: it also needs Snapshot::Lease complete,
 // and Lease's own definition lives there, not in this header (see Lease's
 // forward declaration).
@@ -3907,16 +4298,14 @@ private:
 template <auto Field, class F>
 bool Snapshot::scan_field_short_circuit(const member_value_t<decltype(Field)>& value, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
     bool checked = false, declared = false;
     return for_each_short_circuit<ClassT>([&](const ClassT& o) {
         if (!checked) {
             // define_scan_fields() is static per type: ask the first
             // object once, on behalf of the whole scan.
             checked = true;
-            o.each_scan_field([&](const void* field, std::string) {
-                if (field == field_tag<Field>()) declared = true;
-            });
+            declared = declares_scan_field<Field>(o);
         }
         if (!declared) return true;  // not a match -- keep going
         // Field is either a data member or a nullary const method -- the
@@ -3951,10 +4340,25 @@ std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_by_scan_field
     return out;
 }
 
+template <auto Field>
+Snapshot::ScanFieldRange<Field> Snapshot::range_by_scan_field(
+    const member_value_t<decltype(Field)>& value) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    // An undeclared field must behave exactly like find_by_key/find_by_
+    // cached_field's "undeclared is invisible" rule: vacuously empty,
+    // regardless of whether some object's actual value happens to equal
+    // `value` -- see scan_field_is_declared's own comment.
+    pmap::PersistentSet<Id, IdHash> bucket =
+        scan_field_is_declared<Field>() ? type_bucket_raw(type_tag<ClassT>())
+                                        : pmap::PersistentSet<Id, IdHash>{};
+    return ScanFieldRange<Field>(this, std::move(bucket), value);
+}
+
 template <auto Field, class F>
 void Snapshot::for_each_by_cached_field(const member_value_t<decltype(Field)>& value, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
     cached_field_short_circuit_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
         if (const ClassT* p = cast<ClassT>(find_raw(id))) f(*p);
         return true;  // for_each_by_cached_field never stops early
@@ -3964,7 +4368,7 @@ void Snapshot::for_each_by_cached_field(const member_value_t<decltype(Field)>& v
 template <auto Field, class Pred>
 bool Snapshot::all_of_by_cached_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
     return cached_field_short_circuit_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
         const ClassT* p = cast<ClassT>(find_raw(id));
         return !p || pred(*p);
@@ -3984,7 +4388,7 @@ template <auto Field>
 Snapshot::CachedBucketRange<member_class_t<decltype(Field)>> Snapshot::range_by_cached_field(
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
     return CachedBucketRange<ClassT>(this, cached_field_bucket_raw(field_tag<Field>(), to_field_key(value)));
 }
 
@@ -3992,7 +4396,7 @@ template <auto Field, class F>
 bool Snapshot::referrer_short_circuit(
     Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
     return for_each_short_circuit<ClassT>([&](const ClassT& o) {
         return (o.*Field).raw() != target.raw() || f(o);
     });
@@ -4022,11 +4426,19 @@ std::vector<const member_class_t<decltype(Field)>*> Snapshot::find_referrers(
     return out;
 }
 
+template <auto Field>
+Snapshot::ReferrerRange<Field> Snapshot::range_referrer(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    return ReferrerRange<Field>(this, type_bucket_raw(type_tag<ClassT>()), target.raw());
+}
+
 template <auto Field, class F>
 void Snapshot::for_each_cached_referrers(
     Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
     cached_referrer_short_circuit_raw(field_tag<Field>(), target.raw(), [&](Id id) {
         if (const ClassT* p = cast<ClassT>(find_raw(id))) f(*p);
         return true;  // for_each_cached_referrers never stops early
@@ -4037,7 +4449,7 @@ template <auto Field, class Pred>
 bool Snapshot::all_of_cached_referrers(
     Ref<typename member_value_t<decltype(Field)>::target_type> target, Pred&& pred) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
     return cached_referrer_short_circuit_raw(field_tag<Field>(), target.raw(), [&](Id id) {
         const ClassT* p = cast<ClassT>(find_raw(id));
         return !p || pred(*p);
@@ -4057,7 +4469,7 @@ template <auto Field>
 Snapshot::CachedBucketRange<member_class_t<decltype(Field)>> Snapshot::range_cached_referrers(
     Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
     return CachedBucketRange<ClassT>(this, cached_referrer_bucket_raw(field_tag<Field>(), target.raw()));
 }
 
@@ -4821,6 +5233,28 @@ std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_by_scan_field(
     return out;
 }
 
+// ScanFieldViewRange<Field>::iterator::operator* -- declared alongside
+// ScanFieldViewRange itself (Snapshot's class body), defined here because it
+// needs View<T> to be a complete type. Same reason CachedBucketViewRange::
+// iterator::operator* is deferred -- see its own comment.
+template <auto Field>
+View<member_class_t<decltype(Field)>> Snapshot::ScanFieldViewRange<Field>::iterator::operator*() const {
+    return View<ClassT>(*s_, *ptr_);
+}
+
+template <auto Field>
+Snapshot::ScanFieldViewRange<Field> Snapshot::range_view_by_scan_field(
+    const member_value_t<decltype(Field)>& value) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    // See range_by_scan_field's own comment for why an undeclared field
+    // must be vacuously empty here, not just skip the value filter.
+    pmap::PersistentSet<Id, IdHash> bucket =
+        scan_field_is_declared<Field>() ? type_bucket_raw(type_tag<ClassT>())
+                                        : pmap::PersistentSet<Id, IdHash>{};
+    return ScanFieldViewRange<Field>(this, std::move(bucket), value);
+}
+
 template <auto Field, class F>
 void Snapshot::for_each_view_by_cached_field(const member_value_t<decltype(Field)>& value, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
@@ -4857,7 +5291,7 @@ template <auto Field>
 Snapshot::CachedBucketViewRange<member_class_t<decltype(Field)>> Snapshot::range_view_by_cached_field(
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
     return CachedBucketViewRange<ClassT>(this,
                                          cached_field_bucket_raw(field_tag<Field>(), to_field_key(value)));
 }
@@ -4882,18 +5316,23 @@ std::vector<View<T>> Snapshot::find_all_view(Pred&& pred) const {
     return out;
 }
 
+template <class T>
+Snapshot::CachedBucketViewRange<T> Snapshot::range_view() const {
+    return CachedBucketViewRange<T>(this, type_bucket_raw(type_tag<T>()));
+}
+
 template <auto Field, class F>
 void Snapshot::for_each_view_referrer(
     Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
     // Delegates to for_each_referrer<Field> rather than re-walking
     // for_each_view<ClassT> and re-checking `(o.*Field).raw() == target.raw()`
     // independently (a prior version of this function did that, and as a
-    // result never called record_field_lookup -- every lookup made through
+    // result never called register_field_lookup -- every lookup made through
     // the View-returning referrer API was silently invisible to
     // Model::lookup_stats(). Delegating, the same way for_each_view_by_
     // scan_field/for_each_view_by_cached_field already delegate to their
     // non-view siblings, fixes both at once: one copy of the match logic,
-    // and record_field_lookup fires exactly where for_each_referrer<Field>
+    // and register_field_lookup fires exactly where for_each_referrer<Field>
     // already calls it.
     using ClassT = member_class_t<decltype(Field)>;
     for_each_referrer<Field>(target, [&](const ClassT& o) { f(View<ClassT>(*this, o)); });
@@ -4913,6 +5352,23 @@ std::vector<View<member_class_t<decltype(Field)>>> Snapshot::view_referrers(
     std::vector<View<ClassT>> out;
     for_each_view_referrer<Field>(target, [&](View<ClassT> v) { out.push_back(v); });
     return out;
+}
+
+// ReferrerViewRange<Field>::iterator::operator* -- declared alongside
+// ReferrerViewRange itself (Snapshot's class body), defined here because it
+// needs View<T> to be a complete type. Same reason CachedBucketViewRange::
+// iterator::operator* is deferred -- see its own comment.
+template <auto Field>
+View<member_class_t<decltype(Field)>> Snapshot::ReferrerViewRange<Field>::iterator::operator*() const {
+    return View<ClassT>(*s_, *ptr_);
+}
+
+template <auto Field>
+Snapshot::ReferrerViewRange<Field> Snapshot::range_view_referrer(
+    Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
+    using ClassT = member_class_t<decltype(Field)>;
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    return ReferrerViewRange<Field>(this, type_bucket_raw(type_tag<ClassT>()), target.raw());
 }
 
 template <auto Field, class F>
@@ -4948,7 +5404,7 @@ template <auto Field>
 Snapshot::CachedBucketViewRange<member_class_t<decltype(Field)>> Snapshot::range_view_cached_referrers(
     Ref<typename member_value_t<decltype(Field)>::target_type> target) const {
     using ClassT = member_class_t<decltype(Field)>;
-    record_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+    register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
     return CachedBucketViewRange<ClassT>(this, cached_referrer_bucket_raw(field_tag<Field>(), target.raw()));
 }
 

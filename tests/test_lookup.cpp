@@ -66,6 +66,56 @@ TEST(for_each_is_type_filtered) {
     CHECK_EQ(s.size(), std::size_t{5});
 }
 
+// range<T>/range_view<T>: additive range-based-for form of for_each<T> --
+// same type-filtered walk as for_each_is_type_filtered above, and `break`
+// short-circuits without visiting the rest of the population.
+TEST(range_and_range_view_visit_exactly_the_objects_for_each_does) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    make_order(m, "O1", a1);
+    make_order(m, "O2", a2);
+    make_order(m, "O3", a1);
+    Snapshot s = m.snapshot();
+
+    int orders = 0, accounts = 0;
+    for (const Order& o : s.range<Order>()) {
+        CHECK(!o.code.empty());
+        ++orders;
+    }
+    for (const Account& a : s.range<Account>()) {
+        CHECK(!a.name.empty());
+        ++accounts;
+    }
+    CHECK_EQ(orders, 3);
+    CHECK_EQ(accounts, 2);
+
+    int view_orders = 0;
+    for (View<Order> v : s.range_view<Order>()) {
+        CHECK(!v->code.empty());
+        ++view_orders;
+    }
+    CHECK_EQ(view_orders, 3);
+
+    int seen_before_break = 0;
+    for (const Order& o : s.range<Order>()) {
+        (void)o;
+        ++seen_before_break;
+        break;
+    }
+    CHECK_EQ(seen_before_break, 1);
+
+    // A type with no live objects: empty range, not a crash.
+    Model empty_m;
+    Snapshot empty_s = empty_m.snapshot();
+    int none = 0;
+    for (const Order& o : empty_s.range<Order>()) {
+        (void)o;
+        ++none;
+    }
+    CHECK_EQ(none, 0);
+}
+
 // find_by_key<Field> is type-safe: a value that matches under a
 // DIFFERENT type's key (or the wrong field on the same value) returns
 // null rather than a miscast object.
@@ -222,6 +272,60 @@ TEST(view_referrer_forms_are_empty_for_an_unreferenced_target) {
     CHECK_EQ(seen, 0);
 
     CHECK(s.view_referrers<&Order::account>(lonely).empty());
+}
+
+// range_referrer/range_view_referrer: additive range-based-for form of
+// find_referrers/for_each_referrer/all_of_referrer -- works on ANY Ref<>/
+// Opt<> field, declared cached (account) or not (parent), same as the
+// callback forms; must visit the exact same matches, and `break` must
+// short-circuit the underlying walk.
+TEST(range_referrer_visits_the_same_matches_as_find_referrers) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const Ref<Order> p = make_order(m, "P", a1);
+    make_order(m, "C1", a1, p);
+    make_order(m, "C2", a2, p);
+    make_order(m, "OTHER", a2);
+    Snapshot s = m.snapshot();
+
+    int a1_hits = 0;
+    for (const Order& o : s.range_referrer<&Order::account>(a1)) {
+        CHECK(o.account == a1);
+        ++a1_hits;
+    }
+    CHECK_EQ(a1_hits, 2);
+
+    int child_hits = 0;
+    for (const Order& o : s.range_referrer<&Order::parent>(p)) {
+        CHECK(o.parent == p);
+        ++child_hits;
+    }
+    CHECK_EQ(child_hits, 2);
+
+    int view_hits = 0;
+    for (View<Order> v : s.range_view_referrer<&Order::account>(a1)) {
+        CHECK(v->account == a1);
+        ++view_hits;
+    }
+    CHECK_EQ(view_hits, 2);
+
+    int seen_before_break = 0;
+    for (const Order& o : s.range_referrer<&Order::account>(a1)) {
+        (void)o;
+        ++seen_before_break;
+        break;
+    }
+    CHECK_EQ(seen_before_break, 1);
+
+    const Ref<Account> lonely = make_account(m, "LONELY");
+    s = m.snapshot();
+    int none = 0;
+    for (const Order& o : s.range_referrer<&Order::account>(lonely)) {
+        (void)o;
+        ++none;
+    }
+    CHECK_EQ(none, 0);
 }
 
 // find_by_key works for both a string field and an arithmetic field, and
@@ -510,6 +614,83 @@ TEST(all_of_by_scan_field_and_all_of_by_cached_field_match_std_all_of_semantics)
     CHECK_EQ(calls, 1);
 }
 
+// range_by_scan_field/range_view_by_scan_field: additive range-based-for
+// form of find_by_scan_field/for_each_by_scan_field/all_of_by_scan_field --
+// must visit the exact same matches, `break` must short-circuit, and a
+// nullary-const-method Field (computed_key) must work the same way a data
+// member Field (qty) does.
+TEST(range_by_scan_field_visits_the_same_matches_as_for_each_by_scan_field) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o1 = make_order(m, "O1", a, Opt<Order>{}, 5);
+    make_order(m, "O2", a, Opt<Order>{}, 5);
+    make_order(m, "O3", a, Opt<Order>{}, 7);
+    Snapshot s = m.snapshot();
+
+    int range_hits = 0;
+    for (const Order& o : s.range_by_scan_field<&Order::qty>(5)) {
+        CHECK_EQ(o.qty, std::int64_t{5});
+        ++range_hits;
+    }
+    CHECK_EQ(range_hits, 2);
+
+    int no_match_hits = 0;
+    for (const Order& o : s.range_by_scan_field<&Order::qty>(99)) {
+        (void)o;
+        ++no_match_hits;
+    }
+    CHECK_EQ(no_match_hits, 0);
+
+    int seen_before_break = 0;
+    for (const Order& o : s.range_by_scan_field<&Order::qty>(5)) {
+        (void)o;
+        ++seen_before_break;
+        break;
+    }
+    CHECK_EQ(seen_before_break, 1);
+
+    int view_hits = 0;
+    for (View<Order> v : s.range_view_by_scan_field<&Order::qty>(5)) {
+        CHECK_EQ(v->qty, std::int64_t{5});
+        ++view_hits;
+    }
+    CHECK_EQ(view_hits, 2);
+
+    // Field naming a nullary const method (computed_key), not a data member
+    // -- exercises ScanFieldRange::matches' other branch
+    // (std::is_member_object_pointer_v == false).
+    int computed_hits = 0;
+    for (const Order& o : s.range_by_scan_field<&Order::computed_key>("ord:O1")) {
+        CHECK(o.id == o1.raw());
+        ++computed_hits;
+    }
+    CHECK_EQ(computed_hits, 1);
+}
+
+// A field that exists on the type but was never define_scan_fields()'d
+// must behave exactly like find_by_scan_field's own "undeclared is
+// invisible" rule -- vacuously empty, even for a value (0) that genuinely
+// matches some live object's actual field (a freshly made_account's balance
+// defaults to 0). Proves range_by_scan_field's declared-check runs, not just
+// the value filter.
+TEST(range_by_scan_field_is_empty_for_a_field_never_declared_via_define_scan_fields) {
+    Model m;
+    make_account(m, "A1");  // balance defaults to 0 -- would "match" if unfiltered
+    Snapshot s = m.snapshot();
+
+    // Sanity: find_by_scan_field itself is already empty here -- this test
+    // is about range_by_scan_field matching that, not establishing it fresh.
+    CHECK(s.find_by_scan_field<&Account::balance>(0).empty());
+
+    int hits = 0;
+    for (const Account& a : s.range_by_scan_field<&Account::balance>(0)) {
+        (void)a;
+        ++hits;
+    }
+    CHECK_EQ(hits, 0);
+    CHECK_EQ(s.find_by_scan_field<&Account::balance>(0).size(), std::size_t{0});
+}
+
 // range_by_cached_field: additive range-based-for form of find_by_cached_
 // field/for_each_by_cached_field/all_of_by_cached_field -- must visit the
 // exact same matches as for_each_by_cached_field, and `break` must short-
@@ -725,7 +906,7 @@ TEST(lookup_stats_counts_find_referrers_once_not_once_per_visited_object) {
 // lookup. A prior version of for_each_view_referrer (then still named
 // for_each_referrer_view) re-walked for_each_view<ClassT> and re-checked the
 // match itself instead of delegating to for_each_referrer<Field> -- so it
-// never called record_field_lookup, and every lookup made through the
+// never called register_field_lookup, and every lookup made through the
 // View-returning referrer API was silently invisible to lookup_stats().
 // Delegating (see for_each_view_referrer's own doc comment) fixes that.
 TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too) {
@@ -746,7 +927,7 @@ TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too)
     CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, std::uint64_t{2});
 }
 
-// record_field_lookup() fires from EIGHT entry points, not just the four
+// register_field_lookup() fires from EIGHT entry points, not just the four
 // find_* ones exercised above: for_each_by_scan_field/all_of_by_scan_field,
 // for_each_by_cached_field/all_of_by_cached_field, for_each_referrer/
 // all_of_referrer, and for_each_cached_referrers/all_of_cached_referrers.
@@ -931,7 +1112,7 @@ TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
 // REFERENCE-field entry point (RefIndexReader::index(), feeding
 // find_cached_referrers/for_each_referrer) rather than the value-field one
 // (FieldKeyReader::key(), feeding find_by_cached_field/find_by_scan_field) --
-// a genuinely different code path in record_field_lookup's callers, and one
+// a genuinely different code path in register_field_lookup's callers, and one
 // with a real unnamed field sitting in test_types.h already: Order::account
 // is named ("account") in define_cached_references(), but Order::parent is
 // declared in define_references() (so cascade/null still work) and
