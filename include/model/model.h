@@ -138,8 +138,23 @@ struct IdHash {
             return static_cast<std::size_t>(h);  // 64-bit size_t: identical to before
         } else {
             // 32-bit size_t: fold, so gen still participates instead of
-            // being silently truncated away.
+            // being silently truncated away. The cast is NOT useless here --
+            // h ^ (h >> 32) is uint64_t, size_t is 32 bits on the platform
+            // this branch is for -- but `if constexpr` in a non-template
+            // function (this one) doesn't exempt the untaken branch from
+            // diagnostics the way it does inside a template, so a 64-bit
+            // build (is_perfect true, this branch dead) still type-checks
+            // it and sees a same-width cast there. GCC-only: -Wuseless-cast
+            // doesn't exist under Clang, and an unknown warning name would
+            // itself become an error under this project's -Werror.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuseless-cast"
+#endif
             return static_cast<std::size_t>(h ^ (h >> 32));
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         }
     }
 
