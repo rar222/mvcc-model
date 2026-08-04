@@ -34,8 +34,10 @@
 // push-down, and bucket shrink/drop-on-empty are tricky enough to want living in
 // exactly one place rather than duplicated between a map and a set version.
 
+#include <array>
 #include <cassert>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <memory_resource>
 #include <string>
@@ -780,6 +782,109 @@ public:
     bool each_entry_short_circuit(F&& f) const {
         return each_in_short_circuit(as_node(root_), f);
     }
+
+    // Frame stack depth needed to walk this trie externally (one Node per
+    // level). 13 levels of 5-bit hash slices exhaust all 64 hash bits (shift
+    // = 0, 5, ..., 60) -- see persistent_map_tests.cpp's comment on the
+    // "ran out of hash bits" branch being provably unreachable for two
+    // distinct keys. A fixed array, not a std::vector, so constructing an
+    // iterator never allocates -- the whole reason for_each_by_scan_field &
+    // co. (model.h) avoid materializing a vector in the first place would be
+    // defeated if the iterator backing a range-for did it anyway.
+    static constexpr int kMaxDepth = 13;
+
+    struct Frame {
+        const Node* node = nullptr;
+        std::uint32_t idx = 0;  ///< next bit index (0..32) not yet examined at this node
+    };
+
+public:
+    /// External forward iterator over the trie's entries, same order
+    /// each_in_short_circuit visits them in (unspecified -- trie layout
+    /// order, not insertion or sorted order). Reifies that recursive walk as
+    /// explicit (stack, leaf-chain-pointer) state instead of a call stack, so
+    /// it can be resumed one entry at a time from operator++ -- what
+    /// each_in_short_circuit itself cannot do, since it only ever gets to
+    /// decide "stop" by not calling back into the walk again, never "pause
+    /// and hand control back to the caller between two calls to f".
+    ///
+    /// Read-only: the trie is immutable once published (same rule as every
+    /// other persistent structure in this project), so there is no
+    /// non-const flavor to provide.
+    class iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = Entry;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const Entry*;
+        using reference = const Entry&;
+
+        iterator() = default;
+
+        reference operator*() const { return chain_->entry; }
+        pointer operator->() const { return &chain_->entry; }
+
+        iterator& operator++() {
+            advance();
+            return *this;
+        }
+        iterator operator++(int) {
+            iterator tmp = *this;
+            advance();
+            return tmp;
+        }
+
+        friend bool operator==(const iterator& a, const iterator& b) noexcept {
+            return a.chain_ == b.chain_;
+        }
+        friend bool operator!=(const iterator& a, const iterator& b) noexcept { return !(a == b); }
+
+    private:
+        friend class TrieCore;
+        explicit iterator(const Node* root) {
+            if (root) {
+                stack_[depth_++] = Frame{root, 0};
+                advance();
+            }
+        }
+
+        // Moves to the next entry (or to the end state -- chain_ == nullptr,
+        // depth_ == 0 -- if none remain). Exactly each_in_short_circuit's
+        // walk, just paused/resumed via `stack_`/`chain_` instead of
+        // recursion -- do not let this drift into a second, different
+        // traversal order than that one; see this class's own doc comment.
+        void advance() {
+            if (chain_) {
+                chain_ = chain_->next.get();
+                if (chain_) return;
+            }
+            while (depth_ > 0) {
+                Frame& top = stack_[depth_ - 1];
+                if (top.idx >= 32) {
+                    --depth_;
+                    continue;
+                }
+                const std::uint32_t idx = top.idx++;
+                const std::uint32_t b = bit(idx);
+                if (!(top.node->bitmap & b)) continue;
+                const std::uint32_t pos = popcount_below(top.node->bitmap, idx);
+                if (top.node->is_leaf & b) {
+                    chain_ = as_leaf(top.node->slots[pos]);
+                    return;
+                }
+                assert(depth_ < kMaxDepth &&
+                       "trie deeper than kMaxDepth -- see its own comment");
+                stack_[depth_++] = Frame{as_node(top.node->slots[pos]), 0};
+            }
+        }
+
+        std::array<Frame, kMaxDepth> stack_{};
+        int depth_ = 0;
+        const Leaf* chain_ = nullptr;
+    };
+
+    iterator begin() const { return iterator(as_node(root_)); }
+    iterator end() const { return iterator(); }
 };
 
 }  // namespace detail
@@ -837,6 +942,18 @@ public:
         return core_.each_entry_short_circuit(
             [&](const std::pair<K, V>& e) { return f(e.first, e.second); });
     }
+
+    /// Range-based-for support: `for (auto& [k, v] : m)`. Same trie-layout-
+    /// order caveat as for_each above. See detail::TrieCore::iterator for
+    /// what backs this -- an external walk, not a materialized vector, so
+    /// (unlike find_by_cached_field/find_referrers & co. in model.h) this
+    /// costs nothing extra to allocate; each ++ is real trie-walk work
+    /// though, not free -- prefer for_each_short_circuit in a hot loop that
+    /// wants to stop early without composing range adaptors on top.
+    using iterator = typename Core::iterator;
+    using const_iterator = iterator;
+    iterator begin() const { return core_.begin(); }
+    iterator end() const { return core_.end(); }
 };
 
 /// A persistent SET: like PersistentMap, but there is no value -- the key IS
@@ -888,6 +1005,15 @@ public:
     bool for_each_short_circuit(F&& f) const {
         return core_.each_entry_short_circuit([&](const K& k) { return f(k); });
     }
+
+    /// Range-based-for support: `for (auto& k : s)`. See PersistentMap::
+    /// begin()/end() (and detail::TrieCore::iterator) for the same notes on
+    /// ordering and cost -- identical here, just over K entries instead of
+    /// (K, V) pairs.
+    using iterator = typename Core::iterator;
+    using const_iterator = iterator;
+    iterator begin() const { return core_.begin(); }
+    iterator end() const { return core_.end(); }
 };
 
 /// Add `v` to the persistent-SET bucket at `key` of a PersistentMap<K,

@@ -1048,6 +1048,118 @@ TEST(for_each_short_circuit_set_clash_hash) {
         "ClashHash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
 }
 
+// Range-based-for correctness: iterating `for (auto& [k, v] : m)` /
+// `for (auto& k : s)` must visit exactly the same multiset of entries as
+// for_each -- differential against for_each itself (not against
+// std::unordered_map/set again) since for_each is already covered by every
+// churn test above and is the thing the new external iterator must agree
+// with, entry for entry, in count and content. Covers the three Leaf/chain
+// shapes this file's Hash zoo exists to reach: ordinary (U64Hash), perfect
+// (PerfectU64Hash, NoChain), and long collision chains (ClashHash) -- the
+// iterator's leaf-chain-resume branch (advance()'s `if (chain_)`) is dead
+// code without that last one.
+template <class K, class Hash, class MakeKey>
+void check_map_range_for_matches_for_each(const char* label, int n, MakeKey make_key) {
+    auto require = [&](bool cond, const char* what) {
+        if (!cond) {
+            std::printf("RANGE-FOR FAIL (map/%s): %s\n", label, what);
+            ++g_failures;
+        }
+    };
+
+    PersistentMap<K, int, Hash> m;
+    for (int i = 0; i < n; ++i) m = m.set(make_key(i), i);
+
+    std::unordered_map<K, int> via_for_each;
+    m.for_each([&](const K& k, int v) { via_for_each[k] = v; });
+
+    std::unordered_map<K, int> via_range_for;
+    std::size_t seen = 0;
+    for (const auto& [k, v] : m) {
+        via_range_for[k] = v;
+        ++seen;
+    }
+
+    require(seen == via_for_each.size(), "range-for visits the same entry count as for_each");
+    require(via_range_for.size() == via_for_each.size(), "range-for visits no duplicate keys");
+    require(via_range_for == via_for_each, "range-for visits the same (key, value) pairs as for_each");
+
+    // Empty map: begin() == end() immediately, no entries visited.
+    PersistentMap<K, int, Hash> empty;
+    int empty_seen = 0;
+    for (const auto& kv : empty) {
+        (void)kv;
+        ++empty_seen;
+    }
+    require(empty_seen == 0, "empty map: range-for visits nothing");
+    require(empty.begin() == empty.end(), "empty map: begin() == end()");
+}
+
+template <class K, class Hash, class MakeKey>
+void check_set_range_for_matches_for_each(const char* label, int n, MakeKey make_key) {
+    auto require = [&](bool cond, const char* what) {
+        if (!cond) {
+            std::printf("RANGE-FOR FAIL (set/%s): %s\n", label, what);
+            ++g_failures;
+        }
+    };
+
+    PersistentSet<K, Hash> s;
+    for (int i = 0; i < n; ++i) s = s.insert(make_key(i));
+
+    std::unordered_set<K> via_for_each;
+    s.for_each([&](const K& k) { via_for_each.insert(k); });
+
+    std::unordered_set<K> via_range_for;
+    std::size_t seen = 0;
+    for (const K& k : s) {
+        via_range_for.insert(k);
+        ++seen;
+    }
+
+    require(seen == via_for_each.size(), "range-for visits the same entry count as for_each");
+    require(via_range_for == via_for_each, "range-for visits the same keys as for_each");
+
+    PersistentSet<K, Hash> empty;
+    int empty_seen = 0;
+    for (const K& k : empty) {
+        (void)k;
+        ++empty_seen;
+    }
+    require(empty_seen == 0, "empty set: range-for visits nothing");
+    require(empty.begin() == empty.end(), "empty set: begin() == end()");
+}
+
+TEST(range_for_map_u64_hash_matches_for_each) {
+    check_map_range_for_matches_for_each<std::uint64_t, U64Hash>(
+        "U64Hash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(range_for_map_perfect_u64_hash_matches_for_each) {
+    check_map_range_for_matches_for_each<std::uint64_t, PerfectU64Hash>(
+        "PerfectU64Hash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(range_for_map_clash_hash_matches_for_each) {
+    // Long collision chains: exercises advance()'s leaf-chain-resume branch.
+    check_map_range_for_matches_for_each<std::uint64_t, ClashHash>(
+        "ClashHash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(range_for_map_string_hash_matches_for_each) {
+    check_map_range_for_matches_for_each<std::string, StringHash>(
+        "StringHash", 500, [](int i) { return "k" + std::to_string(i); });
+}
+TEST(range_for_set_u64_hash_matches_for_each) {
+    check_set_range_for_matches_for_each<std::uint64_t, U64Hash>(
+        "U64Hash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(range_for_set_perfect_u64_hash_matches_for_each) {
+    check_set_range_for_matches_for_each<std::uint64_t, PerfectU64Hash>(
+        "PerfectU64Hash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(range_for_set_clash_hash_matches_for_each) {
+    check_set_range_for_matches_for_each<std::uint64_t, ClashHash>(
+        "ClashHash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+
 // Speed: set()/contains() latency must grow like O(log32 n), not O(n), as
 // the population grows -- see the timing helpers' own comment. Run against
 // PersistentSet<uint64_t, PerfectU64Hash>: the newest code path (NoChain,
@@ -1138,5 +1250,63 @@ TEST(speed_set_and_contains_grow_like_log_n_not_linear) {
         }
     } else {
         std::printf("speed check SKIPPED (sanitizer build, see kSlowSanitizedBuild)\n");
+    }
+}
+
+// Speed: callback (for_each_short_circuit) vs. range-based for, over the
+// exact PersistentSet<Id, IdHash> shape model.h's by_type_/by_cached_
+// reference indices use (PerfectU64Hash stands in for model::IdHash here --
+// same "declared perfect" contract, see PerfectU64Hash's own comment).
+// for_each_short_circuit's walk is one recursive function with `f` as a
+// template parameter, so at -O2 it and the lambda body typically inline into
+// a single loop with no reified state. The range-for form instead resumes
+// an explicit (stack_, chain_) state machine (TrieCore::iterator::advance)
+// on every single ++ -- real per-step bookkeeping the recursive form never
+// pays. Both sides run to completion, summing every entry -- the "never
+// stop early" shape model.h's for_each_by_scan_field/for_each_referrer/
+// for_each_cached_referrers all use (see their own doc comments), i.e. the
+// case those call sites would actually pay if converted to range-for.
+TEST(speed_callback_vs_range_for_full_scan) {
+    using PSet = PersistentSet<std::uint64_t, PerfectU64Hash>;
+    const int n = scaled_n(500000);
+
+    PSet s;
+    for (int i = 0; i < n; ++i) s = s.insert(static_cast<std::uint64_t>(i));
+
+    volatile std::uint64_t sink = 0;
+    const double via_callback_ms = best_of(5, [&] {
+        return time_ms([&] {
+            std::uint64_t total = 0;
+            s.for_each_short_circuit([&](std::uint64_t k) {
+                total += k;
+                return true;
+            });
+            sink = total;
+        });
+    });
+    const double via_range_for_ms = best_of(5, [&] {
+        return time_ms([&] {
+            std::uint64_t total = 0;
+            for (std::uint64_t k : s) total += k;
+            sink = total;
+        });
+    });
+    (void)sink;
+
+    std::printf(
+        "\nspeed (PersistentSet<uint64_t, PerfectU64Hash>, n=%d, full scan summing every "
+        "entry):\n"
+        "  for_each_short_circuit  %8.3f ms\n"
+        "  range-based for         %8.3f ms   (x%.2f vs. callback)\n",
+        n, via_callback_ms, via_range_for_ms, via_range_for_ms / via_callback_ms);
+
+    // Not asserted: this is a measurement to inform a design decision (which
+    // for_each_*/all_of_* call sites, if any, are worth converting to range-
+    // for), not a regression gate -- there is no "correct" ratio to pin, and
+    // under a sanitizer build instrumentation overhead swamps the constant
+    // factor being measured anyway (kSlowSanitizedBuild, same rationale as
+    // the speed test above).
+    if (kSlowSanitizedBuild) {
+        std::printf("(sanitizer build -- ratio above is not representative, see kSlowSanitizedBuild)\n");
     }
 }
