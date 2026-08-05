@@ -964,9 +964,50 @@ public:
 /// tag Cache the references that get queried often (e.g. "every Order for
 /// this Account"), and leave rarely-queried ones (a nullable `parent`, say)
 /// tagged Scan.
+///
+/// Derived MUST be `final` (`class Order final : public model::Object<Order>`,
+/// as in every example above) -- enforced below by a static_assert, not just
+/// convention. clone()/tag() are both fixed to Derived at THIS template's own
+/// instantiation, not to whatever the object's actual dynamic type turns out
+/// to be, so a further derivation silently breaks both:
+///
+///     class SpecialOrder : public Order { model::Ref<Widget> extra; ... };
+///
+/// tag() is inherited unchanged from Object<Order> and always returns
+/// type_tag<Order>() -- never type_tag<SpecialOrder>() -- so cast<SpecialOrder>
+/// can never succeed (SpecialOrder can never be found as itself), while
+/// cast<Order> silently succeeds on what is actually a SpecialOrder. clone()
+/// is `new Derived(static_cast<const Derived&>(*this))` with Derived fixed to
+/// Order, so cloning a SpecialOrder -- e.g. on every Transaction::update() --
+/// slices it back down to a plain Order, silently discarding `extra` and
+/// everything else SpecialOrder added. Both failures are silent data
+/// corruption, not a crash: nothing here is memory-unsafe, cast<Order> still
+/// returns a legitimately-Order-shaped object, so this is a permanent,
+/// undetected divergence between what the object was constructed as and what
+/// the model believes it is (CLAUDE.md's "fail loudly" preference exists for
+/// exactly this kind of bug). Marking Order `final` turns "someone derives
+/// SpecialOrder from it" into an ordinary compiler error AT THE DERIVATION
+/// SITE ("cannot derive from 'Order' because it is marked 'final'"), which is
+/// strictly better than trying to detect it after the fact: there is no
+/// sound runtime check to fall back on here, because typeid(*this)/virtual
+/// dispatch during Object<Derived>'s OWN constructor always reports
+/// Object<Derived>'s own type, never the most-derived one under construction
+/// (see [class.cdtor] -- base subobjects don't see the derived type until
+/// their own constructor body starts running), so a runtime check placed
+/// here could never actually observe SpecialOrder either.
 template <class Derived>
 class Object : public ObjectBase {
 public:
+    /// static_assert lives in a constructor body (a per-Derived template
+    /// instantiation), not directly in the class body, because Derived is
+    /// necessarily still incomplete at the point Object<Derived> itself is
+    /// being defined (it's the base of the very type being written) --
+    /// std::is_final_v<Derived> requires a complete type. Deferring to the
+    /// constructor body means the check runs the first time a Derived is
+    /// actually constructed (ODR-use), which for every real model type is
+    /// effectively immediately (Transaction::create<T>, test fixtures, ...).
+    Object() { static_assert(std::is_final_v<Derived>, "model types must be declared `final`"); }
+
     ObjectBase* clone() const override { return new Derived(static_cast<const Derived&>(*this)); }
 
     // sizeof(Derived), not sizeof(*this) -- *this is statically typed as
