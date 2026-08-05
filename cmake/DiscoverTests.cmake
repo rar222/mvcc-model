@@ -37,9 +37,8 @@ if(NOT _mvcc_test_list STREQUAL \"\")
   # Each line into a ; separated string so we can turn it into a list
   string(REPLACE \"\\n\" \";\" _mvcc_test_list \"\${_mvcc_test_list}\")
   foreach(_mvcc_test IN LISTS _mvcc_test_list)
-
     # replace each line's '|' with ';' so we can split into a test name and location
-    string(REGEX REPLACE \"\\|\" \";\" _mvcc_test_parts \"\${_mvcc_test}\")
+    string(REPLACE \"|\" \";\" _mvcc_test_parts \"\${_mvcc_test}\")
 
     list(GET _mvcc_test_parts 0 _mvcc_test_name)
     list(GET _mvcc_test_parts 1 _mvcc_test_location)
