@@ -610,3 +610,68 @@ TEST(cascade_does_not_double_process_a_referrer_with_both_a_non_nullable_and_nul
     CHECK_EQ(s.size(), std::size_t{0});
 }
 
+// A variant of the double-processing bug above, but with the referrer's two
+// edges pointing at TWO DIFFERENT dying targets instead of the same one.
+// remove_raw()'s cascade BFS used to discover "this referrer is doomed"
+// only once it actually VISITED the target reached via the non-nullable
+// edge -- so if the BFS happened to visit the NULLABLE target first (order
+// depends on Transaction::remove_intents_'s std::unordered_set iteration,
+// not call order, so it can't be forced directly from a test), the referrer
+// got nulled via the nullable edge (a spurious Updated) before the BFS
+// reached the non-nullable target and deleted it for real -- the same
+// double-change bug as the same-target case above, just order-dependent
+// instead of always reproducing. The fix precomputes the full "doomed"
+// closure (every id transitively required-dead via non-nullable edges)
+// BEFORE any nulling happens, so this can no longer occur regardless of
+// which order the BFS visits things in.
+//
+// Many independent (referrer, nullable-target, non-nullable-target) triples
+// removed together in ONE commit, rather than one pair, specifically
+// because that visitation order can't be forced: with enough independent
+// pairs, at least some are visited nullable-target-first (the order that
+// reproduced the bug), and the fix has to get ALL of them right regardless.
+TEST(cascade_does_not_double_process_a_referrer_whose_nullable_and_non_nullable_targets_differ_and_die_together) {
+    Model m;
+    constexpr int kTriples = 40;
+    std::vector<Ref<Record>> recs;
+    std::vector<Ref<Account>> targets;
+
+    for (int i = 0; i < kTriples; ++i) {
+        const Ref<Account> non_nullable_target = make_account(m, "NN" + std::to_string(i));
+        const Ref<Account> nullable_target = make_account(m, "N" + std::to_string(i));
+
+        Transaction txn = m.begin();
+        auto r = std::make_unique<Record>();
+        r->label = "R" + std::to_string(i);
+        r->owner = non_nullable_target;   // non-nullable Ref<Account>
+        r->owner_scan = nullable_target;  // nullable Opt<Account>, a DIFFERENT account
+        const Ref<Record> local = txn.create(std::move(r));
+        recs.push_back(commit_ok(m, txn).to_real(local));
+
+        targets.push_back(non_nullable_target);
+        targets.push_back(nullable_target);
+    }
+
+    Transaction remove_txn = m.begin();
+    for (const Ref<Account>& t : targets) remove_txn.remove(t);
+    const CommitResult res = m.try_commit(remove_txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    for (const Ref<Record>& rec : recs) {
+        std::size_t rec_changes = 0, rec_deleted = 0, rec_updated = 0;
+        for (const Change& c : res.changes) {
+            if (c.id != rec.raw()) continue;
+            ++rec_changes;
+            if (c.kind == ChangeKind::Deleted) ++rec_deleted;
+            if (c.kind == ChangeKind::Updated) ++rec_updated;
+        }
+        CHECK_EQ(rec_changes, std::size_t{1});
+        CHECK_EQ(rec_deleted, std::size_t{1});
+        CHECK_EQ(rec_updated, std::size_t{0});
+    }
+
+    Snapshot s = m.snapshot();
+    for (const Ref<Record>& rec : recs) CHECK(s.find(rec) == nullptr);
+    CHECK_EQ(s.size(), std::size_t{0});
+}
+

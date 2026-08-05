@@ -413,6 +413,29 @@ TEST(set_pre_commit_can_race_try_commit_without_a_data_race) {
     CHECK(m.snapshot().size() > 0);
 }
 
+// PreCommitFn runs WHILE commit_mu_ is held (commit_main_locked() calls it
+// from inside try_commit_core()'s lock_guard) -- a hook body that calls
+// back into try_commit()/try_commit_without_undo() on this SAME Model, from
+// this SAME thread, would re-lock the non-recursive commit_mu_ and
+// deadlock. Covered by an assert (commit_owner_ records whichever thread
+// currently holds commit_mu_) rather than actually hanging; exercised via
+// CHECK_ASSERT_FAILURE so a regression here shows up as a normal test
+// failure instead of ctest's timeout killing the whole run.
+TEST(pre_commit_hook_calling_try_commit_reentrantly_asserts) {
+    Model m;
+    m.set_pre_commit([&](Model& model, const Transaction&, const std::vector<Change>&) {
+        Transaction inner = model.begin();
+        auto a = std::make_unique<Account>();
+        a->name = "INNER";
+        inner.create(std::move(a));
+        (void)model.try_commit(inner);  // reentrant: this thread already holds commit_mu_
+        return true;
+    });
+
+    CHECK_ASSERT_FAILURE(make_account(m, "OUTER"));
+    m.set_pre_commit({});
+}
+
 // Try to break invariant 10 (snapshot()/Transaction-building never take
 // commit_mu_) WITHOUT a wall-clock guess: a pre-commit hook parks a
 // committer thread INSIDE the commit_mu_-held critical section (pre_commit_

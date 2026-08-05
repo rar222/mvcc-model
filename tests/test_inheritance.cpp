@@ -291,6 +291,21 @@ TEST(diamond_base_collapses_to_one_shared_subobject) {
     CHECK_EQ(static_cast<Labeled&>(a).schema_version, 7);
 }
 
+// ObjectBase::assign_from's own doc comment states a precondition ("other
+// must be the same concrete type as this") that -- unlike every OTHER
+// checked downcast in model.h (Snapshot::cast<T>, peek_as<T>, ...) -- didn't
+// used to be re-asserted here. A type mismatch through this path is a
+// static_cast to the wrong dynamic type followed by a read/write through
+// it: real UB, not just wrong data (Model::take_undo is the one caller, and
+// only a bug in its id-remapping table could ever mismatch it in practice).
+// Covered by an assert now; this exercises it directly rather than relying
+// on take_undo happening to misbehave.
+TEST(assign_from_rejects_a_type_mismatch) {
+    Account a;
+    Asset b;
+    CHECK_ASSERT_FAILURE(a.assign_from(b));
+}
+
 // A model type may inherit from arbitrary extra (non-model) base classes as
 // long as it's still copyable -- Object<Derived>::clone() and assign_from()
 // go through Asset's compiler-generated copy constructor/assignment, which

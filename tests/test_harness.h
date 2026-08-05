@@ -52,3 +52,25 @@ struct Registrar {
             ++g_failures;                                                        \
         }                                                                        \
     } while (0)
+
+/// Runs `fn` in a forked child (same fork() technique performance_tests.cpp
+/// uses for out-of-process measurement) and reports whether the child died
+/// from a failed `assert` -- for exercising an invariant this project
+/// enforces via a runtime assert rather than a returned error code, without
+/// aborting the actual test binary. True = the child was killed by SIGABRT
+/// (the assert fired); false = anything else, including fn() returning
+/// normally (the assert did NOT fire). Only meaningful in a build where
+/// `assert` is live -- every preset in this project's CMakeLists keeps it on
+/// (see CLAUDE.md), so that's every configuration these tests run under.
+/// Defined once in test_harness.cpp; CHECK_ASSERT_FAILURE below is the
+/// macro every test actually uses, matching CHECK/CHECK_EQ's shape.
+bool dies_of_assert(const std::function<void()>& fn);
+
+#define CHECK_ASSERT_FAILURE(expr)                                                        \
+    do {                                                                                   \
+        if (!dies_of_assert([&] { expr; })) {                                              \
+            std::printf("  FAIL %s:%d: expected an assert failure from: %s\n", __FILE__,   \
+                        __LINE__, #expr);                                                  \
+            ++g_failures;                                                                  \
+        }                                                                                   \
+    } while (0)

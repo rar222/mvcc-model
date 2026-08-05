@@ -621,20 +621,35 @@ class TrieCore {
     // one level deeper than the live entry count alone would need. Not a
     // correctness issue, just a depth (and therefore path-copy cost) that
     // never shrinks back down on its own.
-    std::shared_ptr<const Node> erase_in(const Node* n, std::uint64_t hash, int shift, const K& key,
-                                         bool& removed) const {
-        if (!n) return nullptr;
+    // Takes (and, on a no-op, returns) the OWNING shared_ptr -- not just a raw
+    // Node* -- for the same reason set_in does: it's what lets a "key not
+    // found" result propagate back up as `return owner` (a cheap shared_ptr
+    // copy, one atomic refcount bump) instead of cloning every node on the
+    // way down before discovering, at the bottom, that nothing needed to
+    // change. Each level below detects "no-op" by pointer-comparing its
+    // child's result against the child it passed in: since a genuine no-op
+    // returns that same owner unchanged, `.get()` equality is exact, not a
+    // heuristic. (An erase() on a key that IS present still clones every
+    // node on its path -- same O(log32 n) cost as set() -- this only removes
+    // the cost for the no-op case, which used to pay that same price for
+    // nothing: see persistent_map_tests.cpp's erase_absent_key_* tests.)
+    std::shared_ptr<const void> erase_in(const std::shared_ptr<const void>& owner, std::uint64_t hash,
+                                         int shift, const K& key, bool& removed) const {
+        const Node* n = as_node(owner);
+        if (!n) return owner;  // empty subtree: nothing to erase
         const std::uint32_t idx = slice(hash, shift);
         const std::uint32_t b = bit(idx);
-        if (!(n->bitmap & b)) return copy_shared(n);  // not present
+        if (!(n->bitmap & b)) return owner;  // not present at this level: unchanged
 
         const std::uint32_t pos = popcount_below(n->bitmap, idx);
-        auto nn = clone_node(n);
 
         if (!(n->is_leaf & b)) {
-            auto sub = erase_in(as_node(n->slots[pos]), hash, shift + 5, key, removed);
-            if (sub && sub->bitmap != 0) {
-                nn->slots[pos] = sub;
+            auto sub = erase_in(n->slots[pos], hash, shift + 5, key, removed);
+            if (sub.get() == n->slots[pos].get()) return owner;  // unchanged below: unchanged here too
+            auto nn = clone_node(n);
+            const Node* subnode = as_node(sub);
+            if (subnode && subnode->bitmap != 0) {
+                nn->slots[pos] = std::move(sub);
                 return nn;
             }
             // Subtree emptied: drop this slot.
@@ -646,10 +661,11 @@ class TrieCore {
 
         // Leaf slot.
         const Leaf* lf = as_leaf(n->slots[pos]);
-        if (!leaf_get(lf, key)) return copy_shared(n);  // key absent
+        if (!leaf_get(lf, key)) return owner;  // key absent: unchanged
 
         removed = true;
         auto nl = chain_erase(lf, key);
+        auto nn = clone_node(n);
         if (nl) {
             nn->slots[pos] = std::move(nl);
             return nn;
@@ -659,14 +675,6 @@ class TrieCore {
         nn->is_leaf &= ~b;
         nn->slots.erase(nn->slots.begin() + pos);
         return nn;
-    }
-
-    std::shared_ptr<const Node> copy_shared(const Node* n) const {
-        // The node is unchanged; reuse it. We only have a raw pointer here, so we
-        // must reconstruct a shared_ptr owner -- but every caller already holds
-        // one, so instead of copying we clone. (Called only on the not-present
-        // paths, which are rare; correctness over cleverness.)
-        return clone_node(n);
     }
 
     static const Entry* get_in(const Node* n, std::uint64_t hash, int shift,
@@ -760,11 +768,16 @@ public:
         return TrieCore(r, size_ + (added ? 1 : 0), mem_);
     }
 
-    /// Returns a new core without `key` (or an equal core if absent).
+    /// Returns a new core without `key` (or, if absent, THE SAME core,
+    /// sharing root_ unchanged -- not just structurally equal, actually
+    /// aliasing it: erase_in returns `owner` untouched all the way up when
+    /// nothing was found, so an absent key costs one shared_ptr copy, zero
+    /// node allocations, same as get()'s cost shape. See erase_in's own
+    /// comment.
     TrieCore erase_key(const K& key) const {
         bool removed = false;
-        auto r = erase_in(as_node(root_), hash_key(key), 0, key, removed);
-        return TrieCore(r, size_ - (removed ? 1 : 0), mem_);
+        auto r = erase_in(root_, hash_key(key), 0, key, removed);
+        return TrieCore(std::move(r), size_ - (removed ? 1 : 0), mem_);
     }
 
     const Entry* get_entry(const K& key) const {

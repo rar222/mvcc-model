@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory_resource>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -108,8 +109,10 @@ static_assert(detail::hash_is_perfect_v<PerfectU64Hash>, "explicit true is detec
 // Deterministic (non-random) edge cases that the random-churn differential
 // tests exercise only probabilistically, if at all: the empty-container
 // start state (root_ == nullptr -- get_in/erase_in/each_in's `if (!n)`
-// guards), erasing a key that was never present (copy_shared's "not
-// present, reuse unchanged" path in erase_in), and re-writing a key that's
+// guards), erasing a key that was never present (erase_in's `return owner`
+// no-op path, unchanged and zero-allocation -- see
+// erase_of_absent_key_allocates_nothing_and_shares_the_original_root below
+// for the allocation-count proof), and re-writing a key that's
 // already there (chain_set's/chain_erase's "replace" branch under BOTH the
 // chained and the perfect-hash Leaf shape, plus IdentityKeyOf's own
 // documented "replacing a matched entry with itself is a harmless no-op"
@@ -135,7 +138,8 @@ void check_map_edge_cases(const char* label, const K& k1, const K& k2, const K& 
     require(!visited, "fresh map for_each never invokes f");
 
     // Erase of an absent key from an EMPTY map (root_ == nullptr): a no-op,
-    // not a crash -- erase_in's `if (!n) return nullptr;` guard.
+    // not a crash -- erase_in's `if (!n) return owner;` guard (owner is
+    // already null here, so this returns null right back).
     m = m.erase(k_absent);
     require(m.size() == 0, "erase on empty map stays empty");
 
@@ -143,8 +147,8 @@ void check_map_edge_cases(const char* label, const K& k1, const K& k2, const K& 
     m = m.set(k2, 200);
     require(m.size() == 2, "two distinct keys -> size 2");
 
-    // Erase of an absent key from a NON-empty map: copy_shared's "not
-    // present" path -- unrelated keys must be untouched.
+    // Erase of an absent key from a NON-empty map: erase_in's `return owner`
+    // no-op path -- unrelated keys must be untouched.
     m = m.erase(k_absent);
     require(m.size() == 2, "erase of absent key leaves size unchanged");
     require(m.get(k1) && *m.get(k1) == 100, "erase of absent key: k1 survives");
@@ -930,6 +934,50 @@ TEST(set_edge_cases_clash_hash) {
 }
 TEST(set_edge_cases_perfect_u64_hash) {
     check_set_edge_cases<std::uint64_t, PerfectU64Hash>("PerfectU64Hash", 1, 2, 999);
+}
+
+// Counts allocations so erase_key()'s no-op-vs-real-work cost can be proven
+// directly, not just inferred from behavior. erase_in used to unconditionally
+// clone_node() every level on its way down BEFORE discovering, at the
+// bottom, that the key wasn't there -- same allocation count as a real
+// erase, wasted. The fix (erase_in's `return owner` short-circuit, see its
+// own comment in persistent_map.h) makes a no-op erase cost exactly what
+// get() costs: a trie walk with zero allocations, because it returns the
+// original root unchanged instead of rebuilding an equal one.
+struct CountingResource : std::pmr::memory_resource {
+    std::size_t allocations = 0;
+    void* do_allocate(std::size_t bytes, std::size_t align) override {
+        ++allocations;
+        return std::pmr::new_delete_resource()->allocate(bytes, align);
+    }
+    void do_deallocate(void* p, std::size_t bytes, std::size_t align) noexcept override {
+        std::pmr::new_delete_resource()->deallocate(p, bytes, align);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+};
+
+TEST(erase_of_absent_key_allocates_nothing_and_shares_the_original_root) {
+    CountingResource mem;
+    PersistentMap<std::uint64_t, int, U64Hash> m(&mem);
+    for (std::uint64_t k = 0; k < 500; ++k) m = m.set(k, static_cast<int>(k));
+
+    const std::size_t before = mem.allocations;
+    PersistentMap<std::uint64_t, int, U64Hash> after_noop = m.erase(std::uint64_t{999999});
+    CHECK_EQ(mem.allocations, before);  // zero allocations for a no-op erase
+    CHECK_EQ(after_noop.size(), m.size());
+    CHECK(after_noop.get(std::uint64_t{999999}) == nullptr);
+    CHECK(after_noop.get(std::uint64_t{7}) && *after_noop.get(std::uint64_t{7}) == 7);
+
+    // Contrast: an erase that actually removes a key DOES allocate (the
+    // necessary O(log32 n) path-copy, same shape as set()) -- proving the
+    // zero above is specific to the no-op case, not "this map never
+    // allocates once built."
+    PersistentMap<std::uint64_t, int, U64Hash> after_real = m.erase(std::uint64_t{7});
+    CHECK(mem.allocations > before);
+    CHECK_EQ(after_real.size(), m.size() - 1);
+    CHECK(after_real.get(std::uint64_t{7}) == nullptr);
 }
 
 // for_each_short_circuit's whole reason to exist (see its own comment in

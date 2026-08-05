@@ -7,6 +7,9 @@
 #include "test_harness.h"
 
 #include <chrono>
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
 
 std::vector<TestCase>& registry() {
     static std::vector<TestCase> r;
@@ -15,6 +18,22 @@ std::vector<TestCase>& registry() {
 
 int g_failures = 0;
 const char* g_current = "";
+
+bool dies_of_assert(const std::function<void()>& fn) {
+    // Flush before forking, not just skip re-flushing in the child: under a
+    // piped/redirected stdout (exactly how ctest runs this), the parent's
+    // buffered test output would otherwise get re-dumped by the child's exit
+    // -- same reasoning as performance_tests.cpp's fork()-based helper.
+    std::fflush(nullptr);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        fn();      // reached only if fn() doesn't hit the assert under test
+        _exit(0);  // not exit(): skip static destructors racing the parent's stdio
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+}
 
 Registrar::Registrar(const char* name, const char* filename, int linenum, std::function<void()> fn) {
     registry().push_back({name, filename, linenum, std::move(fn)});
