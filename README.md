@@ -82,11 +82,11 @@ public:
     // Multi-match lookups are separate, opt-in declarations -- see below.
     template <class Self>
     static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::qty>(s.qty);      // find_by_scan_field: every match, O(#objects) scan
+        v.key<&Order::qty>(s.qty);      // find_by_field falls back to an O(#objects) scan
     }
     template <class Self>
     static void define_cached_references(Self& s, const model::RefIndexReader& v) {
-        v.index<&Order::account>();     // find_cached_referrers: every match, O(log n + matches)
+        v.index<&Order::account>();     // find_referrers resolves via an O(log n + matches) index
     }
 };
 
@@ -119,10 +119,12 @@ const Order*   dad   = s.resolve(x->parent);          // Opt<Order>   -> const O
 
 s.for_each<Order>([&](const Order& o) { /* type-filtered iteration */ });
 
-// Multi-match: every order with qty == 5 (unindexed scan)...
-std::vector<const Order*> q5 = s.find_by_scan_field<&Order::qty>(5);
-// ...vs. every order FOR this account (indexed -- see define_cached_references above).
-std::vector<const Order*> mine = s.find_cached_referrers<&Order::account>(acct);
+// Multi-match: every order with qty == 5 -- find_by_field falls back to an
+// unindexed scan here, since qty is declared only in define_scan_fields...
+std::vector<const Order*> q5 = s.find_by_field<&Order::qty>(5);
+// ...vs. every order FOR this account -- find_referrers resolves via the
+// index here, since account is ALSO declared in define_cached_references above.
+std::vector<const Order*> mine = s.find_referrers<&Order::account>(acct);
 
 // 3b. Views work exactly as before -- scoped to a Snapshot, not a Transaction.
 auto v = *s.view_by_key<&Order::computed_key>("ord:O1");
@@ -157,18 +159,21 @@ contention. *Applying* is not parallel: `examples/commit_bench.cpp`'s thread-cou
 shows this plainly (throughput does not scale linearly with writer threads). That's the
 tradeoff this design makes, not an oversight.
 
-**Multi-match lookups are opt-in, and cost is why.** Beyond `define_keys()` (unique,
-indexed, `find_by_key`), a type can declare `define_scan_fields()` for "every match" via an
-O(#objects) scan — costs nothing until you call it — or `define_cached_fields()` /
-`define_cached_references()` for "every match" via a persistent index (`find_by_cached_field`
-/ `find_cached_referrers`), O(log n + matches) per query. The indexed forms aren't free: each
-declared field costs roughly one extra index entry per object, upkept inside the serialized
-`try_commit()` apply phase on every create, delete, and value change — the same write-side
-tax `by_type` already pays, just per declared field instead of per object. That's why it's
-opt-in rather than automatic: index only the fields actually queried often, and leave the
-rest on the scan (or on nothing at all — `find_all()`'s predicate scan and
-`for_each_referrer()` always work, undeclared or not, just at O(#objects) per call instead of
-paid for once per commit).
+**Multi-match lookups are cost-transparent, not cost-fixed, and cost is why they're opt-in.**
+Beyond `define_keys()` (unique, indexed, `find_by_key`), `find_by_field`/`find_referrers` are
+each ONE entry point that resolves via a persistent index — O(log n + matches) — when the
+field is declared in `define_cached_fields()`/`define_cached_references()`, and transparently
+falls back to an O(#objects) scan — costs nothing until you call it — when it's declared only
+in `define_scan_fields()` (or, for a reference field, not cached at all; every `Ref<>`/`Opt<>`
+field is scan-fallback-eligible the moment it's in `define_references()`). The indexed path
+isn't free: each declared field costs roughly one extra index entry per object, upkept inside
+the serialized `try_commit()` apply phase on every create, delete, and value change — the
+same write-side tax `by_type` already pays, just per declared field instead of per object.
+That's why it's opt-in rather than automatic: index only the fields actually queried often —
+`Model::lookup_stats()` reports, per field, how many calls resolved via the index versus fell
+back to the scan, which is the signal for that decision — and leave the rest on the scan (or
+on nothing at all — `find_all()`'s predicate scan always works, undeclared or not, just at
+O(#objects) per call instead of paid for once per commit).
 
 ## Layout
 

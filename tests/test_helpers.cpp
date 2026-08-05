@@ -49,6 +49,24 @@ Ref<Order> make_order(Model& m, const std::string& code, Ref<Account> account, O
     o->account = account;
     o->parent = parent;
     o->qty = qty;
+    // qty_scan is a scan-only twin of qty (see Order's own comment in
+    // test_types.h) -- kept equal here so every existing caller of
+    // make_order gets both the cache-hit and scan-fallback lookup families
+    // exercisable on identical data without having to know the twin exists.
+    // account_scan is NOT auto-set the same way: it's Opt<>, and giving an
+    // object BOTH a non-nullable and a nullable ref to the identical target
+    // trips a real (pre-existing, unrelated to this refactor) double-
+    // processing bug in Model::remove_raw's cascade BFS -- a referrer with
+    // one non-nullable edge forcing its own deletion and a nullable edge to
+    // the same dying target gets a spurious cascade-null Update recorded
+    // for it moments before its own cascade Delete. Setting account_scan
+    // globally here would expose every OTHER test that cascade-deletes an
+    // Account through make_order's Orders to that bug. Callers that
+    // specifically need account_scan == account (to compare find_referrers'
+    // cache-hit and scan-fallback branches on identical data) set it
+    // themselves, and must avoid also cascade-deleting that same account
+    // while it's set.
+    o->qty_scan = qty;
     const Ref<Order> local = txn.create(std::move(o));
     return commit_ok(m, txn).to_real(local);
 }

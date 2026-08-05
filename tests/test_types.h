@@ -46,6 +46,13 @@ public:
     model::Opt<Order> parent;
     std::int64_t qty = 0;
 
+    // Scan-only twins of qty/account -- see include/example/types.h's Order
+    // for why these exist (find_by_field/find_referrers's scan-fallback
+    // branch needs its own field to force onto, since a field also declared
+    // cached always takes the cache-hit branch under the merged lookup).
+    std::int64_t qty_scan = 0;
+    model::Opt<Account> account_scan;
+
     std::string computed_key() const { return "ord:" + code; }
 
     /// Diagnostic only -- see include/example/types.h's Order::to_string()
@@ -64,6 +71,7 @@ public:
     static void define_references(Self& s, V&& v) {
         v(model::field_tag<&Order::account>(), "account", s.account);
         v(model::field_tag<&Order::parent>(), "parent", s.parent);
+        v(model::field_tag<&Order::account_scan>(), "account_scan", s.account_scan);
     }
 
     template <class Self>
@@ -81,6 +89,7 @@ public:
     static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
         v.key<&Order::qty>(s.qty, "qty");
         v.key<&Order::computed_key>(s.computed_key(), "computed_key");
+        v.key<&Order::qty_scan>(s.qty_scan, "qty_scan");
     }
 
     template <class Self>

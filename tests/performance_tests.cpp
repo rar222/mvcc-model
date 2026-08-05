@@ -119,8 +119,8 @@ int scaled(int n) {
 // every measurement, but it does not assert complexity: the data sizes
 // are 25x smaller (see scaled()) AND each operation carries 20-50x
 // instrumentation overhead that is not proportional to its algorithmic
-// work. Observed under TSan at those sizes: find_cached_referrers
-// measured 8.59, 8.36 then 5.37 us -- i.e. it got FASTER as n grew,
+// work. Observed under TSan at those sizes: find_referrers's cache-hit
+// branch measured 8.59, 8.36 then 5.37 us -- i.e. it got FASTER as n grew,
 // purely from instrumentation noise. Asserting a scaling band on that
 // would be asserting the sanitizer's overhead profile, not the model's
 // complexity. Correctness assertions (cascade killed the right objects,
@@ -355,9 +355,22 @@ void seed_accounts(Model& m, int n, std::vector<Ref<Account>>& out) {
 // must pass a distinct prefix per batch, or the second batch's codes collide
 // with the first's and those creates are silently rejected, undercounting
 // the model.
+// `set_account_scan`: opt-in, default off. account_scan is Opt<>, and
+// giving an Order BOTH a non-nullable `account` and a nullable
+// `account_scan` pointing at the identical target trips a real
+// (pre-existing, unrelated to the scan/cached merge) double-processing bug
+// in Model::remove_raw's cascade BFS: a referrer with one non-nullable edge
+// forcing its own deletion and a nullable edge to the same dying target
+// gets a spurious cascade-null Update recorded for it moments before its
+// own cascade Delete -- which both inflates try_commit()'s work (the
+// cascade-scaling test below removes hubs seeded by this function) and
+// double-counts changes. Only the specific benchmark that compares
+// find_referrers' cache-hit vs. scan-fallback branch on identical data
+// needs account_scan set, and it never cascade-deletes the accounts
+// involved -- every other caller leaves it false.
 void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orders,
                  std::vector<Ref<Order>>& out, int qty_mod = 50,
-                 const std::string& code_prefix = "") {
+                 const std::string& code_prefix = "", bool set_account_scan = false) {
     constexpr int kBatch = 2000;
     out.clear();
     out.reserve(static_cast<std::size_t>(n_orders));
@@ -369,6 +382,15 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
             o->code = code_prefix + "O" + std::to_string(j);
             o->account = accounts[static_cast<std::size_t>(j) % accounts.size()];
             o->qty = j % qty_mod;
+            // qty_scan is a scan-only twin of qty (see Order's own comment
+            // in test_types.h) -- kept equal here so the cache-hit-vs-scan-
+            // fallback comparison tests below can force find_by_field onto
+            // either branch on identical data, now that a single dual-
+            // declared field always takes the cache-hit branch under the
+            // merged lookup. See this function's own doc comment for why
+            // account_scan is NOT unconditionally mirrored the same way.
+            o->qty_scan = o->qty;
+            if (set_account_scan) o->account_scan = o->account;
             local.push_back(txn.create(std::move(o)));
         }
         CommitResult res = m.try_commit(txn);
@@ -385,14 +407,15 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 // Account::name is declared in BOTH define_keys() (find_by_key, unique,
 // backed by by_field_'s persistent map -- O(log n), same as the
 // kSmallIndexedRead lookups above, not truly flat) and define_scan_fields()
-// (find_by_scan_field, O(#accounts) linear scan) -- see tests/test_types.h.
-// Same field, same data, same query: any timing difference is attributable
-// entirely to the index, not to anything else. Uses kSmallIndexedRead for
-// the same reason find_by_cached_field and find_cached_referrers do: a
-// sub-microsecond O(log n) call only predicts a ~x1.07 change per step, so
-// ordinary jitter swamps a two-sided 20% band -- see kSmallIndexedRead's
-// own comment.
-TEST(find_by_key_stays_near_flat_while_find_by_scan_field_grows_with_population) {
+// (find_by_field's scan-fallback branch, O(#accounts) linear scan -- name
+// has no define_cached_fields() entry, so find_by_field always falls back
+// here) -- see tests/test_types.h. Same field, same data, same query: any
+// timing difference is attributable entirely to the index, not to anything
+// else. Uses kSmallIndexedRead for the same reason the cache-hit-vs-scan
+// tests below do: a sub-microsecond O(log n) call only predicts a ~x1.07
+// change per step, so ordinary jitter swamps a two-sided 20% band -- see
+// kSmallIndexedRead's own comment.
+TEST(find_by_key_stays_near_flat_while_find_by_field_scan_fallback_grows_with_population) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> key_us, scan_us;
     for (int n : sizes) {
@@ -418,12 +441,12 @@ TEST(find_by_key_stays_near_flat_while_find_by_scan_field_grows_with_population)
         scan_us.push_back(best_of(5, [&] {
             return time_ms([&] {
                        for (int i = 0; i < scan_reps; ++i)
-                           (void)s.find_by_scan_field<&Account::name>(probe);
+                           (void)s.find_by_field<&Account::name>(probe);
                    }) *
                    1000.0 / scan_reps;
         }));
 
-        std::printf("  n=%7d  find_by_key=%9.4f us/call   find_by_scan_field=%9.2f us/call\n", n,
+        std::printf("  n=%7d  find_by_key=%9.4f us/call   find_by_field(scan)=%9.2f us/call\n", n,
                     key_us.back(), scan_us.back());
     }
     check_scaling("find_by_key", GrowthOrder::kLogN, sizes, key_us, kSmallIndexedRead);
@@ -431,9 +454,13 @@ TEST(find_by_key_stays_near_flat_while_find_by_scan_field_grows_with_population)
                      key_us.back(), 3.0);
 }
 
-// Same comparison, one level up: Order::qty is in BOTH define_cached_fields
-// (indexed, O(log n + matches)) and define_scan_fields (O(#orders) scan).
-TEST(find_by_cached_field_stays_near_flat_while_scan_grows_on_the_same_field) {
+// Same comparison, one level up: Order::qty is cache-declared (find_by_field
+// resolves it in O(log n + matches)); its scan-only twin qty_scan (see
+// seed_orders' own comment) is declared only in define_scan_fields(), so
+// find_by_field on it always takes the O(#orders) scan fallback -- same
+// field VALUES (kept equal by seed_orders), same query, so any timing
+// difference is attributable entirely to which branch resolves it.
+TEST(find_by_field_stays_near_flat_via_cache_while_its_scan_only_twin_grows) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> cached_us, scan_us;
     for (int n : sizes) {
@@ -453,7 +480,7 @@ TEST(find_by_cached_field_stays_near_flat_while_scan_grows_on_the_same_field) {
         cached_us.push_back(best_of(15, [&] {
             return time_ms([&] {
                        for (int i = 0; i < kCachedReps; ++i)
-                           (void)s.find_by_cached_field<&Order::qty>(probe_qty);
+                           (void)s.find_by_field<&Order::qty>(probe_qty);
                    }) *
                    1000.0 / kCachedReps;
         }));
@@ -462,29 +489,30 @@ TEST(find_by_cached_field_stays_near_flat_while_scan_grows_on_the_same_field) {
         scan_us.push_back(best_of(5, [&] {
             return time_ms([&] {
                        for (int i = 0; i < scan_reps; ++i)
-                           (void)s.find_by_scan_field<&Order::qty>(probe_qty);
+                           (void)s.find_by_field<&Order::qty_scan>(probe_qty);
                    }) *
                    1000.0 / scan_reps;
         }));
 
         std::printf(
-            "  n=%7d  find_by_cached_field=%9.4f us/call   find_by_scan_field=%9.2f us/call\n", n,
+            "  n=%7d  find_by_field(cache)=%9.4f us/call   find_by_field(scan)=%9.2f us/call\n", n,
             cached_us.back(), scan_us.back());
     }
     // Matches held ~constant across the sweep (see qty_mod above), so this
     // isolates the index's O(log n) term from its O(matches) term.
-    check_scaling("find_by_cached_field", GrowthOrder::kLogN, sizes, cached_us, kSmallIndexedRead);
-    check_gap_widens("cached_field vs scan", scan_us.front(), cached_us.front(), scan_us.back(),
+    check_scaling("find_by_field(cache)", GrowthOrder::kLogN, sizes, cached_us, kSmallIndexedRead);
+    check_gap_widens("find_by_field cache vs scan", scan_us.front(), cached_us.front(), scan_us.back(),
                      cached_us.back(), 3.0);
 }
 
-// The reverse-lookup counterpart: Order::account is in define_references()
-// (always -- required for cascade) AND define_cached_references() (opt-in
-// index). find_referrers is the always-available O(#orders) scan;
-// find_cached_referrers is the O(log n + matches) indexed alternative --
-// same comparison examples/cached_reference_bench.cpp benchmarks in more
-// depth, here as an asserted claim at smaller, CI-friendly sizes.
-TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_population) {
+// The reverse-lookup counterpart: Order::account is cache-declared (via
+// define_cached_references()), so find_referrers resolves it in
+// O(log n + matches); its scan-only twin account_scan (see seed_orders' own
+// comment) is declared only in define_references(), so find_referrers on it
+// always takes the always-available O(#orders) scan fallback -- same comparison
+// examples/cached_reference_bench.cpp benchmarks in more depth, here as an
+// asserted claim at smaller, CI-friendly sizes.
+TEST(find_referrers_beats_its_scan_only_twin_and_the_gap_widens_with_population) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> scan_us, indexed_us;
     for (int n : sizes) {
@@ -497,7 +525,7 @@ TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_population) {
         std::vector<Ref<Account>> accounts;
         seed_accounts(m, n_accounts, accounts);
         std::vector<Ref<Order>> orders;
-        seed_orders(m, accounts, n, orders);
+        seed_orders(m, accounts, n, orders, 50, "", /*set_account_scan=*/true);
         Snapshot s = m.snapshot();
         const Ref<Account> target = accounts[0];
 
@@ -505,7 +533,7 @@ TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_population) {
         scan_us.push_back(best_of(5, [&] {
             return time_ms([&] {
                        for (int i = 0; i < reps; ++i)
-                           (void)s.find_referrers<&Order::account>(target);
+                           (void)s.find_referrers<&Order::account_scan>(target);
                    }) *
                    1000.0 / reps;
         }));
@@ -514,7 +542,7 @@ TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_population) {
         indexed_us.push_back(best_of(15, [&] {
             return time_ms([&] {
                        for (int i = 0; i < kIndexedReps; ++i)
-                           (void)s.find_cached_referrers<&Order::account>(target);
+                           (void)s.find_referrers<&Order::account>(target);
                    }) *
                    1000.0 / kIndexedReps;
         }));
@@ -524,9 +552,9 @@ TEST(find_cached_referrers_beats_the_scan_and_the_gap_widens_with_population) {
     }
     // Matches held ~constant across the sweep (account count scales with
     // n above), so this isolates the index's O(log n) term.
-    check_scaling("find_cached_referrers", GrowthOrder::kLogN, sizes, indexed_us,
+    check_scaling("find_referrers(cache)", GrowthOrder::kLogN, sizes, indexed_us,
                   kSmallIndexedRead);
-    check_gap_widens("cached_referrers vs scan", scan_us.front(), indexed_us.front(),
+    check_gap_widens("find_referrers cache vs scan", scan_us.front(), indexed_us.front(),
                      scan_us.back(), indexed_us.back(), 3.0);
 }
 
@@ -1142,13 +1170,19 @@ namespace {
 //                 the only field here that can back that lookup).
 //   dup_key    -- shared by dup_fanout-many objects; deliberately NOT in
 //                 define_keys(), the same reason Order::qty above isn't --
-//                 this is the "clashing" case, exercised only through the
-//                 multi-match families (find_by_scan_field /
-//                 find_by_cached_field).
+//                 this is the "clashing" case, exercised through find_by_
+//                 field's multi-match cache-hit branch.
+// unique_key_scan/dup_key_scan are scan-only twins of unique_key/dup_key
+// (same pattern as Order::qty_scan in test_types.h), kept equal by
+// seed_str_keyed: since unique_key/dup_key are ALSO cache-declared below,
+// find_by_field always takes their cache-hit branch, so a genuinely
+// scan-forced comparison needs its own, uncached field to call.
 class StrKeyed final : public model::Object<StrKeyed> {
 public:
     std::string unique_key;
     std::string dup_key;
+    std::string unique_key_scan;
+    std::string dup_key_scan;
 
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
@@ -1159,6 +1193,8 @@ public:
     static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
         v.key<&StrKeyed::unique_key>(s.unique_key, "unique_key");
         v.key<&StrKeyed::dup_key>(s.dup_key, "dup_key");
+        v.key<&StrKeyed::unique_key_scan>(s.unique_key_scan, "unique_key_scan");
+        v.key<&StrKeyed::dup_key_scan>(s.dup_key_scan, "dup_key_scan");
     }
 
     template <class Self>
@@ -1213,6 +1249,8 @@ void seed_str_keyed(Model& m, const StringKeyCase& c, int count, int dup_fanout,
             auto o = std::make_unique<StrKeyed>();
             o->unique_key = padded_key(std::to_string(j), c.len);
             o->dup_key = padded_key(std::to_string(j % dup_fanout), c.len);
+            o->unique_key_scan = o->unique_key;
+            o->dup_key_scan = o->dup_key;
             local.push_back(txn.create(std::move(o)));
         }
         CommitResult res = m.try_commit(txn);
@@ -1222,14 +1260,14 @@ void seed_str_keyed(Model& m, const StringKeyCase& c, int count, int dup_fanout,
 
 }  // namespace
 
-// find_by_key and find_by_cached_field are both O(log n) index descents --
-// the population itself doesn't move across this sweep, only the KEY
-// LENGTH does (via padded_key's shared-prefix construction), so any growth
-// here is purely the hashing/comparison cost of a longer string, not a
-// bigger trie. Contrast cached_unique_us against cached_dup_us, measured in
-// the SAME loop: same key length, same index depth, but every dup_key probe
-// now returns ~count/dup_fanout matches instead of one -- isolating the
-// O(#matches) term from the O(string length) term the unique_key column
+// find_by_key and find_by_field's cache-hit branch are both O(log n) index
+// descents -- the population itself doesn't move across this sweep, only
+// the KEY LENGTH does (via padded_key's shared-prefix construction), so any
+// growth here is purely the hashing/comparison cost of a longer string, not
+// a bigger trie. Contrast cached_unique_us against cached_dup_us, measured
+// in the SAME loop: same key length, same index depth, but every dup_key
+// probe now returns ~count/dup_fanout matches instead of one -- isolating
+// the O(#matches) term from the O(string length) term the unique_key column
 // already isolates from population.
 TEST(indexed_lookup_time_vs_string_key_length_unique_vs_clashing) {
     const int kCount = scaled(20000);
@@ -1255,21 +1293,21 @@ TEST(indexed_lookup_time_vs_string_key_length_unique_vs_clashing) {
         cached_unique_us.push_back(best_of(15, [&] {
             return time_ms([&] {
                        for (int i = 0; i < kReps; ++i)
-                           (void)s.find_by_cached_field<&StrKeyed::unique_key>(unique_probe);
+                           (void)s.find_by_field<&StrKeyed::unique_key>(unique_probe);
                    }) *
                    1000.0 / kReps;
         }));
         cached_dup_us.push_back(best_of(15, [&] {
             return time_ms([&] {
                        for (int i = 0; i < kReps; ++i)
-                           (void)s.find_by_cached_field<&StrKeyed::dup_key>(dup_probe);
+                           (void)s.find_by_field<&StrKeyed::dup_key>(dup_probe);
                    }) *
                    1000.0 / kReps;
         }));
 
         std::printf(
-            "  key=%-14s find_by_key(unique)=%8.4f us   find_by_cached_field(unique)=%8.4f us   "
-            "find_by_cached_field(clashing, ~%d matches)=%8.4f us\n",
+            "  key=%-14s find_by_key(unique)=%8.4f us   find_by_field(cache,unique)=%8.4f us   "
+            "find_by_field(cache,clashing, ~%d matches)=%8.4f us\n",
             c.label, key_us.back(), cached_unique_us.back(), kCount / kDupFanout, cached_dup_us.back());
     }
     // All three are O(log n) index descents at a FIXED population -- key
@@ -1293,16 +1331,20 @@ TEST(indexed_lookup_time_vs_string_key_length_unique_vs_clashing) {
     }
 }
 
-// find_by_scan_field walks every live object regardless of how many of them
-// match, so -- unlike find_by_cached_field above -- it should cost the SAME
-// whether the probed value is unique_key (one match) or dup_key (~200
-// matches): the index-vs-scan distinction is exactly what makes clashing
-// values expensive for one family and irrelevant to the other. Key LENGTH,
-// though, is real per-object cost here too (every one of `count` objects
-// gets its own full string compare, not just the O(log n) handful an index
-// descent touches) -- so this is the scan-side counterpart of the test
-// above, over the same string_key_cases().
-TEST(scan_field_time_vs_string_key_length_is_insensitive_to_key_uniqueness) {
+// find_by_field's scan-fallback branch walks every live object regardless
+// of how many of them match, so -- unlike the cache-hit branch above -- it
+// should cost the SAME whether the probed value is unique_key_scan (one
+// match) or dup_key_scan (~200 matches): the index-vs-scan distinction is
+// exactly what makes clashing values expensive for one branch and
+// irrelevant to the other. Key LENGTH, though, is real per-object cost here
+// too (every one of `count` objects gets its own full string compare, not
+// just the O(log n) handful an index descent touches) -- so this is the
+// scan-side counterpart of the test above, over the same string_key_cases().
+// Uses the _scan twins (see StrKeyed's own comment), not unique_key/dup_key
+// directly: those are ALSO cache-declared, so find_by_field on them would
+// always take the cache-hit branch instead of the scan fallback this test
+// is about.
+TEST(scan_fallback_time_vs_string_key_length_is_insensitive_to_key_uniqueness) {
     const int kCount = scaled(20000);
     const int kDupFanout = 100;
     std::vector<double> scan_unique_us, scan_dup_us;
@@ -1319,20 +1361,20 @@ TEST(scan_field_time_vs_string_key_length_is_insensitive_to_key_uniqueness) {
         scan_unique_us.push_back(best_of(5, [&] {
             return time_ms([&] {
                        for (int i = 0; i < scan_reps; ++i)
-                           (void)s.find_by_scan_field<&StrKeyed::unique_key>(unique_probe);
+                           (void)s.find_by_field<&StrKeyed::unique_key_scan>(unique_probe);
                    }) *
                    1000.0 / scan_reps;
         }));
         scan_dup_us.push_back(best_of(5, [&] {
             return time_ms([&] {
                        for (int i = 0; i < scan_reps; ++i)
-                           (void)s.find_by_scan_field<&StrKeyed::dup_key>(dup_probe);
+                           (void)s.find_by_field<&StrKeyed::dup_key_scan>(dup_probe);
                    }) *
                    1000.0 / scan_reps;
         }));
 
         std::printf(
-            "  key=%-14s find_by_scan_field(unique)=%9.2f us   find_by_scan_field(clashing)=%9.2f "
+            "  key=%-14s find_by_field(scan,unique)=%9.2f us   find_by_field(scan,clashing)=%9.2f "
             "us\n",
             c.label, scan_unique_us.back(), scan_dup_us.back());
     }

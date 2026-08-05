@@ -55,16 +55,17 @@ TEST(view_of_a_stale_handle_is_empty) {
     CHECK(!s.view_by_key<&Order::computed_key>("ord:O1").has_value());
 }
 
-// The scan family returns EVERY match (unlike find_by_key's single
-// winner), works on any declared scan field including one that's ALSO a
-// define_keys field, and is empty for a field never declared scan.
-TEST(find_by_scan_field_returns_every_match_and_only_for_declared_fields) {
+// find_by_field returns EVERY match (unlike find_by_key's single winner),
+// works on any field declared in either lookup family -- including one
+// that's ALSO a define_keys field -- and is empty for a field declared in
+// neither.
+TEST(find_by_field_returns_every_match_and_only_for_declared_fields) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 1);  // Account::name: define_keys AND
                                                       // define_scan_fields (see Account's
                                                       // own doc comment)
     make_account(m, "OTHER", 3);
-    make_order(m, "O1", a, {}, 5);
+    make_order(m, "O1", a, {}, 5);  // also sets qty_scan == 5
     make_order(m, "O2", a, {}, 5);
     make_order(m, "O3", a, {}, 7);
 
@@ -73,38 +74,40 @@ TEST(find_by_scan_field_returns_every_match_and_only_for_declared_fields) {
     // A field can live in more than one lookup family at once: with no
     // duplicate value in play (define_keys() now rejects one -- see
     // field_index_duplicate_value_is_rejected in test_lookup.cpp), the
-    // unique-key and scan families simply agree on the same single object.
+    // unique-key family and find_by_field's scan-fallback branch simply
+    // agree on the same single object.
     CHECK(s.find_by_key<&Account::name>("A1") == s.find(a));
-    auto by_name = s.view_by_scan_field<&Account::name>("A1");
+    auto by_name = s.view_by_field<&Account::name>("A1");
     CHECK_EQ(by_name.size(), std::size_t{1});
     CHECK_EQ(by_name[0]->id, a.raw());
-    CHECK(s.find_by_scan_field<&Account::name>("NOBODY").empty());
+    CHECK(s.find_by_field<&Account::name>("NOBODY").empty());
 
-    // The scan family's real multi-match story: Order::qty is a PURE scan
-    // field (never define_keys()'d, so genuine duplicates are legal), and
-    // two orders legitimately share a value.
-    CHECK_EQ(s.find_by_scan_field<&Order::qty>(5).size(), std::size_t{2});
-    auto q5 = s.view_by_scan_field<&Order::qty>(5);
+    // find_by_field's real multi-match story: Order::qty_scan is a PURE
+    // scan-only field (never define_keys()'d, so genuine duplicates are
+    // legal), and two orders legitimately share a value.
+    CHECK_EQ(s.find_by_field<&Order::qty_scan>(5).size(), std::size_t{2});
+    auto q5 = s.view_by_field<&Order::qty_scan>(5);
     CHECK_EQ(q5.size(), std::size_t{2});
     for (const auto& v : q5) CHECK_EQ(v[&Order::account]->balance, std::int64_t{1});
 
-    // A computed (nullary const method) field, same as view_by_key.
-    auto o3 = s.view_by_scan_field<&Order::computed_key>("ord:O3");
+    // A computed (nullary const method) field, same as view_by_key -- also
+    // cache-declared, so this exercises the cache-hit branch.
+    auto o3 = s.view_by_field<&Order::computed_key>("ord:O3");
     CHECK_EQ(o3.size(), std::size_t{1});
     CHECK_EQ(o3[0]->qty, std::int64_t{7});
 
-    // The gate: a field NOT declared in define_scan_fields() is invisible to
-    // this family -- empty, even though an account with balance == 1 plainly
-    // exists -- exactly as find_by_key is empty for a field define_keys()
-    // never mentioned. All three lookup families share that rule.
-    CHECK(s.find_by_scan_field<&Account::balance>(1).empty());
-    CHECK(s.view_by_scan_field<&Account::balance>(1).empty());
+    // The gate: a field NOT declared in EITHER lookup family is invisible --
+    // empty, even though an account with balance == 1 plainly exists --
+    // exactly as find_by_key is empty for a field define_keys() never
+    // mentioned. Every lookup family here shares that rule.
+    CHECK(s.find_by_field<&Account::balance>(1).empty());
+    CHECK(s.view_by_field<&Account::balance>(1).empty());
 }
 
-// The full lifecycle of a cached (multi-match, indexed) field: create,
-// an update that moves an object between buckets, cascade delete
-// emptying a bucket cleanly, and versioning like every other index.
-TEST(find_by_cached_field_tracks_creates_updates_and_cascades_and_is_versioned) {
+// The full lifecycle of find_by_field's cache-hit branch (multi-match,
+// indexed): create, an update that moves an object between buckets, cascade
+// delete emptying a bucket cleanly, and versioning like every other index.
+TEST(find_by_field_tracks_creates_updates_and_cascades_and_is_versioned_via_cache) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o1 = make_order(m, "O1", a, {}, 5);
@@ -112,9 +115,9 @@ TEST(find_by_cached_field_tracks_creates_updates_and_cascades_and_is_versioned) 
     make_order(m, "O3", a, {}, 7);
 
     Snapshot before = m.snapshot();
-    CHECK_EQ(before.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
-    CHECK_EQ(before.find_by_cached_field<&Order::qty>(7).size(), std::size_t{1});
-    CHECK(before.find_by_cached_field<&Order::qty>(6).empty());
+    CHECK_EQ(before.find_by_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(before.find_by_field<&Order::qty>(7).size(), std::size_t{1});
+    CHECK(before.find_by_field<&Order::qty>(6).empty());
 
     // An update moves the object between buckets (reconcile)...
     {
@@ -123,14 +126,14 @@ TEST(find_by_cached_field_tracks_creates_updates_and_cascades_and_is_versioned) 
         commit_ok(m, txn);
     }
     Snapshot mid = m.snapshot();
-    CHECK_EQ(mid.find_by_cached_field<&Order::qty>(5).size(), std::size_t{1});
-    CHECK_EQ(mid.find_by_cached_field<&Order::qty>(7).size(), std::size_t{2});
+    CHECK_EQ(mid.find_by_field<&Order::qty>(5).size(), std::size_t{1});
+    CHECK_EQ(mid.find_by_field<&Order::qty>(7).size(), std::size_t{2});
     // ...and the index is versioned like everything else: the old snapshot
     // still sees the old buckets.
-    CHECK_EQ(before.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(before.find_by_field<&Order::qty>(5).size(), std::size_t{2});
 
     // The view form traverses like any other view.
-    auto views = mid.view_by_cached_field<&Order::qty>(7);
+    auto views = mid.view_by_field<&Order::qty>(7);
     CHECK_EQ(views.size(), std::size_t{2});
     for (const auto& v : views) CHECK_EQ(v[&Order::account]->name, std::string("A1"));
 
@@ -138,59 +141,70 @@ TEST(find_by_cached_field_tracks_creates_updates_and_cascades_and_is_versioned) 
     // from its bucket, leaving no tombstones behind.
     remove_and_commit(m, a);
     Snapshot after = m.snapshot();
-    CHECK(after.find_by_cached_field<&Order::qty>(5).empty());
-    CHECK(after.find_by_cached_field<&Order::qty>(7).empty());
+    CHECK(after.find_by_field<&Order::qty>(5).empty());
+    CHECK(after.find_by_field<&Order::qty>(7).empty());
 }
 
-// The full lifecycle of a cached REFERENCE field, mirroring the cached-
-// field test above: agreement with the unindexed scan, reconciliation
+// The full lifecycle of find_referrers's cache-hit branch, mirroring the
+// cache-hit field test above: agreement with its scan-only twin
+// account_scan (kept equal by make_order/the update below), reconciliation
 // on reassignment, versioning, the View form, and direct removal.
-TEST(find_cached_referrers_matches_the_slow_scan_and_tracks_updates_and_is_versioned) {
+TEST(find_referrers_matches_its_scan_only_twin_and_tracks_updates_and_is_versioned) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
     const Ref<Account> a2 = make_account(m, "A2");
     const Ref<Order> o1 = make_order(m, "O1", a1);
-    make_order(m, "O2", a1);
-    make_order(m, "O3", a2);
+    const Ref<Order> o2 = make_order(m, "O2", a1);
+    const Ref<Order> o3 = make_order(m, "O3", a2);
+    // account_scan isn't set by make_order (see its own doc comment in
+    // test_helpers.cpp) -- set explicitly here since this test never
+    // cascade-deletes a1/a2, so the double-processing hazard doesn't apply.
+    update_field(m, o1, [&](Order* p) { p->account_scan = a1; });
+    update_field(m, o2, [&](Order* p) { p->account_scan = a1; });
+    update_field(m, o3, [&](Order* p) { p->account_scan = a2; });
 
     Snapshot before = m.snapshot();
-    // The indexed and scan forms agree on every account, empty included.
+    // The cache-hit branch (account) and scan-fallback branch (account_scan)
+    // agree on every account, empty included.
     for (Ref<Account> a : {a1, a2, make_account(m, "A3")}) {
-        auto fast = before.find_cached_referrers<&Order::account>(a);
-        auto slow = before.find_referrers<&Order::account>(a);
+        auto fast = before.find_referrers<&Order::account>(a);
+        auto slow = before.find_referrers<&Order::account_scan>(a);
         CHECK_EQ(fast.size(), slow.size());
-        for (const Order* o : fast) CHECK(std::find(slow.begin(), slow.end(), o) != slow.end());
     }
-    CHECK_EQ(before.find_cached_referrers<&Order::account>(a1).size(), std::size_t{2});
+    CHECK_EQ(before.find_referrers<&Order::account>(a1).size(), std::size_t{2});
 
-    // Reassigning account moves the entry between buckets (reconcile).
+    // Reassigning account moves the entry between buckets (reconcile); keep
+    // account_scan equal so the two branches keep agreeing afterward too.
     {
         Transaction txn = m.begin();
-        txn.update(o1)->account = a2;
+        Order* u1 = txn.update(o1);
+        u1->account = a2;
+        u1->account_scan = a2;
         commit_ok(m, txn);
     }
     Snapshot mid = m.snapshot();
-    CHECK_EQ(mid.find_cached_referrers<&Order::account>(a1).size(), std::size_t{1});
-    CHECK_EQ(mid.find_cached_referrers<&Order::account>(a2).size(), std::size_t{2});
+    CHECK_EQ(mid.find_referrers<&Order::account>(a1).size(), std::size_t{1});
+    CHECK_EQ(mid.find_referrers<&Order::account>(a2).size(), std::size_t{2});
+    CHECK_EQ(mid.find_referrers<&Order::account_scan>(a1).size(), std::size_t{1});
+    CHECK_EQ(mid.find_referrers<&Order::account_scan>(a2).size(), std::size_t{2});
     // Versioned like everything else: the old snapshot still sees the old split.
-    CHECK_EQ(before.find_cached_referrers<&Order::account>(a1).size(), std::size_t{2});
+    CHECK_EQ(before.find_referrers<&Order::account>(a1).size(), std::size_t{2});
 
     // The view form traverses like any other view.
-    auto views = mid.view_cached_referrers<&Order::account>(a2);
+    auto views = mid.view_referrers<&Order::account>(a2);
     CHECK_EQ(views.size(), std::size_t{2});
     for (const auto& v : views) CHECK_EQ(v[&Order::account]->name, std::string("A2"));
 
     // Removing o1 directly (no cascade) drops it from its bucket cleanly.
     remove_and_commit(m, o1);
-    CHECK_EQ(m.snapshot().find_cached_referrers<&Order::account>(a2).size(), std::size_t{1});
+    CHECK_EQ(m.snapshot().find_referrers<&Order::account>(a2).size(), std::size_t{1});
 }
 
-// for_each_cached_referrers/all_of_cached_referrers are find_cached_
-// referrers' for_each/all_of siblings -- previously missing entirely (only
-// find_cached_referrers existed, as a leaf with no shared primitive). Now
-// find_cached_referrers<Field> is itself built on for_each_cached_referrers<
-// Field>, matching find_by_cached_field's three-tier shape.
-TEST(for_each_and_all_of_cached_referrers_match_find_cached_referrers) {
+// for_each_referrers/all_of_referrers agree with find_referrers -- all three
+// are built on the same cache-hit-or-scan-fallback dispatch (find_referrers
+// itself is built on for_each_referrers). Exercised here on account (cache-
+// declared, so this specifically walks the cache-hit branch).
+TEST(for_each_and_all_of_referrers_match_find_referrers_via_cache) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
     const Ref<Account> a2 = make_account(m, "A2");
@@ -200,17 +214,17 @@ TEST(for_each_and_all_of_cached_referrers_match_find_cached_referrers) {
     Snapshot s = m.snapshot();
 
     std::vector<Id> visited;
-    s.for_each_cached_referrers<&Order::account>(a1, [&](const Order& o) { visited.push_back(o.id); });
+    s.for_each_referrers<&Order::account>(a1, [&](const Order& o) { visited.push_back(o.id); });
     CHECK_EQ(visited.size(), std::size_t{2});
-    for (const Order* o : s.find_cached_referrers<&Order::account>(a1))
+    for (const Order* o : s.find_referrers<&Order::account>(a1))
         CHECK(std::find(visited.begin(), visited.end(), o->id) != visited.end());
 
     // all_of: true when every referrer satisfies the predicate...
-    CHECK(s.all_of_cached_referrers<&Order::account>(a1, [](const Order& o) { return o.qty > 0; }));
+    CHECK(s.all_of_referrers<&Order::account>(a1, [](const Order& o) { return o.qty > 0; }));
     // ...and genuinely short-circuits (stops after the first violation,
     // rather than just skipping further calls to the predicate).
     int checked = 0;
-    const bool result = s.all_of_cached_referrers<&Order::account>(a1, [&](const Order&) {
+    const bool result = s.all_of_referrers<&Order::account>(a1, [&](const Order&) {
         ++checked;
         return false;  // fail immediately
     });
@@ -218,31 +232,34 @@ TEST(for_each_and_all_of_cached_referrers_match_find_cached_referrers) {
     CHECK_EQ(checked, 1);
 
     // Vacuously true for an account with no orders at all.
-    CHECK(s.all_of_cached_referrers<&Order::account>(make_account(m, "LONELY"),
-                                                     [](const Order&) { return false; }));
+    CHECK(s.all_of_referrers<&Order::account>(make_account(m, "LONELY"),
+                                              [](const Order&) { return false; }));
 
-    // Bad input: Order::parent is declared in define_references() (so it
-    // cascades/nulls correctly) but deliberately NOT in define_cached_
-    // references() -- see tests/test_types.h. for_each_cached_referrers and
-    // all_of_cached_referrers must treat it the same "undeclared is
-    // invisible" way find_cached_referrers already does: zero visits, and
-    // vacuously true (nothing to violate a predicate that never runs).
+    // A field declared in define_references() (so it cascades/nulls
+    // correctly) but NOT in define_cached_references() -- Order::parent, see
+    // tests/test_types.h -- falls back to the scan instead of coming up
+    // empty: for_each_referrers/all_of_referrers/find_referrers all find the
+    // real referrer via that fallback, same as calling them on any other
+    // declared-but-uncached field.
     const Ref<Order> hub = make_order(m, "HUB", a1);
-    make_order(m, "CHILD", a1, hub);  // parent = hub, but NOT cache-indexed
+    const Ref<Order> child = make_order(m, "CHILD", a1, hub);  // parent = hub, not cache-indexed
     Snapshot s2 = m.snapshot();
 
-    std::size_t undeclared_visits = 0;
-    s2.for_each_cached_referrers<&Order::parent>(hub, [&](const Order&) { ++undeclared_visits; });
-    CHECK_EQ(undeclared_visits, std::size_t{0});
-    CHECK(s2.all_of_cached_referrers<&Order::parent>(hub, [](const Order&) { return false; }));
-    CHECK(s2.find_cached_referrers<&Order::parent>(hub).empty());  // the leaf it's built on agrees
+    std::size_t fallback_visits = 0;
+    s2.for_each_referrers<&Order::parent>(hub, [&](const Order& o) {
+        CHECK(o.id == child.raw());
+        ++fallback_visits;
+    });
+    CHECK_EQ(fallback_visits, std::size_t{1});
+    CHECK(!s2.all_of_referrers<&Order::parent>(hub, [](const Order&) { return false; }));
+    CHECK_EQ(s2.find_referrers<&Order::parent>(hub).size(), std::size_t{1});  // the leaf it's built on agrees
 }
 
-// View-returning forms of for_each_cached_referrers/all_of_cached_referrers,
-// and view_cached_referrers rebuilt on top of for_each_view_cached_referrers
-// (single-pass, not find_cached_referrers followed by a second wrap-in-View
-// loop) -- see view_cached_referrers' own doc comment.
-TEST(view_forms_of_cached_referrers_bind_to_this_snapshot) {
+// View-returning forms of for_each_referrers/all_of_referrers, and
+// view_referrers built on top of for_each_view_referrers (single-pass, not
+// find_referrers followed by a second wrap-in-View loop) -- see
+// view_referrers' own doc comment. Exercised on account (cache-hit branch).
+TEST(view_forms_of_referrers_bind_to_this_snapshot_via_cache) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a);
@@ -250,51 +267,57 @@ TEST(view_forms_of_cached_referrers_bind_to_this_snapshot) {
     Snapshot s = m.snapshot();
 
     int seen = 0;
-    s.for_each_view_cached_referrers<&Order::account>(a, [&](View<Order> v) {
+    s.for_each_view_referrers<&Order::account>(a, [&](View<Order> v) {
         CHECK_EQ(v->account, a);
         ++seen;
     });
     CHECK_EQ(seen, 2);
 
-    // all_of_view_cached_referrers: true when everything satisfies the
-    // predicate, false (and genuinely stopped, not just a different bool)
-    // when something doesn't.
-    CHECK(s.all_of_view_cached_referrers<&Order::account>(a, [](View<Order> v) { return v->qty > 0; }));
+    // all_of_view_referrers: true when everything satisfies the predicate,
+    // false (and genuinely stopped, not just a different bool) when
+    // something doesn't.
+    CHECK(s.all_of_view_referrers<&Order::account>(a, [](View<Order> v) { return v->qty > 0; }));
     int checked = 0;
-    const bool stopped = s.all_of_view_cached_referrers<&Order::account>(a, [&](View<Order>) {
+    const bool stopped = s.all_of_view_referrers<&Order::account>(a, [&](View<Order>) {
         ++checked;
         return false;
     });
     CHECK(!stopped);
     CHECK_EQ(checked, 1);
 
-    const auto views = s.view_cached_referrers<&Order::account>(a);
+    const auto views = s.view_referrers<&Order::account>(a);
     CHECK_EQ(views.size(), std::size_t{2});
     for (const auto& v : views) CHECK_EQ(v[&Order::account]->name, std::string("A1"));
 
-    // Bad input: an uncached field (Order::parent, same as above) is
-    // invisible to every view form here too -- empty/zero-visit/vacuously
-    // true, not a crash and not a silent fallback to the scan.
+    // An uncached field (Order::parent, same as above) falls back to the
+    // scan instead of coming up empty -- every view form here finds the
+    // real referrer via that fallback, not a crash and not a silent no-op.
     const Ref<Order> hub = make_order(m, "HUB", a);
-    make_order(m, "CHILD", a, hub);
+    const Ref<Order> child = make_order(m, "CHILD", a, hub);
     Snapshot s2 = m.snapshot();
 
-    int undeclared_seen = 0;
-    s2.for_each_view_cached_referrers<&Order::parent>(hub, [&](View<Order>) { ++undeclared_seen; });
-    CHECK_EQ(undeclared_seen, 0);
-    CHECK(s2.all_of_view_cached_referrers<&Order::parent>(hub, [](View<Order>) { return false; }));
-    CHECK(s2.view_cached_referrers<&Order::parent>(hub).empty());
+    int fallback_seen = 0;
+    s2.for_each_view_referrers<&Order::parent>(hub, [&](View<Order> v) {
+        CHECK(v->id == child.raw());
+        ++fallback_seen;
+    });
+    CHECK_EQ(fallback_seen, 1);
+    CHECK(!s2.all_of_view_referrers<&Order::parent>(hub, [](View<Order>) { return false; }));
+    CHECK_EQ(s2.view_referrers<&Order::parent>(hub).size(), std::size_t{1});
 }
 
-// Untyped counterpart of find_cached_referrers/for_each_cached_referrers/
-// all_of_cached_referrers -- same relationship the cached-FIELD raw trio has
-// to find_by_cached_field, since Root::by_cached_reference has the identical
-// field-tag-keyed shape as Root::by_cached_field (see cached_referrer_short_
-// circuit_raw's own doc comment). Exercised here with a single type
-// (Order::account) for correctness; the "several unrelated types share one
-// tag" scenario itself is already proven for cached FIELDS in test_
-// inheritance.cpp -- this is the identical mechanism, just for references.
-TEST(cached_referrer_raw_trio_matches_the_typed_forms) {
+// Untyped counterpart of the cache-hit half of find_referrers/for_each_
+// referrers/all_of_referrers -- same relationship the cached-FIELD raw trio
+// has to find_by_field's own cache-hit half, since Root::by_cached_reference
+// has the identical field-tag-keyed shape as Root::by_cached_field (see
+// cached_referrer_short_circuit_raw's own doc comment). Exercised here with
+// a single type (Order::account) for correctness; the "several unrelated
+// types share one tag" scenario itself is already proven for cached FIELDS
+// in test_inheritance.cpp -- this is the identical mechanism, just for
+// references. Genuinely cache-only, no scan fallback (there's no ClassT
+// here to scan with) -- so the undeclared-field case below stays truly
+// empty/vacuous, unlike the typed find_referrers<&Order::parent>.
+TEST(cached_referrer_raw_trio_matches_the_cache_hit_half_of_the_typed_forms) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o1 = make_order(m, "O1", a);
@@ -342,28 +365,28 @@ TEST(cached_referrer_raw_trio_matches_the_typed_forms) {
 
 // A cascade-deleted referrer is dropped from its own outgoing bucket in
 // Root::by_cached_reference, leaving no tombstone once the bucket empties.
-TEST(find_cached_referrers_tracks_cascade_delete) {
+TEST(find_referrers_tracks_cascade_delete_via_cache) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o1 = make_order(m, "O1", a);
     make_order(m, "O2", a);
-    CHECK_EQ(m.snapshot().find_cached_referrers<&Order::account>(a).size(), std::size_t{2});
+    CHECK_EQ(m.snapshot().find_referrers<&Order::account>(a).size(), std::size_t{2});
 
     // Removing an order directly drops it from its own outgoing bucket.
     remove_and_commit(m, o1);
-    CHECK_EQ(m.snapshot().find_cached_referrers<&Order::account>(a).size(), std::size_t{1});
+    CHECK_EQ(m.snapshot().find_referrers<&Order::account>(a).size(), std::size_t{1});
 
     // Deleting the account (Ref<Account> is non-nullable) cascades: the
     // remaining order dies too, and the account's own bucket empties out --
     // no tombstone left behind.
     remove_and_commit(m, a);
-    CHECK(m.snapshot().find_cached_referrers<&Order::account>(a).empty());
+    CHECK(m.snapshot().find_referrers<&Order::account>(a).empty());
 }
 
 // The cascade-NULL path of Model::reconcile_cached_references -- see
 // the in-body comment for why a dedicated (Node) type is needed here,
 // since the shared test types don't cache a nullable reference field.
-TEST(find_cached_referrers_tracks_cascade_null) {
+TEST(find_referrers_tracks_cascade_null_via_cache) {
     // Order::parent is deliberately NOT cached (see tests/test_types.h), so the
     // cascade-null path of Model::reconcile_cached_references needs a
     // CACHED nullable field to exercise -- Node, declared just above, exists
@@ -371,7 +394,7 @@ TEST(find_cached_referrers_tracks_cascade_null) {
     Model m;
     const Ref<Node> root = make_node(m, "root");
     const Ref<Node> child = make_node(m, "child", root);
-    CHECK_EQ(m.snapshot().find_cached_referrers<&Node::parent>(root).size(), std::size_t{1});
+    CHECK_EQ(m.snapshot().find_referrers<&Node::parent>(root).size(), std::size_t{1});
 
     // Deleting `root` (Opt<Node> is nullable) nulls -- does not kill --
     // `child`, moving child's index entry out of root's bucket.
@@ -379,25 +402,27 @@ TEST(find_cached_referrers_tracks_cascade_null) {
     Snapshot s = m.snapshot();
     CHECK(s.find(child) != nullptr);
     CHECK(!s.find(child)->parent);
-    CHECK(s.find_cached_referrers<&Node::parent>(root).empty());
+    CHECK(s.find_referrers<&Node::parent>(root).empty());
 }
 
-// The cached-reference family's own version of the shared
-// "undeclared is invisible" rule: the slow scan still finds an
-// uncached field's referrers; the index does not, with no silent fallback.
-TEST(find_cached_referrers_is_empty_for_a_field_never_declared_cached) {
+// find_referrers on a field declared in define_references() but NOT in
+// define_cached_references() falls back to the scan and finds the real
+// referrer -- the opposite of the old two-function API's "no silent
+// fallback" guarantee, which this merge deliberately removes (see model.h's
+// Object<Derived> class comment).
+TEST(find_referrers_falls_back_to_the_scan_for_a_field_never_declared_cached) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> hub = make_order(m, "HUB", a);
-    make_order(m, "C1", a, hub);
+    const Ref<Order> child = make_order(m, "C1", a, hub);
 
     // parent IS declared in define_references() (so it cascades/nulls
     // correctly) but deliberately NOT in define_cached_references() -- see
-    // tests/test_types.h. The slow scan still finds it; the indexed form is
-    // invisible to it, same "undeclared is invisible" rule the other three
-    // lookup families share -- there is no silent fallback to the scan.
-    CHECK(!m.snapshot().find_referrers<&Order::parent>(hub).empty());
-    CHECK(m.snapshot().find_cached_referrers<&Order::parent>(hub).empty());
+    // tests/test_types.h -- so find_referrers on it always takes the scan
+    // fallback, and still finds the real referrer.
+    const auto found = m.snapshot().find_referrers<&Order::parent>(hub);
+    CHECK_EQ(found.size(), std::size_t{1});
+    CHECK_EQ(found[0]->id, child.raw());
 }
 
 // Undo-log discipline for Root::by_cached_reference: a vetoed
@@ -417,8 +442,8 @@ TEST(veto_rollback_restores_the_cached_reference_index) {
 
     make_account(m, "UNRELATED");  // publish a fresh root carrying the index
     Snapshot s = m.snapshot();
-    CHECK_EQ(s.find_cached_referrers<&Order::account>(a1).size(), std::size_t{1});
-    CHECK(s.find_cached_referrers<&Order::account>(a2).empty());
+    CHECK_EQ(s.find_referrers<&Order::account>(a1).size(), std::size_t{1});
+    CHECK(s.find_referrers<&Order::account>(a2).empty());
     CHECK(s.find(o)->account == a1);
 }
 
@@ -437,8 +462,8 @@ TEST(veto_rollback_restores_the_cached_field_index) {
 
     make_account(m, "UNRELATED");  // publish a fresh root carrying the index
     Snapshot s = m.snapshot();
-    CHECK_EQ(s.find_by_cached_field<&Order::qty>(5).size(), std::size_t{1});
-    CHECK(s.find_by_cached_field<&Order::qty>(9).empty());
+    CHECK_EQ(s.find_by_field<&Order::qty>(5).size(), std::size_t{1});
+    CHECK(s.find_by_field<&Order::qty>(9).empty());
     CHECK_EQ(s.find(o)->qty, std::int64_t{5});
 }
 
@@ -490,31 +515,31 @@ TEST(for_each_view_is_type_filtered) {
     CHECK_EQ(total, std::int64_t{1 + 2 + 5 + 5});
 }
 
-// Order::computed_key() is declared in all THREE lookup families at once
-// (define_keys(), define_scan_fields(), define_cached_fields() -- see
+// Order::computed_key() is declared in ALL THREE of define_keys(),
+// define_scan_fields(), and define_cached_fields() at once (see
 // tests/test_types.h), so a single update() that changes what it returns
-// must reconcile all three indexes together, not just the one family most
-// tests happen to exercise.
-TEST(updating_a_field_declared_in_all_three_lookup_families_reconciles_key_scan_and_cached_together) {
+// must reconcile the key index AND the cached-field index together --
+// find_by_field always takes the cache-hit branch for a field declared in
+// both, so that's the only branch observable here (the scan-fallback
+// branch's "always reflects the live value" behavior is generic and already
+// covered via qty_scan elsewhere, not unique to computed_key).
+TEST(updating_a_field_declared_in_multiple_lookup_families_reconciles_key_and_cache_together) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o = make_order(m, "OLD", a);  // computed_key() == "ord:OLD"
 
     Snapshot s = m.snapshot();
     CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:OLD"), s.find(o));
-    CHECK_EQ(s.find_by_scan_field<&Order::computed_key>("ord:OLD").size(), std::size_t{1});
-    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:OLD").size(), std::size_t{1});
+    CHECK_EQ(s.find_by_field<&Order::computed_key>("ord:OLD").size(), std::size_t{1});
 
     update_field(m, o, [](Order* p) { p->code = "NEW"; });  // computed_key() now "ord:NEW"
 
     s = m.snapshot();
     CHECK(s.find_by_key<&Order::computed_key>("ord:OLD") == nullptr);
-    CHECK(s.find_by_scan_field<&Order::computed_key>("ord:OLD").empty());
-    CHECK(s.find_by_cached_field<&Order::computed_key>("ord:OLD").empty());
+    CHECK(s.find_by_field<&Order::computed_key>("ord:OLD").empty());
 
     CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:NEW"), s.find(o));
-    CHECK_EQ(s.find_by_scan_field<&Order::computed_key>("ord:NEW").size(), std::size_t{1});
-    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:NEW").size(), std::size_t{1});
+    CHECK_EQ(s.find_by_field<&Order::computed_key>("ord:NEW").size(), std::size_t{1});
 }
 
 // Same undo-log discipline as veto_rollback_restores_the_field_key_index
@@ -540,15 +565,14 @@ TEST(veto_rollback_restores_a_field_declared_in_multiple_lookup_families_simulta
     CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:OLD"), s.find(o));
     CHECK(s.find_by_key<&Order::computed_key>("ord:NEW") == nullptr);
 
-    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:OLD").size(), std::size_t{1});
-    CHECK(s.find_by_cached_field<&Order::computed_key>("ord:NEW").empty());
+    CHECK_EQ(s.find_by_field<&Order::computed_key>("ord:OLD").size(), std::size_t{1});
+    CHECK(s.find_by_field<&Order::computed_key>("ord:NEW").empty());
 }
 
 // A cascade-deleted object must drop out of every lookup family it
-// participates in AT ONCE -- find_by_key, find_by_scan_field, and
-// find_by_cached_field on computed_key (all three families), plus the
-// scan/cached families on qty -- not just whichever one a narrower test
-// happens to check.
+// participates in AT ONCE -- find_by_key and find_by_field (cache-hit
+// branch) on computed_key, plus find_by_field (cache-hit branch) on qty --
+// not just whichever one a narrower test happens to check.
 TEST(cascade_delete_removes_an_object_from_every_lookup_family_it_participates_in_at_once) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -556,27 +580,23 @@ TEST(cascade_delete_removes_an_object_from_every_lookup_family_it_participates_i
 
     Snapshot s = m.snapshot();
     CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:O1"), s.find(o));
-    CHECK_EQ(s.find_by_scan_field<&Order::computed_key>("ord:O1").size(), std::size_t{1});
-    CHECK_EQ(s.find_by_scan_field<&Order::qty>(5).size(), std::size_t{1});
-    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:O1").size(), std::size_t{1});
-    CHECK_EQ(s.find_by_cached_field<&Order::qty>(5).size(), std::size_t{1});
+    CHECK_EQ(s.find_by_field<&Order::computed_key>("ord:O1").size(), std::size_t{1});
+    CHECK_EQ(s.find_by_field<&Order::qty>(5).size(), std::size_t{1});
 
     remove_and_commit(m, a);  // Order::account is a non-nullable Ref<Account> -- cascades, kills o
 
     s = m.snapshot();
     CHECK(s.find(o) == nullptr);
     CHECK(s.find_by_key<&Order::computed_key>("ord:O1") == nullptr);
-    CHECK(s.find_by_scan_field<&Order::computed_key>("ord:O1").empty());
-    CHECK(s.find_by_scan_field<&Order::qty>(5).empty());
-    CHECK(s.find_by_cached_field<&Order::computed_key>("ord:O1").empty());
-    CHECK(s.find_by_cached_field<&Order::qty>(5).empty());
+    CHECK(s.find_by_field<&Order::computed_key>("ord:O1").empty());
+    CHECK(s.find_by_field<&Order::qty>(5).empty());
 }
 
-// The one hole in an otherwise-complete family: for_each_view_by_scan_field
-// and every OTHER view/all_of variant on cached/scan fields are covered
-// elsewhere in this file -- this is for_each_view_by_cached_field itself,
-// visiting every match (never stopping early) with each one bound to `s`.
-TEST(for_each_view_by_cached_field_visits_every_match_and_binds_views_to_this_snapshot) {
+// The one hole in an otherwise-complete family: for_each_view_by_field on
+// the cache-hit branch -- every OTHER view/all_of variant on cache/scan
+// fields is covered elsewhere in this file -- visiting every match (never
+// stopping early) with each one bound to `s`.
+TEST(for_each_view_by_field_visits_every_match_and_binds_views_to_this_snapshot_via_cache) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, {}, 5);
@@ -585,22 +605,22 @@ TEST(for_each_view_by_cached_field_visits_every_match_and_binds_views_to_this_sn
     Snapshot s = m.snapshot();
 
     int hits = 0;
-    s.for_each_view_by_cached_field<&Order::qty>(5, [&](View<Order> v) {
+    s.for_each_view_by_field<&Order::qty>(5, [&](View<Order> v) {
         CHECK_EQ(v->qty, std::int64_t{5});
         CHECK_EQ(v[&Order::account]->name, std::string("A1"));
         ++hits;
     });
     CHECK_EQ(hits, 2);
 
-    // An undeclared value and a value with no matches both visit nobody.
+    // A value with no matches visits nobody.
     int no_hits = 0;
-    s.for_each_view_by_cached_field<&Order::qty>(99, [&](View<Order>) { ++no_hits; });
+    s.for_each_view_by_field<&Order::qty>(99, [&](View<Order>) { ++no_hits; });
     CHECK_EQ(no_hits, 0);
 
-    // Delegates to for_each_by_cached_field, so it records a lookup exactly
-    // like every other entry point in this family.
+    // Delegates to for_each_by_field, so it records a lookup exactly like
+    // every other entry point in this family.
     const LookupCounts before = m.lookup_stats<&Order::qty>();
-    s.for_each_view_by_cached_field<&Order::qty>(7, [](View<Order>) {});
+    s.for_each_view_by_field<&Order::qty>(7, [](View<Order>) {});
     CHECK_EQ(m.lookup_stats<&Order::qty>().cached_calls, before.cached_calls + 1);
 }
 

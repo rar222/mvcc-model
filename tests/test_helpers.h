@@ -182,6 +182,14 @@ public:
     model::Ref<Account> owner;
     model::Opt<Record> related;
 
+    /// Scan-only twin of owner (see Order::qty_scan in test_types.h for the
+    /// same pattern) -- Opt<>, not Ref<>, so leaving it unset (as every
+    /// caller that doesn't care about it does) is never a validation error.
+    /// Exists so find_referrers's scan-fallback branch can be exercised on
+    /// Record concurrently, now that owner itself is cache-declared and
+    /// find_referrers on it always takes the cache-hit branch.
+    model::Opt<Account> owner_scan;
+
     /// Diagnostic only -- see example::Account::to_string()'s doc comment
     /// for why `id` comes first and owner/related print as raw index:gen
     /// instead of being resolved.
@@ -198,6 +206,7 @@ public:
     static void define_references(Self& s, V&& v) {
         v(model::field_tag<&Record::owner>(), "owner", s.owner);
         v(model::field_tag<&Record::related>(), "related", s.related);
+        v(model::field_tag<&Record::owner_scan>(), "owner_scan", s.owner_scan);
     }
 
     template <class Self>

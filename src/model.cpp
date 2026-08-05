@@ -230,10 +230,10 @@ struct Snapshot::Lease {
 // Needs Lease complete (the `lease_->m` access) -- see model.h's forward
 // declaration of Lease and this function's own doc comment there. `lease_`
 // is null only for a default-constructed Snapshot, which none of this
-// method's four callers (find_by_scan_field/find_by_cached_field/
-// for_each_referrers/find_cached_referrers) can reach without also failing
-// their own `!root_` check first -- but checking here too costs nothing and
-// doesn't rely on call-site discipline to stay safe.
+// method's callers (find_by_field/for_each_referrers, and their siblings)
+// can reach without also failing their own `!root_` check first -- but
+// checking here too costs nothing and doesn't rely on call-site discipline
+// to stay safe.
 void Snapshot::register_field_lookup(const std::type_info& type, const void* field,
                                    bool cached) const {
     if (lease_) lease_->m->register_field_lookup(type, field, cached);

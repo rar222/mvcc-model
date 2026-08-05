@@ -1263,9 +1263,9 @@ TEST(speed_set_and_contains_grow_like_log_n_not_linear) {
 // an explicit (stack_, chain_) state machine (TrieCore::iterator::advance)
 // on every single ++ -- real per-step bookkeeping the recursive form never
 // pays. Both sides run to completion, summing every entry -- the "never
-// stop early" shape model.h's for_each_by_scan_field/for_each_referrers/
-// for_each_cached_referrers all use (see their own doc comments), i.e. the
-// case those call sites would actually pay if converted to range-for.
+// stop early" shape model.h's for_each_by_field/for_each_referrers both use
+// (see their own doc comments), i.e. the case those call sites would
+// actually pay if converted to range-for.
 TEST(speed_callback_vs_range_for_full_scan) {
     using PSet = PersistentSet<std::uint64_t, PerfectU64Hash>;
     const int n = scaled_n(500000);

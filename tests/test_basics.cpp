@@ -526,7 +526,7 @@ TEST(find_raw_is_generation_checked_and_null_for_absent_or_stale_ids) {
     CHECK(saw_order);
 }
 
-// all_of<T> is the primitive every all_of_by_scan_field/all_of_referrers/
+// all_of<T> is the primitive every all_of_by_field/all_of_referrers/
 // etc. is built on -- checked directly here for its own documented
 // contract: `f` returning false actually stops the underlying by_type walk
 // (not just further calls to f), and the return value reports whether the

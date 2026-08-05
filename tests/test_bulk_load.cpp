@@ -438,10 +438,11 @@ TEST(cascade_delete_works_correctly_on_bulk_loaded_data) {
 // Root::by_cached_field/by_cached_reference identically to the ordinary
 // apply_create path -- otherwise a bulk-loaded model would look normal for
 // find_by_key/cascade but silently have empty cached indexes. This checks
-// every lookup family (key, scan, cached-field, cached-referrer) against
-// bulk-loaded data, then confirms a cascade over that same data empties the
-// buckets cleanly (no tombstones), exactly like the Transaction-built
-// equivalent in test_views.cpp.
+// every lookup family (key, find_by_field's cache-hit AND scan-fallback
+// branches via qty/qty_scan, cached-referrer) against bulk-loaded data,
+// then confirms a cascade over that same data empties the buckets cleanly
+// (no tombstones), exactly like the Transaction-built equivalent in
+// test_views.cpp.
 TEST(commit_bulk_without_undo_populates_cached_field_scan_field_and_cached_referrer_indexes) {
     Model m;
     BulkTransaction t = m.begin_bulk();
@@ -453,52 +454,58 @@ TEST(commit_bulk_without_undo_populates_cached_field_scan_field_and_cached_refer
     o1->code = "O1";
     o1->account = a;
     o1->qty = 5;
+    o1->qty_scan = 5;  // scan-only twin, see Order's own comment in test_types.h
     const Ref<Order> ord1 = t.create(std::move(o1));
 
     auto o2 = std::make_unique<Order>();
     o2->code = "O2";
     o2->account = a;
     o2->qty = 5;
+    o2->qty_scan = 5;
     t.create(std::move(o2));
 
     auto o3 = std::make_unique<Order>();
     o3->code = "O3";
     o3->account = a;
     o3->qty = 7;
+    o3->qty_scan = 7;
     o3->parent = ord1;  // Opt<Order>::parent is deliberately NOT cached -- see Order's own comment
     t.create(std::move(o3));
 
     const CommitResult r = m.commit_bulk_without_undo(t);
     CHECK(r.status == CommitStatus::Committed);
     const Ref<Account> real_a = r.to_real(a);
+    const Ref<Order> real_ord1 = r.to_real(ord1);
 
     Snapshot s = m.snapshot();
     CHECK(s.find_by_key<&Account::name>("A1") != nullptr);
     CHECK(s.find_by_key<&Order::computed_key>("ord:O1") != nullptr);
 
-    CHECK_EQ(s.find_by_scan_field<&Order::qty>(5).size(), std::size_t{2});
-    CHECK_EQ(s.find_by_scan_field<&Order::qty>(7).size(), std::size_t{1});
+    // Scan-fallback branch (qty_scan is scan-only).
+    CHECK_EQ(s.find_by_field<&Order::qty_scan>(5).size(), std::size_t{2});
+    CHECK_EQ(s.find_by_field<&Order::qty_scan>(7).size(), std::size_t{1});
 
-    CHECK_EQ(s.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
-    CHECK_EQ(s.find_by_cached_field<&Order::qty>(7).size(), std::size_t{1});
-    CHECK_EQ(s.find_by_cached_field<&Order::computed_key>("ord:O1").size(), std::size_t{1});
+    // Cache-hit branch (qty/computed_key are cache-declared).
+    CHECK_EQ(s.find_by_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(s.find_by_field<&Order::qty>(7).size(), std::size_t{1});
+    CHECK_EQ(s.find_by_field<&Order::computed_key>("ord:O1").size(), std::size_t{1});
 
-    CHECK_EQ(s.find_cached_referrers<&Order::account>(real_a).size(), std::size_t{3});
-    // account is cached, parent is not -- find_referrers (the uncached scan)
-    // still finds the parent edge, but find_cached_referrers must not.
+    // account is cached, parent is not -- find_referrers resolves account
+    // via the index and parent via the scan fallback, both correctly.
     CHECK_EQ(s.find_referrers<&Order::account>(real_a).size(), std::size_t{3});
+    CHECK_EQ(s.find_referrers<&Order::parent>(real_ord1).size(), std::size_t{1});
 
     // Removing the hub cascades through the non-nullable account edges,
     // taking every Order down with it -- and every bucket above must end up
     // empty, not holding a stale entry for a now-dead id.
     remove_and_commit(m, real_a);
     Snapshot after = m.snapshot();
-    CHECK(after.find_by_scan_field<&Order::qty>(5).empty());
-    CHECK(after.find_by_scan_field<&Order::qty>(7).empty());
-    CHECK(after.find_by_cached_field<&Order::qty>(5).empty());
-    CHECK(after.find_by_cached_field<&Order::qty>(7).empty());
-    CHECK(after.find_by_cached_field<&Order::computed_key>("ord:O1").empty());
-    CHECK(after.find_cached_referrers<&Order::account>(real_a).empty());
+    CHECK(after.find_by_field<&Order::qty_scan>(5).empty());
+    CHECK(after.find_by_field<&Order::qty_scan>(7).empty());
+    CHECK(after.find_by_field<&Order::qty>(5).empty());
+    CHECK(after.find_by_field<&Order::qty>(7).empty());
+    CHECK(after.find_by_field<&Order::computed_key>("ord:O1").empty());
+    CHECK(after.find_referrers<&Order::account>(real_a).empty());
 }
 
 // commit_bulk_without_undo() is documented to skip PreCommitFn/

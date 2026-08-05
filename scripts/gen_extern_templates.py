@@ -65,7 +65,7 @@ This script only has full coverage of model.h's entry points if every
 function templated on JUST `<class T>` or `<auto Field>` (no `Pred`/`F`
 functor parameter -- those are excluded on purpose, see render_entries()'s
 docstring) is present in render_entries() below, AND every class template
-one of those functions hands back (ScanFieldRange<Field>,
+one of those functions hands back (FieldRange<Field>,
 CachedBucketRange<ClassT>, ReferrerRange<Field>, and their View siblings)
 has its own `extern template class ...;` line too -- covering the
 FUNCTION that returns a range is not enough; the range's own
@@ -80,7 +80,7 @@ in this repo" for when this check is required, not just suggested):
     # Build extern_template_demo, then ask its own object file what it
     # actually had to define for itself. Filter on nm's type column, not on
     # NAME: a Range<Field> leak's demangled name always embeds the concrete
-    # type as part of Field (e.g. "Snapshot::ScanFieldRange<&example::
+    # type as part of Field (e.g. "Snapshot::FieldRange<&example::
     # Account::name>::..."), so excluding lines that mention "example::"
     # would silently hide exactly the gap this check exists to catch --
     # tried that, don't. `u` alongside `W`/`V` catches GNU_UNIQUE too: the
@@ -116,7 +116,7 @@ in this repo" for when this check is required, not just suggested):
     # model::pmap::detail::TrieCore<Id, Id, IdHash, IdentityKeyOf<Id>>
     # (PersistentSet<Id, IdHash>'s implementation) -- NOT out of scope
     # because it's "a different header's templates" in some vague sense,
-    # but for a sharper reason: unlike ScanFieldRange<Field> and friends,
+    # but for a sharper reason: unlike FieldRange<Field> and friends,
     # this one is never parameterized on the user type T at all -- every
     # Snapshot-side range walks Ids through the exact same
     # PersistentSet<Id, IdHash>, regardless of whether the objects being
@@ -138,7 +138,7 @@ in this repo" for when this check is required, not just suggested):
     # member, since it's easy to add the function and forget the class --
     # that's proof it (or its underlying class template) needs a
     # render_entries() line: a class needs its own
-    # `extern template class Snapshot::ScanFieldRange<...>;`-style line,
+    # `extern template class Snapshot::FieldRange<...>;`-style line,
     # alongside the function's own `extern template ...` line, not instead
     # of it.
     #
@@ -190,13 +190,12 @@ in this repo" for when this check is required, not just suggested):
         build/default/CMakeFiles/extern_template_demo.dir/generated/types_extern.cpp.o \\
       | grep 'model::Snapshot::.*Range<' | wc -l
 
-    # Expected output: some large non-zero count -- 187 right now, across
-    # both Account and Order's six range/view-range families, now that the
-    # `extern template class Snapshot::ScanFieldRange<...>;`-style lines in
-    # render_entries() exist. That 187 is only true as of THIS fix, and
-    # will keep drifting as types.h grows more scan/cached/ref fields --
-    # don't treat the number itself as the thing to check. Before this fix
-    # (i.e. if render_entries() only covered the range_by_scan_field-style
+    # Expected output: some large non-zero count -- across both Account and
+    # Order's range/view-range families, now that the `extern template class
+    # Snapshot::FieldRange<...>;`-style lines in render_entries() exist. The
+    # exact count will keep drifting as types.h grows more scan/cached/ref
+    # fields -- don't treat the number itself as the thing to check. Before
+    # this fix (i.e. if render_entries() only covered the range_by_field-style
     # FUNCTIONS and not the range CLASSES they return), this same command
     # would have read 0: the class templates would never have been
     # explicitly instantiated anywhere, only implicitly (and invisibly to
@@ -240,7 +239,6 @@ class TypeInfo:
     scan_fields: List[str] = field(default_factory=list)
     cached_fields: List[str] = field(default_factory=list)
     ref_fields: List[Tuple[str, str, str]] = field(default_factory=list)  # (field, Ref|Opt, target_type)
-    cached_ref_fields: set = field(default_factory=set)
 
 
 def find_matching_brace(text: str, open_idx: int) -> int:
@@ -309,7 +307,6 @@ def parse_type(name: str, class_body: str, warn) -> TypeInfo:
     info.scan_fields = field_names('define_scan_fields', r'key')
     info.cached_fields = field_names('define_cached_fields', r'key')
     ref_field_names = field_names('define_references', r'field_tag')
-    info.cached_ref_fields = set(field_names('define_cached_references', r'index'))
 
     for fname in ref_field_names:
         decl_type = info.member_types.get(fname)
@@ -389,56 +386,51 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
             arg = f'const {t.member_types[fname]}&'
             out.append(f'extern template const {T}* Snapshot::find_by_key<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template std::optional<View<{T}>> Snapshot::view_by_key<&{T}::{fname}>({arg}) const;')
-        for fname in t.scan_fields:
+        # find_by_field/view_by_field/range_by_field are the single merged
+        # entry point for a field declared via define_scan_fields() and/or
+        # define_cached_fields() (cache-first, scan fallback -- see model.h's
+        # Object<Derived> class comment). One extern-template row per field
+        # regardless of which of the two (or both) declared it -- scan_fields
+        # | cached_fields, deduped, so a field in both isn't emitted twice.
+        for fname in dict.fromkeys(list(t.scan_fields) + list(t.cached_fields)):
             arg = f'const {t.member_types[fname]}&'
-            out.append(f'extern template std::vector<const {T}*> Snapshot::find_by_scan_field<&{T}::{fname}>({arg}) const;')
-            out.append(f'extern template std::vector<View<{T}>> Snapshot::view_by_scan_field<&{T}::{fname}>({arg}) const;')
-            out.append(f'extern template Snapshot::ScanFieldRange<&{T}::{fname}> Snapshot::range_by_scan_field<&{T}::{fname}>({arg}) const;')
-            out.append(f'extern template Snapshot::ScanFieldViewRange<&{T}::{fname}> Snapshot::range_view_by_scan_field<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template std::vector<const {T}*> Snapshot::find_by_field<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template std::vector<View<{T}>> Snapshot::view_by_field<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template Snapshot::FieldRange<&{T}::{fname}> Snapshot::range_by_field<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template Snapshot::FieldViewRange<&{T}::{fname}> Snapshot::range_view_by_field<&{T}::{fname}>({arg}) const;')
             # Class-template instantiations, not just the function that hands
             # one back: without these, begin()/end()/iterator::operator++ etc.
             # get implicitly (weakly) re-instantiated in every TU that
             # range-for's the result -- invisible to a source-level grep for
-            # "does render_entries() mention range_by_scan_field", only
-            # visible by inspecting compiled objects (nm -C --defined-only,
-            # look for a defined 'W'/'V' symbol under this class in a caller
-            # TU instead of types_extern.cpp.o). See this file's docstring.
-            out.append(f'extern template class Snapshot::ScanFieldRange<&{T}::{fname}>;')
-            out.append(f'extern template class Snapshot::ScanFieldViewRange<&{T}::{fname}>;')
-        for fname in t.cached_fields:
-            arg = f'const {t.member_types[fname]}&'
-            out.append(f'extern template std::vector<const {T}*> Snapshot::find_by_cached_field<&{T}::{fname}>({arg}) const;')
-            out.append(f'extern template std::vector<View<{T}>> Snapshot::view_by_cached_field<&{T}::{fname}>({arg}) const;')
-            out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range_by_cached_field<&{T}::{fname}>({arg}) const;')
-            out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view_by_cached_field<&{T}::{fname}>({arg}) const;')
-            # CachedBucketRange<T>/CachedBucketViewRange<T> class instantiation
-            # itself is emitted once, type-uniformly, alongside range<T>/
-            # range_view<T> below -- ClassT is just T here, same specialization
-            # range_cached_referrers and range()/range_view() also return, so
-            # instantiating it again per-field would be a duplicate explicit
-            # instantiation (an error in --mode source).
+            # "does render_entries() mention range_by_field", only visible by
+            # inspecting compiled objects (nm -C --defined-only, look for a
+            # defined 'W'/'V' symbol under this class in a caller TU instead
+            # of types_extern.cpp.o). See this file's docstring.
+            out.append(f'extern template class Snapshot::FieldRange<&{T}::{fname}>;')
+            out.append(f'extern template class Snapshot::FieldViewRange<&{T}::{fname}>;')
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
+            # find_referrers/view_referrers/range_referrers are the single
+            # merged entry point for any Ref<>/Opt<> field (cache-first via
+            # define_cached_references() when declared, scan fallback
+            # otherwise) -- one row regardless of whether this field is also
+            # in define_cached_references(), so unlike the by-field loop
+            # above there's no separate cached-fields list to fold in here.
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template Snapshot::ReferrerRange<&{T}::{fname}> Snapshot::range_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template Snapshot::ReferrerViewRange<&{T}::{fname}> Snapshot::range_view_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template class Snapshot::ReferrerRange<&{T}::{fname}>;')
             out.append(f'extern template class Snapshot::ReferrerViewRange<&{T}::{fname}>;')
-            if fname in t.cached_ref_fields:
-                out.append(f'extern template std::vector<const {T}*> Snapshot::find_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
-                out.append(f'extern template std::vector<View<{T}>> Snapshot::view_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
-                out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
-                out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view_cached_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
         out.append(f'extern template View<{T}> Snapshot::view<{T}>(const {T}&) const noexcept;')
         out.append(f'extern template std::optional<View<{T}>> Snapshot::view<{T}>(Ref<{T}>) const;')
         out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range<{T}>() const;')
         out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view<{T}>() const;')
         # One instantiation each covers every use of CachedBucketRange<T>/
-        # CachedBucketViewRange<T> for this T: range_by_cached_field,
-        # range_cached_referrers, and range()/range_view() above all return
-        # this same specialization (ClassT is always T, never the field's
-        # own type).
+        # CachedBucketViewRange<T> for this T: range()/range_view() above are
+        # the only callers now that range_by_field/range_referrers return
+        # their own FieldRange<Field>/ReferrerRange<Field> instead (emitted
+        # per-field above, not here).
         out.append(f'extern template class Snapshot::CachedBucketRange<{T}>;')
         out.append(f'extern template class Snapshot::CachedBucketViewRange<{T}>;')
         out.append('')

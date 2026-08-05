@@ -1,14 +1,13 @@
-// Timing comparison for the two bucket-backed lookup families
-// (by_cached_field, by_cached_reference) across every access form that
-// exists for them:
+// Timing comparison for find_by_field/find_referrers's cache-hit branch
+// (backed by the two bucket-backed indexes, by_cached_field and
+// by_cached_reference) across every access form that exists for it:
 //
-//   range_by_cached_field / range_cached_referrers   -- range-based for
-//   for_each_by_cached_field / for_each_cached_referrers -- callback, never
-//     stops early
-//   all_of_by_cached_field / all_of_cached_referrers, STOP AFTER THE FIRST
-//     MATCH -- pred returns false immediately
-//   all_of_by_cached_field / all_of_cached_referrers, VISIT EVERY MATCH --
-//     pred always returns true, so it never actually short-circuits
+//   range_by_field / range_referrers   -- range-based for
+//   for_each_by_field / for_each_referrers -- callback, never stops early
+//   all_of_by_field / all_of_referrers, STOP AFTER THE FIRST MATCH -- pred
+//     returns false immediately
+//   all_of_by_field / all_of_referrers, VISIT EVERY MATCH -- pred always
+//     returns true, so it never actually short-circuits
 //
 // Two distinct object types exercise the two distinct lookup families:
 // Widget (a plain cached VALUE field, Root::by_cached_field) and Gadget (a
@@ -51,8 +50,8 @@ public:
     std::string name;
 };
 
-// Exercises range_by_cached_field / for_each_by_cached_field / all_of_by_
-// cached_field: category is a low-cardinality VALUE field, indexed via
+// Exercises range_by_field / for_each_by_field / all_of_by_field's cache-hit
+// branch: category is a low-cardinality VALUE field, indexed via
 // define_cached_fields().
 class Widget final : public Object<Widget> {
 public:
@@ -65,8 +64,8 @@ public:
     }
 };
 
-// Exercises range_cached_referrers / for_each_cached_referrers / all_of_
-// cached_referrers: bucket is a Ref<Bucket>, indexed via define_cached_
+// Exercises range_referrers / for_each_referrers / all_of_referrers's
+// cache-hit branch: bucket is a Ref<Bucket>, indexed via define_cached_
 // references().
 class Gadget final : public Object<Gadget> {
 public:
@@ -146,13 +145,13 @@ FieldResult bench_by_cached_field(int n) {
     constexpr std::int64_t target = 0;
 
     std::size_t matches = 0;
-    s.for_each_by_cached_field<&Widget::category>(target, [&](const Widget&) { ++matches; });
+    s.for_each_by_field<&Widget::category>(target, [&](const Widget&) { ++matches; });
 
     volatile std::int64_t sink = 0;
 
     const double range_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        for (const Widget& w : s.range_by_cached_field<&Widget::category>(target)) total += w.payload;
+        for (const Widget& w : s.range_by_field<&Widget::category>(target)) total += w.payload;
         sink = total;
     });
     // `break` on the very first entry: a range-for's own way of stopping the
@@ -162,7 +161,7 @@ FieldResult bench_by_cached_field(int n) {
     // range-for loop, not a different API entry point.
     const double range_stop_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        for (const Widget& w : s.range_by_cached_field<&Widget::category>(target)) {
+        for (const Widget& w : s.range_by_field<&Widget::category>(target)) {
             total += w.payload;
             break;
         }
@@ -170,13 +169,13 @@ FieldResult bench_by_cached_field(int n) {
     });
     const double for_each_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        s.for_each_by_cached_field<&Widget::category>(target,
-                                                       [&](const Widget& w) { total += w.payload; });
+        s.for_each_by_field<&Widget::category>(target,
+                                                [&](const Widget& w) { total += w.payload; });
         sink = total;
     });
     const double all_of_stop_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        s.all_of_by_cached_field<&Widget::category>(target, [&](const Widget& w) {
+        s.all_of_by_field<&Widget::category>(target, [&](const Widget& w) {
             total += w.payload;
             return false;  // stop after the first match
         });
@@ -184,7 +183,7 @@ FieldResult bench_by_cached_field(int n) {
     });
     const double all_of_all_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        s.all_of_by_cached_field<&Widget::category>(target, [&](const Widget& w) {
+        s.all_of_by_field<&Widget::category>(target, [&](const Widget& w) {
             total += w.payload;
             return true;  // never stops -- visits every match, same as for_each/range
         });
@@ -235,18 +234,18 @@ FieldResult bench_cached_referrers(int n) {
     const Ref<Bucket> target = fx.buckets[0];
 
     std::size_t matches = 0;
-    s.for_each_cached_referrers<&Gadget::bucket>(target, [&](const Gadget&) { ++matches; });
+    s.for_each_referrers<&Gadget::bucket>(target, [&](const Gadget&) { ++matches; });
 
     volatile std::int64_t sink = 0;
 
     const double range_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        for (const Gadget& g : s.range_cached_referrers<&Gadget::bucket>(target)) total += g.payload;
+        for (const Gadget& g : s.range_referrers<&Gadget::bucket>(target)) total += g.payload;
         sink = total;
     });
     const double range_stop_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        for (const Gadget& g : s.range_cached_referrers<&Gadget::bucket>(target)) {
+        for (const Gadget& g : s.range_referrers<&Gadget::bucket>(target)) {
             total += g.payload;
             break;
         }
@@ -254,13 +253,13 @@ FieldResult bench_cached_referrers(int n) {
     });
     const double for_each_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        s.for_each_cached_referrers<&Gadget::bucket>(target,
-                                                      [&](const Gadget& g) { total += g.payload; });
+        s.for_each_referrers<&Gadget::bucket>(target,
+                                              [&](const Gadget& g) { total += g.payload; });
         sink = total;
     });
     const double all_of_stop_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        s.all_of_cached_referrers<&Gadget::bucket>(target, [&](const Gadget& g) {
+        s.all_of_referrers<&Gadget::bucket>(target, [&](const Gadget& g) {
             total += g.payload;
             return false;  // stop after the first match
         });
@@ -268,7 +267,7 @@ FieldResult bench_cached_referrers(int n) {
     });
     const double all_of_all_us = best_of_us(kTrials, [&] {
         std::int64_t total = 0;
-        s.all_of_cached_referrers<&Gadget::bucket>(target, [&](const Gadget& g) {
+        s.all_of_referrers<&Gadget::bucket>(target, [&](const Gadget& g) {
             total += g.payload;
             return true;  // never stops -- visits every match, same as for_each/range
         });

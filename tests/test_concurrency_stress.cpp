@@ -287,6 +287,7 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
             r->value = i + j;
             r->flag = (i + j) % 2 == 0;
             r->owner = accounts[(i + j) % accounts.size()];
+            r->owner_scan = r->owner;
             local.push_back(txn.create(std::move(r)));
         }
         const CommitResult res = commit_ok(m, txn);
@@ -308,10 +309,11 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
 
     // Readers scan every Record (both ref fields must always resolve/never
     // crash) AND cross-check the two "who points at this Account?" answers
-    // against a fixed target -- the O(#Records) scan (find_referrers) and
-    // the O(log n + matches) index (find_cached_referrers) -- against the
-    // SAME frozen Snapshot, so they must agree exactly even while other
-    // threads race concurrent commits underneath.
+    // against a fixed target -- find_referrers's O(log n + matches) cache-hit
+    // branch on owner, and its O(#Records) scan-fallback branch on owner's
+    // scan-only twin owner_scan (kept equal to owner by every writer below)
+    // -- against the SAME frozen Snapshot, so they must agree exactly even
+    // while other threads race concurrent commits underneath.
     auto reader = [&] {
         bool signaled = false;
         while (!stop.load(std::memory_order_relaxed)) {
@@ -328,8 +330,8 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
                 (void)s.resolve(r.related);  // nullable: null or a live Record, never UB
             });
 
-            auto scan = s.find_referrers<&Record::owner>(accounts[0]);
-            auto idx = s.find_cached_referrers<&Record::owner>(accounts[0]);
+            auto scan = s.find_referrers<&Record::owner_scan>(accounts[0]);
+            auto idx = s.find_referrers<&Record::owner>(accounts[0]);
             std::sort(scan.begin(), scan.end());
             std::sort(idx.begin(), idx.end());
             CHECK(scan == idx);
@@ -354,6 +356,7 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
                 r->value = static_cast<std::int64_t>(rng() % 1000);
                 r->flag = (rng() % 2) == 0;
                 r->owner = accounts[rng() % accounts.size()];
+                r->owner_scan = r->owner;
                 if (rng() % 3 == 0) {
                     if (const Ref<Record> rel = pick_live(txn, records, rng)) r->related = rel;
                 }
@@ -363,6 +366,7 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
                     r->value = static_cast<std::int64_t>(rng() % 1000);
                     r->flag = !r->flag;
                     r->owner = accounts[rng() % accounts.size()];
+                    r->owner_scan = r->owner;
                     if (rng() % 4 == 0)
                         r->related.reset();
                     else if (const Ref<Record> rel = pick_live(txn, records, rng))
@@ -397,8 +401,8 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
     final_s.for_each<Record>(
         [&](const Record& r) { CHECK(final_s.resolve(r.owner).id == r.owner.raw()); });
     for (const Ref<Account>& a : accounts) {
-        auto scan = final_s.find_referrers<&Record::owner>(a);
-        auto idx = final_s.find_cached_referrers<&Record::owner>(a);
+        auto scan = final_s.find_referrers<&Record::owner_scan>(a);
+        auto idx = final_s.find_referrers<&Record::owner>(a);
         std::sort(scan.begin(), scan.end());
         std::sort(idx.begin(), idx.end());
         CHECK(scan == idx);

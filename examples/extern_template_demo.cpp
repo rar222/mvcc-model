@@ -59,7 +59,9 @@ int main() {
     if (Order* o = txn.update(ord)) {
         o->code = "O1";
         o->account = acct;
+        o->account_scan = acct;
         o->qty = 5;
+        o->qty_scan = 5;
     }
 
     assert(txn.exists(acct));
@@ -83,21 +85,28 @@ int main() {
 
     assert(s.find_by_key<&Account::name>("Widgets Inc") == &a2);
     assert(s.view_by_key<&Account::name>("Widgets Inc"));
-    assert(s.find_by_scan_field<&Account::name>("Widgets Inc").size() == 1);
-    assert(s.view_by_scan_field<&Account::name>("Widgets Inc").size() == 1);
+    // Account::name is scan-only (define_scan_fields(), not define_cached_
+    // fields()) -- exercises find_by_field's scan-fallback branch.
+    assert(s.find_by_field<&Account::name>("Widgets Inc").size() == 1);
+    assert(s.view_by_field<&Account::name>("Widgets Inc").size() == 1);
 
     assert(s.find_by_key<&Order::computed_key>("ord:O1") == o2);
     assert(s.view_by_key<&Order::computed_key>("ord:O1"));
-    assert(s.find_by_scan_field<&Order::qty>(5).size() == 1);
-    assert(s.find_by_scan_field<&Order::computed_key>("ord:O1").size() == 1);
-    assert(s.view_by_scan_field<&Order::qty>(5).size() == 1);
-    assert(s.find_by_cached_field<&Order::qty>(5).size() == 1);
-    assert(s.find_by_cached_field<&Order::computed_key>("ord:O1").size() == 1);
-    assert(s.view_by_cached_field<&Order::qty>(5).size() == 1);
+    // Order::qty/computed_key are declared in BOTH define_scan_fields() and
+    // define_cached_fields() -- exercises find_by_field's cache-hit branch
+    // (the index always wins when the field is declared cached).
+    assert(s.find_by_field<&Order::qty>(5).size() == 1);
+    assert(s.find_by_field<&Order::computed_key>("ord:O1").size() == 1);
+    assert(s.view_by_field<&Order::qty>(5).size() == 1);
+    // Order::qty_scan/account_scan are scan-only twins of qty/account, kept
+    // at identical values -- exercises find_by_field/find_referrers' scan-
+    // fallback branch on data shaped just like the cache-hit case above.
+    assert(s.find_by_field<&Order::qty_scan>(5).size() == 1);
+    assert(s.view_by_field<&Order::qty_scan>(5).size() == 1);
     assert(s.find_referrers<&Order::account>(acct).size() == 1);
     assert(s.view_referrers<&Order::account>(acct).size() == 1);
-    assert(s.find_cached_referrers<&Order::account>(acct).size() == 1);
-    assert(s.view_cached_referrers<&Order::account>(acct).size() == 1);
+    assert(s.find_referrers<&Order::account_scan>(acct).size() == 1);
+    assert(s.view_referrers<&Order::account_scan>(acct).size() == 1);
 
     // range_* siblings: same lookup families, range-for instead of a vector
     // (see types_extern.h's coverage -- these are template<auto Field>/
@@ -105,30 +114,27 @@ int main() {
     // structurally enumerable and belong in the generated extern coverage).
     {
         int n = 0;
-        for (const Account& x : s.range_by_scan_field<&Account::name>("Widgets Inc")) { (void)x; ++n; }
+        for (const Account& x : s.range_by_field<&Account::name>("Widgets Inc")) { (void)x; ++n; }
         assert(n == 1);
         n = 0;
-        for (View<Account> x : s.range_view_by_scan_field<&Account::name>("Widgets Inc")) { (void)x; ++n; }
+        for (View<Account> x : s.range_view_by_field<&Account::name>("Widgets Inc")) { (void)x; ++n; }
         assert(n == 1);
     }
     {
         int n = 0;
-        for (const Order& x : s.range_by_scan_field<&Order::qty>(5)) { (void)x; ++n; }
+        for (const Order& x : s.range_by_field<&Order::qty>(5)) { (void)x; ++n; }
         assert(n == 1);
         n = 0;
-        for (const Order& x : s.range_by_scan_field<&Order::computed_key>("ord:O1")) { (void)x; ++n; }
+        for (const Order& x : s.range_by_field<&Order::computed_key>("ord:O1")) { (void)x; ++n; }
         assert(n == 1);
         n = 0;
-        for (View<Order> x : s.range_view_by_scan_field<&Order::qty>(5)) { (void)x; ++n; }
+        for (View<Order> x : s.range_view_by_field<&Order::qty>(5)) { (void)x; ++n; }
         assert(n == 1);
         n = 0;
-        for (const Order& x : s.range_by_cached_field<&Order::qty>(5)) { (void)x; ++n; }
+        for (const Order& x : s.range_by_field<&Order::qty_scan>(5)) { (void)x; ++n; }
         assert(n == 1);
         n = 0;
-        for (const Order& x : s.range_by_cached_field<&Order::computed_key>("ord:O1")) { (void)x; ++n; }
-        assert(n == 1);
-        n = 0;
-        for (View<Order> x : s.range_view_by_cached_field<&Order::qty>(5)) { (void)x; ++n; }
+        for (View<Order> x : s.range_view_by_field<&Order::qty_scan>(5)) { (void)x; ++n; }
         assert(n == 1);
         n = 0;
         for (const Order& x : s.range_referrers<&Order::account>(acct)) { (void)x; ++n; }
@@ -137,10 +143,10 @@ int main() {
         for (View<Order> x : s.range_view_referrers<&Order::account>(acct)) { (void)x; ++n; }
         assert(n == 1);
         n = 0;
-        for (const Order& x : s.range_cached_referrers<&Order::account>(acct)) { (void)x; ++n; }
+        for (const Order& x : s.range_referrers<&Order::account_scan>(acct)) { (void)x; ++n; }
         assert(n == 1);
         n = 0;
-        for (View<Order> x : s.range_view_cached_referrers<&Order::account>(acct)) { (void)x; ++n; }
+        for (View<Order> x : s.range_view_referrers<&Order::account_scan>(acct)) { (void)x; ++n; }
         assert(n == 1);
     }
     {

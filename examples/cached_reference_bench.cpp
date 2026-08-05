@@ -3,12 +3,12 @@
 //
 // Two types, structurally identical except for ONE declaration:
 //   UncachedItem::bucket -- listed in define_references() only. "Who points
-//     at this Bucket?" (Snapshot::find_referrers) is an O(#items) linear
-//     scan: nothing indexes it.
+//     at this Bucket?" (Snapshot::find_referrers) falls back to an O(#items)
+//     linear scan: nothing indexes it.
 //   CachedItem::bucket -- ALSO listed in define_cached_references().
-//     find_cached_referrers answers the same question in O(log n +
-//     #matches), backed by Root::by_cached_reference -- see DESIGN.md's
-//     "Lookup families" section.
+//     find_referrers answers the same question in O(log n + #matches)
+//     instead, resolving via its cache-hit branch, backed by
+//     Root::by_cached_reference -- see DESIGN.md's "Lookup families" section.
 //
 // That isolates the cache to exactly one axis: everything else (field
 // shapes, cascade rules, transaction sizes) is identical between the two
@@ -185,8 +185,8 @@ void seed_one_type(Fixture& fx, int n_per_type) {
 struct Result {
     int n_per_type;
     std::size_t matches;
-    double scan_us;      // find_referrers: O(#items) linear scan
-    double indexed_us;   // find_cached_referrers: O(log n + matches)
+    double scan_us;      // find_referrers, scan-fallback branch: O(#items) linear scan
+    double indexed_us;   // find_referrers, cache-hit branch: O(log n + matches)
     double uncached_write_us_per_op;  // reassigning UncachedItem::bucket
     double cached_write_us_per_op;    // reassigning CachedItem::bucket (also touches the index)
 };
@@ -219,8 +219,8 @@ Result bench(int n_per_type) {
     const Ref<Bucket> target = fx.buckets[0];
 
     // ---- reads: measured first, against the freshly seeded state --------
-    const auto slow = s.find_referrers<&UncachedItem::bucket>(target);
-    const auto fast = s.find_cached_referrers<&CachedItem::bucket>(target);
+    const auto slow = s.find_referrers<&UncachedItem::bucket>(target);   // scan fallback
+    const auto fast = s.find_referrers<&CachedItem::bucket>(target);     // cache hit
     assert(slow.size() == fast.size());  // correctness rides along, not just speed
     assert(!slow.empty());
 
@@ -229,7 +229,7 @@ Result bench(int n_per_type) {
         assert(!v.empty());
     });
     const double indexed_us = time_us(3000, [&] {
-        auto v = s.find_cached_referrers<&CachedItem::bucket>(target);
+        auto v = s.find_referrers<&CachedItem::bucket>(target);
         assert(!v.empty());
     });
 
@@ -367,7 +367,8 @@ int main() {
 
     std::printf(
         "=== READS: \"every item pointing at this Bucket?\" ===\n"
-        "for_each_referrers's O(#items) scan vs. find_cached_referrers' O(log n + matches).\n\n");
+        "find_referrers's O(#items) scan fallback (UncachedItem) vs. its O(log n + matches)\n"
+        "cache-hit branch (CachedItem).\n\n");
     std::printf("%12s  %10s  %14s  %14s  %10s\n", "items/type", "matches", "scan (us)", "indexed (us)",
                "speedup");
     for (const Result& r : results) {

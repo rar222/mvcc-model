@@ -698,7 +698,7 @@ class TrieCore {
     // default preset, see CMakeLists.txt) this compiles to the exact same
     // code as the walk written out by hand: the `if (!true) return false`
     // this introduces per entry/level folds away entirely. Same trick
-    // model.h's for_each_by_scan_field uses over its own short-circuiting
+    // model.h's for_each_by_field uses over its own short-circuiting
     // sibling (scan_field_short_circuit) -- do not duplicate the traversal
     // itself to "avoid the indirection"; there is nothing at runtime to avoid.
     template <class F>
@@ -715,9 +715,8 @@ class TrieCore {
     // unlike a caller wrapping each_in in a "stop calling f once a flag
     // flips" guard, which still pays for visiting every remaining entry.
     // Needed for a real std::all_of/std::any_of over a trie-backed index
-    // (see model.h's all_of_by_scan_field/all_of_by_cached_field): a
-    // predicate that fails on the very first match should not force a scan
-    // of the other 999,999.
+    // (see model.h's all_of_by_field, both branches): a predicate that fails
+    // on the very first match should not force a scan of the other 999,999.
     template <class F>
     static bool each_in_short_circuit(const Node* n, F& f) {
         if (!n) return true;
@@ -788,8 +787,8 @@ public:
     // = 0, 5, ..., 60) -- see persistent_map_tests.cpp's comment on the
     // "ran out of hash bits" branch being provably unreachable for two
     // distinct keys. A fixed array, not a std::vector, so constructing an
-    // iterator never allocates -- the whole reason for_each_by_scan_field &
-    // co. (model.h) avoid materializing a vector in the first place would be
+    // iterator never allocates -- the whole reason for_each_by_field & co.
+    // (model.h) avoid materializing a vector in the first place would be
     // defeated if the iterator backing a range-for did it anyway.
     static constexpr int kMaxDepth = 13;
 
@@ -927,7 +926,7 @@ public:
     /// detail::TrieCore::each_in) -- NOT insertion order and NOT sorted by
     /// key. Every model.h caller built on this (Root::by_field's iteration,
     /// etc.) inherits that same "unspecified order" contract already stated
-    /// for the model's own find_by_cached_field and friends.
+    /// for the model's own find_by_field and friends.
     template <class F>
     void for_each(F&& f) const {
         core_.each_entry([&](const std::pair<K, V>& e) { f(e.first, e.second); });
@@ -946,8 +945,8 @@ public:
     /// Range-based-for support: `for (auto& [k, v] : m)`. Same trie-layout-
     /// order caveat as for_each above. See detail::TrieCore::iterator for
     /// what backs this -- an external walk, not a materialized vector, so
-    /// (unlike find_by_cached_field/find_referrers & co. in model.h) this
-    /// costs nothing extra to allocate; each ++ is real trie-walk work
+    /// (unlike find_by_field/find_referrers & co. in model.h) this costs
+    /// nothing extra to allocate; each ++ is real trie-walk work
     /// though, not free -- prefer for_each_short_circuit in a hot loop that
     /// wants to stop early without composing range adaptors on top.
     using iterator = typename Core::iterator;

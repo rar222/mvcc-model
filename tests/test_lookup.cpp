@@ -538,30 +538,35 @@ TEST(lookup_stats_is_zero_before_the_first_call_for_a_field) {
     CHECK(m.lookup_diagnostics().stats.empty());
 }
 
-// find_by_cached_field/find_by_scan_field share one field (Order::qty is
-// declared in BOTH define_cached_fields() and define_scan_fields()), so
-// this exercises the counts staying INDEPENDENT per family on the same
-// field, not just per field.
-TEST(lookup_stats_counts_cached_and_uncached_calls_independently) {
+// find_by_field is cache-first, scan-fallback -- qty is declared cached, its
+// scan-only twin qty_scan is not (see Order's own comment in test_types.h),
+// so calling find_by_field on each exercises the two branches independently
+// and each field's OWN lookup_stats stay separate from the other's.
+TEST(lookup_stats_counts_cache_hits_and_scan_fallbacks_independently) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
-    make_order(m, "O1", a, Opt<Order>{}, 5);
+    make_order(m, "O1", a, Opt<Order>{}, 5);  // sets qty_scan == qty == 5 too
     Snapshot s = m.snapshot();
 
-    (void)s.find_by_cached_field<&Order::qty>(5);
-    (void)s.find_by_cached_field<&Order::qty>(5);
-    (void)s.find_by_cached_field<&Order::qty>(7);  // no match -- still a CALL
-    (void)s.find_by_scan_field<&Order::qty>(5);
+    (void)s.find_by_field<&Order::qty>(5);
+    (void)s.find_by_field<&Order::qty>(5);
+    (void)s.find_by_field<&Order::qty>(7);  // no match -- still a CALL
+    (void)s.find_by_field<&Order::qty_scan>(5);
 
-    const LookupCounts c = m.lookup_stats<&Order::qty>();
-    CHECK_EQ(c.cached_calls, std::uint64_t{3});
-    CHECK_EQ(c.uncached_calls, std::uint64_t{1});
+    const LookupCounts qty_c = m.lookup_stats<&Order::qty>();
+    CHECK_EQ(qty_c.cached_calls, std::uint64_t{3});
+    CHECK_EQ(qty_c.uncached_calls, std::uint64_t{0});
+    const LookupCounts qty_scan_c = m.lookup_stats<&Order::qty_scan>();
+    CHECK_EQ(qty_scan_c.cached_calls, std::uint64_t{0});
+    CHECK_EQ(qty_scan_c.uncached_calls, std::uint64_t{1});
 }
 
-// for_each_by_scan_field/for_each_by_cached_field are find_by_scan_field/
-// find_by_cached_field's no-vector siblings -- same matches, delivered via
-// callback instead of a returned std::vector.
-TEST(for_each_by_scan_field_and_for_each_by_cached_field_visit_every_match) {
+// for_each_by_field is find_by_field's no-vector sibling -- same matches,
+// delivered via callback instead of a returned std::vector. Exercised on
+// both qty (cache-hit branch) and its scan-only twin qty_scan (scan-
+// fallback branch), on identical data, to prove both branches visit every
+// match correctly.
+TEST(for_each_by_field_visits_every_match_via_either_branch) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, 5);
@@ -570,30 +575,30 @@ TEST(for_each_by_scan_field_and_for_each_by_cached_field_visit_every_match) {
     Snapshot s = m.snapshot();
 
     int scan_hits = 0;
-    s.for_each_by_scan_field<&Order::qty>(5, [&](const Order& o) {
-        CHECK_EQ(o.qty, std::int64_t{5});
+    s.for_each_by_field<&Order::qty_scan>(5, [&](const Order& o) {
+        CHECK_EQ(o.qty_scan, std::int64_t{5});
         ++scan_hits;
     });
     CHECK_EQ(scan_hits, 2);
 
     int cached_hits = 0;
-    s.for_each_by_cached_field<&Order::qty>(5, [&](const Order& o) {
+    s.for_each_by_field<&Order::qty>(5, [&](const Order& o) {
         CHECK_EQ(o.qty, std::int64_t{5});
         ++cached_hits;
     });
     CHECK_EQ(cached_hits, 2);
 
     int no_match_hits = 0;
-    s.for_each_by_scan_field<&Order::qty>(99, [&](const Order&) { ++no_match_hits; });
+    s.for_each_by_field<&Order::qty_scan>(99, [&](const Order&) { ++no_match_hits; });
     CHECK_EQ(no_match_hits, 0);
 }
 
-// all_of_by_scan_field/all_of_by_cached_field: std::all_of's boolean
-// contract (vacuously true on no matches, false as soon as one match fails
-// pred) -- see the declarations' own comment for why pred simply stops
-// being CALLED after the first failure rather than the underlying scan
-// stopping early.
-TEST(all_of_by_scan_field_and_all_of_by_cached_field_match_std_all_of_semantics) {
+// all_of_by_field: std::all_of's boolean contract (vacuously true on no
+// matches, false as soon as one match fails pred) -- see the declaration's
+// own comment for why pred simply stops being CALLED after the first
+// failure rather than the underlying walk stopping early. Exercised on both
+// the scan-fallback branch (qty_scan) and the cache-hit branch (qty).
+TEST(all_of_by_field_matches_std_all_of_semantics_via_either_branch) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, 5);
@@ -601,12 +606,12 @@ TEST(all_of_by_scan_field_and_all_of_by_cached_field_match_std_all_of_semantics)
     make_order(m, "O3", a, Opt<Order>{}, 7);
     Snapshot s = m.snapshot();
 
-    CHECK(s.all_of_by_scan_field<&Order::qty>(99, [](const Order&) { return false; }));  // vacuous
-    CHECK(s.all_of_by_scan_field<&Order::qty>(5, [](const Order& o) { return o.qty == 5; }));
-    CHECK(s.all_of_by_cached_field<&Order::qty>(5, [](const Order& o) { return o.qty == 5; }));
+    CHECK(s.all_of_by_field<&Order::qty_scan>(99, [](const Order&) { return false; }));  // vacuous
+    CHECK(s.all_of_by_field<&Order::qty_scan>(5, [](const Order& o) { return o.qty_scan == 5; }));
+    CHECK(s.all_of_by_field<&Order::qty>(5, [](const Order& o) { return o.qty == 5; }));
 
     int calls = 0;
-    const bool result = s.all_of_by_cached_field<&Order::qty>(5, [&](const Order&) {
+    const bool result = s.all_of_by_field<&Order::qty>(5, [&](const Order&) {
         ++calls;
         return false;  // fails on the FIRST match -- pred should not run again
     });
@@ -614,12 +619,14 @@ TEST(all_of_by_scan_field_and_all_of_by_cached_field_match_std_all_of_semantics)
     CHECK_EQ(calls, 1);
 }
 
-// range_by_scan_field/range_view_by_scan_field: additive range-based-for
-// form of find_by_scan_field/for_each_by_scan_field/all_of_by_scan_field --
-// must visit the exact same matches, `break` must short-circuit, and a
-// nullary-const-method Field (computed_key) must work the same way a data
-// member Field (qty) does.
-TEST(range_by_scan_field_visits_the_same_matches_as_for_each_by_scan_field) {
+// range_by_field/range_view_by_field: additive range-based-for form of
+// find_by_field/for_each_by_field/all_of_by_field -- must visit the exact
+// same matches, `break` must short-circuit, and a nullary-const-method
+// Field (computed_key) must work the same way a data member Field (qty)
+// does. Primary walk uses qty_scan to exercise the scan-fallback branch
+// (where FieldRange actually filters per element); computed_key is
+// cache-declared, exercising the cache-hit branch (no filtering) instead.
+TEST(range_by_field_visits_the_same_matches_as_for_each_by_field) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o1 = make_order(m, "O1", a, Opt<Order>{}, 5);
@@ -628,21 +635,21 @@ TEST(range_by_scan_field_visits_the_same_matches_as_for_each_by_scan_field) {
     Snapshot s = m.snapshot();
 
     int range_hits = 0;
-    for (const Order& o : s.range_by_scan_field<&Order::qty>(5)) {
-        CHECK_EQ(o.qty, std::int64_t{5});
+    for (const Order& o : s.range_by_field<&Order::qty_scan>(5)) {
+        CHECK_EQ(o.qty_scan, std::int64_t{5});
         ++range_hits;
     }
     CHECK_EQ(range_hits, 2);
 
     int no_match_hits = 0;
-    for (const Order& o : s.range_by_scan_field<&Order::qty>(99)) {
+    for (const Order& o : s.range_by_field<&Order::qty_scan>(99)) {
         (void)o;
         ++no_match_hits;
     }
     CHECK_EQ(no_match_hits, 0);
 
     int seen_before_break = 0;
-    for (const Order& o : s.range_by_scan_field<&Order::qty>(5)) {
+    for (const Order& o : s.range_by_field<&Order::qty_scan>(5)) {
         (void)o;
         ++seen_before_break;
         break;
@@ -650,53 +657,55 @@ TEST(range_by_scan_field_visits_the_same_matches_as_for_each_by_scan_field) {
     CHECK_EQ(seen_before_break, 1);
 
     int view_hits = 0;
-    for (View<Order> v : s.range_view_by_scan_field<&Order::qty>(5)) {
-        CHECK_EQ(v->qty, std::int64_t{5});
+    for (View<Order> v : s.range_view_by_field<&Order::qty_scan>(5)) {
+        CHECK_EQ(v->qty_scan, std::int64_t{5});
         ++view_hits;
     }
     CHECK_EQ(view_hits, 2);
 
     // Field naming a nullary const method (computed_key), not a data member
-    // -- exercises ScanFieldRange::matches' other branch
-    // (std::is_member_object_pointer_v == false).
+    // -- exercises FieldRange::matches' other branch
+    // (std::is_member_object_pointer_v == false), reached here via the
+    // cache-hit path since computed_key is also define_cached_fields()'d.
     int computed_hits = 0;
-    for (const Order& o : s.range_by_scan_field<&Order::computed_key>("ord:O1")) {
+    for (const Order& o : s.range_by_field<&Order::computed_key>("ord:O1")) {
         CHECK(o.id == o1.raw());
         ++computed_hits;
     }
     CHECK_EQ(computed_hits, 1);
 }
 
-// A field that exists on the type but was never define_scan_fields()'d
-// must behave exactly like find_by_scan_field's own "undeclared is
+// A field that exists on the type but was never declared in EITHER lookup
+// family must behave exactly like find_by_field's own "undeclared is
 // invisible" rule -- vacuously empty, even for a value (0) that genuinely
 // matches some live object's actual field (a freshly made_account's balance
-// defaults to 0). Proves range_by_scan_field's declared-check runs, not just
-// the value filter.
-TEST(range_by_scan_field_is_empty_for_a_field_never_declared_via_define_scan_fields) {
+// defaults to 0). Proves range_by_field's declared-check runs, not just the
+// value filter.
+TEST(range_by_field_is_empty_for_a_field_never_declared_in_either_family) {
     Model m;
     make_account(m, "A1");  // balance defaults to 0 -- would "match" if unfiltered
     Snapshot s = m.snapshot();
 
-    // Sanity: find_by_scan_field itself is already empty here -- this test
-    // is about range_by_scan_field matching that, not establishing it fresh.
-    CHECK(s.find_by_scan_field<&Account::balance>(0).empty());
+    // Sanity: find_by_field itself is already empty here -- this test is
+    // about range_by_field matching that, not establishing it fresh.
+    CHECK(s.find_by_field<&Account::balance>(0).empty());
 
     int hits = 0;
-    for (const Account& a : s.range_by_scan_field<&Account::balance>(0)) {
+    for (const Account& a : s.range_by_field<&Account::balance>(0)) {
         (void)a;
         ++hits;
     }
     CHECK_EQ(hits, 0);
-    CHECK_EQ(s.find_by_scan_field<&Account::balance>(0).size(), std::size_t{0});
+    CHECK_EQ(s.find_by_field<&Account::balance>(0).size(), std::size_t{0});
 }
 
-// range_by_cached_field: additive range-based-for form of find_by_cached_
-// field/for_each_by_cached_field/all_of_by_cached_field -- must visit the
-// exact same matches as for_each_by_cached_field, and `break` must short-
-// circuit (stop the underlying bucket walk, not just skip further loop
-// bodies) the same way all_of_by_cached_field's pred returning false does.
-TEST(range_by_cached_field_visits_the_same_matches_as_for_each_by_cached_field) {
+// range_by_field's cache-hit branch: additive range-based-for form of
+// find_by_field/for_each_by_field/all_of_by_field on a cache-declared field
+// -- must visit the exact same matches as for_each_by_field, and `break`
+// must short-circuit (stop the underlying bucket walk, not just skip
+// further loop bodies) the same way all_of_by_field's pred returning false
+// does.
+TEST(range_by_field_visits_the_same_matches_as_for_each_by_field_via_cache) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, 5);
@@ -705,26 +714,25 @@ TEST(range_by_cached_field_visits_the_same_matches_as_for_each_by_cached_field) 
     Snapshot s = m.snapshot();
 
     int range_hits = 0;
-    for (const Order& o : s.range_by_cached_field<&Order::qty>(5)) {
+    for (const Order& o : s.range_by_field<&Order::qty>(5)) {
         CHECK_EQ(o.qty, std::int64_t{5});
         ++range_hits;
     }
     CHECK_EQ(range_hits, 2);
 
     // No matches for this value: empty range, no special-casing at the call
-    // site -- same "undeclared/no-match is empty" contract as find_by_cached_
-    // field.
+    // site -- same "undeclared/no-match is empty" contract as find_by_field.
     int no_match_hits = 0;
-    for (const Order& o : s.range_by_cached_field<&Order::qty>(99)) {
+    for (const Order& o : s.range_by_field<&Order::qty>(99)) {
         (void)o;
         ++no_match_hits;
     }
     CHECK_EQ(no_match_hits, 0);
 
     // break stops the walk itself, not just further loop bodies -- exactly
-    // what all_of_by_cached_field's early return false gives you.
+    // what all_of_by_field's early return false gives you.
     int seen_before_break = 0;
-    for (const Order& o : s.range_by_cached_field<&Order::qty>(5)) {
+    for (const Order& o : s.range_by_field<&Order::qty>(5)) {
         (void)o;
         ++seen_before_break;
         break;
@@ -732,8 +740,8 @@ TEST(range_by_cached_field_visits_the_same_matches_as_for_each_by_cached_field) 
     CHECK_EQ(seen_before_break, 1);
 }
 
-// range_view_by_cached_field: same matches, View<Order> bound to `s`.
-TEST(range_view_by_cached_field_binds_views_to_this_snapshot) {
+// range_view_by_field: same matches, View<Order> bound to `s`.
+TEST(range_view_by_field_binds_views_to_this_snapshot) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, 5);
@@ -741,17 +749,17 @@ TEST(range_view_by_cached_field_binds_views_to_this_snapshot) {
     Snapshot s = m.snapshot();
 
     int hits = 0;
-    for (View<Order> v : s.range_view_by_cached_field<&Order::qty>(5)) {
+    for (View<Order> v : s.range_view_by_field<&Order::qty>(5)) {
         CHECK_EQ(v->qty, std::int64_t{5});
         ++hits;
     }
     CHECK_EQ(hits, 2);
 }
 
-// range_cached_referrers/range_view_cached_referrers: same bucket
-// (Root::by_cached_reference) find_cached_referrers/for_each_cached_
-// referrers already read, via range-based for instead of a callback.
-TEST(range_cached_referrers_visits_the_same_matches_as_find_cached_referrers) {
+// range_referrers/range_view_referrers on the cache-hit branch: same bucket
+// (Root::by_cached_reference) find_referrers/for_each_referrers already
+// read, via range-based for instead of a callback.
+TEST(range_referrers_visits_the_same_matches_as_find_referrers_via_cache) {
     Model m;
     const Ref<Account> a1 = make_account(m, "A1");
     const Ref<Account> a2 = make_account(m, "A2");
@@ -760,18 +768,18 @@ TEST(range_cached_referrers_visits_the_same_matches_as_find_cached_referrers) {
     make_order(m, "O3", a2);
     Snapshot s = m.snapshot();
 
-    const auto expected = s.find_cached_referrers<&Order::account>(a1);
+    const auto expected = s.find_referrers<&Order::account>(a1);
     CHECK_EQ(expected.size(), std::size_t{2});
 
     int hits = 0;
-    for (const Order& o : s.range_cached_referrers<&Order::account>(a1)) {
+    for (const Order& o : s.range_referrers<&Order::account>(a1)) {
         CHECK(o.account == a1);
         ++hits;
     }
     CHECK_EQ(hits, static_cast<int>(expected.size()));
 
     int view_hits = 0;
-    for (View<Order> v : s.range_view_cached_referrers<&Order::account>(a1)) {
+    for (View<Order> v : s.range_view_referrers<&Order::account>(a1)) {
         CHECK(v->account == a1);
         ++view_hits;
     }
@@ -781,37 +789,40 @@ TEST(range_cached_referrers_visits_the_same_matches_as_find_cached_referrers) {
     const Ref<Account> lonely = make_account(m, "LONELY");
     s = m.snapshot();
     int lonely_hits = 0;
-    for (const Order& o : s.range_cached_referrers<&Order::account>(lonely)) {
+    for (const Order& o : s.range_referrers<&Order::account>(lonely)) {
         (void)o;
         ++lonely_hits;
     }
     CHECK_EQ(lonely_hits, 0);
 }
 
-// range_by_cached_field/range_cached_referrers must record a cached lookup
-// call the same way find_by_cached_field/find_cached_referrers do -- see
-// LookupCounts' own doc comment: it exists to let a caller decide, from
-// ACTUAL usage, whether a cached field/reference is worth its write-side
-// cost. A range-for call site that didn't count here would make that
-// diagnostic silently undercount usage for anyone who switched to it.
-TEST(range_by_cached_field_and_range_cached_referrers_record_lookup_stats) {
+// range_by_field/range_referrers must record a cache-hit lookup call the
+// same way find_by_field/find_referrers do when the field/reference is
+// declared cached -- see LookupCounts' own doc comment: it exists to let a
+// caller decide, from ACTUAL usage, whether a cached field/reference is
+// worth its write-side cost. A range-for call site that didn't count here
+// would make that diagnostic silently undercount usage for anyone who
+// switched to it.
+TEST(range_by_field_and_range_referrers_record_lookup_stats) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, 5);
     Snapshot s = m.snapshot();
 
-    for (const Order& o : s.range_by_cached_field<&Order::qty>(5)) (void)o;
-    for (const Order& o : s.range_by_cached_field<&Order::qty>(5)) (void)o;
+    for (const Order& o : s.range_by_field<&Order::qty>(5)) (void)o;
+    for (const Order& o : s.range_by_field<&Order::qty>(5)) (void)o;
     const LookupCounts qty_counts = m.lookup_stats<&Order::qty>();
     CHECK_EQ(qty_counts.cached_calls, std::uint64_t{2});
 
-    for (const Order& o : s.range_cached_referrers<&Order::account>(a)) (void)o;
+    for (const Order& o : s.range_referrers<&Order::account>(a)) (void)o;
     const LookupCounts account_counts = m.lookup_stats<&Order::account>();
     CHECK_EQ(account_counts.cached_calls, std::uint64_t{1});
 }
 
-// View-returning forms of the same two functions.
-TEST(for_each_view_by_scan_field_and_all_of_view_by_cached_field_bind_to_this_snapshot) {
+// View-returning forms of for_each_by_field/all_of_by_field, one on each
+// branch: for_each_view_by_field on the scan-fallback twin qty_scan,
+// all_of_view_by_field on the cache-declared qty.
+TEST(for_each_view_by_field_and_all_of_view_by_field_bind_to_this_snapshot) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, 5);
@@ -819,41 +830,45 @@ TEST(for_each_view_by_scan_field_and_all_of_view_by_cached_field_bind_to_this_sn
     Snapshot s = m.snapshot();
 
     int hits = 0;
-    s.for_each_view_by_scan_field<&Order::qty>(5, [&](View<Order> v) {
-        CHECK_EQ(v->qty, std::int64_t{5});
+    s.for_each_view_by_field<&Order::qty_scan>(5, [&](View<Order> v) {
+        CHECK_EQ(v->qty_scan, std::int64_t{5});
         ++hits;
     });
     CHECK_EQ(hits, 2);
 
-    CHECK(s.all_of_view_by_cached_field<&Order::qty>(5, [](View<Order> v) { return v->qty == 5; }));
-    CHECK(!s.all_of_view_by_cached_field<&Order::qty>(5, [](View<Order> v) { return v->qty != 5; }));
-    CHECK(s.all_of_view_by_scan_field<&Order::qty>(99, [](View<Order>) { return false; }));  // vacuous
+    CHECK(s.all_of_view_by_field<&Order::qty>(5, [](View<Order> v) { return v->qty == 5; }));
+    CHECK(!s.all_of_view_by_field<&Order::qty>(5, [](View<Order> v) { return v->qty != 5; }));
+    CHECK(s.all_of_view_by_field<&Order::qty_scan>(99, [](View<Order>) { return false; }));  // vacuous
 }
 
 // A single transaction that both retires an old match (update qty away from
-// 5) and installs a fresh one (create with qty 5) at once -- find_by_scan_field
-// and find_by_cached_field must land on the exact same surviving pair, not
-// just agree on count, proving the cached index's erase-on-reassign and
-// insert-on-create both take effect within one commit rather than one
-// lagging the other.
-TEST(scan_and_cached_field_agree_after_a_mutate_and_a_create_in_one_transaction) {
+// 5) and installs a fresh one (create with qty 5) at once -- find_by_field
+// on the cache-declared qty and on its scan-only twin qty_scan must land on
+// the exact same surviving pair, not just agree on count, proving the
+// cached index's erase-on-reassign and insert-on-create both take effect
+// within one commit rather than one lagging the other (and that the scan
+// fallback, walking the live population directly, agrees with it).
+TEST(cache_hit_and_scan_fallback_agree_after_a_mutate_and_a_create_in_one_transaction) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
-    const Ref<Order> o1 = make_order(m, "O1", a, Opt<Order>{}, 5);
+    const Ref<Order> o1 = make_order(m, "O1", a, Opt<Order>{}, 5);  // qty_scan == 5 too
     const Ref<Order> o2 = make_order(m, "O2", a, Opt<Order>{}, 5);
 
     Snapshot s0 = m.snapshot();
-    CHECK_EQ(s0.find_by_scan_field<&Order::qty>(5).size(), std::size_t{2});
-    CHECK_EQ(s0.find_by_cached_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(s0.find_by_field<&Order::qty>(5).size(), std::size_t{2});
+    CHECK_EQ(s0.find_by_field<&Order::qty_scan>(5).size(), std::size_t{2});
     CHECK(s0.find(o1) != nullptr);  // baseline: o1's Id resolves, qty still 5
     CHECK_EQ(s0.find(o1)->qty, std::int64_t{5});
 
     Transaction txn = m.begin();
-    txn.update(o1)->qty = 9;  // o1 drops out of the qty==5 match set
+    Order* u1 = txn.update(o1);
+    u1->qty = 9;       // o1 drops out of the qty==5 match set
+    u1->qty_scan = 9;  // ...and its scan-only twin, kept equal
     auto o3 = std::make_unique<Order>();
     o3->code = "O3";
     o3->account = a;
-    o3->qty = 5;  // o3 joins the qty==5 match set
+    o3->qty = 5;       // o3 joins the qty==5 match set
+    o3->qty_scan = 5;
     const Ref<Order> local3 = txn.create(std::move(o3));
     const CommitResult res = commit_ok(m, txn);
     const Ref<Order> o3_real = res.to_real(local3);
@@ -868,37 +883,44 @@ TEST(scan_and_cached_field_agree_after_a_mutate_and_a_create_in_one_transaction)
     CHECK(o1_in_s1 != nullptr);
     CHECK_EQ(o1_in_s1->qty, std::int64_t{9});
 
-    const auto scan = s1.find_by_scan_field<&Order::qty>(5);
-    const auto cached = s1.find_by_cached_field<&Order::qty>(5);
-    CHECK_EQ(scan.size(), std::size_t{2});
-    CHECK_EQ(cached.size(), std::size_t{2});
+    const auto cache_hit = s1.find_by_field<&Order::qty>(5);
+    const auto scan_fallback = s1.find_by_field<&Order::qty_scan>(5);
+    CHECK_EQ(cache_hit.size(), std::size_t{2});
+    CHECK_EQ(scan_fallback.size(), std::size_t{2});
 
-    for (const auto& matches : {scan, cached}) {
-        std::vector<Id> ids;
-        for (const Order* o : matches) ids.push_back(o->id);
-        CHECK(std::find(ids.begin(), ids.end(), o2.raw()) != ids.end());
-        CHECK(std::find(ids.begin(), ids.end(), o3_real.raw()) != ids.end());
-        CHECK(std::find(ids.begin(), ids.end(), o1.raw()) == ids.end());
+    std::vector<Id> cache_hit_ids, scan_fallback_ids;
+    for (const Order* o : cache_hit) cache_hit_ids.push_back(o->id);
+    for (const Order* o : scan_fallback) scan_fallback_ids.push_back(o->id);
+    for (std::vector<Id>* ids : {&cache_hit_ids, &scan_fallback_ids}) {
+        CHECK(std::find(ids->begin(), ids->end(), o2.raw()) != ids->end());
+        CHECK(std::find(ids->begin(), ids->end(), o3_real.raw()) != ids->end());
+        CHECK(std::find(ids->begin(), ids->end(), o1.raw()) == ids->end());
     }
 }
 
 // find_referrers<Field> is a thin wrapper around for_each_referrers<Field> --
 // the count must land once per CALL to the public API, not once per object
-// for_each_referrers happens to visit internally.
+// for_each_referrers happens to visit internally. account is cache-declared
+// (hits the index); account_scan is its scan-only twin (falls back), so the
+// two calls below exercise each branch's own counter independently.
 TEST(lookup_stats_counts_find_referrers_once_not_once_per_visited_object) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
-    make_order(m, "O1", a);
-    make_order(m, "O2", a);
-    make_order(m, "O3", a);
+    const Ref<Order> o1 = make_order(m, "O1", a);
+    const Ref<Order> o2 = make_order(m, "O2", a);
+    const Ref<Order> o3 = make_order(m, "O3", a);
+    // account_scan isn't set by make_order (see its own doc comment in
+    // test_helpers.cpp) -- set explicitly here since this test never
+    // cascade-deletes `a`, so the double-processing hazard doesn't apply.
+    for (Ref<Order> o : {o1, o2, o3}) update_field(m, o, [&](Order* p) { p->account_scan = a; });
     Snapshot s = m.snapshot();
 
-    const auto found = s.find_referrers<&Order::account>(a);
+    const auto found = s.find_referrers<&Order::account_scan>(a);
     CHECK_EQ(found.size(), std::size_t{3});  // visited three objects...
-    const LookupCounts c = m.lookup_stats<&Order::account>();
+    const LookupCounts c = m.lookup_stats<&Order::account_scan>();
     CHECK_EQ(c.uncached_calls, std::uint64_t{1});  // ...but that is ONE call
 
-    (void)s.find_cached_referrers<&Order::account>(a);
+    (void)s.find_referrers<&Order::account>(a);
     CHECK_EQ(m.lookup_stats<&Order::account>().cached_calls, std::uint64_t{1});
 }
 
@@ -909,33 +931,38 @@ TEST(lookup_stats_counts_find_referrers_once_not_once_per_visited_object) {
 // never called register_field_lookup, and every lookup made through the
 // View-returning referrer API was silently invisible to lookup_stats().
 // Delegating (see for_each_view_referrers's own doc comment) fixes that.
+// Uses account_scan (View<T>'s referrer accessors forward straight to
+// Snapshot's merged for_each_referrers/find_referrers, so a cache-declared
+// field would hit the index branch instead of the one this test is about).
 TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
-    make_order(m, "O1", a);
-    make_order(m, "O2", a);
+    const Ref<Order> o1 = make_order(m, "O1", a);
+    const Ref<Order> o2 = make_order(m, "O2", a);
+    // account_scan isn't set by make_order -- see test_helpers.cpp's own
+    // doc comment; set explicitly since this test never cascade-deletes `a`.
+    for (Ref<Order> o : {o1, o2}) update_field(m, o, [&](Order* p) { p->account_scan = a; });
     Snapshot s = m.snapshot();
 
     auto va = s.view(a);
     int seen = 0;
-    va->for_each_referrers<&Order::account>([&](View<Order>) { ++seen; });
+    va->for_each_referrers<&Order::account_scan>([&](View<Order>) { ++seen; });
     CHECK_EQ(seen, 2);
-    CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, std::uint64_t{1});
+    CHECK_EQ(m.lookup_stats<&Order::account_scan>().uncached_calls, std::uint64_t{1});
 
-    const auto found = s.view(*s.find(a)).find_referrers<&Order::account>();
+    const auto found = s.view(*s.find(a)).find_referrers<&Order::account_scan>();
     CHECK_EQ(found.size(), std::size_t{2});
-    CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, std::uint64_t{2});
+    CHECK_EQ(m.lookup_stats<&Order::account_scan>().uncached_calls, std::uint64_t{2});
 }
 
-// register_field_lookup() fires from EIGHT entry points, not just the four
-// find_* ones exercised above: for_each_by_scan_field/all_of_by_scan_field,
-// for_each_by_cached_field/all_of_by_cached_field, for_each_referrers/
-// all_of_referrers, and for_each_cached_referrers/all_of_cached_referrers.
+// register_field_lookup() fires from every for_each_*/all_of_* entry point:
+// for_each_by_field/all_of_by_field and for_each_referrers/all_of_referrers.
 // The regression above (for_each_view_referrers once silently skipped it via
 // an independent re-walk) shows exactly this class of bug is real -- this
-// test pins all eight, one call each, including that a short-circuited
-// all_of_* still records exactly one call even though it stops after the
-// first match.
+// test pins all four, once via the cache-hit branch (qty/account) and once
+// via the scan-fallback branch (qty_scan/account_scan), including that a
+// short-circuited all_of_* still records exactly one call even though it
+// stops after the first match.
 TEST(lookup_stats_records_a_call_from_every_for_each_and_all_of_entry_point_once_each) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -943,31 +970,33 @@ TEST(lookup_stats_records_a_call_from_every_for_each_and_all_of_entry_point_once
     make_order(m, "O2", a, Opt<Order>{}, 5);
     Snapshot s = m.snapshot();
 
+    const LookupCounts qty_scan0 = m.lookup_stats<&Order::qty_scan>();
+    s.for_each_by_field<&Order::qty_scan>(5, [](const Order&) {});
+    CHECK_EQ(m.lookup_stats<&Order::qty_scan>().uncached_calls, qty_scan0.uncached_calls + 1);
+
+    s.all_of_by_field<&Order::qty_scan>(5, [](const Order&) { return true; });
+    CHECK_EQ(m.lookup_stats<&Order::qty_scan>().uncached_calls, qty_scan0.uncached_calls + 2);
+
     const LookupCounts qty0 = m.lookup_stats<&Order::qty>();
-    s.for_each_by_scan_field<&Order::qty>(5, [](const Order&) {});
-    CHECK_EQ(m.lookup_stats<&Order::qty>().uncached_calls, qty0.uncached_calls + 1);
-
-    s.all_of_by_scan_field<&Order::qty>(5, [](const Order&) { return true; });
-    CHECK_EQ(m.lookup_stats<&Order::qty>().uncached_calls, qty0.uncached_calls + 2);
-
-    s.for_each_by_cached_field<&Order::qty>(5, [](const Order&) {});
+    s.for_each_by_field<&Order::qty>(5, [](const Order&) {});
     CHECK_EQ(m.lookup_stats<&Order::qty>().cached_calls, qty0.cached_calls + 1);
 
-    s.all_of_by_cached_field<&Order::qty>(5, [](const Order&) { return true; });
+    s.all_of_by_field<&Order::qty>(5, [](const Order&) { return true; });
     CHECK_EQ(m.lookup_stats<&Order::qty>().cached_calls, qty0.cached_calls + 2);
+
+    const LookupCounts acct_scan0 = m.lookup_stats<&Order::account_scan>();
+    s.for_each_referrers<&Order::account_scan>(a, [](const Order&) {});
+    CHECK_EQ(m.lookup_stats<&Order::account_scan>().uncached_calls, acct_scan0.uncached_calls + 1);
+
+    s.all_of_referrers<&Order::account_scan>(a, [](const Order&) { return true; });
+    CHECK_EQ(m.lookup_stats<&Order::account_scan>().uncached_calls, acct_scan0.uncached_calls + 2);
 
     const LookupCounts acct0 = m.lookup_stats<&Order::account>();
     s.for_each_referrers<&Order::account>(a, [](const Order&) {});
-    CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, acct0.uncached_calls + 1);
-
-    s.all_of_referrers<&Order::account>(a, [](const Order&) { return true; });
-    CHECK_EQ(m.lookup_stats<&Order::account>().uncached_calls, acct0.uncached_calls + 2);
-
-    s.for_each_cached_referrers<&Order::account>(a, [](const Order&) {});
     CHECK_EQ(m.lookup_stats<&Order::account>().cached_calls, acct0.cached_calls + 1);
 
     int visits = 0;
-    const bool stopped = s.all_of_cached_referrers<&Order::account>(a, [&](const Order&) {
+    const bool stopped = s.all_of_referrers<&Order::account>(a, [&](const Order&) {
         ++visits;
         return false;  // stop after the first match
     });
@@ -987,8 +1016,8 @@ TEST(lookup_stats_is_independent_per_model) {
     Snapshot s1 = m1.snapshot();
     Snapshot s2 = m2.snapshot();
 
-    (void)s1.find_by_scan_field<&Account::name>("A1");
-    (void)s1.find_by_scan_field<&Account::name>("A1");
+    (void)s1.find_by_field<&Account::name>("A1");
+    (void)s1.find_by_field<&Account::name>("A1");
 
     CHECK_EQ(m1.lookup_stats<&Account::name>().uncached_calls, std::uint64_t{2});
     CHECK_EQ(m2.lookup_stats<&Account::name>().uncached_calls, std::uint64_t{0});
@@ -1009,7 +1038,7 @@ TEST(lookup_stats_aggregates_concurrent_calls_from_every_thread_with_no_flush) {
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&m] {
             Snapshot s = m.snapshot();
-            for (int i = 0; i < kCallsPerThread; ++i) (void)s.find_by_cached_field<&Order::qty>(5);
+            for (int i = 0; i < kCallsPerThread; ++i) (void)s.find_by_field<&Order::qty>(5);
         });
     }
     for (auto& th : threads) th.join();
@@ -1018,24 +1047,39 @@ TEST(lookup_stats_aggregates_concurrent_calls_from_every_thread_with_no_flush) {
              static_cast<std::uint64_t>(kThreads) * kCallsPerThread);
 }
 
+// qty (cache-declared) and qty_scan (its scan-only twin) each resolve
+// deterministically via one branch, so a single field can no longer show
+// both nonzero cached_calls AND uncached_calls the way one merged field
+// used to under the old two-function API -- this now checks two entries,
+// one per branch.
 TEST(lookup_diagnostics_is_labeled_by_declaring_type) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, 5);
     Snapshot s = m.snapshot();
-    (void)s.find_by_cached_field<&Order::qty>(5);
-    (void)s.find_by_scan_field<&Order::qty>(9);
+    (void)s.find_by_field<&Order::qty>(5);
+    (void)s.find_by_field<&Order::qty_scan>(9);
 
     const Model::LookupDiagnostics diag = m.lookup_diagnostics();
-    CHECK_EQ(diag.stats.size(), std::size_t{1});
+    CHECK_EQ(diag.stats.size(), std::size_t{2});
     // stats stores a raw type_info pointer, not a demangled name (that only
     // happens in to_string(), see its own test below) -- so the precise,
     // non-string way to check "labeled by declaring type" is comparing
     // type_info directly.
-    const auto it = diag.stats.begin();
-    CHECK(*it->first.type == typeid(Order));
-    CHECK_EQ(it->second.cached_calls, std::uint64_t{1});
-    CHECK_EQ(it->second.uncached_calls, std::uint64_t{1});
+    int cached_entries = 0, uncached_entries = 0;
+    for (const auto& [key, counts] : diag.stats) {
+        CHECK(*key.type == typeid(Order));
+        if (counts.cached_calls > 0) {
+            CHECK_EQ(counts.cached_calls, std::uint64_t{1});
+            CHECK_EQ(counts.uncached_calls, std::uint64_t{0});
+            ++cached_entries;
+        } else {
+            CHECK_EQ(counts.uncached_calls, std::uint64_t{1});
+            ++uncached_entries;
+        }
+    }
+    CHECK_EQ(cached_entries, 1);
+    CHECK_EQ(uncached_entries, 1);
 }
 
 TEST(lookup_diagnostics_to_string_is_human_readable) {
@@ -1047,34 +1091,48 @@ TEST(lookup_diagnostics_to_string_is_human_readable) {
     CHECK(m.lookup_diagnostics().to_string().find("none") !=
           std::string::npos);  // nothing called yet
 
-    (void)s.find_by_cached_field<&Order::qty>(5);
-    (void)s.find_by_cached_field<&Order::qty>(5);
-    (void)s.find_by_scan_field<&Order::qty>(5);
+    (void)s.find_by_field<&Order::qty>(5);
+    (void)s.find_by_field<&Order::qty>(5);
+    (void)s.find_by_field<&Order::qty_scan>(5);
 
     const std::string report = m.lookup_diagnostics().to_string();
-    // Order::qty is named ("qty") in test_types.h's define_cached_fields()/
-    // define_scan_fields() -- registered the moment the Order above was
-    // created, well before either lookup call -- so the report shows the
-    // real name instead of falling back to a bare address.
+    // Order::qty/qty_scan are named ("qty"/"qty_scan") in test_types.h's
+    // define_cached_fields()/define_scan_fields() -- registered the moment
+    // the Order above was created, well before either lookup call -- so the
+    // report shows the real names instead of falling back to a bare address.
     CHECK(report.find("Order::qty") != std::string::npos);
+    CHECK(report.find("Order::qty_scan") != std::string::npos);
     CHECK(report.find("@") == std::string::npos);  // no address fallback needed
 
     std::printf("LookupDiagnostics: %s\n", report.c_str());
 
     // Numbers are column-aligned (right-justified, padded with spaces) for
     // table readability, so check label-then-eventually-digit rather than
-    // pinning the exact width.
-    auto value_after = [&](const char* label) -> std::string {
-        const auto pos = report.find(label);
+    // pinning the exact width. Rows are sorted by total calls descending
+    // (see LookupDiagnostics::to_string()), so qty's row (2 calls) comes
+    // before qty_scan's (1 call); "Order::qty " (trailing space) anchors
+    // qty's own row specifically, since "Order::qty_scan" would otherwise
+    // also match a bare "Order::qty" search.
+    auto value_after = [&](const std::string& text, const char* label) -> std::string {
+        const auto pos = text.find(label);
         if (pos == std::string::npos) return {};
         std::size_t i = pos + std::strlen(label);
-        while (i < report.size() && report[i] == ' ') ++i;
+        while (i < text.size() && text[i] == ' ') ++i;
         const std::size_t start = i;
-        while (i < report.size() && std::isdigit(static_cast<unsigned char>(report[i]))) ++i;
-        return report.substr(start, i - start);
+        while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
+        return text.substr(start, i - start);
     };
-    CHECK_EQ(value_after("cached="), std::string("2"));
-    CHECK_EQ(value_after("uncached="), std::string("1"));
+    const std::size_t qty_row_start = report.find("Order::qty ");
+    const std::size_t qty_scan_row_start = report.find("Order::qty_scan");
+    CHECK(qty_row_start != std::string::npos);
+    CHECK(qty_scan_row_start != std::string::npos);
+    CHECK(qty_row_start < qty_scan_row_start);  // higher total sorts first
+    const std::string qty_row = report.substr(qty_row_start, qty_scan_row_start - qty_row_start);
+    const std::string qty_scan_row = report.substr(qty_scan_row_start);
+    CHECK_EQ(value_after(qty_row, "cached="), std::string("2"));
+    CHECK_EQ(value_after(qty_row, "uncached="), std::string("0"));
+    CHECK_EQ(value_after(qty_scan_row, "cached="), std::string("0"));
+    CHECK_EQ(value_after(qty_scan_row, "uncached="), std::string("1"));
 }
 
 namespace {
@@ -1100,7 +1158,7 @@ TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
     commit_ok(m, txn);
 
     Snapshot s = m.snapshot();
-    (void)s.find_by_cached_field<&Unnamed::code>(7);
+    (void)s.find_by_field<&Unnamed::code>(7);
 
     const std::string report = m.lookup_diagnostics().to_string();
     CHECK(report.find("Unnamed") != std::string::npos);
@@ -1110,8 +1168,8 @@ TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
 
 // Same named/unnamed split as the two tests above, but through the
 // REFERENCE-field entry point (RefIndexReader::index(), feeding
-// find_cached_referrers/for_each_referrers) rather than the value-field one
-// (FieldKeyReader::key(), feeding find_by_cached_field/find_by_scan_field) --
+// find_referrers/for_each_referrers's cache-hit branch) rather than the
+// value-field one (FieldKeyReader::key(), feeding find_by_field) --
 // a genuinely different code path in register_field_lookup's callers, and one
 // with a real unnamed field sitting in test_types.h already: Order::account
 // is named ("account") in define_cached_references(), but Order::parent is
@@ -1127,7 +1185,7 @@ TEST(lookup_diagnostics_shows_names_for_reference_fields_too) {
     make_order(m, "CHILD", a, parent_order);
     Snapshot s = m.snapshot();
 
-    (void)s.find_cached_referrers<&Order::account>(a);
+    (void)s.find_referrers<&Order::account>(a);
     s.for_each_referrers<&Order::parent>(parent_order, [](const Order&) {});
 
     const std::string report = m.lookup_diagnostics().to_string();
