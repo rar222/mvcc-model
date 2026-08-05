@@ -73,6 +73,18 @@ struct PerfectU64Hash {
     static constexpr bool is_perfect = true;
 };
 
+// A LIE: declares is_perfect = true (same promise PerfectU64Hash makes) but
+// its body is ClashHash's -- genuinely colliding. Exists to trigger
+// chain_set's "Hash declared is_perfect but produced a real collision"
+// assert (persistent_map.h) from a real set() call -- see
+// chain_set_asserts_when_a_hash_declared_perfect_actually_collides below,
+// and that test's own comment for why chain_erase's identical-looking
+// assert ISN'T reachable the same way.
+struct LyingPerfectHash {
+    std::uint64_t operator()(std::uint64_t k) const noexcept { return k % 3; }
+    static constexpr bool is_perfect = true;
+};
+
 // Declares is_perfect = false EXPLICITLY, as opposed to U64Hash/StringHash/
 // ClashHash simply never mentioning it -- exercises the other half of
 // hash_is_perfect_v's std::bool_constant<Hash::is_perfect> branch (not just
@@ -978,6 +990,28 @@ TEST(erase_of_absent_key_allocates_nothing_and_shares_the_original_root) {
     CHECK(mem.allocations > before);
     CHECK_EQ(after_real.size(), m.size() - 1);
     CHECK(after_real.get(std::uint64_t{7}) == nullptr);
+}
+
+// chain_set's kPerfectHash branch trusts its caller's promise (Hash::
+// is_perfect == true) unconditionally -- no per-entry key comparison, unlike
+// erase_in, which only ever calls chain_erase() after leaf_get() has already
+// confirmed presence via a real key comparison (see persistent_map.h's own
+// comments on both). A Hash that lies about being perfect makes that trust
+// observable: two DIFFERENT keys sharing a hash under LyingPerfectHash reach
+// set_in's "same hash, replace-or-append" branch (lf_hash == hash), which
+// calls chain_set() believing the existing leaf must already BE this key --
+// and it isn't. (chain_erase's identical-looking assert has no equivalent
+// path: leaf_get already ruled out anything but a genuine match before
+// chain_erase is ever called, so it can't observe this class of lie.)
+TEST(chain_set_asserts_when_a_hash_declared_perfect_actually_collides) {
+    PersistentMap<std::uint64_t, int, LyingPerfectHash> m;
+    m = m.set(std::uint64_t{1}, 100);  // fine: first (and, per the lie, only) key at this hash
+
+    // 4 % 3 == 1 % 3 == 1: a real collision LyingPerfectHash claims can't happen.
+    CHECK(dies_of_assert([&] {
+        PersistentMap<std::uint64_t, int, LyingPerfectHash> m2 = m.set(std::uint64_t{4}, 200);
+        (void)m2;
+    }));
 }
 
 // for_each_short_circuit's whole reason to exist (see its own comment in

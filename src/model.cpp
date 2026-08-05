@@ -549,6 +549,25 @@ std::size_t Model::wait_for_reclamation() {
     // Nudge the reaper and wait for it to complete at least one full round after
     // this point, so anything reclaimable at the current watermark is freed.
     std::unique_lock lk(reap_mu_);
+    // ~Model()'s reap_waiters_ check and its reaper_stop_ = true assignment are
+    // one atomic reap_mu_ critical section (see ~Model()) -- but that alone
+    // still leaves a gap: a caller that reaches THIS function after that
+    // section has already completed would sail past a reap_waiters_ check
+    // that already passed, register itself anyway, and wait on reap_done_cv_
+    // for a round the now-permanently-exited reaper will never produce --
+    // blocking forever, and then blocking ~Model()'s own reap_done_cv_
+    // destructor right along with it (destroying a condition_variable with a
+    // live waiter is UB; observed in practice as exactly this hang, not a
+    // crash). Checking reaper_stop_ HERE, under the same reap_mu_ ~Model()
+    // sets it under, closes the gap: whichever of the two critical sections
+    // -- this one, or ~Model()'s -- runs first is authoritative, and the
+    // other one's check (this assert, or ~Model()'s reap_waiters_ one) is
+    // guaranteed to observe it, because both the read and the write happen
+    // strictly inside the same mutex's critical sections with no gap between
+    // them on either side.
+    assert(!reaper_stop_ &&
+           "wait_for_reclamation(): called concurrently with (or after) ~Model() -- "
+           "every caller must return before the Model is destroyed");
     // target: the round counter value that proves a FRESH pass (started after
     // this call, not one already in flight) has finished -- reap_done_round_
     // is incremented once per completed pass, so "current value + 1" is the

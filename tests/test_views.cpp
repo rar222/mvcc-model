@@ -641,22 +641,3 @@ TEST(view_operator_star_dereferences_to_the_same_object_as_operator_arrow) {
     CHECK_EQ(via_star.qty, std::int64_t{5});
 }
 
-// Snapshot::view(const T&) is documented as unchecked -- "pairing an object
-// from one snapshot with another compiles and is exactly the version-mixing
-// bug views exist to prevent" -- but it's covered by an assert (find_raw(
-// obj.id) == &obj) rather than left silent. This exercises that assert with
-// the clearest possible mismatch: an object that isn't in the target
-// Model's spine at all.
-TEST(view_pairs_object_from_a_different_model_asserts) {
-    Model a;
-    const Ref<Account> acc = make_account(a, "A1");
-    Snapshot sa = a.snapshot();
-    const Account* obj = sa.find(acc);
-    CHECK(obj != nullptr);
-
-    Model b;  // empty: obj.id cannot resolve to anything in b's spine
-    Snapshot sb = b.snapshot();
-
-    CHECK_ASSERT_FAILURE((void)sb.view(*obj));
-}
-

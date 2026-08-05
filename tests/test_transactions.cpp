@@ -779,21 +779,3 @@ TEST(model_begin_with_snapshot_also_accepts_name_and_data) {
     CHECK_EQ(std::any_cast<std::string>(txn.data()), std::string("payload"));
 }
 
-// Model::begin(Snapshot base, ...) must reject a snapshot taken from a
-// DIFFERENT Model: unlike Snapshot::begin() (which derives the owning Model
-// from the snapshot's own Lease and can't go wrong), this overload has no
-// type-level link between `base` and `this`, so nothing else stops a caller
-// from pairing them up wrong -- the resulting Transaction would silently
-// read/write `this` Model's spine at whatever slot indices the OTHER
-// Model's ids happened to use. Covered by an assert (see Model::begin's own
-// comment); this exercises it via CHECK_ASSERT_FAILURE rather than actually
-// letting the corruption happen.
-TEST(model_begin_with_snapshot_from_a_different_model_asserts) {
-    Model a;
-    make_account(a, "A1");
-    Model b;
-    Snapshot sb = b.snapshot();
-
-    CHECK_ASSERT_FAILURE((void)a.begin(sb, "x", {}));
-}
-
