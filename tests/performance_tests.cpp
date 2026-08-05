@@ -1191,10 +1191,10 @@ public:
 
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.key<&StrKeyed::unique_key>(s.unique_key, model::LookupType::Cache, "unique_key");
-        v.key<&StrKeyed::dup_key>(s.dup_key, model::LookupType::Cache, "dup_key");
-        v.key<&StrKeyed::unique_key_scan>(s.unique_key_scan, model::LookupType::Scan, "unique_key_scan");
-        v.key<&StrKeyed::dup_key_scan>(s.dup_key_scan, model::LookupType::Scan, "dup_key_scan");
+        v.field<&StrKeyed::unique_key>(s.unique_key, model::LookupType::Cache, "unique_key");
+        v.field<&StrKeyed::dup_key>(s.dup_key, model::LookupType::Cache, "dup_key");
+        v.field<&StrKeyed::unique_key_scan>(s.unique_key_scan, model::LookupType::Scan, "unique_key_scan");
+        v.field<&StrKeyed::dup_key_scan>(s.dup_key_scan, model::LookupType::Scan, "dup_key_scan");
     }
 };
 

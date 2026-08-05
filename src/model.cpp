@@ -1292,7 +1292,7 @@ std::string Model::LookupDiagnostics::to_string() const {
             total > 0 ? 100.0 * static_cast<double>(counts.cached_calls) / static_cast<double>(total)
                      : 0.0;
         // Prefer the real field name (opted in via FieldKeyReader::key()/
-        // LookupFieldReader::key()/CachedRefReader -- see detail::
+        // LookupFieldReader::field()/CachedRefReader -- see detail::
         // register_field_name_once/register_field_name) over the address:
         // a real name is a strictly better disambiguator
         // than a hex address, so once we have one there's no reason to show

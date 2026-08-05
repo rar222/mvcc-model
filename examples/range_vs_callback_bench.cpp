@@ -60,7 +60,7 @@ public:
 
     template <class Self>
     static void define_fields(Self& s, const LookupFieldReader& v) {
-        v.key<&Widget::category>(s.category, LookupType::Cache, "category");
+        v.field<&Widget::category>(s.category, LookupType::Cache, "category");
     }
 };
 

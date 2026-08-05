@@ -490,7 +490,7 @@ struct UndoRemapper {
 namespace detail {
 /// Global (process-wide, NOT per-Model) registry: field_tag<Field>() -> a
 /// human name, for fields whose declaration opted in by passing one to
-/// FieldKeyReader::key() or LookupFieldReader::key() below. A property of
+/// FieldKeyReader::key() or LookupFieldReader::field() below. A property of
 /// how the FIELD is declared, not of any particular Model or object
 /// instance -- unlike Model's own (per-Model) field lookup stats, this is
 /// intentionally shared across every Model in the process, the same scope
@@ -528,7 +528,7 @@ inline std::string field_name_of(const void* field) {
 }
 
 /// One-time-per-Field registration, called from FieldKeyReader::key() and
-/// LookupFieldReader::key(). The `static` guard is the SAME "instantiate
+/// LookupFieldReader::field(). The `static` guard is the SAME "instantiate
 /// once per template argument, then it's free" trick field_tag<Field>()
 /// itself relies on (a function-local static's initialization is
 /// thread-safe and happens exactly once) -- extended here to also run a
@@ -554,7 +554,7 @@ inline void register_field_name_once(const char* name) noexcept {
 /// Cache-tagged reference field ever gets a display name; a Scan-only one
 /// never does (see Model::LookupDiagnostics::to_string()'s "falls back to an
 /// address" case). Unlike FieldKeyReader::key<Field>()/LookupFieldReader::
-/// key<Field>(), there's no `Field` NTTP available here to feed
+/// field<Field>(), there's no `Field` NTTP available here to feed
 /// detail::register_field_name_once<Field>() -- `field` arrives as an
 /// already-computed `const void*` (see RefReader's own comment for why:
 /// avoiding a `.template operator()<Field>` disambiguator at the generic
@@ -630,7 +630,7 @@ std::string to_field_key(const V& v) {
 /// to_string() -- purely cosmetic; nothing correctness-critical reads it. A
 /// field also declared in define_fields() (like Order::computed_key, both a
 /// unique key AND a cached multi-match field) only needs a name once --
-/// LookupFieldReader::key() below registers it the identical way.
+/// LookupFieldReader::field() below registers it the identical way.
 struct FieldKeyReader {
     const FieldKeyFn& fn;
     template <auto Field, class V>
@@ -649,7 +649,7 @@ struct FieldKeyReader {
 /// enough for both.
 using LookupFieldFn = std::function<void(const void* field, std::string key, LookupType type)>;
 
-/// Visitor for define_fields(): `v.key<&Order::qty>(s.qty, LookupType::Cache,
+/// Visitor for define_fields(): `v.field<&Order::qty>(s.qty, LookupType::Cache,
 /// "qty")`. `type` is required (no default): every field gets exactly one
 /// LookupType, chosen at the one
 /// place it's declared, which is what makes "the same field declared both
@@ -662,7 +662,7 @@ using LookupFieldFn = std::function<void(const void* field, std::string key, Loo
 struct LookupFieldReader {
     const LookupFieldFn& fn;
     template <auto Field, class V>
-    void key(const V& v, LookupType type, const char* name = nullptr) const {
+    void field(const V& v, LookupType type, const char* name = nullptr) const {
         fn(field_tag<Field>(), to_field_key(v), type);
         detail::register_field_name_once<Field>(name);
     }
@@ -937,7 +937,7 @@ public:
 ///
 ///     template <class Self>
 ///     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-///         v.key<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
+///         v.field<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
 ///         // find_by_field<&Order::qty>(5) -> ALL matches, via the index
 ///     }
 ///
@@ -2957,7 +2957,7 @@ public:
     /// `type` for the declaring TYPE's name, and falls back to `field`'s
     /// raw address to disambiguate two looked-up fields on the same type
     /// that were never given a name (see FieldKeyReader::key()/
-    /// LookupFieldReader::key()/CachedRefReader's own `name` parameter).
+    /// LookupFieldReader::field()/CachedRefReader's own `name` parameter).
     class LookupDiagnostics {
     public:
         std::unordered_map<FieldLookupKey, LookupCounts, FieldLookupKeyHash> stats;

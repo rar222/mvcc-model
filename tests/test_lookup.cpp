@@ -1142,7 +1142,7 @@ public:
     std::int64_t code = 0;
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.key<&Unnamed::code>(s.code, model::LookupType::Cache);  // no name argument
+        v.field<&Unnamed::code>(s.code, model::LookupType::Cache);  // no name argument
     }
 };
 }  // namespace
@@ -1167,7 +1167,7 @@ TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
 // Same named/unnamed split as the two tests above, but through the
 // REFERENCE-field entry point (CachedRefReader, feeding find_referrers/
 // for_each_referrers's cache-hit branch) rather than the value-field one
-// (LookupFieldReader::key(), feeding find_by_field) -- a genuinely different
+// (LookupFieldReader::field(), feeding find_by_field) -- a genuinely different
 // code path in register_field_lookup's callers, and one with a real unnamed
 // field sitting in test_types.h already: Order::account is named ("account")
 // and tagged LookupType::Cache in define_references(), but Order::parent is

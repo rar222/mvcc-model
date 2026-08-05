@@ -50,8 +50,9 @@ HOW IT PARSES -- READ THIS BEFORE TRUSTING THE OUTPUT
 This is regex + brace-counting, not a C++ parser. It works because this
 project's user types follow one consistent, narrow shape (see types.h):
 one CRTP base (`class T final : public model::Object<T>`), one member
-per line, `v.key<&T::field>(...)` / `v.index<&T::field>(...)` /
-`field_tag<&T::field>()` call forms inside the define_* functions, and
+per line, `v.key<&T::field>(...)` (define_keys()) / `v.field<&T::field>(...)`
+(define_fields()) / `field_tag<&T::field>()` (define_references()) call
+forms inside the define_* functions, and
 plain (non-templated-on-the-user-side) field types. It will silently
 produce wrong or incomplete output for anything outside that shape:
 macros, multiple inheritance, nested namespaces, key methods that take
@@ -304,7 +305,7 @@ def parse_type(name: str, class_body: str, warn) -> TypeInfo:
         return list(dict.fromkeys(names))  # de-dup, keep first-seen order
 
     info.key_fields = field_names('define_keys', r'key')
-    info.fields = field_names('define_fields', r'key')
+    info.fields = field_names('define_fields', r'field')
     ref_field_names = field_names('define_references', r'field_tag')
 
     for fname in ref_field_names:

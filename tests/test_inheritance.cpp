@@ -153,9 +153,9 @@ public:
     /// find_by_field's cache-hit branch on &Asset::asset_description.
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.key<&Asset::asset_description_scan>(s.asset_description_scan(), model::LookupType::Scan,
+        v.field<&Asset::asset_description_scan>(s.asset_description_scan(), model::LookupType::Scan,
                                                 "description_scan");
-        v.key<&Asset::asset_description>(s.asset_description(), model::LookupType::Cache, "description");
+        v.field<&Asset::asset_description>(s.asset_description(), model::LookupType::Cache, "description");
         // The raw inherited field, under its OWN tag -- same &Labeled::
         // label split as define_keys() above. A tag can be declared exactly
         // once now (Cache or Scan, never both -- see Object<Derived>::
@@ -167,7 +167,7 @@ public:
         // across types (member_class_t<Field> forces one concrete type),
         // but Snapshot::find_by_cached_field_raw can: see finding_by_the_
         // inherited_description_field_finds_both_types_in_one_call below.
-        v.key<&Labeled::description>(s.description, model::LookupType::Cache, "base description");
+        v.field<&Labeled::description>(s.description, model::LookupType::Cache, "base description");
         // A SECOND shared-across-types tag, same description VALUE as the
         // asset_description() entry above, but under &Keys::example_key --
         // a tag with no inheritance relationship to Asset (or to Labeled)
@@ -175,7 +175,7 @@ public:
         // holding the same string, under three different tags: proof the
         // sharing is about the TAG (an arbitrary NTTP identity), not about
         // where the field happens to live or where the value came from.
-        v.key<&Keys::example_key>(s.asset_description(), model::LookupType::Cache, "asset description");
+        v.field<&Keys::example_key>(s.asset_description(), model::LookupType::Cache, "asset description");
     }
 };
 
@@ -229,17 +229,17 @@ public:
     // while a per-type scan tag isn't.
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.key<&Gizmo::gizmo_description_scan>(s.gizmo_description_scan(), model::LookupType::Scan,
+        v.field<&Gizmo::gizmo_description_scan>(s.gizmo_description_scan(), model::LookupType::Scan,
                                                 "description_scan");
-        v.key<&Gizmo::gizmo_description>(s.gizmo_description(), model::LookupType::Cache, "description");
-        v.key<&Labeled::description>(s.description, model::LookupType::Cache, "base description");
+        v.field<&Gizmo::gizmo_description>(s.gizmo_description(), model::LookupType::Cache, "description");
+        v.field<&Labeled::description>(s.description, model::LookupType::Cache, "base description");
         // Same &Keys::example_key tag Asset registers above -- see Keys'
         // own doc comment and Asset::define_fields' comment on it. Gizmo
         // shares no base with Keys (or, for that matter, with Asset beyond
         // Timestamped/Labeled/Object<Derived>), which is the point: this
         // tag's sharing comes from nothing but both types naming the same
         // &Keys::example_key.
-        v.key<&Keys::example_key>(s.gizmo_description(), model::LookupType::Cache, "gizmo description");
+        v.field<&Keys::example_key>(s.gizmo_description(), model::LookupType::Cache, "gizmo description");
     }
 };
 

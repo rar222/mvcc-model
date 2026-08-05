@@ -89,7 +89,7 @@ public:
     /// multi-match duplicates are legal.
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.key<&Account::name>(s.name, model::LookupType::Scan, "name");
+        v.field<&Account::name>(s.name, model::LookupType::Scan, "name");
     }
 };
 
@@ -171,9 +171,9 @@ public:
     /// lookup paths agree.
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.key<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
-        v.key<&Order::computed_key>(s.computed_key(), model::LookupType::Cache, "computed_key");
-        v.key<&Order::qty_scan>(s.qty_scan, model::LookupType::Scan, "qty_scan");
+        v.field<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
+        v.field<&Order::computed_key>(s.computed_key(), model::LookupType::Cache, "computed_key");
+        v.field<&Order::qty_scan>(s.qty_scan, model::LookupType::Scan, "qty_scan");
     }
 };
 
