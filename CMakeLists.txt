@@ -306,3 +306,25 @@ set_tests_properties("stand_alone.two_writer_demo_integration" PROPERTIES TIMEOU
 add_test(NAME "stand_alone.extern_template_demo" COMMAND extern_template_demo)
 set_tests_properties("stand_alone.extern_template_demo" PROPERTIES TIMEOUT 300)
 
+# Automated form of scripts/gen_extern_templates.py's own "HOW TO CHECK IF
+# THIS SCRIPT IS MISSING A SYMBOL" docstring section: fails if
+# extern_template_demo.cpp.o had to define its own copy of a model.h entry
+# point instead of resolving it from generated/types_extern.cpp.o -- proof,
+# from actual compiled output, that a new (or newly-used) template entry
+# point in example/types.h/model.h isn't covered by render_entries() yet.
+# Only meaningful at -O2 (the default preset): at -O0 (debug/asan/tsan) the
+# compiler doesn't inline as aggressively, so the checker's allowlist
+# (tuned against this preset's specific inlining behavior -- see the
+# checker script's own comment) doesn't hold there.
+if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" AND NOT MODEL_ASAN AND NOT MODEL_TSAN)
+  add_test(
+    NAME "extern_template_demo.gen_extern_templates_has_no_missing_coverage"
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_extern_template_coverage.py
+            --object ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/extern_template_demo.dir/examples/extern_template_demo.cpp.o
+            --nm ${CMAKE_NM}
+  )
+  set_tests_properties("extern_template_demo.gen_extern_templates_has_no_missing_coverage" PROPERTIES
+    TIMEOUT 60)
+endif()
+
