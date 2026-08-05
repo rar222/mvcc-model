@@ -563,19 +563,19 @@ TEST(cascade_bfs_dedupes_an_object_reached_from_two_different_dying_targets) {
     CHECK_EQ(s.size(), std::size_t{0});
 }
 
-// Regression test: a referrer with BOTH a non-nullable and a nullable ref
-// field pointing at the SAME dying target used to be processed twice by
-// remove_raw()'s cascade BFS -- once via the nullable edge (clone_for_
-// cascade_null + null_ref, logged as an Updated change, since peek_raw()
-// on the referrer still succeeded at that point because it was only
-// QUEUED for cascade-deletion via the non-nullable edge, not yet actually
-// removed) and again via the non-nullable edge once the BFS reached it on
-// a later iteration (the real Deleted change). Record::owner (Ref<Account>,
-// non-nullable) and Record::owner_scan (Opt<Account>, nullable) are exactly
-// this shape when both are pointed at the same account. The fix tracks
-// every id already known to be doomed (queued for cascade, not just
-// visited) and skips the nullable-null branch for it -- so rec must show
-// up in the changeset exactly once, as Deleted, never Updated.
+// A referrer with BOTH a non-nullable and a nullable ref field pointing at
+// the SAME dying target must be processed by remove_raw()'s cascade BFS
+// exactly once, via the non-nullable edge (the real Deleted change) -- not
+// also via the nullable edge (which would otherwise clone_for_cascade_null
+// + null_ref it first, logged as a spurious Updated change, since peek_raw()
+// on the referrer still succeeds while it's merely QUEUED for
+// cascade-deletion via the non-nullable edge and not yet actually removed).
+// remove_raw() tracks every id already known to be doomed (queued for
+// cascade, not just visited) and skips the nullable-null branch for it.
+// Record::owner (Ref<Account>, non-nullable) and Record::owner_scan
+// (Opt<Account>, nullable) are exactly this shape when both are pointed at
+// the same account: rec must show up in the changeset exactly once, as
+// Deleted, never Updated.
 TEST(cascade_does_not_double_process_a_referrer_with_both_a_non_nullable_and_nullable_ref_to_the_same_target) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");

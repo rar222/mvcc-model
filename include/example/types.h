@@ -3,14 +3,13 @@
 // Example domain types. These are user code, not part of the model -- they show
 // exactly what a type has to provide to live in the store.
 //
-// The declaration contract (each define_X below) is unchanged: a field left out of
+// The declaration contract (each define_X below): a field left out of
 // define_fields()/define_references() is invisible to find_by_field/find_referrers
 // (find_by_key on an undeclared field is similarly invisible to define_keys()) --
-// empty, nothing walked. What changed is that the OLD three-way split (scan-only /
-// cached-only / cached-reference-opt-in) is now a single LookupType tag (Cache or
-// Scan) attached to each field/reference at its one declaration site -- a field can
-// be tagged exactly one way, never both. See model.h's Object<Derived> class
-// comment for the full contract.
+// empty, nothing walked. Each field/reference carries a single LookupType tag
+// (Cache or Scan) attached at its one declaration site -- a field can be tagged
+// exactly one way, never both. See model.h's Object<Derived> class comment for
+// the full contract.
 //   define_references()     optional: list every reference field ONCE, tagged by its own
 //                           address and a model::LookupType (Cache or Scan) -- Cache backs
 //                           find_referrers's "who points at this?" lookup with an INDEXED

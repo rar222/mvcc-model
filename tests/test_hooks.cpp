@@ -305,9 +305,8 @@ TEST(pre_commit_hook_veto_unwinds_everything_as_if_try_commit_were_never_called)
     CHECK(m.snapshot().find(o2) != nullptr);
 }
 
-// Regression test for the reconcile_out_refs undo-log bug -- see
-// the in-body comment. A vetoed reassignment must restore the old edge
-// AND remove the phantom new one, or a later cascade sees a lie.
+// A vetoed reassignment must restore the old edge AND remove the phantom
+// new one, or a later cascade sees a lie -- see the in-body comment.
 TEST(veto_rollback_restores_the_reverse_index_so_later_cascades_stay_correct) {
     Model m;
     const Ref<Account> x = make_account(m, "X");

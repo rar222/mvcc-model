@@ -546,15 +546,13 @@ inline void register_field_name_once(const char* name) noexcept {
 /// Cache-declared SUBSET of define_references() -- forwards to `fn` only the
 /// fields tagged LookupType::Cache, in the same (field, name, target,
 /// nullable) shape RefReader already uses, so ObjectBase::each_cached_
-/// reference can hand its RefFn straight through without an adapter.
-/// Replaces the old define_cached_references()/RefIndexReader split: there's
-/// no separate declaration to invoke anymore, just a filter over
-/// define_references()'s own single list.
+/// reference can hand its RefFn straight through without an adapter. There's
+/// no separate declaration to invoke: just a filter over define_references()'s
+/// own single list.
 ///
-/// Registers `name` (if supplied) here, not in RefReader -- matching the old
-/// design's behavior exactly: only a Cache-tagged reference field ever got a
-/// display name before (via RefIndexReader::index(name)); a Scan-only one
-/// never did (see Model::LookupDiagnostics::to_string()'s "falls back to an
+/// Registers `name` (if supplied) here, not in RefReader: only a
+/// Cache-tagged reference field ever gets a display name; a Scan-only one
+/// never does (see Model::LookupDiagnostics::to_string()'s "falls back to an
 /// address" case). Unlike FieldKeyReader::key<Field>()/LookupFieldReader::
 /// key<Field>(), there's no `Field` NTTP available here to feed
 /// detail::register_field_name_once<Field>() -- `field` arrives as an
@@ -585,16 +583,13 @@ struct CachedRefReader {
 /// Callback shape for enumerating a type's define_keys() fields ONLY (see
 /// ObjectBase::each_field_key): the field's identity tag plus its value in
 /// canonical string form (to_field_key). define_fields()'s multi-match
-/// family uses the LookupType-carrying LookupFieldFn below instead -- the
-/// two used to share this shape (back when a field could be independently
-/// declared in up to three of define_keys()/define_scan_fields()/
-/// define_cached_fields()), but define_keys() is a genuinely different
-/// concept (a UNIQUE index, not a cache-or-scan multi-match one), so it gets
-/// its own shape now that the multi-match side needs to carry a LookupType.
-/// Being one shape (not one per field type) is what lets a single
-/// heterogeneous vector of (field, key) pairs represent a type's whole
-/// define_keys() set (see collect_update_baseline_field_keys()) with no
-/// variant.
+/// family uses the LookupType-carrying LookupFieldFn below instead --
+/// define_keys() is a genuinely different concept (a UNIQUE index, not a
+/// cache-or-scan multi-match one), so it gets its own shape, distinct from
+/// the multi-match side's LookupType-carrying one. Being one shape (not one
+/// per field type) is what lets a single heterogeneous vector of (field,
+/// key) pairs represent a type's whole define_keys() set (see
+/// collect_update_baseline_field_keys()) with no variant.
 using FieldKeyFn = std::function<void(const void* field, std::string key)>;
 
 /// Canonical string form of a define_keys()-indexed field's value: a
@@ -655,9 +650,8 @@ struct FieldKeyReader {
 using LookupFieldFn = std::function<void(const void* field, std::string key, LookupType type)>;
 
 /// Visitor for define_fields(): `v.key<&Order::qty>(s.qty, LookupType::Cache,
-/// "qty")` -- replaces the old, separate FieldKeyReader-based
-/// define_scan_fields()/define_cached_fields() pair. `type` is required (no
-/// default): every field gets exactly one LookupType, chosen at the one
+/// "qty")`. `type` is required (no default): every field gets exactly one
+/// LookupType, chosen at the one
 /// place it's declared, which is what makes "the same field declared both
 /// Cache and Scan" structurally impossible rather than merely discouraged --
 /// there is only one call site for it to happen at. (A field declared
@@ -1981,8 +1975,7 @@ public:
 
     /// View-returning form of find_referrers. Named view_referrers (not
     /// find_referrers_view) to match view_by_key/view_by_field: "view_"
-    /// replaces "find_" as a PREFIX everywhere else in this file: only this
-    /// one used to be a suffix.
+    /// consistently replaces "find_" as a PREFIX throughout this file.
     template <auto Field>
     std::vector<View<member_class_t<decltype(Field)>>> view_referrers(
         Ref<typename member_value_t<decltype(Field)>::target_type> target) const;
@@ -2699,9 +2692,9 @@ public:
     // by_type_/by_field_/by_cached_field_/by_cached_reference_ -- log their
     // pre-attempt handle only ONCE per attempt per key touched, not once per
     // object touching that key; see logged_index_entry()'s doc comment. That
-    // used to dominate this cost -- N objects of one type meant N separate
-    // captures of the SAME by_type_ handle -- which is why this used to be
-    // measured far higher than it is now.) Put 200,000 creates in one
+    // once-per-key capture is what keeps N objects of the same type from
+    // logging N separate captures of the SAME by_type_ handle.) Put 200,000
+    // creates in one
     // Transaction and you still retain 200,000 sets of the remaining
     // per-object closures simultaneously -- measured at ~1.8x the
     // steady-state per-object cost of a bulk load (default build,
@@ -3620,11 +3613,10 @@ private:
     }
 
     /// seed_index_entry() PLUS the once-per-attempt rollback capture of the
-    /// whole pre-attempt handle for `key` -- replaces what used to be four
-    /// separate, byte-for-byte identical functions (log_by_type_once/
-    /// log_by_field_once/log_by_cached_field_once/
-    /// log_by_cached_reference_once), each differing only in which INDEX
-    /// member and which DIRTY set it closed over. `dirty` is that index's
+    /// whole pre-attempt handle for `key`. Templated on `Index` so the same
+    /// logic serves all four whole-map indexes -- by_type_, by_field_,
+    /// by_cached_field_, by_cached_reference_ -- without duplicating
+    /// byte-for-byte identical code once per index. `dirty` is that index's
     /// own first-touch-this-attempt set (e.g. dirty_by_field_ for
     /// by_field_) -- mirrors cow()'s dirty_ (first-touch-clones-the-chunk)
     /// trick, applied to a whole-map handle instead of a Chunk.
@@ -4018,15 +4010,13 @@ private:
     /// by TSan: a real data race between a Node destructor (triggered by
     /// by_type_[tag]'s old value being overwritten/dropped) and a
     /// concurrent allocate_shared<Node> on a different thread, in
-    /// performance_tests.cpp's four-writer-threads stress test -- caught
-    /// only once the ordering bug that had left the pool completely
-    /// unused (see apply_create's own comment) was fixed and the pool
-    /// started actually being exercised. unsynchronized_pool_resource is
-    /// therefore unsafe here NO MATTER how tightly it's scoped (Model-
-    /// owned or process-wide, it doesn't matter -- see persistent_map.h's
-    /// TrieCore::mem_ comment, which used to claim otherwise). Paying for
-    /// synchronization here is the price of NOT slowing down the
-    /// lock-free read path with a matching lock -- the alternative would
+    /// performance_tests.cpp's four-writer-threads stress test, once
+    /// by_type_[tag]'s first-touch seeding (see apply_create's own comment)
+    /// routes allocations through the pool instead of plain new/delete.
+    /// unsynchronized_pool_resource is therefore unsafe here NO MATTER how
+    /// tightly it's scoped (Model-owned or process-wide, it doesn't
+    /// matter). Paying for synchronization here is the price of NOT slowing
+    /// down the lock-free read path with a matching lock -- the alternative would
     /// be routing every Root/Snapshot teardown through commit_mu_ too,
     /// which is a strictly worse trade.
     ///
@@ -4257,10 +4247,9 @@ private:
     /// CURRENTLY touched by some entry still in undo_list_ maps to THAT
     /// entry's iterator. Lets a commit that touched ids {a, b, c} find
     /// exactly which retained entries conflict in O(|{a,b,c}|) expected
-    /// time -- one hash lookup per id THIS commit touched -- instead of the
-    /// O(|undo_list_|) scan-every-entry approach that used to run on every
-    /// single commit regardless of how much (or how little) history was
-    /// actually affected.
+    /// time -- one hash lookup per id THIS commit touched -- rather than
+    /// scanning every entry in undo_list_ regardless of how much (or how
+    /// little) history is actually affected.
     ///
     /// At most ONE entry can be indexed under a given id at any moment: any
     /// commit that touches id X always prunes whichever entry currently

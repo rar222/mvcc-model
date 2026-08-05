@@ -216,11 +216,10 @@ TEST(find_referrers_answers_who_points_at_me) {
     CHECK_EQ(view_children.size(), std::size_t{2});
 }
 
-// all_of_referrers/all_of_view_referrers -- previously missing entirely (only
-// the scan/cached-field families had an all_of_* sibling; the referrer
-// family didn't). Both are built on the same referrer_short_circuit
-// for_each_referrers itself now delegates to, so this also checks the walk
-// genuinely stops early rather than just skipping further predicate calls.
+// all_of_referrers/all_of_view_referrers are built on the same
+// referrer_short_circuit for_each_referrers itself delegates to, so this
+// also checks the walk genuinely stops early rather than just skipping
+// further predicate calls.
 TEST(all_of_referrers_and_all_of_view_referrers_short_circuit) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -1048,10 +1047,9 @@ TEST(lookup_stats_aggregates_concurrent_calls_from_every_thread_with_no_flush) {
 }
 
 // qty (cache-declared) and qty_scan (its scan-only twin) each resolve
-// deterministically via one branch, so a single field can no longer show
-// both nonzero cached_calls AND uncached_calls the way one merged field
-// used to under the old two-function API -- this now checks two entries,
-// one per branch.
+// deterministically via one branch, so no single field can ever show both
+// nonzero cached_calls AND uncached_calls -- this checks two entries, one
+// per branch.
 TEST(lookup_diagnostics_is_labeled_by_declaring_type) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");

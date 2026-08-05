@@ -1296,8 +1296,7 @@ std::string Model::LookupDiagnostics::to_string() const {
         // register_field_name_once/register_field_name) over the address:
         // a real name is a strictly better disambiguator
         // than a hex address, so once we have one there's no reason to show
-        // both. A field never given a name falls back to the address, same
-        // as before this option existed.
+        // both. A field never given a name falls back to the address.
         const std::string field_name = detail::field_name_of(key.field);
         std::ostringstream label;
         label << detail::demangle_type_name(*key.type);
@@ -1352,11 +1351,12 @@ std::optional<Model::IntegrityError> Model::apply_create(std::unique_ptr<ObjectB
 
     // Every object gets an (internal, Id-keyed) entry in its type's
     // enumeration index, unconditionally -- this is what for_each<T>() scans.
-    // logged_index_entry pool-seeds by_type_[tag] on first touch (so every
-    // Node/Leaf this and every later insert()/erase() allocates from
-    // node_pool_ instead of plain new/delete -- see its own comment in
-    // model.h for the ordering bug this fixes) and captures the pre-attempt
-    // value once, for the rollback log.
+    // logged_index_entry pool-seeds by_type_[tag] on first touch, which is
+    // what routes every Node/Leaf this and every later insert()/erase()
+    // allocates through node_pool_ instead of plain new/delete -- see
+    // node_pool_'s own comment in model.h for why that routing has to
+    // happen here -- and captures the pre-attempt value once, for the
+    // rollback log.
     const TypeTag tag = raw->tag();
     auto& sub = logged_index_entry(by_type_, dirty_by_type_, tag);
     sub = sub.insert(id);
@@ -1696,15 +1696,14 @@ Transaction Snapshot::begin(std::string name, std::any data) const {
 // ---------------------------------------------------------------------------
 // Transaction / BulkTransaction: raw helpers
 // ---------------------------------------------------------------------------
-// Not templates -- Transaction/BulkTransaction are concrete classes, so these
-// were previously defined in-class purely out of habit, not because they
-// need to be. Unlike Snapshot::find_raw (model.h's "Hot path -- keep
-// inlineable" section, the read path), these sit on the WRITE path -- 10-100
-// commits/sec per CLAUDE.md's target scale -- so moving them here, where
-// they're compiled and optimized exactly once instead of once per TU that
-// calls create/update/remove/peek, costs nothing worth measuring at that
-// rate. See examples/extern_template_demo.cpp's header comment for the
-// compile-time motivation.
+// Not templates -- Transaction/BulkTransaction are concrete classes, so
+// nothing requires these to live in the header. Unlike Snapshot::find_raw
+// (model.h's "Hot path -- keep inlineable" section, the read path), these
+// sit on the WRITE path -- 10-100 commits/sec per CLAUDE.md's target scale
+// -- so defining them here, where they're compiled and optimized exactly
+// once instead of once per TU that calls create/update/remove/peek, costs
+// nothing worth measuring at that rate. See examples/extern_template_demo.cpp's
+// header comment for the compile-time motivation.
 
 ObjectBase* BulkTransaction::update_raw(Id id) const {
     if (!is_local(id)) return nullptr;
@@ -2115,9 +2114,9 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     // Built once and shared (not copied) into every subscriber's Update AND
     // the changelog entry below -- changes_ itself is still read a few more
     // times past this point (last_write_version_, the undo list's `touched`
-    // set, and the final CommitResult), so this is one copy out of it, same
-    // as before; what's eliminated is the PER-SUBSCRIBER copy the old code
-    // made by passing changes_ by value into each Update.
+    // set, and the final CommitResult), so this is the only copy taken out
+    // of it: every subscriber's Update holds the same shared_ptr rather
+    // than its own copy of changes_.
     auto shared_changes = std::make_shared<const std::vector<Change>>(changes_);
 
     {

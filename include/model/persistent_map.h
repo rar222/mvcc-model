@@ -278,7 +278,7 @@ class TrieCore {
     /// unique_ptr tail links, which stay on plain new; see chain_copy/
     /// chain_set_links/chain_erase_links). nullptr (the default, and every
     /// existing caller's behavior -- persistent_map_tests.cpp included) means
-    /// "use ordinary make_shared", exactly as before this was added.
+    /// "use ordinary make_shared".
     ///
     /// Profiling one_million_random_basic_records_in_a_single_transaction_
     /// without_undo (examples/basic_record_bench.cpp) found cloning
@@ -463,13 +463,12 @@ class TrieCore {
     // shared top node's own slots vector), so a child's OWN use_count()
     // reads 1 even though it is only reachable through that still-shared
     // parent, and mutating it in place would corrupt what `pa` sees through
-    // the very same parent. (Caught by persistent_map_tests.cpp's
-    // perfect_hash_map_persists_old_version_across_derived_edits during
-    // development of this optimization -- see git history if this comment
-    // and the bug it describes ever drift apart.) So a node is only
-    // eligible to be mutated in place when BOTH hold: its ancestors are
-    // already private (parent_private), AND it itself isn't additionally
-    // referenced (use_count() == 1).
+    // the very same parent -- persistent_map_tests.cpp's
+    // perfect_hash_map_persists_old_version_across_derived_edits guards
+    // exactly this scenario. So a node is only eligible to be mutated in
+    // place when BOTH hold: its ancestors are already private
+    // (parent_private), AND it itself isn't additionally referenced
+    // (use_count() == 1).
     //
     // Model's per-index tries are only ever touched from inside
     // try_commit(), under commit_mu_ (see model.h's invariant 7), and are
@@ -488,11 +487,11 @@ class TrieCore {
     // root: its one insert touches nodes still referenced by the
     // previously-published Root (or, for a brand-new tag's first touch,
     // additionally by the rollback capture -- see log_by_type_once's doc
-    // comment in model.cpp), so it clones exactly as before -- this path
-    // can only ever remove clones for a MULTI-insert transaction revisiting
-    // the same node, never add cost to a single-insert one (see
-    // small_txn_bench.cpp, which exists to catch exactly this class of
-    // regression).
+    // comment in model.cpp), so it still clones every node on its path --
+    // this in-place optimization can only ever remove clones for a
+    // MULTI-insert transaction revisiting the same node, never add cost to
+    // a single-insert one (see small_txn_bench.cpp, which exists to catch
+    // exactly this class of regression).
     //
     // Ordering is what makes the use_count() check correct even with
     // parent_private threaded through: every branch below computes the

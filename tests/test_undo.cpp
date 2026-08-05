@@ -728,9 +728,8 @@ TEST(set_max_undo_list_size_and_memory_bytes_caps_both_apply) {
 //
 // `owner` must already be gone BEFORE take_undo() builds the reconstruction,
 // not just before the caller's try_commit(): take_undo() fixes the returned
-// Transaction's base() immediately (unlike the old two-call apply_undo(),
-// which built its Transaction fresh at commit time), and classify_apply_
-// failure() tells Invalid from Conflict/RefIntegrity by whether the dangling
+// Transaction's base() immediately, and classify_apply_failure() tells
+// Invalid from Conflict/RefIntegrity by whether the dangling
 // target still existed at THAT base -- see take_undo_can_itself_report_
 // conflict_against_a_concurrent_commit below for the "still alive at base,
 // killed after" (Conflict) half of that split.
