@@ -337,12 +337,30 @@ private:
 // Object model
 // ---------------------------------------------------------------------------
 
+/// Which multi-match lookup path a define_fields()/define_references() entry
+/// resolves through -- Cache backs it with a persistent index (O(log n +
+/// matches), one index entry per object maintained every commit); Scan
+/// leaves it on the always-correct, zero-write-cost O(#objects) linear scan.
+/// Exactly one per declared field: define_fields()/define_references() each
+/// assert (see Object<Derived>::validate_field_declarations/
+/// validate_ref_declarations) that no field is declared twice, so there is
+/// no way for a field to be both -- the caller of find_by_field/
+/// find_referrers never has to know or care which one it got. See
+/// Object<Derived>'s class comment for the full cost model.
+enum class LookupType { Cache, Scan };
+
 /// Callback shape for enumerating an object's outgoing references (see
 /// ObjectBase::each_ref): the field's identity tag, its diagnostic-only
 /// name, the id it currently points at (possibly null), and whether the
 /// field is an Opt<> (nullable) rather than a Ref<>. Drives the reverse
 /// index, cascade resolution, and validation -- everything that needs to
-/// walk edges without knowing concrete types.
+/// walk edges without knowing concrete types. Deliberately carries no
+/// LookupType: every consumer of each_ref (validate, cascade, the writer-
+/// private reverse index) needs EVERY ref field regardless of how it's
+/// looked up -- only the read-side cache population (each_cached_reference,
+/// below) cares about LookupType, and it filters at the define_references()
+/// call site instead (see CachedRefReader) so this shape never needs to grow
+/// a parameter its other ~9 call sites would just ignore.
 using RefFn = std::function<void(const void* field, const char* name, Id target, bool nullable)>;
 
 /// Reports every outgoing reference. Nullability is read off the *field type*, so
@@ -351,10 +369,15 @@ using RefFn = std::function<void(const void* field, const char* name, Id target,
 /// hand-assigned int slot to keep in sync between define_references(),
 /// null_ref(), and the reverse index. (Plain `const void*` here, not a
 /// `Field` template parameter on operator() itself: define_references() is
-/// generic over V -- it's called with RefReader, RefNuller, AND RefRemapper --
-/// and a dependent `v.operator()<Field>(...)` call would need a `.template`
-/// disambiguator. Computing the tag at the call site with the free function
-/// field_tag<Field>() and passing it as an ordinary argument avoids that.)
+/// generic over V -- it's called with RefReader, RefNuller, RefRemapper,
+/// UndoRemapper, AND CachedRefReader -- and a dependent
+/// `v.operator()<Field>(...)` call would need a `.template` disambiguator.
+/// Computing the tag at the call site with the free function field_tag<Field>()
+/// and passing it as an ordinary argument avoids that.)
+///
+/// `type` (see LookupType) says whether this field is cached or left on the
+/// scan fallback -- RefReader itself ignores it (every consumer of each_ref
+/// wants every field regardless), it only matters to CachedRefReader below.
 ///
 /// `name` is diagnostic-only (IntegrityError messages) -- a string literal the
 /// caller passes alongside field_tag<Field>(). A mismatch here can only
@@ -362,11 +385,11 @@ using RefFn = std::function<void(const void* field, const char* name, Id target,
 struct RefReader {
     const RefFn& fn;
     template <class T>
-    void operator()(const void* field, const char* name, const Ref<T>& r) const {
+    void operator()(const void* field, const Ref<T>& r, LookupType, const char* name) const {
         fn(field, name, r.raw(), false);
     }
     template <class T>
-    void operator()(const void* field, const char* name, const Opt<T>& r) const {
+    void operator()(const void* field, const Opt<T>& r, LookupType, const char* name) const {
         fn(field, name, r.raw(), true);
     }
 };
@@ -376,9 +399,9 @@ struct RefReader {
 struct RefNuller {
     const void* target;
     template <class T>
-    void operator()(const void*, const char*, Ref<T>&) const {}
+    void operator()(const void*, Ref<T>&, LookupType, const char*) const {}
     template <class T>
-    void operator()(const void* field, const char*, Opt<T>& r) const {
+    void operator()(const void* field, Opt<T>& r, LookupType, const char*) const {
         if (field == target) r.reset();
     }
 };
@@ -424,11 +447,11 @@ struct RefRemapper {
     }
 
     template <class T>
-    void operator()(const void*, const char*, Ref<T>& r) const {
+    void operator()(const void*, Ref<T>& r, LookupType, const char*) const {
         if (is_local(r.raw())) r = Ref<T>(translate(r.raw()));
     }
     template <class T>
-    void operator()(const void*, const char*, Opt<T>& r) const {
+    void operator()(const void*, Opt<T>& r, LookupType, const char*) const {
         if (r.raw() && is_local(r.raw())) r = Opt<T>(translate(r.raw()));
     }
 };
@@ -455,11 +478,11 @@ struct UndoRemapper {
     }
 
     template <class T>
-    void operator()(const void*, const char*, Ref<T>& r) const {
+    void operator()(const void*, Ref<T>& r, LookupType, const char*) const {
         r = Ref<T>(translate(r.raw()));
     }
     template <class T>
-    void operator()(const void*, const char*, Opt<T>& r) const {
+    void operator()(const void*, Opt<T>& r, LookupType, const char*) const {
         if (r.raw()) r = Opt<T>(translate(r.raw()));
     }
 };
@@ -467,7 +490,7 @@ struct UndoRemapper {
 namespace detail {
 /// Global (process-wide, NOT per-Model) registry: field_tag<Field>() -> a
 /// human name, for fields whose declaration opted in by passing one to
-/// FieldKeyReader::key() or RefIndexReader::index() below. A property of
+/// FieldKeyReader::key() or LookupFieldReader::key() below. A property of
 /// how the FIELD is declared, not of any particular Model or object
 /// instance -- unlike Model's own (per-Model) field lookup stats, this is
 /// intentionally shared across every Model in the process, the same scope
@@ -487,11 +510,11 @@ inline std::unordered_map<const void*, std::string>& field_names() {
 /// Registers `name` for `field`, the FIRST time this exact call site ever
 /// runs (see register_field_name_once below) -- so the mutex here is taken
 /// at most once per distinct Field, ever, for the life of the process, not
-/// on every define_keys()/define_cached_fields()/define_cached_references()
-/// traversal (those run on every create/update, which would otherwise make
-/// this a real write-side cost). First name wins if ever called twice for
-/// the same field with different strings (shouldn't happen -- a field's
-/// name is fixed by its own declaration).
+/// on every define_keys()/define_fields()/define_references() traversal
+/// (those run on every create/update, which would otherwise make this a
+/// real write-side cost). First name wins if ever called twice for the same
+/// field with different strings (shouldn't happen -- a field's name is
+/// fixed by its own declaration).
 inline void register_field_name(const void* field, const char* name) {
     std::lock_guard lk(g_field_name_mu);
     field_names().try_emplace(field, name);
@@ -505,7 +528,7 @@ inline std::string field_name_of(const void* field) {
 }
 
 /// One-time-per-Field registration, called from FieldKeyReader::key() and
-/// RefIndexReader::index(). The `static` guard is the SAME "instantiate
+/// LookupFieldReader::key(). The `static` guard is the SAME "instantiate
 /// once per template argument, then it's free" trick field_tag<Field>()
 /// itself relies on (a function-local static's initialization is
 /// thread-safe and happens exactly once) -- extended here to also run a
@@ -520,38 +543,55 @@ inline void register_field_name_once(const char* name) noexcept {
 }
 }  // namespace detail
 
-/// Callback shape for declaring WHICH Ref<>/Opt<> fields -- already listed in
-/// define_references() -- should also get a reverse-lookup index. See
-/// define_cached_references() and Snapshot::find_referrers.
-using RefIndexFn = std::function<void(const void* field)>;
-
-/// Visitor for define_cached_references(): `v.index<&Order::account>()`
-/// marks that field for the index. No value to supply -- unlike
-/// FieldKeyReader::key(), this is pure metadata (WHICH field, not what
-/// value it holds right now), so define_cached_references() must not read
-/// instance state: Object<Derived> calls it once per TYPE (a function-local
-/// static caches the result), not once per object, and if it happened to
-/// return something different for a different instance, only the FIRST
-/// caller's answer would ever be used.
+/// Cache-declared SUBSET of define_references() -- forwards to `fn` only the
+/// fields tagged LookupType::Cache, in the same (field, name, target,
+/// nullable) shape RefReader already uses, so ObjectBase::each_cached_
+/// reference can hand its RefFn straight through without an adapter.
+/// Replaces the old define_cached_references()/RefIndexReader split: there's
+/// no separate declaration to invoke anymore, just a filter over
+/// define_references()'s own single list.
 ///
-/// `name`, if supplied, is registered (once, see detail::
-/// register_field_name_once) for display in Model::LookupDiagnostics::
-/// to_string() -- purely cosmetic, like RefReader's own `name` parameter;
-/// nothing correctness-critical reads it.
-struct RefIndexReader {
-    const RefIndexFn& fn;
-    template <auto Field>
-    void index(const char* name = nullptr) const {
-        fn(field_tag<Field>());
-        detail::register_field_name_once<Field>(name);
+/// Registers `name` (if supplied) here, not in RefReader -- matching the old
+/// design's behavior exactly: only a Cache-tagged reference field ever got a
+/// display name before (via RefIndexReader::index(name)); a Scan-only one
+/// never did (see Model::LookupDiagnostics::to_string()'s "falls back to an
+/// address" case). Unlike FieldKeyReader::key<Field>()/LookupFieldReader::
+/// key<Field>(), there's no `Field` NTTP available here to feed
+/// detail::register_field_name_once<Field>() -- `field` arrives as an
+/// already-computed `const void*` (see RefReader's own comment for why:
+/// avoiding a `.template operator()<Field>` disambiguator at the generic
+/// `v(...)` call site) -- so this calls the plain, always-locks
+/// detail::register_field_name(field, name) instead of the once-per-Field
+/// cached wrapper. That costs one mutex-guarded try_emplace per commit that
+/// touches a named Cache-tagged reference field (add_cached_references/
+/// drop_cached_references/reconcile_cached_references, never the read path),
+/// which is negligible next to everything else a commit already does.
+struct CachedRefReader {
+    const RefFn& fn;
+    template <class T>
+    void operator()(const void* field, const Ref<T>& r, LookupType type, const char* name) const {
+        if (type != LookupType::Cache) return;
+        if (name) detail::register_field_name(field, name);
+        fn(field, name, r.raw(), false);
+    }
+    template <class T>
+    void operator()(const void* field, const Opt<T>& r, LookupType type, const char* name) const {
+        if (type != LookupType::Cache) return;
+        if (name) detail::register_field_name(field, name);
+        fn(field, name, r.raw(), true);
     }
 };
 
-/// Callback shape for enumerating a type's declared lookup fields (see
-/// ObjectBase::each_field_key / each_cached_field / each_scan_field): the
-/// field's identity tag plus its value in canonical string form
-/// (to_field_key). One shape serves all three lookup families -- and, being
-/// one shape rather than one per field type, is what lets a single
+/// Callback shape for enumerating a type's define_keys() fields ONLY (see
+/// ObjectBase::each_field_key): the field's identity tag plus its value in
+/// canonical string form (to_field_key). define_fields()'s multi-match
+/// family uses the LookupType-carrying LookupFieldFn below instead -- the
+/// two used to share this shape (back when a field could be independently
+/// declared in up to three of define_keys()/define_scan_fields()/
+/// define_cached_fields()), but define_keys() is a genuinely different
+/// concept (a UNIQUE index, not a cache-or-scan multi-match one), so it gets
+/// its own shape now that the multi-match side needs to carry a LookupType.
+/// Being one shape (not one per field type) is what lets a single
 /// heterogeneous vector of (field, key) pairs represent a type's whole
 /// define_keys() set (see collect_update_baseline_field_keys()) with no
 /// variant.
@@ -579,10 +619,10 @@ std::string to_field_key(const V& v) {
     }
 }
 
-/// Reports every field a type opts into fast lookup via define_keys(). Unlike
-/// RefReader (which only ever sees Ref<T>/Opt<T>), this accepts any field
-/// whose value to_field_key() can turn into a canonical string key. A type
-/// with no define_keys() reports nothing -- "zero or more" fields, not
+/// Reports every field a type opts into fast lookup via define_keys() ONLY.
+/// Unlike RefReader (which only ever sees Ref<T>/Opt<T>), this accepts any
+/// field whose value to_field_key() can turn into a canonical string key. A
+/// type with no define_keys() reports nothing -- "zero or more" fields, not
 /// mandatory.
 ///
 /// The field is identified by its own pointer-to-member (via field_tag),
@@ -592,11 +632,10 @@ std::string to_field_key(const V& v) {
 ///
 /// `name`, if supplied, is registered (once, see detail::
 /// register_field_name_once) for display in Model::LookupDiagnostics::
-/// to_string() -- purely cosmetic; nothing correctness-critical reads it.
-/// One shape serves define_keys()/define_cached_fields()/
-/// define_scan_fields() alike, so naming a field in any ONE of them (a
-/// field reused across more than one, like Account::name, only needs it
-/// once) names it for all.
+/// to_string() -- purely cosmetic; nothing correctness-critical reads it. A
+/// field also declared in define_fields() (like Order::computed_key, both a
+/// unique key AND a cached multi-match field) only needs a name once --
+/// LookupFieldReader::key() below registers it the identical way.
 struct FieldKeyReader {
     const FieldKeyFn& fn;
     template <auto Field, class V>
@@ -606,13 +645,42 @@ struct FieldKeyReader {
     }
 };
 
+/// Callback shape for enumerating a type's define_fields() entries: the
+/// field's identity tag, its value in canonical string form, and which
+/// LookupType it was declared with. One shape serves every caller of
+/// each_field -- the write side filters to LookupType::Cache when
+/// maintaining Root::by_cached_field, the read side's scan-fallback check
+/// filters to LookupType::Scan -- so declaring a field once, tagged, is
+/// enough for both.
+using LookupFieldFn = std::function<void(const void* field, std::string key, LookupType type)>;
+
+/// Visitor for define_fields(): `v.key<&Order::qty>(s.qty, LookupType::Cache,
+/// "qty")` -- replaces the old, separate FieldKeyReader-based
+/// define_scan_fields()/define_cached_fields() pair. `type` is required (no
+/// default): every field gets exactly one LookupType, chosen at the one
+/// place it's declared, which is what makes "the same field declared both
+/// Cache and Scan" structurally impossible rather than merely discouraged --
+/// there is only one call site for it to happen at. (A field declared
+/// TWICE by mistake -- same or different LookupType -- is still possible to
+/// type by accident; see Object<Derived>::validate_field_declarations for
+/// the assert that catches that.) `name`, if supplied, is registered the
+/// same way FieldKeyReader::key()'s is.
+struct LookupFieldReader {
+    const LookupFieldFn& fn;
+    template <auto Field, class V>
+    void key(const V& v, LookupType type, const char* name = nullptr) const {
+        fn(field_tag<Field>(), to_field_key(v), type);
+        detail::register_field_name_once<Field>(name);
+    }
+};
+
 namespace detail {
-// Detection traits for the four opt-in declarations (define_references,
-// define_keys, define_cached_fields, define_scan_fields). Object<Derived>
-// branches on these with `if constexpr`, so a user type declares only what
-// it needs -- omitting one costs nothing and overrides nothing -- and a
-// declaration with the wrong signature simply doesn't match (it is silently
-// unused, which is why every declared field deserves a test; see CLAUDE.md).
+// Detection traits for the three opt-in declarations (define_references,
+// define_keys, define_fields). Object<Derived> branches on these with
+// `if constexpr`, so a user type declares only what it needs -- omitting one
+// costs nothing and overrides nothing -- and a declaration with the wrong
+// signature simply doesn't match (it is silently unused, which is why every
+// declared field deserves a test; see CLAUDE.md).
 template <class D, class = void>
 struct has_define_references : std::false_type {};
 template <class D>
@@ -628,24 +696,10 @@ struct has_define_keys<D, std::void_t<decltype(D::define_keys(
     : std::true_type {};
 
 template <class D, class = void>
-struct has_define_cached_fields : std::false_type {};
+struct has_define_fields : std::false_type {};
 template <class D>
-struct has_define_cached_fields<D, std::void_t<decltype(D::define_cached_fields(
-                                       std::declval<const D&>(), std::declval<const FieldKeyReader&>()))>>
-    : std::true_type {};
-
-template <class D, class = void>
-struct has_define_scan_fields : std::false_type {};
-template <class D>
-struct has_define_scan_fields<D, std::void_t<decltype(D::define_scan_fields(
-                                     std::declval<const D&>(), std::declval<const FieldKeyReader&>()))>>
-    : std::true_type {};
-
-template <class D, class = void>
-struct has_define_cached_references : std::false_type {};
-template <class D>
-struct has_define_cached_references<D, std::void_t<decltype(D::define_cached_references(
-                                          std::declval<const D&>(), std::declval<const RefIndexReader&>()))>>
+struct has_define_fields<D, std::void_t<decltype(D::define_fields(
+                                std::declval<const D&>(), std::declval<const LookupFieldReader&>()))>>
     : std::true_type {};
 
 /// Demangles a typeid name for use as a diagnostic label (Object<Derived>::type()).
@@ -745,33 +799,33 @@ public:
     /// keeps the index in sync.
     virtual void each_field_key(const FieldKeyFn&) const {}
 
-    /// Fields declared in define_cached_fields(), for the indexed half of
-    /// find_by_field's MULTI-match lookup. Same visitor shape and same
-    /// diff-at-apply-time maintenance as each_field_key; see Object<> for the
-    /// contract and the cost model.
-    virtual void each_cached_field(const FieldKeyFn&) const {}
-
-    /// Fields declared in define_scan_fields(), for the UNINDEXED
-    /// scan-fallback half of find_by_field's multi-match lookup. Nothing in
-    /// the model maintains anything for these -- the declaration is purely
-    /// the visibility gate that keeps every lookup family uniform (declared
-    /// in neither family == invisible to the lookup). See Object<>.
-    virtual void each_scan_field(const FieldKeyFn&) const {}
+    /// Every field declared in define_fields(), each carrying its own
+    /// LookupType -- the single source for BOTH halves of find_by_field's
+    /// MULTI-match lookup. Callers filter: the write side (Model::
+    /// add_cached_fields & co.) keeps only LookupType::Cache entries when
+    /// maintaining Root::by_cached_field; the read side's scan-fallback
+    /// check (Snapshot::declares_scan_field) keeps only LookupType::Scan.
+    /// A field declared in neither define_fields() nor here at all is
+    /// invisible to the lookup -- the declaration is the visibility gate.
+    /// See Object<> for the contract and the cost model.
+    virtual void each_field(const LookupFieldFn&) const {}
 
     /// The reverse-index SUBSET of each_ref(): only the Ref<>/Opt<> fields
-    /// declared in define_cached_references(), for the indexed half of
-    /// find_referrers's "who points at this?" lookup -- the read-side
-    /// counterpart of the writer-private referrers_ index (that one can
-    /// never be handed to a reader; see CLAUDE.md invariant 8). Same
-    /// diff-at-apply-time maintenance discipline as each_cached_field, just
-    /// keyed by the field's TARGET instead of an arbitrary value. See
-    /// Object<> for the contract and the cost model.
+    /// declared LookupType::Cache in define_references(), for the indexed
+    /// half of find_referrers's "who points at this?" lookup -- the
+    /// read-side counterpart of the writer-private referrers_ index (that
+    /// one can never be handed to a reader; see CLAUDE.md invariant 8). Same
+    /// diff-at-apply-time maintenance discipline as each_field, just keyed
+    /// by the field's TARGET instead of an arbitrary value. See Object<> for
+    /// the contract and the cost model.
     virtual void each_cached_reference(const RefFn&) const {}
 };
 
 /// CRTP base. Derive from it and declare your reference fields ONCE, in
 /// define_references() -- optional, like define_keys(): a type with no
-/// outgoing Ref<>/Opt<> fields simply omits it.
+/// outgoing Ref<>/Opt<> fields simply omits it. Each field's LookupType
+/// (Cache or Scan -- see its own doc comment) is declared right there,
+/// inline, at the same call that lists the field at all:
 ///
 ///     class Order final : public model::Object<Order> {
 ///     public:
@@ -781,8 +835,8 @@ public:
 ///
 ///         template <class Self, class V>
 ///         static void define_references(Self& s, V&& v) {
-///             v(field_tag<&Order::account>(), "account", s.account);
-///             v(field_tag<&Order::parent>(), "parent", s.parent);
+///             v(field_tag<&Order::account>(), s.account, model::LookupType::Cache, "account");
+///             v(field_tag<&Order::parent>(), s.parent, model::LookupType::Scan, "parent");
 ///         }
 ///     };
 ///
@@ -859,61 +913,63 @@ public:
 /// rollback log to unwind a rejected batch against; see its own doc comment.
 /// For "give me every match, not just one," there is one MULTI-match family
 /// per shape (by value, or by referrer), each cost-transparent rather than
-/// cost-fixed: it consults an index when one exists and transparently falls
-/// back to a scan when it doesn't, so the caller never has to pick a
-/// function based on how a field happens to be declared. A field declared in
-/// NEITHER define_scan_fields() nor define_cached_fields() (or, for
-/// referrers, not itself a Ref<>/Opt<> field at all) is still invisible to
-/// its lookup (empty result, same as find_by_key on a field define_keys()
+/// cost-fixed: it consults an index when the field is declared LookupType::
+/// Cache, and transparently falls back to a scan when it's declared
+/// LookupType::Scan, so the caller never has to pick a function based on how
+/// a field happens to be declared -- there is only one function per shape.
+/// A field declared in NEITHER define_fields() nor define_references() (or,
+/// for referrers, not itself a Ref<>/Opt<> field at all) is still invisible
+/// to its lookup (empty result, same as find_by_key on a field define_keys()
 /// never mentioned) -- the fallback only ever reaches an opted-in field,
-/// never an arbitrary one:
+/// never an arbitrary one. And a field CANNOT be declared both Cache and
+/// Scan: each is declared at exactly one call site, tagged with exactly one
+/// LookupType (see LookupType's own doc comment, and
+/// validate_field_declarations()/validate_ref_declarations() below for the
+/// assert that catches an accidental double declaration):
 ///
-///   define_keys()          -> find_by_key    / view_by_key
+///   define_keys()   -> find_by_key    / view_by_key
 ///       unique, indexed: O(log n); a duplicate value is rejected, not
 ///       overwritten.
-///   define_scan_fields() and/or define_cached_fields()
-///                           -> find_by_field  / view_by_field
-///       every match. If the field is declared in define_cached_fields(),
-///       resolves via the index: O(log n + #matches), paid for by one index
-///       entry per object per field, maintained on every
-///       create/delete/value-change inside the serialized commit path (each
-///       cached field costs about what by_type does). Otherwise, if it's
-///       declared in define_scan_fields(), falls back to an UNINDEXED
-///       O(#T objects) scan with zero write-side cost. Which path a given
-///       call actually took is observable via Model::lookup_stats() (see
-///       LookupCounts below) -- that's the signal for whether a field
-///       queried often enough deserves define_cached_fields().
+///   define_fields()  -> find_by_field  / view_by_field
+///       every match. A field tagged LookupType::Cache resolves via the
+///       index: O(log n + #matches), paid for by one index entry per object
+///       per field, maintained on every create/delete/value-change inside
+///       the serialized commit path (each cached field costs about what
+///       by_type does). A field tagged LookupType::Scan falls back to an
+///       UNINDEXED O(#T objects) scan with zero write-side cost. Which path
+///       a given call actually took is observable via Model::lookup_stats()
+///       (see LookupCounts below) -- that's the signal for whether a
+///       Scan-tagged field is queried often enough to retag Cache.
 ///
 ///     template <class Self>
-///     static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-///         v.key<&Order::qty>(s.qty);  // find_by_field<&Order::qty>(5) -> ALL matches
+///     static void define_fields(Self& s, const model::LookupFieldReader& v) {
+///         v.key<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
+///         // find_by_field<&Order::qty>(5) -> ALL matches, via the index
 ///     }
 ///
-/// (define_cached_fields is declared identically; a field may appear in
-/// either or both -- appearing in both is never observable at the call site
-/// once the field is also cached, since the index always wins when present.)
 /// The fully undeclared escape hatch remains the Snapshot::find_by_predicate()
 /// predicate scan.
 ///
 /// A SECOND family, structurally different (it indexes by TARGET, not by
 /// value, and only applies to Ref<>/Opt<> fields already listed in
 /// define_references()): for_each_referrers / find_referrers / view_referrers.
-/// Every Ref<>/Opt<> field is already eligible (define_references() alone is
-/// enough for the O(#T) scan fallback); additionally declaring the field's
-/// IDENTITY in define_cached_references() upgrades that same call to the
+/// Every Ref<>/Opt<> field is already eligible for the O(#T) scan fallback
+/// the moment it's declared LookupType::Scan in define_references(); tagging
+/// it LookupType::Cache there instead upgrades that same call to the
 /// O(log n + #matches) index (define_references() already supplies the
 /// target and nullability, so nothing else needs declaring):
 ///
 ///     template <class Self>
-///     static void define_cached_references(Self& s, const model::RefIndexReader& v) {
-///         v.index<&Order::account>();  // find_referrers<&Order::account>(acct) now indexed
+///     static void define_references(Self& s, V&& v) {
+///         v(field_tag<&Order::account>(), s.account, model::LookupType::Cache, "account");
+///         // find_referrers<&Order::account>(acct) -> now indexed
 ///     }
 ///
-/// Same cost model as define_cached_fields (one index entry per object per
-/// declared reference field, maintained every commit) -- so cache the
-/// references that get queried often (e.g. "every Order for this Account"),
-/// and leave rarely-queried ones (a nullable `parent`, say) on the scan
-/// fallback.
+/// Same cost model as a Cache-tagged define_fields() entry (one index entry
+/// per object per declared reference field, maintained every commit) -- so
+/// tag Cache the references that get queried often (e.g. "every Order for
+/// this Account"), and leave rarely-queried ones (a nullable `parent`, say)
+/// tagged Scan.
 template <class Derived>
 class Object : public ObjectBase {
 public:
@@ -939,8 +995,10 @@ public:
     }
 
     void each_ref(const RefFn& fn) const override {
-        if constexpr (detail::has_define_references<Derived>::value)
+        if constexpr (detail::has_define_references<Derived>::value) {
+            validate_ref_declarations();
             Derived::define_references(static_cast<const Derived&>(*this), RefReader{fn});
+        }
     }
 
     void null_ref(const void* field) override {
@@ -963,36 +1021,69 @@ public:
             Derived::define_keys(static_cast<const Derived&>(*this), FieldKeyReader{fn});
     }
 
-    void each_cached_field(const FieldKeyFn& fn) const override {
-        if constexpr (detail::has_define_cached_fields<Derived>::value)
-            Derived::define_cached_fields(static_cast<const Derived&>(*this), FieldKeyReader{fn});
-    }
-
-    void each_scan_field(const FieldKeyFn& fn) const override {
-        if constexpr (detail::has_define_scan_fields<Derived>::value)
-            Derived::define_scan_fields(static_cast<const Derived&>(*this), FieldKeyReader{fn});
+    void each_field(const LookupFieldFn& fn) const override {
+        if constexpr (detail::has_define_fields<Derived>::value) {
+            validate_field_declarations();
+            Derived::define_fields(static_cast<const Derived&>(*this), LookupFieldReader{fn});
+        }
     }
 
     void each_cached_reference(const RefFn& fn) const override {
-        if constexpr (detail::has_define_cached_references<Derived>::value) {
-            // Computed once per Derived, not once per object: define_cached_
-            // references() is required to be pure metadata (see
-            // RefIndexReader), so any instance's answer is every instance's
-            // answer -- a function-local static (thread-safe init) is exactly
-            // the "compute once per type" tool already used for type()'s
-            // demangled name above.
-            static const std::unordered_set<const void*> wanted = [this] {
-                std::unordered_set<const void*> w;
-                RefIndexFn collect = [&](const void* f) { w.insert(f); };
-                Derived::define_cached_references(static_cast<const Derived&>(*this), RefIndexReader{collect});
-                return w;
-            }();
-            if constexpr (detail::has_define_references<Derived>::value) {
-                RefFn filtered = [&](const void* field, const char* name, Id target, bool nullable) {
-                    if (wanted.count(field)) fn(field, name, target, nullable);
+        if constexpr (detail::has_define_references<Derived>::value) {
+            // Same one-time validation each_ref() runs -- called here too
+            // (not just there) so this stays correct regardless of whether
+            // each_ref() ever happens to run first for this Derived; the
+            // static guard inside makes the second call (whichever order)
+            // a cheap no-op.
+            validate_ref_declarations();
+            Derived::define_references(static_cast<const Derived&>(*this), CachedRefReader{fn});
+        }
+    }
+
+private:
+    // Both validation passes run ONCE per Derived type (function-local
+    // static, thread-safe init -- the same "compute once per type" tool
+    // type()'s demangled name above already uses), the first time each_ref/
+    // each_field is ever called for it -- i.e. at commit time, never on the
+    // read path (find_by_field/find_referrers dispatch only checks
+    // Root::by_cached_field/by_cached_reference presence, never walks these).
+    // A field declared twice -- same or different LookupType, doesn't matter
+    // -- is a define_fields()/define_references() authoring bug, not
+    // something that should compile clean and silently pick one; see
+    // LookupType's own doc comment for why this is what makes "the same
+    // field both Cache and Scan" actually impossible, not merely
+    // discouraged. `assert` stays live on the default preset (CLAUDE.md: "do
+    // not add NDEBUG"), so this fails loudly the moment the type is ever
+    // touched, matching this codebase's "prefer failing loudly" rule rather
+    // than the old "no compiler error and no assert" gap invariant 1 warns
+    // against for a field left OUT of define_references() entirely.
+    void validate_field_declarations() const {
+        if constexpr (detail::has_define_fields<Derived>::value) {
+            static const bool ok = [this] {
+                std::unordered_set<const void*> seen;
+                LookupFieldFn check = [&](const void* field, std::string, LookupType) {
+                    assert(seen.insert(field).second &&
+                           "define_fields(): a field must be declared exactly once (Cache or Scan)");
                 };
-                Derived::define_references(static_cast<const Derived&>(*this), RefReader{filtered});
-            }
+                Derived::define_fields(static_cast<const Derived&>(*this), LookupFieldReader{check});
+                return true;
+            }();
+            (void)ok;
+        }
+    }
+
+    void validate_ref_declarations() const {
+        if constexpr (detail::has_define_references<Derived>::value) {
+            static const bool ok = [this] {
+                std::unordered_set<const void*> seen;
+                RefFn check = [&](const void* field, const char*, Id, bool) {
+                    assert(seen.insert(field).second &&
+                           "define_references(): a field must be declared exactly once (Cache or Scan)");
+                };
+                Derived::define_references(static_cast<const Derived&>(*this), RefReader{check});
+                return true;
+            }();
+            (void)ok;
         }
     }
 };
@@ -1078,21 +1169,23 @@ struct Root {
     /// separate mandatory "primary key" index.
     std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_field;
 
-    /// One persistent MULTIMAP per define_cached_fields()-declared field:
-    /// canonical value string -> a persistent set of every Id whose field
-    /// currently holds that value. Unlike by_field, every match is kept. The
-    /// bucket is a persistent SET, NEVER a flat vector: a flat bucket would
-    /// make each mutation O(#duplicates of that value), which for a
-    /// low-cardinality field (a status, a category) is O(n) per op -- the
-    /// exact size-proportional cost this design exists to avoid.
+    /// One persistent MULTIMAP per define_fields()-declared field tagged
+    /// LookupType::Cache: canonical value string -> a persistent set of
+    /// every Id whose field currently holds that value. Unlike by_field,
+    /// every match is kept. The bucket is a persistent SET, NEVER a flat
+    /// vector: a flat bucket would make each mutation O(#duplicates of that
+    /// value), which for a low-cardinality field (a status, a category) is
+    /// O(n) per op -- the exact size-proportional cost this design exists to
+    /// avoid.
     std::unordered_map<const void*,
                        pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
                                           pmap::StringHash>>
         by_cached_field;
 
-    /// One persistent MULTIMAP per define_cached_references()-declared
-    /// Ref<>/Opt<> field: TARGET's Id -> a persistent set of every REFERRER's
-    /// Id whose field currently points there. Same bucket discipline as
+    /// One persistent MULTIMAP per define_references()-declared Ref<>/Opt<>
+    /// field tagged LookupType::Cache: TARGET's Id -> a persistent set of
+    /// every REFERRER's Id whose field currently points there. Same bucket
+    /// discipline as
     /// by_cached_field (persistent set buckets, never flat vectors -- a hub
     /// object referenced by thousands would otherwise make every one of
     /// those referrers' commits O(#referrers)). This is the published,
@@ -1120,8 +1213,8 @@ class View;
 
 /// Call counts for one field's find_by_field/for_each_referrers (and
 /// siblings) calls, split by which path a call actually took: resolved via
-/// the define_cached_fields()/define_cached_references() index, or fell back
-/// to the O(#T) scan. Purely observational: lets a caller decide, from
+/// the index (the field was tagged LookupType::Cache), or fell back to the
+/// O(#T) scan (tagged LookupType::Scan). Purely observational: lets a caller decide, from
 /// ACTUAL usage over the model's whole lifetime, whether declaring a field
 /// cached would pay for itself, or whether it's fine left on the scan
 /// fallback (or undeclared entirely, which records nothing since the call
@@ -1416,26 +1509,25 @@ public:
     };
 
     /// Multi-match lookup: every object whose `Field` -- declared via
-    /// define_scan_fields() and/or define_cached_fields() -- currently
-    /// equals `value`. Named like find_by_key: `s.find_by_field<&Order::qty>(5)`,
-    /// with class and value type both deduced from the field itself, and
-    /// `Field` may also be a nullary const method.
+    /// define_fields() -- currently equals `value`. Named like find_by_key:
+    /// `s.find_by_field<&Order::qty>(5)`, with class and value type both
+    /// deduced from the field itself, and `Field` may also be a nullary
+    /// const method.
     ///
-    /// Cost-transparent, not cost-fixed: if `Field` is declared in
-    /// define_cached_fields(), resolves via Root::by_cached_field in
-    /// O(log n + #matches); otherwise, if it's declared in
-    /// define_scan_fields(), falls back to an UNINDEXED O(#ClassT objects)
-    /// scan, comparing the field's actual typed value. Empty if the field is
-    /// declared in NEITHER family -- an undeclared field is invisible to
-    /// this lookup, same rule find_by_key follows for a field define_keys()
-    /// never mentioned; nothing is walked in that case, so declaring nothing
-    /// stays a compile-time-cheap no-op rather than a silent O(n) footgun.
-    /// Which path a given call actually took is observable via
-    /// Model::lookup_stats<Field>() -- that's the signal for whether a
-    /// scan-only field is queried often enough to deserve
-    /// define_cached_fields(). Result order is unspecified (index order for
-    /// a cache hit, by_type order for a scan fallback -- neither is
-    /// insertion order).
+    /// Cost-transparent, not cost-fixed: if `Field` is tagged LookupType::
+    /// Cache, resolves via Root::by_cached_field in O(log n + #matches);
+    /// if tagged LookupType::Scan, falls back to an UNINDEXED
+    /// O(#ClassT objects) scan, comparing the field's actual typed value.
+    /// Empty if the field is not declared in define_fields() at all -- an
+    /// undeclared field is invisible to this lookup, same rule find_by_key
+    /// follows for a field define_keys() never mentioned; nothing is walked
+    /// in that case, so declaring nothing stays a compile-time-cheap no-op
+    /// rather than a silent O(n) footgun. Which path a given call actually
+    /// took is observable via Model::lookup_stats<Field>() -- that's the
+    /// signal for whether a Scan-tagged field is queried often enough to
+    /// retag Cache. Result order is unspecified (index order for a cache
+    /// hit, by_type order for a scan fallback -- neither is insertion
+    /// order).
     /// Defined out-of-line (after Model) so its body can call
     /// Model::register_field_lookup() for LookupCounts -- see that method's
     /// doc comment for why this can't be inline here.
@@ -1698,10 +1790,10 @@ public:
     /// Root::by_cached_reference bucket (`filtered_` false, O(log n +
     /// matches), no per-element check) -- see for_each_referrers's own doc
     /// comment for which, and when. No "declared" check gates the scan
-    /// fallback (unlike FieldRange/define_scan_fields()): for_each_referrers
-    /// already works on ANY Ref<>/Opt<> field, declared in
-    /// define_cached_references() or not. See FieldRange's own comment for
-    /// the cost note this shares.
+    /// fallback (unlike FieldRange, gated by a Scan-tagged define_fields()
+    /// entry): for_each_referrers already works on ANY Ref<>/Opt<> field
+    /// listed in define_references(), tagged LookupType::Cache or Scan. See
+    /// FieldRange's own comment for the cost note this shares.
     template <auto Field>
     class ReferrerRange {
     public:
@@ -1843,14 +1935,17 @@ public:
     /// the parameter type itself, not a runtime static_assert.
     ///
     /// Cost-transparent, not cost-fixed, same as find_by_field: if `Field`
-    /// is declared in define_cached_references(), resolves via
-    /// Root::by_cached_reference in O(log n + #matches); otherwise falls
-    /// back to an O(number of ClassT objects) scan -- every Ref<>/Opt<>
-    /// field is eligible for the scan fallback the moment it's listed in
-    /// define_references(), with no separate opt-in needed the way
-    /// find_by_field requires define_scan_fields(). Which path a given call
-    /// took is observable via Model::lookup_stats<Field>(). NEVER stops
-    /// early -- see all_of_referrers for the short-circuiting sibling.
+    /// is tagged LookupType::Cache in define_references(), resolves via
+    /// Root::by_cached_reference in O(log n + #matches); if tagged
+    /// LookupType::Scan, falls back to an O(number of ClassT objects) scan.
+    /// Unlike define_fields() (whose only reason to exist is opting a field
+    /// into the value-lookup family), define_references() is ALREADY
+    /// mandatory for basic correctness (cascade delete/null, invariant 1) --
+    /// the LookupType tag just piggybacks on a declaration that has to be
+    /// there anyway, so every Ref<>/Opt<> field ends up eligible for one
+    /// path or the other, never neither. Which path a given call took is
+    /// observable via Model::lookup_stats<Field>(). NEVER stops early -- see
+    /// all_of_referrers for the short-circuiting sibling.
     /// Defined out-of-line (after Model) -- see find_by_field's comment.
     template <auto Field, class F>
     void for_each_referrers(Ref<typename member_value_t<decltype(Field)>::target_type> target,
@@ -1986,15 +2081,15 @@ public:
 
     /// Untyped counterpart of the CACHE-HIT half of find_by_field -- same
     /// "field disambiguates the keyspace" reasoning as find_by_key_raw, but
-    /// multi-match: every currently-live object whose define_cached_fields()
-    /// value under `field` equals `key`, read straight out of
-    /// Root::by_cached_field's O(log n + matches) index (see
+    /// multi-match: every currently-live object whose LookupType::Cache
+    /// define_fields() value under `field` equals `key`, read straight out
+    /// of Root::by_cached_field's O(log n + matches) index (see
     /// find_by_key_raw's own comment for the general shape this mirrors).
     /// Covers the one case find_by_field<Field> itself cannot: several
     /// UNRELATED concrete types registering the IDENTICAL field tag (e.g.
     /// several Object<Derived> types built on one shared, non-model mixin
-    /// base, each with its own define_cached_fields() entry naming that
-    /// mixin's field). find_by_field<Field>'s return type is
+    /// base, each with its own define_fields() entry naming that mixin's
+    /// field). find_by_field<Field>'s return type is
     /// `member_class_t<decltype(Field)>*` -- a single concrete type -- so it
     /// can't express "could be any of several"; this returns every match
     /// regardless of concrete type and leaves the tag() check to the caller,
@@ -2017,9 +2112,10 @@ public:
 
     /// Untyped counterpart of the cache-hit half of all_of_by_field --
     /// short-circuits: `pred` returning false stops the walk immediately and
-    /// this returns false. Vacuously true if the field was never
-    /// define_cached_fields()'d or nothing currently holds `key`, same as
-    /// every other lookup family's empty-is-not-an-error contract.
+    /// this returns false. Vacuously true if the field was never declared
+    /// LookupType::Cache in define_fields() or nothing currently holds
+    /// `key`, same as every other lookup family's empty-is-not-an-error
+    /// contract.
     bool all_of_by_cached_field_raw(const void* field, const std::string& key,
                                     const std::function<bool(const ObjectBase&)>& pred) const;
 
@@ -2041,31 +2137,37 @@ private:
         return static_cast<const T*>(o);
     }
 
-    /// Whether `o` declares Field via define_scan_fields() (checked by tag,
-    /// via each_scan_field). Factored out to ONE place so scan_field_short_
-    /// circuit's own inline once-per-scan check and range_by_field/
-    /// range_view_by_field's upfront check (see scan_field_is_declared
-    /// below) can't drift apart on what "declared" means -- there is
-    /// exactly one definition of it in this file.
+    /// Whether `o` declares Field with LookupType::Scan in define_fields()
+    /// (checked by tag, via each_field). Factored out to ONE place so
+    /// scan_field_short_circuit's own inline once-per-scan check and
+    /// range_by_field/range_view_by_field's upfront check (see
+    /// scan_field_is_declared below) can't drift apart on what "declared"
+    /// means -- there is exactly one definition of it in this file. Only
+    /// ever consulted once cached_field_is_declared() has already answered
+    /// false for the same field, so in practice this is really just "is
+    /// Field declared at all" (a field can never be both, see LookupType's
+    /// own doc comment) -- the explicit `type == LookupType::Scan` check is
+    /// kept anyway so the function is correct read in isolation, not just
+    /// under that calling convention.
     template <auto Field>
     static bool declares_scan_field(const ObjectBase& o) {
         bool declared = false;
-        o.each_scan_field([&](const void* field, std::string) {
-            if (field == field_tag<Field>()) declared = true;
+        o.each_field([&](const void* field, std::string, LookupType type) {
+            if (field == field_tag<Field>() && type == LookupType::Scan) declared = true;
         });
         return declared;
     }
 
-    /// Whether Field is declared via define_scan_fields() for ClassT,
-    /// checked by asking any ONE live object of that type -- define_scan_
-    /// fields() is static per type, so one answer speaks for the whole
-    /// population (same assumption scan_field_short_circuit's own inline
-    /// check makes). False (vacuously) if ClassT currently has no live
-    /// objects to ask. What find_by_field/range_by_field/range_view_by_field
-    /// use to decide whether the SCAN FALLBACK'S bucket should be the real
-    /// by_type[ClassT] population or empty -- a field declared in neither
-    /// lookup family must behave exactly like find_by_key's "undeclared is
-    /// invisible" rule, not just skip the value filter.
+    /// Whether Field is declared LookupType::Scan for ClassT, checked by
+    /// asking any ONE live object of that type -- define_fields() is static
+    /// per type, so one answer speaks for the whole population (same
+    /// assumption scan_field_short_circuit's own inline check makes). False
+    /// (vacuously) if ClassT currently has no live objects to ask. What
+    /// find_by_field/range_by_field/range_view_by_field use to decide
+    /// whether the SCAN FALLBACK'S bucket should be the real by_type[ClassT]
+    /// population or empty -- a field declared in neither lookup family must
+    /// behave exactly like find_by_key's "undeclared is invisible" rule, not
+    /// just skip the value filter.
     template <auto Field>
     bool scan_field_is_declared() const {
         using ClassT = member_class_t<decltype(Field)>;
@@ -2077,24 +2179,25 @@ private:
         return declared;
     }
 
-    /// Whether `field` has a define_cached_fields() entry at all -- i.e.
-    /// whether find_by_field/for_each_by_field/all_of_by_field/range_by_field
-    /// should take the cache-hit branch or fall back to the scan. A field's
-    /// presence as a key in Root::by_cached_field already IS this fact (see
-    /// Root::by_cached_field's own doc comment: one entry is added the first
-    /// time define_cached_fields() runs for it, never removed), so this is
-    /// just naming that check in one place -- same reason declares_scan_
-    /// field/scan_field_is_declared exist as named helpers instead of an
-    /// inline map lookup repeated at every call site.
+    /// Whether `field` has a LookupType::Cache entry in define_fields() at
+    /// all -- i.e. whether find_by_field/for_each_by_field/all_of_by_field/
+    /// range_by_field should take the cache-hit branch or fall back to the
+    /// scan. A field's presence as a key in Root::by_cached_field already IS
+    /// this fact (see Root::by_cached_field's own doc comment: one entry is
+    /// added the first time a Cache-tagged define_fields() entry runs for
+    /// it, never removed), so this is just naming that check in one place --
+    /// same reason declares_scan_field/scan_field_is_declared exist as named
+    /// helpers instead of an inline map lookup repeated at every call site.
     bool cached_field_is_declared(const void* field) const {
         return root_ && root_->by_cached_field.find(field) != root_->by_cached_field.end();
     }
 
     /// Same role as cached_field_is_declared, for the referrer family:
-    /// whether `field` has a define_cached_references() entry, i.e. whether
-    /// for_each_referrers/all_of_referrers/find_referrers/range_referrers
-    /// should take the cache-hit branch (Root::by_cached_reference) or fall
-    /// back to the always-available O(#ClassT objects) scan.
+    /// whether `field` has a LookupType::Cache entry in define_references(),
+    /// i.e. whether for_each_referrers/all_of_referrers/find_referrers/
+    /// range_referrers should take the cache-hit branch (Root::
+    /// by_cached_reference) or fall back to the always-available
+    /// O(#ClassT objects) scan.
     bool cached_referrer_is_declared(const void* field) const {
         return root_ && root_->by_cached_reference.find(field) != root_->by_cached_reference.end();
     }
@@ -2124,20 +2227,21 @@ private:
     /// above deliberately does not, to match this file's for_each_* naming
     /// convention (see its own doc comment). `f` returns true to keep going,
     /// false to stop early; this returns false iff `f` stopped it (vacuously
-    /// true if the field was never define_cached_fields()'d, or nothing
-    /// currently holds `key` -- same "undeclared/no-match is empty, not an
-    /// error" contract every lookup family in this file shares).
+    /// true if the field was never declared LookupType::Cache in
+    /// define_fields(), or nothing currently holds `key` -- same
+    /// "undeclared/no-match is empty, not an error" contract every lookup
+    /// family in this file shares).
     bool cached_field_short_circuit_raw(const void* field, const std::string& key,
                                         const std::function<bool(Id)>& f) const;
 
     /// Same lookup as cached_field_short_circuit_raw (field-tag -> that
     /// field's persistent multimap -> bucket for `key`), but hands back the
     /// bucket itself -- an empty PersistentSet if the field was never
-    /// define_cached_fields()'d or nothing currently holds `key` -- instead
-    /// of walking it via a callback. What FieldRange/FieldViewRange
-    /// (range_by_field & co.) are built on for the cache-hit case: a range
-    /// needs to hand out an independent begin()/end() pair, not a single
-    /// walk-then-return.
+    /// declared LookupType::Cache in define_fields() or nothing currently
+    /// holds `key` -- instead of walking it via a callback. What
+    /// FieldRange/FieldViewRange (range_by_field & co.) are built on for the
+    /// cache-hit case: a range needs to hand out an independent
+    /// begin()/end() pair, not a single walk-then-return.
     pmap::PersistentSet<Id, IdHash> cached_field_bucket_raw(const void* field,
                                                             const std::string& key) const;
 
@@ -2145,11 +2249,14 @@ private:
     /// half of both for_each_referrers<Field> and all_of_referrers<Field> --
     /// same role scan_field_short_circuit plays for the by-field family,
     /// just walking all_of<ClassT> with a reference-equality match
-    /// (`(o.*Field).raw() == target.raw()`) instead of a value comparison,
-    /// and with no define_references()-declared check: unlike a scan field,
-    /// this fallback is reachable for ANY Ref<>/Opt<> field, not just ones
-    /// declared in define_cached_references() -- see for_each_referrers's
-    /// own doc comment. Defined out-of-line alongside its callers -- see
+    /// (`(o.*Field).raw() == target.raw()`) instead of a value comparison.
+    /// Reads `o.*Field` directly, bypassing define_references() entirely --
+    /// so unlike a scan-tagged value field (gated by declares_scan_field),
+    /// this fallback works for ANY Ref<>/Opt<> pointer-to-member, whether or
+    /// not it's even listed in define_references() at all (a field left out
+    /// of define_references() is still invisible to cascade/null/the
+    /// reverse index -- invariant 1 -- but this scan doesn't go through any
+    /// of that machinery). Defined out-of-line alongside its callers -- see
     /// find_by_field's comment for why (register_field_lookup).
     template <auto Field, class F>
     bool referrer_short_circuit(Ref<typename member_value_t<decltype(Field)>::target_type> target,
@@ -2157,8 +2264,8 @@ private:
 
     /// Shared, short-circuiting bucket walk behind the CACHE-HIT half of
     /// every referrer lookup in this file -- for_each_referrers<Field>,
-    /// all_of_referrers<Field> (reached when Field is declared in
-    /// define_cached_references()), plus the genuinely cache-only
+    /// all_of_referrers<Field> (reached when Field is tagged LookupType::
+    /// Cache in define_references()), plus the genuinely cache-only
     /// find_cached_referrers_raw, for_each_cached_referrers_raw, AND
     /// all_of_cached_referrers_raw. Same relationship
     /// cached_field_short_circuit_raw has to the by-field family (see its
@@ -2857,7 +2964,7 @@ public:
     /// `type` for the declaring TYPE's name, and falls back to `field`'s
     /// raw address to disambiguate two looked-up fields on the same type
     /// that were never given a name (see FieldKeyReader::key()/
-    /// RefIndexReader::index()'s own `name` parameter).
+    /// LookupFieldReader::key()/CachedRefReader's own `name` parameter).
     class LookupDiagnostics {
     public:
         std::unordered_map<FieldLookupKey, LookupCounts, FieldLookupKeyHash> stats;
@@ -2986,9 +3093,9 @@ public:
     /// This field's index-hit-vs-scan-fallback call counts, for the life of
     /// this Model -- zero if Field was never looked up via find_by_field/
     /// for_each_referrers/find_referrers (or a sibling entry point in either
-    /// family). The direct way to ask "is define_cached_fields()/
-    /// define_cached_references() paying for itself on THIS field" without
-    /// needing lookup_diagnostics()'s enumerate-everything list.
+    /// family). The direct way to ask "is this field's LookupType::Cache tag
+    /// paying for itself" without needing lookup_diagnostics()'s
+    /// enumerate-everything list.
     template <auto Field>
     LookupCounts lookup_stats() const {
         using ClassT = member_class_t<decltype(Field)>;
@@ -3435,7 +3542,7 @@ private:
 
     // Same trio again, for the reverse-lookup multimap (by_cached_reference_)
     // -- keyed by each declared field's TARGET, walked via
-    // each_cached_reference() instead of each_cached_field().
+    // each_cached_reference() instead of each_field().
     void add_cached_references(const ObjectBase* o);
     void drop_cached_references(const ObjectBase* o);
     void reconcile_cached_references(const ObjectBase* before, const ObjectBase* after);
@@ -4247,8 +4354,8 @@ bool Snapshot::scan_field_short_circuit(const member_value_t<decltype(Field)>& v
     bool checked = false, declared = false;
     return all_of<ClassT>([&](const ClassT& o) {
         if (!checked) {
-            // define_scan_fields() is static per type: ask the first
-            // object once, on behalf of the whole scan.
+            // define_fields() is static per type: ask the first object
+            // once, on behalf of the whole scan.
             checked = true;
             declared = declares_scan_field<Field>(o);
         }

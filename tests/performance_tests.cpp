@@ -406,10 +406,10 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 
 // Account::name is declared in BOTH define_keys() (find_by_key, unique,
 // backed by by_field_'s persistent map -- O(log n), same as the
-// kSmallIndexedRead lookups above, not truly flat) and define_scan_fields()
-// (find_by_field's scan-fallback branch, O(#accounts) linear scan -- name
-// has no define_cached_fields() entry, so find_by_field always falls back
-// here) -- see tests/test_types.h. Same field, same data, same query: any
+// kSmallIndexedRead lookups above, not truly flat) and define_fields()
+// tagged LookupType::Scan (find_by_field's scan-fallback branch,
+// O(#accounts) linear scan -- name isn't tagged LookupType::Cache, so
+// find_by_field always falls back here) -- see tests/test_types.h. Same field, same data, same query: any
 // timing difference is attributable entirely to the index, not to anything
 // else. Uses kSmallIndexedRead for the same reason the cache-hit-vs-scan
 // tests below do: a sub-microsecond O(log n) call only predicts a ~x1.07
@@ -454,9 +454,9 @@ TEST(find_by_key_stays_near_flat_while_find_by_field_scan_fallback_grows_with_po
                      key_us.back(), 3.0);
 }
 
-// Same comparison, one level up: Order::qty is cache-declared (find_by_field
-// resolves it in O(log n + matches)); its scan-only twin qty_scan (see
-// seed_orders' own comment) is declared only in define_scan_fields(), so
+// Same comparison, one level up: Order::qty is tagged LookupType::Cache
+// (find_by_field resolves it in O(log n + matches)); its scan-only twin
+// qty_scan (see seed_orders' own comment) is tagged LookupType::Scan, so
 // find_by_field on it always takes the O(#orders) scan fallback -- same
 // field VALUES (kept equal by seed_orders), same query, so any timing
 // difference is attributable entirely to which branch resolves it.
@@ -505,10 +505,10 @@ TEST(find_by_field_stays_near_flat_via_cache_while_its_scan_only_twin_grows) {
                      cached_us.back(), 3.0);
 }
 
-// The reverse-lookup counterpart: Order::account is cache-declared (via
-// define_cached_references()), so find_referrers resolves it in
+// The reverse-lookup counterpart: Order::account is tagged LookupType::Cache
+// in define_references(), so find_referrers resolves it in
 // O(log n + matches); its scan-only twin account_scan (see seed_orders' own
-// comment) is declared only in define_references(), so find_referrers on it
+// comment) is tagged LookupType::Scan, so find_referrers on it
 // always takes the always-available O(#orders) scan fallback -- same comparison
 // examples/cached_reference_bench.cpp benchmarks in more depth, here as an
 // asserted claim at smaller, CI-friendly sizes.
@@ -1190,17 +1190,11 @@ public:
     }
 
     template <class Self>
-    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&StrKeyed::unique_key>(s.unique_key, "unique_key");
-        v.key<&StrKeyed::dup_key>(s.dup_key, "dup_key");
-        v.key<&StrKeyed::unique_key_scan>(s.unique_key_scan, "unique_key_scan");
-        v.key<&StrKeyed::dup_key_scan>(s.dup_key_scan, "dup_key_scan");
-    }
-
-    template <class Self>
-    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&StrKeyed::unique_key>(s.unique_key, "unique_key");
-        v.key<&StrKeyed::dup_key>(s.dup_key, "dup_key");
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.key<&StrKeyed::unique_key>(s.unique_key, model::LookupType::Cache, "unique_key");
+        v.key<&StrKeyed::dup_key>(s.dup_key, model::LookupType::Cache, "dup_key");
+        v.key<&StrKeyed::unique_key_scan>(s.unique_key_scan, model::LookupType::Scan, "unique_key_scan");
+        v.key<&StrKeyed::dup_key_scan>(s.dup_key_scan, model::LookupType::Scan, "dup_key_scan");
     }
 };
 
@@ -1485,7 +1479,7 @@ public:
     model::Ref<Account> bucket;
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&MemUncached::bucket>(), "bucket", s.bucket);
+        v(model::field_tag<&MemUncached::bucket>(), s.bucket, model::LookupType::Scan, "bucket");
     }
 };
 class MemCached final : public model::Object<MemCached> {
@@ -1493,12 +1487,7 @@ public:
     model::Ref<Account> bucket;
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&MemCached::bucket>(), "bucket", s.bucket);
-    }
-    template <class Self>
-    static void define_cached_references(Self& s, const model::RefIndexReader& v) {
-        (void)s;
-        v.index<&MemCached::bucket>();
+        v(model::field_tag<&MemCached::bucket>(), s.bucket, model::LookupType::Cache, "bucket");
     }
 };
 
@@ -1666,9 +1655,8 @@ TEST(bulk_load_avoids_the_single_transaction_rollback_log_memory_blowup) {
 
 // ---------------------------------------------------------------------------
 // Basic bulk-insert timing: a plain type with NOTHING declared -- no
-// define_keys(), no define_references(), no define_scan_fields(), no
-// define_cached_fields() -- so each_ref()/each_field_key()/each_cached_
-// field()/each_scan_field() all fall back to Object<>'s own no-op defaults
+// define_keys(), no define_references(), no define_fields() -- so
+// each_ref()/each_field_key()/each_field()/each_cached_reference() all fall back to Object<>'s own no-op defaults
 // (see ObjectBase's own doc comments). That makes apply's per-object cost
 // as close to "just write a slot" as this model gets: no ref to validate
 // (invariant 1), no index to insert into. One giant Transaction, committed

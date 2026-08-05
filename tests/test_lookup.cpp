@@ -666,7 +666,7 @@ TEST(range_by_field_visits_the_same_matches_as_for_each_by_field) {
     // Field naming a nullary const method (computed_key), not a data member
     // -- exercises FieldRange::matches' other branch
     // (std::is_member_object_pointer_v == false), reached here via the
-    // cache-hit path since computed_key is also define_cached_fields()'d.
+    // cache-hit path since computed_key is tagged LookupType::Cache.
     int computed_hits = 0;
     for (const Order& o : s.range_by_field<&Order::computed_key>("ord:O1")) {
         CHECK(o.id == o1.raw());
@@ -1097,9 +1097,9 @@ TEST(lookup_diagnostics_to_string_is_human_readable) {
 
     const std::string report = m.lookup_diagnostics().to_string();
     // Order::qty/qty_scan are named ("qty"/"qty_scan") in test_types.h's
-    // define_cached_fields()/define_scan_fields() -- registered the moment
-    // the Order above was created, well before either lookup call -- so the
-    // report shows the real names instead of falling back to a bare address.
+    // define_fields() -- registered the moment the Order above was created,
+    // well before either lookup call -- so the report shows the real names
+    // instead of falling back to a bare address.
     CHECK(report.find("Order::qty") != std::string::npos);
     CHECK(report.find("Order::qty_scan") != std::string::npos);
     CHECK(report.find("@") == std::string::npos);  // no address fallback needed
@@ -1143,8 +1143,8 @@ class Unnamed final : public model::Object<Unnamed> {
 public:
     std::int64_t code = 0;
     template <class Self>
-    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Unnamed::code>(s.code);  // no name argument
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.key<&Unnamed::code>(s.code, model::LookupType::Cache);  // no name argument
     }
 };
 }  // namespace
@@ -1167,17 +1167,17 @@ TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
 }
 
 // Same named/unnamed split as the two tests above, but through the
-// REFERENCE-field entry point (RefIndexReader::index(), feeding
-// find_referrers/for_each_referrers's cache-hit branch) rather than the
-// value-field one (FieldKeyReader::key(), feeding find_by_field) --
-// a genuinely different code path in register_field_lookup's callers, and one
-// with a real unnamed field sitting in test_types.h already: Order::account
-// is named ("account") in define_cached_references(), but Order::parent is
-// declared in define_references() (so cascade/null still work) and
-// deliberately left OUT of define_cached_references() entirely -- see its
-// own comment -- so it never reaches RefIndexReader::index() and has no
-// registered name. Both fields live on the SAME type, which is exactly the
-// disambiguation case FieldStat::field exists for.
+// REFERENCE-field entry point (CachedRefReader, feeding find_referrers/
+// for_each_referrers's cache-hit branch) rather than the value-field one
+// (LookupFieldReader::key(), feeding find_by_field) -- a genuinely different
+// code path in register_field_lookup's callers, and one with a real unnamed
+// field sitting in test_types.h already: Order::account is named ("account")
+// and tagged LookupType::Cache in define_references(), but Order::parent is
+// also declared in define_references() (so cascade/null still work) and
+// deliberately tagged LookupType::Scan instead -- see its own comment -- so
+// it never reaches CachedRefReader and has no registered name. Both fields
+// live on the SAME type, which is exactly the disambiguation case
+// FieldStat::field exists for.
 TEST(lookup_diagnostics_shows_names_for_reference_fields_too) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");

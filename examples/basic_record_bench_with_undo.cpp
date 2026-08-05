@@ -7,10 +7,9 @@
 // try_commit_without_undo() pays for).
 //
 // BasicRecord has NO define_keys(), NO define_references(), NO
-// define_scan_fields(), NO define_cached_fields() -- see basic_record_
-// bench.cpp's own doc comment for why that makes it the cheapest possible
-// object shape, isolating the model's own per-object floor rather than this
-// type's field overhead.
+// define_fields() -- see basic_record_bench.cpp's own doc comment for why
+// that makes it the cheapest possible object shape, isolating the model's
+// own per-object floor rather than this type's field overhead.
 //
 // Usage: ./basic_record_bench_with_undo [count]   (default 1,000,000)
 

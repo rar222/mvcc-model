@@ -6,9 +6,9 @@
 // every other test binary in the project.
 //
 // BasicRecord has NO define_keys(), NO define_references(), NO
-// define_scan_fields(), NO define_cached_fields() -- deliberately nothing
-// declared, so each_ref()/each_field_key()/each_cached_field()/
-// each_scan_field() all fall back to Object<>'s own no-op defaults. That
+// define_fields() -- deliberately nothing declared, so each_ref()/
+// each_field_key()/each_field()/each_cached_reference() all fall back to
+// Object<>'s own no-op defaults. That
 // makes this the cheapest possible object shape for try_commit()'s apply
 // phase: no ref to validate (invariant 1), no by_field_/by_cached_field_/
 // by_cached_reference_ index entries to insert. The only per-object

@@ -193,7 +193,7 @@ need it.
 ## 4. One commit, end to end
 
 Putting §1–§3 together: a `try_commit()` that changes one `Order`'s `qty`, a field also
-covered by `define_cached_fields()`:
+tagged `LookupType::Cache` in `define_fields()`:
 
 ```
  1. Model::cow(chunk_of(order.id))                      -- clone ONE Chunk               (S1)

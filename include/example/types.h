@@ -4,31 +4,29 @@
 // exactly what a type has to provide to live in the store.
 //
 // The declaration contract (each define_X below) is unchanged: a field left out of
-// every lookup family is invisible to it (find_by_key on an undeclared field,
-// find_by_field/find_referrers on a field declared in neither family -- empty,
-// nothing walked). What changed is the READ side: find_by_scan_field/find_by_
-// cached_field collapsed into one find_by_field, and for_each_cached_referrers/
-// find_cached_referrers into for_each_referrers/find_referrers -- each cache-first,
-// scan-fallback. See model.h's Object<Derived> class comment for the full contract.
-//   define_references()     optional: list every reference field ONCE, tagged by its own address
+// define_fields()/define_references() is invisible to find_by_field/find_referrers
+// (find_by_key on an undeclared field is similarly invisible to define_keys()) --
+// empty, nothing walked. What changed is that the OLD three-way split (scan-only /
+// cached-only / cached-reference-opt-in) is now a single LookupType tag (Cache or
+// Scan) attached to each field/reference at its one declaration site -- a field can
+// be tagged exactly one way, never both. See model.h's Object<Derived> class
+// comment for the full contract.
+//   define_references()     optional: list every reference field ONCE, tagged by its own
+//                           address and a model::LookupType (Cache or Scan) -- Cache backs
+//                           find_referrers's "who points at this?" lookup with an INDEXED
+//                           O(log n + matches) reverse index (one entry per object,
+//                           maintained every commit); Scan leaves it on the always-
+//                           available O(#objects) scan fallback (zero write-side cost).
+//                           Declare Cache only for what's queried often.
 //   define_keys()           optional: zero or more fields (or computed methods) for fast
 //                           UNIQUE lookup (find_by_key; a create/update that would duplicate
 //                           another live object's value is rejected, CommitStatus::Invalid)
-//   define_scan_fields()    optional: zero or more fields that make find_by_field reachable
-//                           via an UNINDEXED O(#objects) scan when the same field isn't ALSO
-//                           in define_cached_fields() -- zero write-side cost, for fields
-//                           queried rarely
-//   define_cached_fields()  optional: zero or more fields that make find_by_field resolve via
-//                           an INDEXED O(log n + matches) lookup instead (every match kept).
-//                           Costs one index entry per object per field, maintained on every
-//                           commit -- declare only what's queried often; find_by_field always
-//                           prefers this over the scan when a field is in both families.
-//   define_cached_references()  optional: zero or more Ref<>/Opt<> fields -- ALREADY listed
-//                           in define_references() -- that make find_referrers's "who points
-//                           at this?" lookup resolve via an INDEXED O(log n + matches) lookup
-//                           instead of its always-available O(#objects) scan fallback. Same
-//                           cost model as define_cached_fields; declare only what's queried
-//                           often.
+//   define_fields()         optional: zero or more fields, each tagged model::LookupType::
+//                           Cache or model::LookupType::Scan, that make find_by_field
+//                           reachable -- Cache resolves via an INDEXED O(log n + matches)
+//                           lookup (one index entry per object, maintained every commit);
+//                           Scan resolves via an UNINDEXED O(#objects) scan (zero write-side
+//                           cost). Declare Cache only for what's queried often.
 //
 // (type() also exists, for diagnostic messages, but Object<Derived> derives it
 // from typeid() automatically -- there's nothing to override.)
@@ -83,16 +81,16 @@ public:
         v.key<&Account::name>(s.name, "name");
     }
 
-    /// name is ALSO a scan field (and nothing else -- not in define_cached_
-    /// fields()), so find_by_field<&Account::name> exercises the scan-
-    /// fallback branch. It's ALSO a define_keys() field, so no two live
-    /// Accounts can actually share a name (a duplicate is rejected at commit
-    /// time), meaning find_by_field on it can only ever return zero or one
-    /// match in practice. See Order::qty for a scan field where genuine
+    /// name is tagged Scan (nothing else references it as Cache), so
+    /// find_by_field<&Account::name> exercises the scan-fallback branch.
+    /// It's ALSO a define_keys() field, so no two live Accounts can
+    /// actually share a name (a duplicate is rejected at commit time),
+    /// meaning find_by_field on it can only ever return zero or one match
+    /// in practice. See Order::qty for a scan field where genuine
     /// multi-match duplicates are legal.
     template <class Self>
-    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Account::name>(s.name, "name");
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.key<&Account::name>(s.name, model::LookupType::Scan, "name");
     }
 };
 
@@ -133,32 +131,27 @@ public:
                ", parent=" + (parent ? ref_str(parent.raw()) : "null") + "}";
     }
 
+    /// account is the classic hot reverse lookup ("every Order for this
+    /// Account") -- worth the index, so it's tagged LookupType::Cache and
+    /// find_referrers<&Order::account> resolves via Root::by_cached_
+    /// reference. parent and account_scan are deliberately tagged Scan:
+    /// queried rarely enough that find_referrers's O(#orders) scan fallback
+    /// is the better trade (zero write-side cost) -- the same "index only
+    /// what's worth it" tradeoff define_fields() applies to plain fields,
+    /// below. account_scan exists specifically to give find_referrers a
+    /// scan-fallback case shaped like account's cache-hit case (see its own
+    /// field comment); parent is Order's genuinely-nullable, rarely-queried
+    /// ref. All three are still declared in define_references() regardless
+    /// of tag -- that's what makes account CASCADE and parent/account_scan
+    /// NULL correctly on their target's delete (see Ref<>/Opt<> nullability
+    /// above); the LookupType only adds (or withholds) the fast reverse
+    /// lookup on top of that.
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Order::account>(), "account", s.account);
-        v(model::field_tag<&Order::parent>(), "parent", s.parent);
-        v(model::field_tag<&Order::account_scan>(), "account_scan", s.account_scan);
-    }
-
-    /// account is the classic hot reverse lookup ("every Order for this
-    /// Account") -- worth the index, so find_referrers<&Order::account>
-    /// resolves via Root::by_cached_reference. parent and account_scan are
-    /// deliberately left OUT: queried rarely enough that find_referrers's
-    /// O(#orders) scan fallback is the better trade (zero write-side cost)
-    /// -- the same "index only what's worth it" tradeoff define_cached_
-    /// fields()/define_scan_fields() apply to plain fields, above.
-    /// account_scan exists specifically to give find_referrers a scan-
-    /// fallback case shaped like account's cache-hit case (see its own field
-    /// comment); parent is Order's genuinely-nullable, rarely-queried ref.
-    /// All three are still declared in define_references() regardless --
-    /// that's what makes account CASCADE and parent/account_scan NULL
-    /// correctly on their target's delete (see Ref<>/Opt<> nullability
-    /// above); this declaration only adds the fast lookup on top of
-    /// account.
-    template <class Self>
-    static void define_cached_references(Self& s, const model::RefIndexReader& v) {
-        (void)s;
-        v.index<&Order::account>("account");
+        v(model::field_tag<&Order::account>(), s.account, model::LookupType::Cache, "account");
+        v(model::field_tag<&Order::parent>(), s.parent, model::LookupType::Scan, "parent");
+        v(model::field_tag<&Order::account_scan>(), s.account_scan, model::LookupType::Scan,
+          "account_scan");
     }
 
     template <class Self>
@@ -166,29 +159,22 @@ public:
         v.key<&Order::computed_key>(s.computed_key(), "computed_key");
     }
 
-    /// The scan-fallback family: makes find_by_field reachable via an
-    /// UNINDEXED O(#orders) scan when a field isn't ALSO in define_cached_
-    /// fields() (qty_scan isn't, so it stays on the scan; qty also appears
-    /// in define_cached_fields() below, so find_by_field<&Order::qty>
-    /// resolves via the index instead -- the two declarations aren't a
-    /// meaningful redundancy for qty itself, just a fixture the tests use to
-    /// prove both paths agree).
-    template <class Self>
-    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::qty>(s.qty, "qty");
-        v.key<&Order::computed_key>(s.computed_key(), "computed_key");
-        v.key<&Order::qty_scan>(s.qty_scan, "qty_scan");
-    }
-
     /// qty is deliberately non-unique (many orders share a quantity), so it
-    /// goes in a MULTI-match family, not define_keys():
-    /// s.find_by_field<&Order::qty>(5) -> every order with qty == 5, via the
-    /// index (this declaration is what makes it resolve that way instead of
-    /// falling back to the scan qty_scan uses).
+    /// goes in the MULTI-match family, not define_keys():
+    /// s.find_by_field<&Order::qty>(5) -> every order with qty == 5.
+    /// Tagged Cache, so that resolves via the index; qty_scan is a scan-
+    /// only twin kept equal to qty (see its own field comment) so find_by_
+    /// field/find_referrers's scan-fallback branch can be exercised on data
+    /// shaped exactly like qty's cache-hit case. computed_key is ALSO
+    /// declared here (in addition to define_keys() above) purely as a
+    /// fixture: the two declarations aren't a meaningful redundancy for
+    /// computed_key itself, just a way for tests to prove the cache and key
+    /// lookup paths agree.
     template <class Self>
-    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::qty>(s.qty, "qty");
-        v.key<&Order::computed_key>(s.computed_key(), "computed_key");
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.key<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
+        v.key<&Order::computed_key>(s.computed_key(), model::LookupType::Cache, "computed_key");
+        v.key<&Order::qty_scan>(s.qty_scan, model::LookupType::Scan, "qty_scan");
     }
 };
 

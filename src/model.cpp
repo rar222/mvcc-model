@@ -126,7 +126,7 @@ bool Snapshot::cached_field_short_circuit_raw(const void* field, const std::stri
     // of value -> set of every Id currently holding it -- same two-level
     // shape as by_field/find_by_key_raw above, just multi-match per value.
     auto it = root_->by_cached_field.find(field);
-    if (it == root_->by_cached_field.end()) return true;  // never define_cached_fields()'d: vacuous
+    if (it == root_->by_cached_field.end()) return true;  // never tagged LookupType::Cache: vacuous
     const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key);
     if (!bucket) return true;  // no live object currently holds this exact value: vacuous
     return bucket->for_each_short_circuit(f);
@@ -170,7 +170,7 @@ bool Snapshot::cached_referrer_short_circuit_raw(const void* field, Id target,
     // there -- same two-level shape as by_cached_field/cached_field_short_
     // circuit_raw above, just keyed by Id instead of a value string.
     auto it = root_->by_cached_reference.find(field);
-    if (it == root_->by_cached_reference.end()) return true;  // never define_cached_references()'d: vacuous
+    if (it == root_->by_cached_reference.end()) return true;  // never tagged LookupType::Cache: vacuous
     const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target);
     if (!bucket) return true;  // nothing currently references this target: vacuous
     return bucket->for_each_short_circuit(f);
@@ -994,7 +994,8 @@ void Model::reconcile_field_keys(
 
 void Model::add_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
-    o->each_cached_field([&](const void* field, std::string key) {
+    o->each_field([&](const void* field, std::string key, LookupType type) {
+        if (type != LookupType::Cache) return;  // Scan-tagged: no index to maintain
         // Two-level structure: by_cached_field_[field] is the OUTER map (key
         // string -> bucket); logged_index_entry pool-seeds it on first touch
         // and captures its pre-attempt state, once, for the rollback log.
@@ -1008,7 +1009,8 @@ void Model::add_cached_fields(const ObjectBase* o) {
 
 void Model::drop_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
-    o->each_cached_field([&](const void* field, std::string key) {
+    o->each_field([&](const void* field, std::string key, LookupType type) {
+        if (type != LookupType::Cache) return;
         auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field);
         sub = pmap::bucket_erase(sub, key, id);
     });
@@ -1021,10 +1023,13 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
     // against it one field at a time. A linear-scan vector, not an
     // unordered_map -- see reconcile_out_refs()'s comment for why.
     std::vector<std::pair<const void*, std::string>> old_keys;
-    before->each_cached_field(
-        [&](const void* field, std::string key) { old_keys.emplace_back(field, std::move(key)); });
+    before->each_field([&](const void* field, std::string key, LookupType type) {
+        if (type != LookupType::Cache) return;
+        old_keys.emplace_back(field, std::move(key));
+    });
 
-    after->each_cached_field([&](const void* field, std::string new_key) {
+    after->each_field([&](const void* field, std::string new_key, LookupType type) {
+        if (type != LookupType::Cache) return;
         const auto it = std::find_if(old_keys.begin(), old_keys.end(),
                                      [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
@@ -1047,12 +1052,12 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
 }
 
 // The cached-reference (reverse multimap) index -- the read-side counterpart
-// of referrers_, opt-in per Ref<>/Opt<> field via define_cached_references().
-// Same persistent-bucket discipline as the cached-field trio above (never a
-// flat vector; every mutation rollback-logged), keyed by the TARGET's Id bytes
-// instead of a field's value, storing the REFERRER's Id in each bucket.
-// each_cached_reference() already filters to just the declared fields, so
-// these never do anything for a field not opted in.
+// of referrers_, opt-in per Ref<>/Opt<> field tagged LookupType::Cache in
+// define_references(). Same persistent-bucket discipline as the cached-field
+// trio above (never a flat vector; every mutation rollback-logged), keyed by
+// the TARGET's Id bytes instead of a field's value, storing the REFERRER's Id
+// in each bucket. each_cached_reference() already filters to just the
+// Cache-tagged fields, so these never do anything for a Scan-tagged one.
 
 void Model::add_cached_references(const ObjectBase* o) {
     const Id id = o->id;  // the REFERRER -- the value stored in the bucket, not the bucket's key
@@ -1287,8 +1292,9 @@ std::string Model::LookupDiagnostics::to_string() const {
             total > 0 ? 100.0 * static_cast<double>(counts.cached_calls) / static_cast<double>(total)
                      : 0.0;
         // Prefer the real field name (opted in via FieldKeyReader::key()/
-        // RefIndexReader::index() -- see detail::register_field_name_once)
-        // over the address: a real name is a strictly better disambiguator
+        // LookupFieldReader::key()/CachedRefReader -- see detail::
+        // register_field_name_once/register_field_name) over the address:
+        // a real name is a strictly better disambiguator
         // than a hex address, so once we have one there's no reason to show
         // both. A field never given a name falls back to the address, same
         // as before this option existed.
@@ -2525,7 +2531,8 @@ void Model::add_field_keys_no_log(const ObjectBase* o) {
 // same reason as add_field_keys_no_log() above.
 void Model::add_cached_fields_no_log(const ObjectBase* o) {
     const Id id = o->id;
-    o->each_cached_field([&](const void* field, std::string key) {
+    o->each_field([&](const void* field, std::string key, LookupType type) {
+        if (type != LookupType::Cache) return;
         // seed_index_entry + pool-seeded bucket: see add_cached_fields's
         // identical seeding (no rollback capture needed on this bulk-load
         // path, but still needs to seed the pool on first touch).

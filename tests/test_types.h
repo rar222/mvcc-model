@@ -34,8 +34,8 @@ public:
     }
 
     template <class Self>
-    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Account::name>(s.name, "name");
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.key<&Account::name>(s.name, model::LookupType::Scan, "name");
     }
 };
 
@@ -69,15 +69,10 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Order::account>(), "account", s.account);
-        v(model::field_tag<&Order::parent>(), "parent", s.parent);
-        v(model::field_tag<&Order::account_scan>(), "account_scan", s.account_scan);
-    }
-
-    template <class Self>
-    static void define_cached_references(Self& s, const model::RefIndexReader& v) {
-        (void)s;
-        v.index<&Order::account>("account");
+        v(model::field_tag<&Order::account>(), s.account, model::LookupType::Cache, "account");
+        v(model::field_tag<&Order::parent>(), s.parent, model::LookupType::Scan, "parent");
+        v(model::field_tag<&Order::account_scan>(), s.account_scan, model::LookupType::Scan,
+          "account_scan");
     }
 
     template <class Self>
@@ -86,15 +81,9 @@ public:
     }
 
     template <class Self>
-    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::qty>(s.qty, "qty");
-        v.key<&Order::computed_key>(s.computed_key(), "computed_key");
-        v.key<&Order::qty_scan>(s.qty_scan, "qty_scan");
-    }
-
-    template <class Self>
-    static void define_cached_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::qty>(s.qty, "qty");
-        v.key<&Order::computed_key>(s.computed_key(), "computed_key");
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.key<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
+        v.key<&Order::computed_key>(s.computed_key(), model::LookupType::Cache, "computed_key");
+        v.key<&Order::qty_scan>(s.qty_scan, model::LookupType::Scan, "qty_scan");
     }
 };

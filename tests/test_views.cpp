@@ -62,8 +62,8 @@ TEST(view_of_a_stale_handle_is_empty) {
 TEST(find_by_field_returns_every_match_and_only_for_declared_fields) {
     Model m;
     const Ref<Account> a = make_account(m, "A1", 1);  // Account::name: define_keys AND
-                                                      // define_scan_fields (see Account's
-                                                      // own doc comment)
+                                                      // define_fields (Scan-tagged, see
+                                                      // Account's own doc comment)
     make_account(m, "OTHER", 3);
     make_order(m, "O1", a, {}, 5);  // also sets qty_scan == 5
     make_order(m, "O2", a, {}, 5);
@@ -236,7 +236,7 @@ TEST(for_each_and_all_of_referrers_match_find_referrers_via_cache) {
                                               [](const Order&) { return false; }));
 
     // A field declared in define_references() (so it cascades/nulls
-    // correctly) but NOT in define_cached_references() -- Order::parent, see
+    // correctly) but tagged LookupType::Scan, not Cache -- Order::parent, see
     // tests/test_types.h -- falls back to the scan instead of coming up
     // empty: for_each_referrers/all_of_referrers/find_referrers all find the
     // real referrer via that fallback, same as calling them on any other
@@ -405,8 +405,8 @@ TEST(find_referrers_tracks_cascade_null_via_cache) {
     CHECK(s.find_referrers<&Node::parent>(root).empty());
 }
 
-// find_referrers on a field declared in define_references() but NOT in
-// define_cached_references() falls back to the scan and finds the real
+// find_referrers on a field declared in define_references() but tagged
+// LookupType::Scan, not Cache, falls back to the scan and finds the real
 // referrer -- the opposite of the old two-function API's "no silent
 // fallback" guarantee, which this merge deliberately removes (see model.h's
 // Object<Derived> class comment).
@@ -417,7 +417,7 @@ TEST(find_referrers_falls_back_to_the_scan_for_a_field_never_declared_cached) {
     const Ref<Order> child = make_order(m, "C1", a, hub);
 
     // parent IS declared in define_references() (so it cascades/nulls
-    // correctly) but deliberately NOT in define_cached_references() -- see
+    // correctly) but tagged LookupType::Scan, not Cache -- see
     // tests/test_types.h -- so find_referrers on it always takes the scan
     // fallback, and still finds the real referrer.
     const auto found = m.snapshot().find_referrers<&Order::parent>(hub);
@@ -515,14 +515,14 @@ TEST(for_each_view_is_type_filtered) {
     CHECK_EQ(total, std::int64_t{1 + 2 + 5 + 5});
 }
 
-// Order::computed_key() is declared in ALL THREE of define_keys(),
-// define_scan_fields(), and define_cached_fields() at once (see
-// tests/test_types.h), so a single update() that changes what it returns
-// must reconcile the key index AND the cached-field index together --
-// find_by_field always takes the cache-hit branch for a field declared in
-// both, so that's the only branch observable here (the scan-fallback
-// branch's "always reflects the live value" behavior is generic and already
-// covered via qty_scan elsewhere, not unique to computed_key).
+// Order::computed_key() is declared in BOTH define_keys() and define_fields()
+// (tagged LookupType::Cache) at once (see tests/test_types.h), so a single
+// update() that changes what it returns must reconcile the key index AND
+// the cached-field index together -- find_by_field always takes the
+// cache-hit branch for a Cache-tagged field, so that's the only branch
+// observable here (the scan-fallback branch's "always reflects the live
+// value" behavior is generic and already covered via qty_scan elsewhere,
+// not unique to computed_key).
 TEST(updating_a_field_declared_in_multiple_lookup_families_reconciles_key_and_cache_together) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");

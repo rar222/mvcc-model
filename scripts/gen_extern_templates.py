@@ -36,10 +36,11 @@ information:
    list of types.
 
 2. Field-dependent entry points -- these need each type's define_keys() /
-   define_scan_fields() / define_cached_fields() / define_references() /
-   define_cached_references() bodies, because that's the ONLY place (other
-   than the field's own declared type) that says which fields participate
-   in which lookup family. A Ref<T>/Opt<T> data member that's declared but
+   define_fields() / define_references() bodies, because that's the ONLY
+   place (other than the field's own declared type) that says which fields
+   participate in which lookup family (and, for define_fields()/
+   define_references(), which LookupType -- Cache or Scan -- each one is
+   tagged). A Ref<T>/Opt<T> data member that's declared but
    left out of define_references() is invisible to the model (see
    CLAUDE.md invariant 1 / types.h's own header comment) -- this script
    warns about that case instead of silently guessing.
@@ -156,7 +157,7 @@ in this repo" for when this check is required, not just suggested):
     # template line in the first place. They land in types_extern.cpp.o
     # correctly, PULLED IN TRANSITIVELY: they're only ever called from
     # inside Object<T>'s own virtual-dispatch bodies (via define_keys()/
-    # define_cached_fields()/define_cached_references()), so explicitly
+    # define_fields()/define_references()), so explicitly
     # instantiating `class Object<T>` (render_entries()'s very first line
     # for every type) forces the compiler to instantiate everything those
     # bodies call, too -- confirm they're absent from the CALLER
@@ -236,8 +237,7 @@ class TypeInfo:
     name: str
     member_types: Dict[str, str] = field(default_factory=dict)  # field/method name -> declared type
     key_fields: List[str] = field(default_factory=list)
-    scan_fields: List[str] = field(default_factory=list)
-    cached_fields: List[str] = field(default_factory=list)
+    fields: List[str] = field(default_factory=list)  # define_fields()-declared (Cache or Scan tagged)
     ref_fields: List[Tuple[str, str, str]] = field(default_factory=list)  # (field, Ref|Opt, target_type)
 
 
@@ -304,8 +304,7 @@ def parse_type(name: str, class_body: str, warn) -> TypeInfo:
         return list(dict.fromkeys(names))  # de-dup, keep first-seen order
 
     info.key_fields = field_names('define_keys', r'key')
-    info.scan_fields = field_names('define_scan_fields', r'key')
-    info.cached_fields = field_names('define_cached_fields', r'key')
+    info.fields = field_names('define_fields', r'key')
     ref_field_names = field_names('define_references', r'field_tag')
 
     for fname in ref_field_names:
@@ -387,12 +386,13 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
             out.append(f'extern template const {T}* Snapshot::find_by_key<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template std::optional<View<{T}>> Snapshot::view_by_key<&{T}::{fname}>({arg}) const;')
         # find_by_field/view_by_field/range_by_field are the single merged
-        # entry point for a field declared via define_scan_fields() and/or
-        # define_cached_fields() (cache-first, scan fallback -- see model.h's
-        # Object<Derived> class comment). One extern-template row per field
-        # regardless of which of the two (or both) declared it -- scan_fields
-        # | cached_fields, deduped, so a field in both isn't emitted twice.
-        for fname in dict.fromkeys(list(t.scan_fields) + list(t.cached_fields)):
+        # entry point for a field declared via define_fields(), tagged
+        # LookupType::Cache or LookupType::Scan (cache-first, scan fallback
+        # -- see model.h's Object<Derived> class comment). One extern-
+        # template row per field -- a field can only ever be tagged one way,
+        # so unlike the old scan_fields/cached_fields split there's nothing
+        # to union or dedup here.
+        for fname in t.fields:
             arg = f'const {t.member_types[fname]}&'
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_by_field<&{T}::{fname}>({arg}) const;')
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_by_field<&{T}::{fname}>({arg}) const;')
@@ -411,11 +411,11 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
             # find_referrers/view_referrers/range_referrers are the single
-            # merged entry point for any Ref<>/Opt<> field (cache-first via
-            # define_cached_references() when declared, scan fallback
-            # otherwise) -- one row regardless of whether this field is also
-            # in define_cached_references(), so unlike the by-field loop
-            # above there's no separate cached-fields list to fold in here.
+            # merged entry point for any Ref<>/Opt<> field (cache-first when
+            # tagged LookupType::Cache in define_references(), scan fallback
+            # when tagged LookupType::Scan) -- one row per field either way,
+            # so unlike the by-field loop above there's no separate list to
+            # fold in here.
             out.append(f'extern template std::vector<const {T}*> Snapshot::find_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template std::vector<View<{T}>> Snapshot::view_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
             out.append(f'extern template Snapshot::ReferrerRange<&{T}::{fname}> Snapshot::range_referrers<&{T}::{fname}>(Ref<{Y}>) const;')
@@ -451,11 +451,8 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
 
         out.append('// -- Model --')
         out.append(f'extern template const {T}* Model::peek_as<{T}>(Id) const;')
-        seen_lookup_stats = set()  # scan+cached share fields (e.g. Order::computed_key); de-dup
-        for fname in t.scan_fields + t.cached_fields:
-            if fname not in seen_lookup_stats:
-                seen_lookup_stats.add(fname)
-                out.append(f'extern template LookupCounts Model::lookup_stats<&{T}::{fname}>() const;')
+        for fname in t.fields:
+            out.append(f'extern template LookupCounts Model::lookup_stats<&{T}::{fname}>() const;')
         out.append('')
 
         out.append('// -- CommitResult --')

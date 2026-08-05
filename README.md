@@ -70,8 +70,8 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Order::account>(), "account", s.account);
-        v(model::field_tag<&Order::parent>(), "parent", s.parent);
+        v(model::field_tag<&Order::account>(), s.account, model::LookupType::Cache, "account");
+        v(model::field_tag<&Order::parent>(), s.parent, model::LookupType::Scan, "parent");
     }
 
     template <class Self>
@@ -79,14 +79,12 @@ public:
         v.key<&Order::computed_key>(s.computed_key());
     }
 
-    // Multi-match lookups are separate, opt-in declarations -- see below.
+    // Multi-match lookups: each field's LookupType decides how find_by_field/
+    // find_referrers resolves it -- Cache via an O(log n + matches) index,
+    // Scan via an O(#objects) fallback. A field can be tagged exactly one way.
     template <class Self>
-    static void define_scan_fields(Self& s, const model::FieldKeyReader& v) {
-        v.key<&Order::qty>(s.qty);      // find_by_field falls back to an O(#objects) scan
-    }
-    template <class Self>
-    static void define_cached_references(Self& s, const model::RefIndexReader& v) {
-        v.index<&Order::account>();     // find_referrers resolves via an O(log n + matches) index
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.key<&Order::qty>(s.qty, model::LookupType::Scan);
     }
 };
 
@@ -120,10 +118,10 @@ const Order*   dad   = s.resolve(x->parent);          // Opt<Order>   -> const O
 s.for_each<Order>([&](const Order& o) { /* type-filtered iteration */ });
 
 // Multi-match: every order with qty == 5 -- find_by_field falls back to an
-// unindexed scan here, since qty is declared only in define_scan_fields...
+// unindexed scan here, since qty is tagged LookupType::Scan above...
 std::vector<const Order*> q5 = s.find_by_field<&Order::qty>(5);
 // ...vs. every order FOR this account -- find_referrers resolves via the
-// index here, since account is ALSO declared in define_cached_references above.
+// index here, since account is tagged LookupType::Cache above.
 std::vector<const Order*> mine = s.find_referrers<&Order::account>(acct);
 
 // 3b. Views work exactly as before -- scoped to a Snapshot, not a Transaction.
@@ -159,14 +157,14 @@ contention. *Applying* is not parallel: `examples/commit_bench.cpp`'s thread-cou
 shows this plainly (throughput does not scale linearly with writer threads). That's the
 tradeoff this design makes, not an oversight.
 
-**Multi-match lookups are cost-transparent, not cost-fixed, and cost is why they're opt-in.**
-Beyond `define_keys()` (unique, indexed, `find_by_key`), `find_by_field`/`find_referrers` are
-each ONE entry point that resolves via a persistent index — O(log n + matches) — when the
-field is declared in `define_cached_fields()`/`define_cached_references()`, and transparently
-falls back to an O(#objects) scan — costs nothing until you call it — when it's declared only
-in `define_scan_fields()` (or, for a reference field, not cached at all; every `Ref<>`/`Opt<>`
-field is scan-fallback-eligible the moment it's in `define_references()`). The indexed path
-isn't free: each declared field costs roughly one extra index entry per object, upkept inside
+**Multi-match lookups are cost-transparent, not cost-fixed, and cost is why `LookupType::Cache`
+is opt-in.** Beyond `define_keys()` (unique, indexed, `find_by_key`), `find_by_field`/
+`find_referrers` are each ONE entry point that resolves via a persistent index —
+O(log n + matches) — when the field is tagged `LookupType::Cache` in `define_fields()`/
+`define_references()`, and transparently falls back to an O(#objects) scan — costs nothing
+until you call it — when it's tagged `LookupType::Scan` instead (every `Ref<>`/`Opt<>` field is
+scan-fallback-eligible the moment it's in `define_references()`, regardless of its tag). The
+indexed path isn't free: each declared field costs roughly one extra index entry per object, upkept inside
 the serialized `try_commit()` apply phase on every create, delete, and value change — the
 same write-side tax `by_type` already pays, just per declared field instead of per object.
 That's why it's opt-in rather than automatic: index only the fields actually queried often —

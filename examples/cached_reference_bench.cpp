@@ -2,13 +2,15 @@
 // that pays for it.
 //
 // Two types, structurally identical except for ONE declaration:
-//   UncachedItem::bucket -- listed in define_references() only. "Who points
-//     at this Bucket?" (Snapshot::find_referrers) falls back to an O(#items)
-//     linear scan: nothing indexes it.
-//   CachedItem::bucket -- ALSO listed in define_cached_references().
-//     find_referrers answers the same question in O(log n + #matches)
-//     instead, resolving via its cache-hit branch, backed by
-//     Root::by_cached_reference -- see DESIGN.md's "Lookup families" section.
+//   UncachedItem::bucket -- listed in define_references(), tagged
+//     LookupType::Scan. "Who points at this Bucket?" (Snapshot::
+//     find_referrers) falls back to an O(#items) linear scan: nothing
+//     indexes it.
+//   CachedItem::bucket -- listed in define_references(), tagged
+//     LookupType::Cache instead. find_referrers answers the same question
+//     in O(log n + #matches) instead, resolving via its cache-hit branch,
+//     backed by Root::by_cached_reference -- see DESIGN.md's "Lookup
+//     families" section.
 //
 // That isolates the cache to exactly one axis: everything else (field
 // shapes, cascade rules, transaction sizes) is identical between the two
@@ -63,7 +65,7 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(field_tag<&UncachedItem::bucket>(), "bucket", s.bucket);
+        v(field_tag<&UncachedItem::bucket>(), s.bucket, LookupType::Scan, "bucket");
     }
 };
 
@@ -72,16 +74,10 @@ public:
     Ref<Bucket> bucket;
     std::int64_t payload = 0;
 
+    // The one word UncachedItem doesn't have.
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(field_tag<&CachedItem::bucket>(), "bucket", s.bucket);
-    }
-
-    // The one line UncachedItem doesn't have.
-    template <class Self>
-    static void define_cached_references(Self& s, const RefIndexReader& v) {
-        (void)s;
-        v.index<&CachedItem::bucket>();
+        v(field_tag<&CachedItem::bucket>(), s.bucket, LookupType::Cache, "bucket");
     }
 };
 
@@ -434,7 +430,7 @@ int main() {
 
     std::printf(
         "\nThis is the whole tradeoff in one run: index only the reverse lookups you actually\n"
-        "run often (define_cached_references) -- and leave the rest on the always-correct,\n"
-        "zero-write-cost, zero-standing-memory scan (plain find_referrers).\n");
+        "run often (tag the field LookupType::Cache in define_references()) -- and leave the\n"
+        "rest on the always-correct, zero-write-cost, zero-standing-memory scan (LookupType::Scan).\n");
     return 0;
 }

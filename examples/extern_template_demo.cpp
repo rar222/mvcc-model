@@ -85,16 +85,15 @@ int main() {
 
     assert(s.find_by_key<&Account::name>("Widgets Inc") == &a2);
     assert(s.view_by_key<&Account::name>("Widgets Inc"));
-    // Account::name is scan-only (define_scan_fields(), not define_cached_
-    // fields()) -- exercises find_by_field's scan-fallback branch.
+    // Account::name is tagged LookupType::Scan in define_fields() --
+    // exercises find_by_field's scan-fallback branch.
     assert(s.find_by_field<&Account::name>("Widgets Inc").size() == 1);
     assert(s.view_by_field<&Account::name>("Widgets Inc").size() == 1);
 
     assert(s.find_by_key<&Order::computed_key>("ord:O1") == o2);
     assert(s.view_by_key<&Order::computed_key>("ord:O1"));
-    // Order::qty/computed_key are declared in BOTH define_scan_fields() and
-    // define_cached_fields() -- exercises find_by_field's cache-hit branch
-    // (the index always wins when the field is declared cached).
+    // Order::qty/computed_key are tagged LookupType::Cache in define_fields()
+    // -- exercises find_by_field's cache-hit branch.
     assert(s.find_by_field<&Order::qty>(5).size() == 1);
     assert(s.find_by_field<&Order::computed_key>("ord:O1").size() == 1);
     assert(s.view_by_field<&Order::qty>(5).size() == 1);
