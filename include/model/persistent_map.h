@@ -908,11 +908,27 @@ public:
 
     /// Returns a new map with key=val. O(log32 n) node allocations; shares the
     /// rest of the structure with `*this`.
+    ///
+    /// NOT ALWAYS A REAL CLONE -- like View<T>, this has a hazard worth
+    /// reading before reusing this type outside its one current caller
+    /// (Model's own indexes). set_in's mutate-in-place fast path (see its own
+    /// long comment) mutates a node in place, rather than cloning it, whenever
+    /// that node is provably unshared (use_count()==1 at every ancestor down
+    /// to it). That's provably safe for Model, which only ever touches these
+    /// tries from inside try_commit() under commit_mu_ and never exposes one
+    /// to a reader mid-transaction -- but it means `*this` itself can be the
+    /// node that gets mutated: `auto old = m; m = m.set(k, v);` can
+    /// retroactively change what `old` reads if nothing else is keeping
+    /// `old`'s root alive with an extra owning reference. Safe as long as
+    /// you always discard (or explicitly, separately capture) the prior
+    /// value the same way Model does; do not assume `old` above is
+    /// insulated from `m`'s later mutations.
     PersistentMap set(const K& key, const V& val) const {
         return PersistentMap(core_.set_entry(key, std::pair<K, V>(key, val)));
     }
 
-    /// Returns a new map without `key` (or an equal map if absent).
+    /// Returns a new map without `key` (or an equal map if absent). Same
+    /// mutate-in-place hazard as set() above.
     PersistentMap erase(const K& key) const { return PersistentMap(core_.erase_key(key)); }
 
     const V* get(const K& key) const {
@@ -979,10 +995,12 @@ public:
     bool empty() const noexcept { return core_.empty(); }
 
     /// Returns a new set with `key` present. O(log32 n) node allocations;
-    /// shares the rest of the structure with `*this`.
+    /// shares the rest of the structure with `*this`. Same mutate-in-place
+    /// aliasing hazard as PersistentMap::set -- see its doc comment.
     PersistentSet insert(const K& key) const { return PersistentSet(core_.set_entry(key, key)); }
 
-    /// Returns a new set without `key` (or an equal set if absent).
+    /// Returns a new set without `key` (or an equal set if absent). Same
+    /// mutate-in-place hazard as PersistentMap::set.
     PersistentSet erase(const K& key) const { return PersistentSet(core_.erase_key(key)); }
 
     bool contains(const K& key) const { return core_.get_entry(key) != nullptr; }

@@ -443,6 +443,14 @@ Model::~Model() {
     // fully returned, so there is no concurrent access to race against below.
     {
         std::lock_guard lk(reap_mu_);
+
+        // A wait_for_reclamation() caller holds no Snapshot, so the live_ check above
+        // can't catch one still blocked here -- assert it directly instead of letting
+        // it dangle on a condition variable this destructor is about to free.
+        assert(reap_waiters_ == 0 &&
+               "~Model(): a thread is still blocked in wait_for_reclamation() -- "
+               "every caller must return before the Model is destroyed");
+
         reaper_stop_ = true;
     }
     reap_cv_.notify_all();
@@ -473,7 +481,13 @@ void Model::reaper_loop() {
         // run a pass" flag both producers set; re-check it (not just
         // reaper_stop_) so a spurious wakeup just goes back to sleep.
         reap_cv_.wait(lk, [&] { return reaper_stop_ || dirty_reap_; });
-        if (reaper_stop_ && reap_queue_.empty()) return;  // nothing left to drain: exit now
+        // No early return here: a waiter in wait_for_reclamation() may have set
+        // dirty_reap_ concurrently with reaper_stop_ being set, and is blocked on
+        // reap_done_cv_ waiting for THIS pass's reap_done_round_++/notify_all()
+        // below. Returning here (before that happens) would leave it parked on a
+        // condition variable belonging to a Model whose destructor has already
+        // finished and freed it -- a use-after-free, not just a missed wakeup.
+        // The equivalent check after the pass runs (below) is the only safe exit.
         dirty_reap_ = false;  // this pass is about to consume the reason it was set
 
         // min_live: the oldest version any live Snapshot (or open
@@ -541,8 +555,10 @@ std::size_t Model::wait_for_reclamation() {
     // next pass to complete from here on.
     const std::uint64_t target = reap_done_round_ + 1;
     dirty_reap_ = true;  // force a pass even if nothing new was enqueued since the last one
+    ++reap_waiters_;  // ~Model() asserts this is zero -- see reap_waiters_'s own comment
     reap_cv_.notify_one();
     reap_done_cv_.wait(lk, [&] { return reap_done_round_ >= target; });
+    --reap_waiters_;
     return reap_queue_.size();  // whatever is still pinned by live snapshots
 }
 
@@ -1493,19 +1509,43 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
     // deleted, in visitation order, for the caller (try_commit()) to report.
     std::vector<Id> killed;
     std::unordered_set<std::uint32_t> visited;
+
     // Every id guaranteed to be deleted by the end of this BFS: the initial
-    // seeds, plus every referrer queued below via a non-nullable edge. A
-    // nullable edge landing on an id already in `doomed` must be skipped,
-    // not nulled -- the referrer is going to be deleted anyway (it may not
-    // have been visited yet, so peek_raw() alone can't tell us that), so
-    // nulling it first would produce a spurious Updated change immediately
-    // followed by the real Deleted one once the BFS actually reaches it.
-    // This covers both a referrer with two edges (one non-nullable, one
-    // nullable) into the SAME victim, and a referrer already doomed by an
-    // earlier victim in this same pass that also nullably references a
-    // later one.
+    // seeds, plus every id transitively reachable from a seed by following
+    // non-nullable edges backward through referrers_. Computed here, in one
+    // read-only pass over the pre-mutation graph, BEFORE any nulling or
+    // deletion happens below -- not discovered incrementally as the main
+    // loop visits each victim. referrers_ only shrinks as the main loop
+    // below runs (nulling/deleting never adds an edge), so this closure over
+    // the starting graph is exactly the doomed set for the whole cascade,
+    // computed up front rather than approximated as-we-go.
+    //
+    // This matters because a nullable edge landing on an id already in
+    // `doomed` must be skipped, not nulled -- the referrer is going to be
+    // deleted anyway, so nulling it first would produce a spurious Updated
+    // change immediately followed by the real Deleted one once the BFS
+    // actually reaches it. Discovering `doomed` incrementally (only when the
+    // main loop happens to visit the NON-nullable target first) missed this
+    // for a referrer R that nullably references X (visited early) but
+    // non-nullably references Y (visited later): R would get nulled while
+    // visiting X, then deleted once Y is reached, publishing both changes to
+    // subscribers for what should be a single delete. Precomputing the
+    // closure up front, independent of visitation order, closes that gap as
+    // well as covering the same-referrer-two-edges-into-one-victim case the
+    // original incremental version already handled.
     std::unordered_set<std::uint32_t> doomed;
-    for (const Id& seed : work) doomed.insert(seed.index);
+    {
+        std::vector<Id> frontier = work;
+        while (!frontier.empty()) {
+            const Id x = frontier.back();
+            frontier.pop_back();
+            if (!doomed.insert(x.index).second) continue;  // cycles terminate here too
+            auto it = referrers_.find(x.index);
+            if (it == referrers_.end()) continue;
+            for (const RefEdge& e : it->second)
+                if (!e.nullable) frontier.push_back(e.from);
+        }
+    }
 
     while (!work.empty()) {
         const Id x = work.back();  // `x`: the id currently being resolved this iteration
@@ -1519,14 +1559,6 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
         auto it = referrers_.find(x.index);
         const std::vector<RefEdge> edges =
             (it == referrers_.end()) ? std::vector<RefEdge>{} : it->second;
-
-        // First pass: any referrer with a non-nullable edge into x is
-        // doomed, full stop -- record that before the second pass decides
-        // what to do with each edge, so a nullable edge from the SAME
-        // referrer into x is never processed regardless of which order the
-        // two edges happen to appear in `edges`.
-        for (const RefEdge& e : edges)
-            if (!e.nullable) doomed.insert(e.from.index);
 
         // Every edge currently pointing AT x: for a NULLABLE field, clear
         // just that field (the referrer survives) -- unless the referrer is
@@ -1685,6 +1717,16 @@ Transaction Model::begin(std::string name, std::any data) {
 }
 
 Transaction Model::begin(Snapshot base, std::string name, std::any data) {
+    // A Snapshot carries no type-level link to its owning Model, so nothing
+    // stops a caller from handing this a snapshot taken from a DIFFERENT
+    // Model -- unlike Snapshot::begin(), which derives the owning Model from
+    // the snapshot's own Lease and can't go wrong. Without this check, the
+    // resulting Transaction's model_ would be `this` (passing try_commit()'s
+    // existing cross-model assert) while base_ silently reads a different
+    // Model's slots -- apply would then mutate `this`'s spine_ at whatever
+    // slot indices the foreign snapshot happened to use.
+    assert((!base.lease_ || base.lease_->m == this) &&
+           "Model::begin(): snapshot belongs to a different Model");
     return Transaction(this, std::move(base), std::move(name), std::move(data));
 }
 
@@ -2456,6 +2498,17 @@ void Model::record_commit_outcome(CommitStatus status) noexcept {
 
 CommitResult Model::try_commit_core(Transaction& txn, bool keep_undo) {
     assert(txn.model_ == this && "Transaction belongs to a different Model");
+    // PreCommitFn/PreTransactionsFn run WHILE commit_mu_ is held (see their own
+    // doc comments) -- a hook body that calls try_commit()/try_commit_without_undo()
+    // on this same Model, from this same thread, would re-lock the non-recursive
+    // commit_mu_ and deadlock (or hit UB, depending on the mutex implementation).
+    // Catch it loudly instead: commit_owner_ is only ever written by whichever
+    // thread currently holds commit_mu_, so comparing it against this thread's own
+    // id is race-free.
+    assert(commit_owner_.load(std::memory_order_relaxed) != std::this_thread::get_id() &&
+           "try_commit(): reentrant call on the same thread while it already holds "
+           "commit_mu_ -- likely a PreCommitFn/PreTransactionsFn hook calling back "
+           "into try_commit() (self-deadlock)");
 
     if (txn.is_empty()) {
         record_commit_outcome(CommitStatus::Committed);
@@ -2470,6 +2523,13 @@ CommitResult Model::try_commit_core(Transaction& txn, bool keep_undo) {
     PostCommitFn post_commit_copy;
     CommitResult result = [&] {
         std::lock_guard commit_lk(commit_mu_);
+        commit_owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        // Cleared before commit_lk unlocks (declared after it: destroyed first,
+        // LIFO) so no other thread can ever observe a stale owner.
+        struct ResetOwner {
+            std::atomic<std::thread::id>& owner;
+            ~ResetOwner() { owner.store({}, std::memory_order_relaxed); }
+        } reset_owner{commit_owner_};
         post_commit_copy = post_commit_;
         return commit_main_locked(txn, keep_undo);
     }();

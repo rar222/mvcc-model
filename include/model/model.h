@@ -382,6 +382,25 @@ using RefFn = std::function<void(const void* field, const char* name, Id target,
 /// `name` is diagnostic-only (IntegrityError messages) -- a string literal the
 /// caller passes alongside field_tag<Field>(). A mismatch here can only
 /// mislabel a diagnostic; nothing correctness-critical reads it.
+///
+/// TAG/VALUE MISMATCH RISK, distinct from omitting a field entirely (which
+/// CLAUDE.md already calls out): at every define_references() call site the
+/// tag and the value are two independent expressions --
+/// `v(field_tag<&Order::account>(), s.account, ...)` -- deliberately, to avoid
+/// a `.template operator()<Field>` disambiguator (see above). Nothing ties
+/// them together, so a copy-paste slip that swaps which field's VALUE goes
+/// with which field's TAG (e.g. pairing field_tag<&Order::account>() with
+/// s.parent instead of s.account) compiles cleanly and reports a real edge
+/// under the WRONG field: the reverse index, cascade BFS, and RefNuller all
+/// key off the tag, so the swapped field's nullability and cascade behavior
+/// get silently attributed to the field named by the tag -- a direct
+/// violation of invariant 1 if the swap crosses a nullable/non-nullable pair.
+/// There is no cheap compile-time or runtime check available for this:
+/// field_tag<Field>() is an opaque static-anchor address with no way back to
+/// the member pointer it was instantiated from, so nothing here can verify
+/// the value argument actually came from that same member. Test coverage
+/// (one cascade test per ref field, per CLAUDE.md) is the only mitigation --
+/// review new/edited define_references() call sites by eye.
 struct RefReader {
     const RefFn& fn;
     template <class T>
@@ -635,6 +654,13 @@ struct FieldKeyReader {
     const FieldKeyFn& fn;
     template <auto Field, class V>
     void key(const V& v, const char* name = nullptr) const {
+        // V is otherwise deduced purely from the call-site argument, independent
+        // of Field -- a copy-pasted field swap (v.key<&Gadget::label>(s.otherField))
+        // would silently populate Field's index with the wrong field's values.
+        // The read side (find_by_key<Field>) is statically typed on Field alone
+        // and can't make this mistake; tie the write side down the same way.
+        static_assert(std::is_same_v<V, member_value_t<decltype(Field)>>,
+                      "key<Field>(v): v's type must match Field's own declared value type");
         fn(field_tag<Field>(), to_field_key(v));
         detail::register_field_name_once<Field>(name);
     }
@@ -663,6 +689,11 @@ struct LookupFieldReader {
     const LookupFieldFn& fn;
     template <auto Field, class V>
     void field(const V& v, LookupType type, const char* name = nullptr) const {
+        // See FieldKeyReader::key's identical static_assert: V is otherwise
+        // deduced independent of Field, so a swapped-field call site would
+        // silently populate the wrong field's index.
+        static_assert(std::is_same_v<V, member_value_t<decltype(Field)>>,
+                      "field<Field>(v): v's type must match Field's own declared value type");
         fn(field_tag<Field>(), to_field_key(v), type);
         detail::register_field_name_once<Field>(name);
     }
@@ -1017,6 +1048,13 @@ public:
     std::size_t byte_size() const override { return sizeof(Derived); }
 
     void assign_from(const ObjectBase& other) override {
+        // Unlike every other downcast in this header (Snapshot::cast<T>,
+        // peek_as<T>, ...), which all gate on tag() == type_tag<T>() first, this
+        // one had no check: a type mismatch here is a static_cast to the wrong
+        // dynamic type followed by a read through it -- real UB, not just wrong
+        // data. Assert the precondition assign_from's own doc comment already
+        // states instead of silently trusting the caller (Model::take_undo).
+        assert(other.tag() == type_tag<Derived>() && "assign_from: type mismatch");
         static_cast<Derived&>(*this) = static_cast<const Derived&>(other);
     }
 
@@ -4181,6 +4219,9 @@ private:
     std::uint64_t reap_done_round_ = 0;            ///< bumped after each reap pass
     bool dirty_reap_ = false;                      ///< a reap pass is due
     bool reaper_stop_ = false;                     ///< dtor -> reaper: drain and exit
+    std::size_t reap_waiters_ = 0;  ///< count of threads currently blocked in wait_for_reclamation();
+                                     ///< ~Model() asserts this is zero -- a waiter holds no Snapshot,
+                                     ///< so live_.empty() can't catch a caller still blocked here
 
     // ---- commit-lock-protected state ----------------------------------------
     // Touched ONLY by whichever thread currently holds commit_mu_, only from
@@ -4190,6 +4231,14 @@ private:
     // strictly safer, not a rewrite. See CLAUDE.md invariant 7 and the lock
     // order rule (commit_mu_ -> ver_mu_ -> reap_mu_, never reversed).
     mutable std::mutex commit_mu_;
+    std::atomic<std::thread::id> commit_owner_{};  ///< thread currently holding commit_mu_, or the
+                                                    ///< default id when unheld; set/cleared only by
+                                                    ///< that holder, so it's race-free to read from
+                                                    ///< the same thread. Lets try_commit_core() assert
+                                                    ///< against reentrant self-deadlock (a PreCommitFn/
+                                                    ///< PreTransactionsFn hook calling try_commit()
+                                                    ///< again) instead of silently hanging on the
+                                                    ///< non-recursive mutex.
     std::uint64_t version_ = 0;  ///< 64-bit because it's bounded by TIME, not population:
                                  ///< it increments forever, and at 100 commits/sec a uint32
                                  ///< would wrap in ~16 months of uptime. See Id's width note
@@ -5254,6 +5303,15 @@ private:
 
 template <class T>
 View<T> Snapshot::view(const T& obj) const noexcept {
+    // The one place a caller-supplied object gets paired with a caller-chosen
+    // snapshot -- every other View in this header is built from an object this
+    // same Snapshot just looked up itself (view_by_key, view_by_field,
+    // operator[]'s resolve()d target, ...), so it's correct by construction and
+    // doesn't need re-checking here. This is the entry point the class comment's
+    // "pairing an object from one snapshot with another compiles" warning is
+    // about; one find_raw() lookup is cheap enough to always run, off the hot
+    // per-hop traversal path (View's own constructor stays unchecked/noexcept).
+    assert(find_raw(obj.id) == &obj && "Snapshot::view(): obj was not read from this snapshot");
     return View<T>(*this, obj);
 }
 
