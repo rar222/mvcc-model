@@ -16,8 +16,8 @@ std::vector<TestCase>& registry() {
 int g_failures = 0;
 const char* g_current = "";
 
-Registrar::Registrar(const char* name, std::function<void()> fn) {
-    registry().push_back({name, std::move(fn)});
+Registrar::Registrar(const char* name, const char* filename, int linenum, std::function<void()> fn) {
+    registry().push_back({name, filename, linenum, std::move(fn)});
 }
 
 int main(int argc, char** argv) {
@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     // every TEST() case into its own CTest entry, so IDE test explorers (and
     // `ctest -R`) see them individually instead of one opaque binary.
     if (argc > 1 && std::string(argv[1]) == "--list") {
-        for (const auto& t : registry()) std::printf("%s\n", t.name);
+        for (const auto& t : registry()) std::printf("%s|%s:%d\n", t.name, t.filename, t.linenum);
         return 0;
     }
 

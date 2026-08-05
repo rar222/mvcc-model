@@ -17,6 +17,8 @@
 
 struct TestCase {
     const char* name;
+    const char* filename;
+    int linenum;
     std::function<void()> fn;
 };
 
@@ -25,12 +27,12 @@ extern int g_failures;
 extern const char* g_current;
 
 struct Registrar {
-    Registrar(const char* name, std::function<void()> fn);
+    Registrar(const char* name, const char* filename, int linenum, std::function<void()> fn);
 };
 
 #define TEST(name)                            \
     static void name();                       \
-    static Registrar reg_##name(#name, name); \
+    static Registrar reg_##name(#name, __FILE__, __LINE__, name); \
     static void name()
 
 #define CHECK(cond)                                                       \

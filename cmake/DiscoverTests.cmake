@@ -34,15 +34,23 @@ if(NOT _mvcc_list_result EQUAL 0)
 endif()
 string(STRIP \"\${_mvcc_test_list}\" _mvcc_test_list)
 if(NOT _mvcc_test_list STREQUAL \"\")
+  # Each line into a ; separated string so we can turn it into a list
   string(REPLACE \"\\n\" \";\" _mvcc_test_list \"\${_mvcc_test_list}\")
-  foreach(_mvcc_test_name IN LISTS _mvcc_test_list)
+  foreach(_mvcc_test IN LISTS _mvcc_test_list)
+
+    # replace each line's '|' with ';' so we can split into a test name and location
+    string(REGEX REPLACE \"\\|\" \";\" _mvcc_test_parts \"\${_mvcc_test}\")
+
+    list(GET _mvcc_test_parts 0 _mvcc_test_name)
+    list(GET _mvcc_test_parts 1 _mvcc_test_location)
+
     # Positional add_test(<name> <command> [args...]), not the NAME/COMMAND
     # keyword form: ctest include()s this file in its own bare script
     # interpreter, with no cmake_minimum_required() in scope, so it falls
     # back to ancient default policies that don't recognize the keyword
     # form -- it silently parses \"NAME\" as a literal test name instead.
     add_test(\"${target}.\${_mvcc_test_name}\" \"$<TARGET_FILE:${target}>\" --exact \"\${_mvcc_test_name}\")
-    set_tests_properties(\"${target}.\${_mvcc_test_name}\" PROPERTIES TIMEOUT ${ARG_TIMEOUT} ${_mvcc_extra_props})
+    set_tests_properties(\"${target}.\${_mvcc_test_name}\" PROPERTIES DEF_SOURCE_LINE \"\${_mvcc_test_location}\" TIMEOUT ${ARG_TIMEOUT} ${_mvcc_extra_props})
   endforeach()
 endif()
 ")
