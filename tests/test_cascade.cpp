@@ -563,3 +563,50 @@ TEST(cascade_bfs_dedupes_an_object_reached_from_two_different_dying_targets) {
     CHECK_EQ(s.size(), std::size_t{0});
 }
 
+// Regression test: a referrer with BOTH a non-nullable and a nullable ref
+// field pointing at the SAME dying target used to be processed twice by
+// remove_raw()'s cascade BFS -- once via the nullable edge (clone_for_
+// cascade_null + null_ref, logged as an Updated change, since peek_raw()
+// on the referrer still succeeded at that point because it was only
+// QUEUED for cascade-deletion via the non-nullable edge, not yet actually
+// removed) and again via the non-nullable edge once the BFS reached it on
+// a later iteration (the real Deleted change). Record::owner (Ref<Account>,
+// non-nullable) and Record::owner_scan (Opt<Account>, nullable) are exactly
+// this shape when both are pointed at the same account. The fix tracks
+// every id already known to be doomed (queued for cascade, not just
+// visited) and skips the nullable-null branch for it -- so rec must show
+// up in the changeset exactly once, as Deleted, never Updated.
+TEST(cascade_does_not_double_process_a_referrer_with_both_a_non_nullable_and_nullable_ref_to_the_same_target) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+
+    Transaction txn = m.begin();
+    auto r = std::make_unique<Record>();
+    r->label = "R1";
+    r->owner = a;       // non-nullable Ref<Account> -> a
+    r->owner_scan = a;  // nullable Opt<Account> -> the SAME a
+    const Ref<Record> local = txn.create(std::move(r));
+    const Ref<Record> rec = commit_ok(m, txn).to_real(local);
+
+    Transaction remove_txn = m.begin();
+    remove_txn.remove(a);
+    const CommitResult res = m.try_commit(remove_txn);
+    CHECK(res.status == CommitStatus::Committed);
+
+    std::size_t rec_changes = 0, rec_deleted = 0, rec_updated = 0;
+    for (const Change& c : res.changes) {
+        if (c.id != rec.raw()) continue;
+        ++rec_changes;
+        if (c.kind == ChangeKind::Deleted) ++rec_deleted;
+        if (c.kind == ChangeKind::Updated) ++rec_updated;
+    }
+    CHECK_EQ(rec_changes, std::size_t{1});
+    CHECK_EQ(rec_deleted, std::size_t{1});
+    CHECK_EQ(rec_updated, std::size_t{0});
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find(rec) == nullptr);
+    CHECK(s.find(a) == nullptr);
+    CHECK_EQ(s.size(), std::size_t{0});
+}
+

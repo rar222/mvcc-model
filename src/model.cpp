@@ -1493,6 +1493,19 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
     // deleted, in visitation order, for the caller (try_commit()) to report.
     std::vector<Id> killed;
     std::unordered_set<std::uint32_t> visited;
+    // Every id guaranteed to be deleted by the end of this BFS: the initial
+    // seeds, plus every referrer queued below via a non-nullable edge. A
+    // nullable edge landing on an id already in `doomed` must be skipped,
+    // not nulled -- the referrer is going to be deleted anyway (it may not
+    // have been visited yet, so peek_raw() alone can't tell us that), so
+    // nulling it first would produce a spurious Updated change immediately
+    // followed by the real Deleted one once the BFS actually reaches it.
+    // This covers both a referrer with two edges (one non-nullable, one
+    // nullable) into the SAME victim, and a referrer already doomed by an
+    // earlier victim in this same pass that also nullably references a
+    // later one.
+    std::unordered_set<std::uint32_t> doomed;
+    for (const Id& seed : work) doomed.insert(seed.index);
 
     while (!work.empty()) {
         const Id x = work.back();  // `x`: the id currently being resolved this iteration
@@ -1507,14 +1520,24 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
         const std::vector<RefEdge> edges =
             (it == referrers_.end()) ? std::vector<RefEdge>{} : it->second;
 
+        // First pass: any referrer with a non-nullable edge into x is
+        // doomed, full stop -- record that before the second pass decides
+        // what to do with each edge, so a nullable edge from the SAME
+        // referrer into x is never processed regardless of which order the
+        // two edges happen to appear in `edges`.
+        for (const RefEdge& e : edges)
+            if (!e.nullable) doomed.insert(e.from.index);
+
         // Every edge currently pointing AT x: for a NULLABLE field, clear
-        // just that field (the referrer survives); for a non-nullable one,
-        // the referrer cannot exist without x, so it joins the BFS frontier
-        // and will itself be visited (and cascade further) in a later
-        // iteration of this same loop.
+        // just that field (the referrer survives) -- unless the referrer is
+        // already doomed, in which case skip it entirely; for a
+        // non-nullable one, the referrer cannot exist without x, so it
+        // joins the BFS frontier and will itself be visited (and cascade
+        // further) in a later iteration of this same loop.
         for (const RefEdge& e : edges) {
             if (!peek_raw(e.from)) continue;  // referrer itself already deleted this same pass
             if (e.nullable) {
+                if (doomed.count(e.from.index)) continue;  // dies anyway; see `doomed`'s doc comment above
                 // `baseline` is captured BEFORE clone_for_cascade_null() installs
                 // the clone, so reconcile_out_refs (etc.) below can diff
                 // "before this field was nulled" against "after" -- see
