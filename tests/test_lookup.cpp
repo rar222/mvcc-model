@@ -25,7 +25,7 @@ using namespace model;
 // pointer-to-member TYPE (std::int64_t TwoFieldsSameType::*) but are
 // different VALUES of that type, so they must still resolve to two
 // different, stable addresses -- otherwise every same-typed field on a
-// class would collide in by_field_/by_type_ and one would silently shadow
+// class would collide in by_key_/by_type_ and one would silently shadow
 // the other.
 TEST(field_tag_is_keyed_by_value_not_just_pointer_to_member_type) {
     struct TwoFieldsSameType {
@@ -474,7 +474,7 @@ TEST(opt_survives_a_cascade_that_ref_does_not) {
 }
 
 
-// Root::by_field (the define_keys index) is versioned like the object
+// Root::by_key (the define_keys index) is versioned like the object
 // store itself: an older Snapshot keeps answering find_by_key as of its
 // own version, even as later commits add and remove entries.
 TEST(the_index_is_versioned_like_everything_else) {

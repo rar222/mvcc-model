@@ -333,7 +333,7 @@ TEST(veto_rollback_restores_the_reverse_index_so_later_cascades_stay_correct) {
     CHECK(m.snapshot().find(o) == nullptr);
 }
 
-// Same undo-log discipline for by_field_: a vetoed rename must leave the
+// Same undo-log discipline for by_key_: a vetoed rename must leave the
 // OLD value still findable and the NEW value NOT findable, once a later
 // commit actually publishes.
 TEST(veto_rollback_restores_the_field_key_index) {
@@ -346,7 +346,7 @@ TEST(veto_rollback_restores_the_field_key_index) {
     CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
     m.set_pre_commit({});
 
-    make_account(m, "UNRELATED");  // publish a fresh root carrying by_field_
+    make_account(m, "UNRELATED");  // publish a fresh root carrying by_key_
     Snapshot s = m.snapshot();
     CHECK_EQ(s.find(a)->name, std::string("OLD"));
     CHECK(s.find_by_key<&Account::name>("OLD") == s.find(a));

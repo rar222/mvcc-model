@@ -2,8 +2,8 @@
 // index, not just by_type_ -- the natural next question after basic_record_
 // bench.cpp (which profiled BasicRecord, a type with nothing declared).
 // Order (include/example/types.h) touches:
-//   by_type_              -- every object, unconditionally (see basic_record_bench.cpp)
-//   by_field_              -- computed_key (define_keys())
+//   by_type_               -- every object, unconditionally (see basic_record_bench.cpp)
+//   by_key_                -- computed_key (define_keys())
 //   by_cached_field_       -- qty, computed_key (define_fields(), LookupType::Cache)
 //   by_cached_reference_   -- account (define_references(), LookupType::Cache)
 //   referrers_             -- account (non-nullable), parent (nullable)

@@ -260,7 +260,7 @@ TEST(bulk_load_rejects_a_duplicate_define_keys_value_within_the_batch) {
 }
 
 // The duplicate-key check is keyed by field TAG (identifies a (type, field)
-// pair), same as by_field_ itself -- so the same string value claimed on two
+// pair), same as by_key_ itself -- so the same string value claimed on two
 // DIFFERENT types' define_keys() fields is not a collision at all. Widget's
 // computed_key() returns its `key` member unprefixed, so it can be made to
 // collide, string-for-string, with Account::name.

@@ -51,7 +51,7 @@ namespace model::pmap {
 /// string keys across the trie. A named, reusable functor (rather than a
 /// private method baked into the trie) so it can be passed as the explicit
 /// Hash argument wherever a PersistentMap is keyed by a real string
-/// (Root::by_field, and the OUTER map of Root::by_cached_field) -- see
+/// (Root::by_key, and the OUTER map of Root::by_cached_field) -- see
 /// model.h's Root for those instantiations.
 struct StringHash {
     std::uint64_t operator()(const std::string& k) const noexcept {
@@ -273,7 +273,7 @@ class TrieCore {
     std::shared_ptr<const void> root_;
     std::size_t size_ = 0;
 
-    /// EXPERIMENTAL: where this instance's Node/Leaf HEAD allocations come
+    /// Where this instance's Node/Leaf HEAD allocations come
     /// from (the shared_ptr ones stored in Node::slots -- never the
     /// unique_ptr tail links, which stay on plain new; see chain_copy/
     /// chain_set_links/chain_erase_links). nullptr (the default, and every
@@ -896,7 +896,7 @@ class PersistentMap {
 public:
     PersistentMap() = default;
 
-    /// EXPERIMENTAL: an empty map whose Node/Leaf allocations (this one and
+    /// An empty map whose Node/Leaf allocations (this one and
     /// every one later derived from it via set()/erase()) are pooled
     /// through `mem` instead of plain new/delete. See detail::TrieCore::
     /// mem_'s own comment for the lifetime obligation this places on the
@@ -923,7 +923,7 @@ public:
     /// Visits every (key, value) pair once. Order is the trie's own layout
     /// (hash-slice bucket order, walked idx 0..31 per node -- see
     /// detail::TrieCore::each_in) -- NOT insertion order and NOT sorted by
-    /// key. Every model.h caller built on this (Root::by_field's iteration,
+    /// key. Every model.h caller built on this (Root::by_key's iteration,
     /// etc.) inherits that same "unspecified order" contract already stated
     /// for the model's own find_by_field and friends.
     template <class F>
@@ -968,7 +968,7 @@ class PersistentSet {
 public:
     PersistentSet() = default;
 
-    /// EXPERIMENTAL: an empty set whose Node/Leaf allocations (this one and
+    /// An empty set whose Node/Leaf allocations (this one and
     /// every one later derived from it via insert()/erase()) are pooled
     /// through `mem` instead of plain new/delete. See detail::TrieCore::
     /// mem_'s own comment for the lifetime obligation this places on the
@@ -1021,7 +1021,7 @@ public:
 /// currently-matching Id). Creates a `mem`-seeded bucket if this is the
 /// first holder of that key -- deliberately never a bare `{}`, which would
 /// start an UNPOOLED lineage for that one bucket (see PersistentMap's/
-/// PersistentSet's own EXPERIMENTAL pooling constructor comment above).
+/// PersistentSet's own pooling constructor comment above).
 template <class K, class Hash, class V, class VHash>
 PersistentMap<K, PersistentSet<V, VHash>, Hash> bucket_insert(
     const PersistentMap<K, PersistentSet<V, VHash>, Hash>& m, const K& key, const V& v,

@@ -85,7 +85,7 @@ struct ExplicitlyImperfectHash {
 // A small POD VALUE type, distinct from the `int` every PersistentMap test
 // above stores -- mirrors the shape of model::Id (two uint32 fields, memberwise
 // equality) without depending on model.h (see this file's own top comment and
-// U64Hash's comment for why). Root::by_field (model.h) is exactly
+// U64Hash's comment for why). Root::by_key (model.h) is exactly
 // PersistentMap<std::string, Id, StringHash>: a struct value, not a
 // primitive. Never used as a KEY/hashed here -- only as the V in a
 // PersistentMap<std::string, FakeId, StringHash> below -- so it needs
@@ -310,7 +310,7 @@ TEST(nested_bucket_map_perfect_hash_keyed_matches_by_cached_reference_pattern) {
         "perfect-hash-keyed", 6000, [](std::uint32_t n) { return static_cast<std::uint64_t>(n); });
 }
 
-// Structural analog of Root::by_field: PersistentMap<std::string, Id,
+// Structural analog of Root::by_key: PersistentMap<std::string, Id,
 // StringHash> -- SAME K and Hash as the model (pmap::StringHash), with
 // FakeId (see its own comment above) standing in for Id as a non-primitive
 // VALUE, exercising set()/get()/erase()/for_each() copying a struct instead

@@ -211,7 +211,7 @@ public:
         // per-type copy of it. field_tag<Field> is keyed on the pointer-to-
         // member VALUE, and Labeled::label only has one address; Asset and
         // Gizmo both naming &Labeled::label means they share one entry in
-        // Root::by_field, keyed by that single tag, with entries from BOTH
+        // Root::by_key, keyed by that single tag, with entries from BOTH
         // types living in it side by side. See
         // finding_by_the_inherited_label_field_can_return_either_diamond_
         // type below for what that implies: one raw lookup can hand back
@@ -385,7 +385,7 @@ TEST(finding_by_the_inherited_label_field_uses_the_untyped_api) {
 // any one type (see find_by_key_raw's own doc comment: "the key string is
 // only unique within field's own keyspace"). Asset and Gizmo both register
 // &Labeled::label -- the SAME tag, since it names the one place `label` is
-// actually declared -- so Root::by_field holds ONE map for it with entries
+// actually declared -- so Root::by_key holds ONE map for it with entries
 // from both types mixed together. That has two consequences neither a
 // single-type field could show:
 //   1. A raw lookup by that tag can come back as EITHER type -- the caller

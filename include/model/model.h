@@ -602,7 +602,7 @@ using FieldKeyFn = std::function<void(const void* field, std::string key)>;
 /// collect_update_baseline_field_keys() stores baseline values in this form
 /// rather than the field's native type: it lets old-vs-new be a plain ==
 /// regardless of the field's declared type, and lets that baseline live in
-/// the same string-keyed shape as by_field_ itself.
+/// the same string-keyed shape as by_key_ itself.
 template <class V>
 std::string to_field_key(const V& v) {
     if constexpr (std::is_same_v<V, std::string>) {
@@ -872,7 +872,7 @@ public:
 ///     only ever runs when the KEY-OWNING object itself is created or
 ///     updated (add_field_keys/reconcile_field_keys, called from
 ///     apply_create/apply_update) -- whatever string computed_key() returns
-///     is baked into Root::by_field ONCE, at that instant, and never
+///     is baked into Root::by_key ONCE, at that instant, and never
 ///     recomputed later. If the key depended on a REFERENCED object's
 ///     field, updating that OTHER object without touching the referrer
 ///     would leave the referrer's indexed key silently stale: find_by_key
@@ -1161,11 +1161,11 @@ struct Root {
     /// way by_type needs TypeTag. Empty for types that declare none. This is
     /// the unique lookup-by-value index (later write wins); there is no
     /// separate mandatory "primary key" index.
-    std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_field;
+    std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_key;
 
     /// One persistent MULTIMAP per define_fields()-declared field tagged
     /// LookupType::Cache: canonical value string -> a persistent set of
-    /// every Id whose field currently holds that value. Unlike by_field,
+    /// every Id whose field currently holds that value. Unlike by_key,
     /// every match is kept. The bucket is a persistent SET, NEVER a flat
     /// vector: a flat bucket would make each mutation O(#duplicates of that
     /// value), which for a low-cardinality field (a status, a category) is
@@ -2689,7 +2689,7 @@ public:
     // (alloc_slot), one inverse per outgoing ref edge (add_out_refs), and a
     // cheap per-id UndoAction (pending_undo_actions_) -- none of it released until
     // the WHOLE transaction resolves. (The four WHOLE-MAP-HANDLE indexes --
-    // by_type_/by_field_/by_cached_field_/by_cached_reference_ -- log their
+    // by_type_/by_key_/by_cached_field_/by_cached_reference_ -- log their
     // pre-attempt handle only ONCE per attempt per key touched, not once per
     // object touching that key; see logged_index_entry()'s doc comment. That
     // once-per-key capture is what keeps N objects of the same type from
@@ -2993,7 +2993,7 @@ public:
         std::size_t slots_free = 0;       ///< free_slots_.size() -- recycled slots ready for reuse
         std::size_t slots_exhausted = 0;  ///< == exhausted_slots()
 
-        std::size_t key_indexed_fields = 0;               ///< by_field_.size()
+        std::size_t key_indexed_fields = 0;               ///< by_key_.size()
         std::size_t cached_value_indexed_fields = 0;       ///< by_cached_field_.size()
         std::size_t cached_reference_indexed_fields = 0;   ///< by_cached_reference_.size()
         std::size_t reverse_index_targets = 0;  ///< referrers_.size() -- slots with >=1 referrer
@@ -3456,7 +3456,7 @@ private:
     ///                                      to_field_key()'s canonical
     ///                                      string form, AS OF THE BASELINE
     ///                                      (before this transaction's own
-    ///                                      edit) -- what by_field_ indexed
+    ///                                      edit) -- what by_key_ indexed
     ///                                      this object under prior to the
     ///                                      update. Canonical string, not
     ///                                      the field's native type, for
@@ -3513,7 +3513,7 @@ private:
     void drop_out_refs(const ObjectBase* o);
     void reconcile_out_refs(const ObjectBase* before, const ObjectBase* after);
 
-    // Same trio for the unique key index (by_field_)...
+    // Same trio for the unique key index (by_key_)...
     void add_field_keys(const ObjectBase* o);
     void drop_field_keys(const ObjectBase* o);
     /// `old_keys_hint`, when non-null, is `before`'s already-computed
@@ -3599,7 +3599,7 @@ private:
     /// time this exact key is ever touched -- via try_emplace, so a later
     /// read/write through operator[] never accidentally default-constructs
     /// an UNPOOLED entry first. `index` is one of the four whole-map-handle
-    /// indexes below (by_type_, by_field_, by_cached_field_,
+    /// indexes below (by_type_, by_key_, by_cached_field_,
     /// by_cached_reference_) -- all `unordered_map<const void*, ...>`
     /// (TypeTag is itself a `const void*` alias; see its own doc comment),
     /// so one template covers every one of them regardless of their
@@ -3614,11 +3614,11 @@ private:
 
     /// seed_index_entry() PLUS the once-per-attempt rollback capture of the
     /// whole pre-attempt handle for `key`. Templated on `Index` so the same
-    /// logic serves all four whole-map indexes -- by_type_, by_field_,
+    /// logic serves all four whole-map indexes -- by_type_, by_key_,
     /// by_cached_field_, by_cached_reference_ -- without duplicating
     /// byte-for-byte identical code once per index. `dirty` is that index's
-    /// own first-touch-this-attempt set (e.g. dirty_by_field_ for
-    /// by_field_) -- mirrors cow()'s dirty_ (first-touch-clones-the-chunk)
+    /// own first-touch-this-attempt set (e.g. dirty_by_key_ for
+    /// by_key_) -- mirrors cow()'s dirty_ (first-touch-clones-the-chunk)
     /// trick, applied to a whole-map handle instead of a Chunk.
     ///
     /// Why only the FIRST touch of a key needs to log anything:
@@ -3990,11 +3990,12 @@ private:
     /// as try_commit_core().
     CommitResult run_pre_transaction_core(Transaction& txn, bool keep_undo);
 
-    /// EXPERIMENTAL: backs the Node/Leaf allocations of by_type_ (see
-    /// apply_create's by_type_[tag] seeding in model.cpp, the only current
-    /// user) instead of routing them through glibc's general-purpose
-    /// malloc/free -- see pmap::detail::TrieCore::mem_'s own comment for the
-    /// measured cost this targets.
+    /// Backs the Node/Leaf allocations of all four whole-map indexes --
+    /// by_type_, by_key_, by_cached_field_, by_cached_reference_ (see
+    /// seed_index_entry/logged_index_entry in model.cpp, seeded on each
+    /// index's first touch) -- instead of routing them through glibc's
+    /// general-purpose malloc/free -- see pmap::detail::TrieCore::mem_'s
+    /// own comment for the measured cost this targets.
     ///
     /// synchronized_pool_resource, NOT unsynchronized: this was the ONE
     /// thing that looked safe here and wasn't. commit_mu_ (invariant 7)
@@ -4022,7 +4023,7 @@ private:
     ///
     /// MUST still be declared before every member that could still
     /// reference a Node/Leaf allocated from it -- root_, by_type_,
-    /// by_field_, by_cached_field_, by_cached_reference_ below -- because
+    /// by_key_, by_cached_field_, by_cached_reference_ below -- because
     /// std::pmr::polymorphic_allocator stores only a raw memory_resource*
     /// inside the shared_ptr control block std::allocate_shared builds
     /// (see TrieCore::mem_), so this pool must outlive every Node/Leaf
@@ -4160,13 +4161,13 @@ private:
     // indexes' rollback capture -- see logged_index_entry()'s doc comment.
     // Same "attempt-scoped, cleared alongside dirty_" lifetime as dirty_ itself.
     std::unordered_set<TypeTag> dirty_by_type_;
-    std::unordered_set<const void*> dirty_by_field_;
+    std::unordered_set<const void*> dirty_by_key_;
     std::unordered_set<const void*> dirty_by_cached_field_;
     std::unordered_set<const void*> dirty_by_cached_reference_;
     // The writer's working copies of Root's three indexes -- same persistent
     // structures, so publishing them into a new Root is a cheap map copy.
     std::unordered_map<TypeTag, pmap::PersistentSet<Id, IdHash>> by_type_;
-    std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_field_;
+    std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_key_;
     std::unordered_map<const void*,
                        pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
                                           pmap::StringHash>>

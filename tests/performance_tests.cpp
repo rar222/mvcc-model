@@ -405,7 +405,7 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 // ---------------------------------------------------------------------------
 
 // Account::name is declared in BOTH define_keys() (find_by_key, unique,
-// backed by by_field_'s persistent map -- O(log n), same as the
+// backed by by_key_'s persistent map -- O(log n), same as the
 // kSmallIndexedRead lookups above, not truly flat) and define_fields()
 // tagged LookupType::Scan (find_by_field's scan-fallback branch,
 // O(#accounts) linear scan -- name isn't tagged LookupType::Cache, so

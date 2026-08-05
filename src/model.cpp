@@ -106,11 +106,11 @@ bool all_of_raw(const Snapshot& s, const RawWalk& walk, const std::function<bool
 
 const ObjectBase* Snapshot::find_by_key_raw(const void* field, const std::string& key) const {
     if (!root_) return nullptr;  // default-constructed Snapshot: nothing to look up
-    // by_field maps field-tag (the `field` pointer, see field_tag<>) -> that
+    // by_key maps field-tag (the `field` pointer, see field_tag<>) -> that
     // field's own persistent map of key -> Id. Two lookups, not one flat map,
     // because each field owns an independent keyspace (see field_tag's doc).
-    auto it = root_->by_field.find(field);
-    if (it == root_->by_field.end()) return nullptr;  // this field was never define_keys()'d
+    auto it = root_->by_key.find(field);
+    if (it == root_->by_key.end()) return nullptr;  // this field was never define_keys()'d
     const Id* id = it->second.get(key);               // no match for this exact key value
     // find_raw() re-checks the generation, so even if the id this key mapped
     // to at commit time has since been recycled (in a LATER snapshot -- this
@@ -124,7 +124,7 @@ bool Snapshot::cached_field_short_circuit_raw(const void* field, const std::stri
     if (!root_) return true;  // default-constructed Snapshot: nothing to look up, vacuously complete
     // by_cached_field maps field-tag -> that field's own persistent multimap
     // of value -> set of every Id currently holding it -- same two-level
-    // shape as by_field/find_by_key_raw above, just multi-match per value.
+    // shape as by_key/find_by_key_raw above, just multi-match per value.
     auto it = root_->by_cached_field.find(field);
     if (it == root_->by_cached_field.end()) return true;  // never tagged LookupType::Cache: vacuous
     const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key);
@@ -798,8 +798,8 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
     // of the two ends up applying first (see reconcile_field_keys()'s own
     // conditional erase for the mutation-order half of this).
     for (const auto& [field, plan] : plans) {
-        const auto fit = by_field_.find(field);
-        if (fit == by_field_.end()) continue;  // this field has no committed entries at all
+        const auto fit = by_key_.find(field);
+        if (fit == by_key_.end()) continue;  // this field has no committed entries at all
         for (const auto& [key, owner] : plan.claims) {
             (void)owner;
             if (plan.vacated.count(key)) continue;
@@ -906,22 +906,22 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
     });
 }
 
-// by_field_ maintenance: the define_keys() unique-key index (Root::by_field).
-// One persistent map PER FIELD (by_field_[field]), each mapping that field's
+// by_key_ maintenance: the define_keys() unique-key index (Root::by_key).
+// One persistent map PER FIELD (by_key_[field]), each mapping that field's
 // key string -> the single Id currently holding it -- unique, unlike the
 // cached-field/cached-reference multimaps below. Every mutation captures the
 // prior per-field map as a whole (`prev`; cheap, since PersistentMap sharing
 // means this is a handle copy, not a deep copy) so the rollback log can restore
-// it verbatim on rollback: a missed restore would leave by_field_ answering
+// it verbatim on rollback: a missed restore would leave by_key_ answering
 // find_by_key() with a value that never actually committed.
 
 void Model::add_field_keys(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key) {
-        // logged_index_entry: pool-seeds by_field_[field] on first touch AND
+        // logged_index_entry: pool-seeds by_key_[field] on first touch AND
         // captures its pre-attempt value once, for the rollback log -- see
         // its own doc comment in model.h.
-        auto& sub = logged_index_entry(by_field_, dirty_by_field_, field);
+        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field);
         sub = sub.set(key, id);  // key is unique per field by construction (see
                                  // define_keys' contract); a collision here is a
                                  // caller bug, not something this layer detects
@@ -930,7 +930,7 @@ void Model::add_field_keys(const ObjectBase* o) {
 
 void Model::drop_field_keys(const ObjectBase* o) {
     o->each_field_key([&](const void* field, std::string key) {
-        auto& sub = logged_index_entry(by_field_, dirty_by_field_, field);
+        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field);
         sub = sub.erase(key);
     });
 }
@@ -965,9 +965,9 @@ void Model::reconcile_field_keys(
         // Same rollback pattern as add_field_keys/drop_field_keys: capture
         // the whole prior map (cheap -- persistent, structure-shared), once
         // per attempt (logged_index_entry), and restore it on rollback.
-        // Without this, a vetoed/conflicted attempt leaves by_field_
+        // Without this, a vetoed/conflicted attempt leaves by_key_
         // permanently indexing values that never committed.
-        auto& sub = logged_index_entry(by_field_, dirty_by_field_, field);
+        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field);
         // Only erase the OLD key if we still hold it. local_updated_ is an
         // unordered_map -- apply order across objects in one transaction is
         // arbitrary -- so a same-transaction swap (this object vacates K
@@ -1183,7 +1183,7 @@ Model::Diagnostics Model::diagnostics() const {
         diag.slots_free = free_slots_.size();
         diag.slots_exhausted = exhausted_slots_;
 
-        diag.key_indexed_fields = by_field_.size();
+        diag.key_indexed_fields = by_key_.size();
         diag.cached_value_indexed_fields = by_cached_field_.size();
         diag.cached_reference_indexed_fields = by_cached_reference_.size();
 
@@ -1671,7 +1671,7 @@ void Model::rollback_apply() {
 void Model::clear_attempt_scratch() {
     dirty_.clear();
     dirty_by_type_.clear();
-    dirty_by_field_.clear();
+    dirty_by_key_.clear();
     dirty_by_cached_field_.clear();
     dirty_by_cached_reference_.clear();
 }
@@ -2090,7 +2090,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     r->version = version_;
     r->spine = spine_;        // ~n/kChunkSize shared_ptr copies. Cheap.
     r->by_type = by_type_;    // O(#types): each per-type submap is shared, not copied.
-    r->by_field = by_field_;  // O(#indexed fields): same reasoning.
+    r->by_key = by_key_;  // O(#indexed fields): same reasoning.
     r->by_cached_field = by_cached_field_;          // O(#cached fields): ditto.
     r->by_cached_reference = by_cached_reference_;  // O(#cached ref fields): ditto.
 
@@ -2542,7 +2542,7 @@ void Model::add_field_keys_no_log(const ObjectBase* o) {
         // seed_index_entry: see add_field_keys's identical seeding for why
         // (no rollback capture needed on this bulk-load path, but still
         // needs to seed the pool on first touch).
-        auto& sub = seed_index_entry(by_field_, field);
+        auto& sub = seed_index_entry(by_key_, field);
         sub = sub.set(key, id);
     });
 }
@@ -2599,7 +2599,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     // only ever resolve to another object in THIS SAME BATCH, by local index.
     //
     // Also checks define_keys() uniqueness within the batch, same idea:
-    // the wipe below empties by_field_ before install, so the ONLY collision
+    // the wipe below empties by_key_ before install, so the ONLY collision
     // that can ever happen post-wipe is two objects in this same batch
     // claiming the same key -- no committed baseline to reconcile against,
     // unlike validate_field_key_uniqueness(). `claims` is keyed by field then
@@ -2656,7 +2656,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     spine_.clear();
     clear_attempt_scratch();
     by_type_.clear();
-    by_field_.clear();
+    by_key_.clear();
     by_cached_field_.clear();
     by_cached_reference_.clear();
     referrers_.clear();

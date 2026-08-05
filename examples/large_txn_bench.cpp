@@ -7,7 +7,7 @@
 //
 // Order (example/types.h) is used rather than Account because it touches
 // every commit_mu_-protected index apply_transaction_contents maintains:
-// by_type_, by_field_ (computed_key), by_cached_field_ (qty, computed_key),
+// by_type_, by_key_ (computed_key), by_cached_field_ (qty, computed_key),
 // by_cached_reference_ (account), and referrers_ (account: non-nullable,
 // parent: nullable) -- so a bulk create/update/remove here exercises the
 // same per-object work a large real-world transaction would.

@@ -10,7 +10,7 @@
 // each_field_key()/each_field()/each_cached_reference() all fall back to
 // Object<>'s own no-op defaults. That
 // makes this the cheapest possible object shape for try_commit()'s apply
-// phase: no ref to validate (invariant 1), no by_field_/by_cached_field_/
+// phase: no ref to validate (invariant 1), no by_key_/by_cached_field_/
 // by_cached_reference_ index entries to insert. The only per-object
 // bookkeeping every create() ever pays regardless of declared fields is
 // by_type_ (Root's "every Id of this type" set) and the raw slot

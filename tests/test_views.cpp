@@ -544,7 +544,7 @@ TEST(updating_a_field_declared_in_multiple_lookup_families_reconciles_key_and_ca
 
 // Same undo-log discipline as veto_rollback_restores_the_field_key_index
 // (test_hooks.cpp) and veto_rollback_restores_the_cached_field_index above,
-// but on a field that lives in by_field_ AND by_cached_field_ at once
+// but on a field that lives in by_key_ AND by_cached_field_ at once
 // (Order::computed_key): a vetoed change must leave BOTH indexes exactly as
 // they were, not one rolled back and the other not.
 TEST(veto_rollback_restores_a_field_declared_in_multiple_lookup_families_simultaneously) {
