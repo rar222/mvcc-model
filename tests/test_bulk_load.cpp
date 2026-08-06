@@ -44,7 +44,7 @@ TEST(bulk_load_into_a_fresh_model_installs_everything_with_cross_object_local_re
     Snapshot s = m.snapshot();
     CHECK(s.find(real_a) != nullptr);
     CHECK(s.find(real_o) != nullptr);
-    CHECK_EQ(s.find(real_o)->account.raw(), real_a.raw());
+    CHECK_EQ(s.find(real_o)->account.id(), real_a.id());
     CHECK(s.find_by_key<&Account::name>("A1") != nullptr);
 }
 
@@ -71,7 +71,7 @@ TEST(bulk_transaction_update_fixes_up_a_forward_reference_after_the_fact) {
     const Ref<Order> real_o = r.to_real(o);
 
     Snapshot s = m.snapshot();
-    CHECK_EQ(s.find(real_o)->account.raw(), real_a.raw());
+    CHECK_EQ(s.find(real_o)->account.id(), real_a.id());
 }
 
 TEST(bulk_transaction_update_returns_null_for_an_id_this_batch_never_created) {
@@ -361,7 +361,7 @@ TEST(bulk_load_accepts_forward_references_self_loops_and_cycles) {
     self->label = "SELF";
     self->next = local(0);  // position 0: itself -- non-nullable self-loop
     const Ref<Link> sl = t.create(std::move(self));
-    CHECK(sl.raw() == local(0).raw());  // the predicted id is the minted one
+    CHECK(sl.id() == local(0).id());  // the predicted id is the minted one
 
     auto c1 = std::make_unique<Link>();
     c1->label = "C1";
@@ -379,9 +379,9 @@ TEST(bulk_load_accepts_forward_references_self_loops_and_cycles) {
     const Ref<Link> r2 = r.to_real(l2);
     {
         Snapshot s = m.snapshot();
-        CHECK(s.find(rs)->next.raw() == rs.raw());  // self-loop resolved to itself
-        CHECK(s.find(r1)->next.raw() == r2.raw());  // cycle edges resolved crosswise
-        CHECK(s.find(r2)->next.raw() == r1.raw());
+        CHECK(s.find(rs)->next.id() == rs.id());  // self-loop resolved to itself
+        CHECK(s.find(r1)->next.id() == r2.id());  // cycle edges resolved crosswise
+        CHECK(s.find(r2)->next.id() == r1.id());
     }
 
     // The bulk-built non-nullable cycle lives and dies as a unit, exactly
@@ -430,7 +430,7 @@ TEST(cascade_delete_works_correctly_on_bulk_loaded_data) {
     Snapshot s = m.snapshot();
     CHECK(s.find(real_c) == nullptr);
     CHECK(s.find(real_g) != nullptr);
-    CHECK(s.find(real_g)->parent.raw() == Id{});  // nulled, not cascaded
+    CHECK(s.find(real_g)->parent.id() == Id{});  // nulled, not cascaded
 }
 
 // commit_bulk_without_undo() installs through a SEPARATE, no-log path

@@ -79,7 +79,7 @@ TEST(find_by_field_returns_every_match_and_only_for_declared_fields) {
     CHECK(s.find_by_key<&Account::name>("A1") == s.find(a));
     auto by_name = s.view_by_field<&Account::name>("A1");
     CHECK_EQ(by_name.size(), std::size_t{1});
-    CHECK_EQ(by_name[0]->id, a.raw());
+    CHECK_EQ(by_name[0]->id, a.id());
     CHECK(s.find_by_field<&Account::name>("NOBODY").empty());
 
     // find_by_field's real multi-match story: Order::qty_scan is a PURE
@@ -247,7 +247,7 @@ TEST(for_each_and_all_of_referrers_match_find_referrers_via_cache) {
 
     std::size_t fallback_visits = 0;
     s2.for_each_referrers<&Order::parent>(hub, [&](const Order& o) {
-        CHECK(o.id == child.raw());
+        CHECK(o.id == child.id());
         ++fallback_visits;
     });
     CHECK_EQ(fallback_visits, std::size_t{1});
@@ -298,7 +298,7 @@ TEST(view_forms_of_referrers_bind_to_this_snapshot_via_cache) {
 
     int fallback_seen = 0;
     s2.for_each_view_referrers<&Order::parent>(hub, [&](View<Order> v) {
-        CHECK(v->id == child.raw());
+        CHECK(v->id == child.id());
         ++fallback_seen;
     });
     CHECK_EQ(fallback_seen, 1);
@@ -326,35 +326,35 @@ TEST(cached_referrer_raw_trio_matches_the_cache_hit_half_of_the_typed_forms) {
 
     const void* tag = model::field_tag<&Order::account>();
 
-    const std::vector<const ObjectBase*> found = s.find_cached_referrers_raw(tag, a.raw());
+    const std::vector<const ObjectBase*> found = s.find_cached_referrers_raw(tag, a.id());
     CHECK_EQ(found.size(), std::size_t{2});
     bool saw_o1 = false, saw_o2 = false;
     for (const ObjectBase* o : found) {
         CHECK(o->tag() == model::type_tag<Order>());
-        if (o->id == o1.raw()) saw_o1 = true;
-        if (o->id == o2.raw()) saw_o2 = true;
+        if (o->id == o1.id()) saw_o1 = true;
+        if (o->id == o2.id()) saw_o2 = true;
     }
     CHECK(saw_o1);
     CHECK(saw_o2);
 
     std::size_t visits = 0;
-    s.for_each_cached_referrers_raw(tag, a.raw(), [&](const ObjectBase&) { ++visits; });
+    s.for_each_cached_referrers_raw(tag, a.id(), [&](const ObjectBase&) { ++visits; });
     CHECK_EQ(visits, std::size_t{2});
 
     int checked = 0;
-    CHECK(!s.all_of_cached_referrers_raw(tag, a.raw(), [&](const ObjectBase&) {
+    CHECK(!s.all_of_cached_referrers_raw(tag, a.id(), [&](const ObjectBase&) {
         ++checked;
         return false;
     }));
     CHECK_EQ(checked, 1);  // stopped after the first, didn't visit the second
 
     // Undeclared field / no referrers: empty and vacuously true, not an error.
-    CHECK(s.find_cached_referrers_raw(model::field_tag<&Order::parent>(), a.raw()).empty());
+    CHECK(s.find_cached_referrers_raw(model::field_tag<&Order::parent>(), a.id()).empty());
     std::size_t undeclared_visits = 0;
-    s.for_each_cached_referrers_raw(model::field_tag<&Order::parent>(), a.raw(),
+    s.for_each_cached_referrers_raw(model::field_tag<&Order::parent>(), a.id(),
                                     [&](const ObjectBase&) { ++undeclared_visits; });
     CHECK_EQ(undeclared_visits, std::size_t{0});
-    CHECK(s.all_of_cached_referrers_raw(model::field_tag<&Order::parent>(), a.raw(),
+    CHECK(s.all_of_cached_referrers_raw(model::field_tag<&Order::parent>(), a.id(),
                                         [](const ObjectBase&) { return false; }));
 
     // A target Id that was never even created, on a DECLARED field: also
@@ -422,7 +422,7 @@ TEST(find_referrers_falls_back_to_the_scan_for_a_field_never_declared_cached) {
     // fallback, and still finds the real referrer.
     const auto found = m.snapshot().find_referrers<&Order::parent>(hub);
     CHECK_EQ(found.size(), std::size_t{1});
-    CHECK_EQ(found[0]->id, child.raw());
+    CHECK_EQ(found[0]->id, child.id());
 }
 
 // Undo-log discipline for Root::by_cached_reference: a vetoed

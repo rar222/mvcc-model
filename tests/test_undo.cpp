@@ -110,7 +110,7 @@ TEST(undo_remove_action_deletes_the_target) {
     const Ref<Account> a = make_account(m, "A1");
 
     std::vector<TestUndoAction> actions;
-    actions.push_back({TestUndoAction::Kind::Remove, a.raw(), nullptr});
+    actions.push_back({TestUndoAction::Kind::Remove, a.id(), nullptr});
     const CommitResult res = apply_test_undo(m, actions);
 
     CHECK(res.status == CommitStatus::Committed);
@@ -129,7 +129,7 @@ TEST(undo_restore_update_action_restores_old_field_values) {
     CHECK_EQ(m.snapshot().find(a)->balance, std::int64_t{999});
 
     std::vector<TestUndoAction> actions;
-    actions.push_back({TestUndoAction::Kind::RestoreUpdate, a.raw(), std::move(pre_image)});
+    actions.push_back({TestUndoAction::Kind::RestoreUpdate, a.id(), std::move(pre_image)});
     const CommitResult res = apply_test_undo(m, actions);
 
     CHECK(res.status == CommitStatus::Committed);
@@ -148,14 +148,14 @@ TEST(undo_recreate_action_resurrects_with_a_new_id) {
     CHECK(m.snapshot().find(a) == nullptr);
 
     std::vector<TestUndoAction> actions;
-    actions.push_back({TestUndoAction::Kind::Recreate, a.raw(), std::move(pre_image)});
+    actions.push_back({TestUndoAction::Kind::Recreate, a.id(), std::move(pre_image)});
     const CommitResult res = apply_test_undo(m, actions);
 
     CHECK(res.status == CommitStatus::Committed);
     const Account* revived = m.snapshot().find_by_key<&Account::name>("A1");
     CHECK(revived != nullptr);
     CHECK_EQ(revived->balance, std::int64_t{42});
-    CHECK(revived->id != a.raw());  // a new id, not the old (dead) one
+    CHECK(revived->id != a.id());  // a new id, not the old (dead) one
 }
 
 // The hard case, and the one that actually answers "would cascaded items
@@ -183,16 +183,16 @@ TEST(undo_reconnects_a_multi_object_cascade_including_victim_to_victim_edges) {
     {
         Snapshot pre = m.snapshot();
         actions.push_back(
-            {TestUndoAction::Kind::RestoreUpdate, surv.raw(),
+            {TestUndoAction::Kind::RestoreUpdate, surv.id(),
              std::unique_ptr<ObjectBase>(pre.find(surv)->clone())});
         actions.push_back(
-            {TestUndoAction::Kind::Recreate, mid2.raw(),
+            {TestUndoAction::Kind::Recreate, mid2.id(),
              std::unique_ptr<ObjectBase>(pre.find(mid2)->clone())});
         actions.push_back(
-            {TestUndoAction::Kind::Recreate, mid1.raw(),
+            {TestUndoAction::Kind::Recreate, mid1.id(),
              std::unique_ptr<ObjectBase>(pre.find(mid1)->clone())});
         actions.push_back(
-            {TestUndoAction::Kind::Recreate, hub.raw(),
+            {TestUndoAction::Kind::Recreate, hub.id(),
              std::unique_ptr<ObjectBase>(pre.find(hub)->clone())});
     }
 
@@ -213,9 +213,9 @@ TEST(undo_reconnects_a_multi_object_cascade_including_victim_to_victim_edges) {
     CHECK(new_mid1 != nullptr);
     CHECK(new_mid2 != nullptr);
     CHECK(new_hub != nullptr);
-    CHECK(new_mid1->id != mid1.raw());  // genuinely new ids throughout
-    CHECK(new_mid2->id != mid2.raw());
-    CHECK(new_hub->id != hub.raw());
+    CHECK(new_mid1->id != mid1.id());  // genuinely new ids throughout
+    CHECK(new_mid2->id != mid2.id());
+    CHECK(new_hub->id != hub.id());
 
     CHECK(new_mid1->account == Ref<Account>(new_hub->id));  // remapped to the NEW hub
     CHECK(new_mid2->account == Ref<Account>(new_hub->id));
@@ -291,7 +291,7 @@ TEST(undo_list_captures_a_pure_remove_and_apply_undo_resurrects_with_a_new_id) {
     const Account* revived = m.snapshot().find_by_key<&Account::name>("A1");
     CHECK(revived != nullptr);
     CHECK_EQ(revived->balance, std::int64_t{42});
-    CHECK(revived->id != a.raw());
+    CHECK(revived->id != a.id());
 }
 
 // The same multi-object cascade as undo_reconnects_a_multi_object_cascade_
@@ -837,7 +837,7 @@ TEST(applying_an_undo_produces_a_new_undo_entry_of_its_own) {
     const Account* revived = m.snapshot().find_by_key<&Account::name>("A1");
     CHECK(revived != nullptr);
     CHECK_EQ(revived->balance, std::int64_t{7});
-    CHECK(revived->id != a.raw());
+    CHECK(revived->id != a.id());
 
     const auto after_undo2 = m.list_undo();
     CHECK_EQ(after_undo2.size(), std::size_t{1});  // the chain keeps going

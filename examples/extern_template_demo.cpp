@@ -66,8 +66,8 @@ int main() {
 
     assert(txn.exists(acct));
     assert(txn.peek(acct));
-    assert(txn.peek_as<Account>(acct.raw()));
-    assert(!txn.peek_before<Order>(ord.raw()));  // fresh create -- no "before" value yet
+    assert(txn.peek_as<Account>(acct.id()));
+    assert(!txn.peek_before<Order>(ord.id()));  // fresh create -- no "before" value yet
 
     CommitResult r = m.try_commit(txn);
     assert(r.status == CommitStatus::Committed);
@@ -75,7 +75,7 @@ int main() {
     ord = r.to_real(ord);
     Opt<Order> maybe_ord = ord;
     maybe_ord = r.to_real(maybe_ord);  // Opt<T> overload -- passes through, not itself local here
-    assert(maybe_ord && maybe_ord.raw() == ord.raw());
+    assert(maybe_ord && maybe_ord.id() == ord.id());
 
     Snapshot s = m.snapshot();
     const Account& a2 = s.resolve(acct);

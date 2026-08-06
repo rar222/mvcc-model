@@ -30,7 +30,7 @@ TEST(subscriber_gets_a_changeset_per_commit) {
     auto u = sub->poll_for_update();
     CHECK(u.has_value());
     CHECK_EQ(u->changes->size(), std::size_t{1});
-    CHECK_EQ((*u->changes)[0].id, a.raw());
+    CHECK_EQ((*u->changes)[0].id, a.id());
     CHECK((*u->changes)[0].kind == ChangeKind::Created);
     CHECK(!u->coalesced);
     CHECK(u->snapshot.find(a) != nullptr);
@@ -90,7 +90,7 @@ TEST(repeated_updates_of_an_already_known_object_coalesce_to_updated_never_creat
     while (auto u = sub->poll_for_update()) {
         if (u->coalesced) saw_coalesced = true;
         for (const Change& c : *u->changes) {
-            if (c.id != o.raw()) continue;
+            if (c.id != o.id()) continue;
             ++mentions;
             CHECK(c.kind == ChangeKind::Updated);
         }
@@ -120,8 +120,8 @@ TEST(create_then_delete_between_drains_cancels_out) {
     int mentions_o = 0, mentions_a = 0;
     while (auto u = sub->poll_for_update()) {
         for (const Change& c : *u->changes) {
-            if (c.id == o.raw()) ++mentions_o;
-            if (c.id == a.raw()) ++mentions_a;
+            if (c.id == o.id()) ++mentions_o;
+            if (c.id == a.id()) ++mentions_a;
         }
     }
     CHECK_EQ(mentions_o, 0);
@@ -152,7 +152,7 @@ TEST(update_then_delete_in_one_coalescing_window_collapses_to_deleted_not_cancel
     CHECK(u.has_value());
     CHECK(u->coalesced);
     CHECK_EQ(u->changes->size(), std::size_t{1});
-    CHECK((*u->changes)[0].id == a.raw());
+    CHECK((*u->changes)[0].id == a.id());
     CHECK((*u->changes)[0].kind == ChangeKind::Deleted);
     CHECK(u->snapshot.find(a) == nullptr);  // gone as of this (merged) Update's snapshot
     CHECK(!sub->poll_for_update().has_value());  // collapse() always leaves exactly one entry
@@ -367,11 +367,11 @@ TEST(depth_zero_always_collapses_but_coalesced_still_means_actual_backlog) {
     // overflow_coalesces_instead_of_growing exercises at higher depths.
     int mentions_a = 0, mentions_b = 0;
     for (const Change& c : *u->changes) {
-        if (c.id == a.raw()) {
+        if (c.id == a.id()) {
             ++mentions_a;
             CHECK(c.kind == ChangeKind::Created);
             CHECK_EQ(u->snapshot.find(a)->balance, std::int64_t{2});
-        } else if (c.id == b.raw()) {
+        } else if (c.id == b.id()) {
             ++mentions_b;
             CHECK(c.kind == ChangeKind::Created);
         }

@@ -126,7 +126,7 @@ TEST(
 
     Snapshot final_s = m.snapshot();
     final_s.for_each<Order>(
-        [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.raw()); });
+        [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.id()); });
 }
 
 // The intersection the individual hook tests above never cover: every hook
@@ -244,7 +244,7 @@ TEST(hooks_survive_heavy_concurrent_cascade_churn_without_corruption) {
 
     Snapshot final_s = m.snapshot();
     final_s.for_each<Order>(
-        [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.raw()); });
+        [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.id()); });
 }
 
 // Up to N threads mixed reader/writer — kThreads = 8, split 4 readers / 4 writers, all launched and
@@ -399,7 +399,7 @@ TEST(concurrent_stress_mixed_readers_and_writers_at_scale_across_five_fields_two
     const std::size_t final_size = final_s.size();
     CHECK(final_size >= std::size_t{10000} && final_size <= std::size_t{100000});
     final_s.for_each<Record>(
-        [&](const Record& r) { CHECK(final_s.resolve(r.owner).id == r.owner.raw()); });
+        [&](const Record& r) { CHECK(final_s.resolve(r.owner).id == r.owner.id()); });
     for (const Ref<Account>& a : accounts) {
         auto scan = final_s.find_referrers<&Record::owner_scan>(a);
         auto idx = final_s.find_referrers<&Record::owner>(a);

@@ -123,7 +123,7 @@ public:
         };
         return "Asset{id=" + ref_str(id) + ", label=" + label + ", created_at=" + std::to_string(created_at) +
                ", schema_version=" + std::to_string(schema_version) + ", value=" + std::to_string(value) +
-               ", owner=" + ref_str(owner.raw()) + "}";
+               ", owner=" + ref_str(owner.id()) + "}";
     }
 
     template <class Self, class V>
@@ -192,7 +192,7 @@ public:
     std::string gizmo_description_scan() const { return description; }  // see Asset::asset_description_scan()
 
     std::string to_string() const {
-        const model::Id linked_id = linked.raw();
+        const model::Id linked_id = linked.id();
         return "Gizmo{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
                ", linked=" + (linked ? std::to_string(linked_id.index) + ":" + std::to_string(linked_id.gen)
                                      : "null") +
@@ -311,7 +311,7 @@ TEST(model_type_with_diamond_base_creates_and_reads_back_fields_from_every_base)
     CHECK_EQ(ap->label, std::string("ASSET1"));     // from Labeled
     CHECK_EQ(ap->created_at, std::int64_t{12345});  // from Timestamped
     CHECK_EQ(ap->schema_version, 1);                // from Entity, via either mixin
-    CHECK_EQ(s.resolve(ap->owner).id, acc.raw());   // Asset's own field, resolves normally
+    CHECK_EQ(s.resolve(ap->owner).id, acc.id());   // Asset's own field, resolves normally
 }
 
 // define_keys() on a COMPUTED method (asset_key(), declared on Asset itself)
@@ -326,7 +326,7 @@ TEST(model_type_with_diamond_base_supports_keys_computed_from_an_inherited_field
 
     Snapshot s = m.snapshot();
     CHECK(s.find_by_key<&Asset::asset_key>("asset:DUP") != nullptr);
-    CHECK_EQ(s.find_by_key<&Asset::asset_key>("asset:DUP")->id, a1.raw());
+    CHECK_EQ(s.find_by_key<&Asset::asset_key>("asset:DUP")->id, a1.id());
     CHECK(s.find_by_key<&Asset::asset_key>("asset:NOPE") == nullptr);
 
     // Same label as a1 -> rejected, same as two Accounts sharing a name.
@@ -375,7 +375,7 @@ TEST(finding_by_the_inherited_label_field_uses_the_untyped_api) {
     CHECK(raw != nullptr);
     CHECK(raw->tag() == model::type_tag<Asset>());  // the caller's job, not find_by_key_raw's
     const Asset* ap = static_cast<const Asset*>(raw);
-    CHECK_EQ(ap->id, a1.raw());
+    CHECK_EQ(ap->id, a1.id());
     CHECK_EQ(ap->label, std::string("ASSET1"));
 
     CHECK(s.find_by_key_raw(model::field_tag<&Labeled::label>(), "NOPE") == nullptr);
@@ -406,12 +406,12 @@ TEST(finding_by_the_inherited_label_field_can_return_either_diamond_type) {
     const ObjectBase* raw_a = s.find_by_key_raw(model::field_tag<&Labeled::label>(), "ASSET-LABEL");
     CHECK(raw_a != nullptr);
     CHECK(raw_a->tag() == model::type_tag<Asset>());
-    CHECK_EQ(static_cast<const Asset*>(raw_a)->id, a.raw());
+    CHECK_EQ(static_cast<const Asset*>(raw_a)->id, a.id());
 
     const ObjectBase* raw_g = s.find_by_key_raw(model::field_tag<&Labeled::label>(), "GIZMO-LABEL");
     CHECK(raw_g != nullptr);
     CHECK(raw_g->tag() == model::type_tag<Gizmo>());  // a DIFFERENT concrete type, same tag lookup
-    CHECK_EQ(static_cast<const Gizmo*>(raw_g)->id, g.raw());
+    CHECK_EQ(static_cast<const Gizmo*>(raw_g)->id, g.id());
 
     // Cross-type collision: a Gizmo claiming an already-live Asset's label
     // (or vice versa) is rejected exactly like same-type duplicates are --
@@ -469,7 +469,7 @@ TEST(updating_the_inherited_label_field_reconciles_its_own_key_entry) {
     CHECK(old_raw == nullptr);  // stale key entry: gone
     const ObjectBase* new_raw = s.find_by_key_raw(model::field_tag<&Labeled::label>(), "NEW");
     CHECK(new_raw != nullptr);
-    CHECK_EQ(static_cast<const Asset*>(new_raw)->id, a.raw());
+    CHECK_EQ(static_cast<const Asset*>(new_raw)->id, a.id());
 }
 
 // Asset's non-nullable owner Ref<Account> is declared directly on Asset
@@ -527,8 +527,8 @@ TEST(model_type_with_diamond_base_supports_cached_referrer_lookup) {
     CHECK_EQ(for_acc1.size(), std::size_t{2});
     bool saw_a1 = false, saw_a2 = false;
     for (const Asset* ap : for_acc1) {
-        if (ap->id == a1.raw()) saw_a1 = true;
-        if (ap->id == a2.raw()) saw_a2 = true;
+        if (ap->id == a1.id()) saw_a1 = true;
+        if (ap->id == a2.id()) saw_a2 = true;
     }
     CHECK(saw_a1);
     CHECK(saw_a2);
@@ -591,15 +591,15 @@ TEST(scan_field_over_inherited_description_matches_across_types_and_allows_dupli
     CHECK_EQ(assets.size(), std::size_t{2});  // duplicates within ONE type: both a1 and a2
     bool saw_a1 = false, saw_a2 = false;
     for (const Asset* ap : assets) {
-        if (ap->id == a1.raw()) saw_a1 = true;
-        if (ap->id == a2.raw()) saw_a2 = true;
+        if (ap->id == a1.id()) saw_a1 = true;
+        if (ap->id == a2.id()) saw_a2 = true;
     }
     CHECK(saw_a1);
     CHECK(saw_a2);
 
     const auto gizmos = s.find_by_field<&Gizmo::gizmo_description_scan>("SHARED");
     CHECK_EQ(gizmos.size(), std::size_t{1});  // the SAME value, matched on the OTHER type too
-    CHECK_EQ(gizmos.front()->id, g.raw());
+    CHECK_EQ(gizmos.front()->id, g.id());
 
     CHECK(s.find_by_field<&Asset::asset_description_scan>("NOPE").empty());
 }
@@ -622,19 +622,19 @@ TEST(cached_field_over_inherited_description_matches_across_types_and_allows_dup
     CHECK_EQ(assets.size(), std::size_t{2});
     bool saw_a1 = false, saw_a2 = false;
     for (const Asset* ap : assets) {
-        if (ap->id == a1.raw()) saw_a1 = true;
-        if (ap->id == a2.raw()) saw_a2 = true;
+        if (ap->id == a1.id()) saw_a1 = true;
+        if (ap->id == a2.id()) saw_a2 = true;
     }
     CHECK(saw_a1);
     CHECK(saw_a2);
 
     const auto gizmos_shared = s.find_by_field<&Gizmo::gizmo_description>("SHARED");
     CHECK_EQ(gizmos_shared.size(), std::size_t{1});
-    CHECK_EQ(gizmos_shared.front()->id, g1.raw());
+    CHECK_EQ(gizmos_shared.front()->id, g1.id());
 
     const auto gizmos_other = s.find_by_field<&Gizmo::gizmo_description>("OTHER");
     CHECK_EQ(gizmos_other.size(), std::size_t{1});
-    CHECK_EQ(gizmos_other.front()->id, g2.raw());
+    CHECK_EQ(gizmos_other.front()->id, g2.id());
 
     CHECK(s.find_by_field<&Asset::asset_description>("OTHER").empty());  // OTHER belongs to a Gizmo, not an Asset
 }
@@ -666,13 +666,13 @@ TEST(finding_by_the_inherited_description_field_finds_both_types_in_one_call) {
 
     bool saw_a1 = false, saw_a2 = false, saw_g1 = false;
     for (const ObjectBase* o : shared) {
-        if (o->id == a1.raw()) {
+        if (o->id == a1.id()) {
             CHECK(o->tag() == model::type_tag<Asset>());
             saw_a1 = true;
-        } else if (o->id == a2.raw()) {
+        } else if (o->id == a2.id()) {
             CHECK(o->tag() == model::type_tag<Asset>());
             saw_a2 = true;
-        } else if (o->id == g1.raw()) {
+        } else if (o->id == g1.id()) {
             CHECK(o->tag() == model::type_tag<Gizmo>());
             saw_g1 = true;
         }
@@ -684,7 +684,7 @@ TEST(finding_by_the_inherited_description_field_finds_both_types_in_one_call) {
     const std::vector<const ObjectBase*> other =
         s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "OTHER");
     CHECK_EQ(other.size(), std::size_t{1});
-    CHECK_EQ(other.front()->id, g2.raw());
+    CHECK_EQ(other.front()->id, g2.id());
 
     CHECK(s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "NOPE").empty());
     // A field never tagged LookupType::Cache at all: empty, not an error.
@@ -718,10 +718,10 @@ TEST(finding_by_an_unrelated_tag_type_finds_both_asset_and_gizmo) {
 
     bool saw_asset = false, saw_gizmo = false;
     for (const ObjectBase* o : tagged) {
-        if (o->id == a.raw()) {
+        if (o->id == a.id()) {
             CHECK(o->tag() == model::type_tag<Asset>());
             saw_asset = true;
-        } else if (o->id == g.raw()) {
+        } else if (o->id == g.id()) {
             CHECK(o->tag() == model::type_tag<Gizmo>());
             saw_gizmo = true;
         }
@@ -763,8 +763,8 @@ TEST(for_each_by_cached_field_raw_visits_every_match_across_types) {
     s.for_each_by_cached_field_raw(model::field_tag<&Keys::example_key>(), "TAGGED",
                                    [&](const ObjectBase& o) {
                                        ++visits;
-                                       if (o.id == a.raw()) saw_asset = true;
-                                       if (o.id == g.raw()) saw_gizmo = true;
+                                       if (o.id == a.id()) saw_asset = true;
+                                       if (o.id == g.id()) saw_gizmo = true;
                                    });
     CHECK_EQ(visits, std::size_t{2});
     CHECK(saw_asset);

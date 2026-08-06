@@ -120,8 +120,8 @@ TEST(pre_commit_hook_finds_outgoing_refs_pointing_outside_the_transaction) {
             if (!alive.count(c.id) || c.tag != type_tag<Order>()) continue;
             const Order* o = model.peek_as<Order>(c.id);
             if (!o) continue;
-            referenced.insert(o->account.raw());
-            if (o->parent) referenced.insert(o->parent.raw());
+            referenced.insert(o->account.id());
+            if (o->parent) referenced.insert(o->parent.id());
         }
         for (Id id : referenced)
             if (!alive.count(id)) outside.push_back(id);
@@ -161,12 +161,12 @@ TEST(pre_commit_hook_finds_outgoing_refs_pointing_outside_the_transaction) {
     m.set_pre_commit({});
 
     CHECK_EQ(outside.size(), std::size_t{4});
-    for (Id id : {a2.raw(), a3.raw(), a4.raw(), existing.raw()})
+    for (Id id : {a2.id(), a3.id(), a4.id(), existing.id()})
         CHECK(std::find(outside.begin(), outside.end(), id) != outside.end());
     // a1 was to_update's OLD target -- no longer referenced after the
     // update, so reading it would mean the hook saw a stale value instead
     // of the final one (invariant 9).
-    CHECK(std::find(outside.begin(), outside.end(), a1.raw()) == outside.end());
+    CHECK(std::find(outside.begin(), outside.end(), a1.id()) == outside.end());
 }
 
 // The type-agnostic version of the test above: the hook above hardcodes
@@ -270,14 +270,14 @@ TEST(pre_commit_hook_finds_outgoing_refs_across_many_object_types_with_no_per_ty
                outside.end();
     };
     CHECK_EQ(outside.size(), std::size_t{6});
-    CHECK(contains(type_tag<Account>(), a1.raw()));  // referenced by o2.account AND rec1.owner
-    CHECK(contains(type_tag<Account>(), a2.raw()));
-    CHECK(contains(type_tag<Order>(), o_old.raw()));
-    CHECK(contains(type_tag<Node>(), n_old.raw()));
-    CHECK(contains(type_tag<Record>(), r_old.raw()));
-    CHECK(contains(type_tag<Link>(), l_b.raw()));
-    CHECK(!contains(type_tag<Order>(), o1_local.raw()));       // stale local id, never real
-    CHECK(!contains(type_tag<Order>(), res.to_real(o1_local).raw()));  // real, but inside the txn
+    CHECK(contains(type_tag<Account>(), a1.id()));  // referenced by o2.account AND rec1.owner
+    CHECK(contains(type_tag<Account>(), a2.id()));
+    CHECK(contains(type_tag<Order>(), o_old.id()));
+    CHECK(contains(type_tag<Node>(), n_old.id()));
+    CHECK(contains(type_tag<Record>(), r_old.id()));
+    CHECK(contains(type_tag<Link>(), l_b.id()));
+    CHECK(!contains(type_tag<Order>(), o1_local.id()));       // stale local id, never real
+    CHECK(!contains(type_tag<Order>(), res.to_real(o1_local).id()));  // real, but inside the txn
 }
 
 // A hook returning false (Vetoed) leaves the model in EXACTLY its
@@ -477,7 +477,7 @@ TEST(create_with_a_dead_ref_is_rejected_as_invalid) {
     const CommitResult res = m.try_commit(txn);
     CHECK(res.status == CommitStatus::Invalid);
     CHECK(res.error.has_value());
-    CHECK(res.error->bad_target == a.raw());
+    CHECK(res.error->bad_target == a.id());
     CHECK(m.snapshot().find(good) == nullptr);  // txn's base already reflects a/good gone
 }
 
@@ -678,7 +678,7 @@ TEST(precommit_conflict_reports_conflict_reason_when_the_failing_pretransaction_
     CHECK(res.status == CommitStatus::PrecommitConflict);
     CHECK(res.conflict.has_value());  // forwarded from the failing pre-transaction's OWN Conflict
     CHECK(res.conflict->reason == ConflictReason::IdSetOverlap);
-    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a.raw()) !=
+    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a.id()) !=
           res.conflict->ids.end());
     CHECK_EQ(m.snapshot().size(), std::size_t{1});  // main txn never applied
 
@@ -972,8 +972,8 @@ TEST(post_commit_hook_computes_new_objects_and_unchanged_referenced_objects) {
             if (!alive.count(c.id) || c.tag != type_tag<Order>()) continue;
             const Order* o = r.snapshot.find<Order>(Ref<Order>(c.id));
             if (!o) continue;
-            referenced.insert(o->account.raw());
-            if (o->parent) referenced.insert(o->parent.raw());
+            referenced.insert(o->account.id());
+            if (o->parent) referenced.insert(o->parent.id());
         }
         for (Id id : referenced)
             if (!alive.count(id)) unchanged_referenced.push_back(id);
@@ -1013,19 +1013,19 @@ TEST(post_commit_hook_computes_new_objects_and_unchanged_referenced_objects) {
     // --- 1: truly new objects --- (Id has no operator<, only ==, so this
     // checks set membership directly rather than sorting)
     CHECK_EQ(new_objects.size(), std::size_t{2});
-    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(survivor_local).raw()) !=
+    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(survivor_local).id()) !=
           new_objects.end());
-    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(fresh_local).raw()) !=
+    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(fresh_local).id()) !=
           new_objects.end());
-    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(victim_local).raw()) ==
+    CHECK(std::find(new_objects.begin(), new_objects.end(), res.to_real(victim_local).id()) ==
           new_objects.end());  // cancelled-via-cascade -- filtered out
 
     // --- 2: unchanged objects referenced by created/updated ones ---
     CHECK_EQ(unchanged_referenced.size(), std::size_t{4});
-    for (Id id : {a2.raw(), a3.raw(), a4.raw(), existing.raw()})
+    for (Id id : {a2.id(), a3.id(), a4.id(), existing.id()})
         CHECK(std::find(unchanged_referenced.begin(), unchanged_referenced.end(), id) !=
               unchanged_referenced.end());
-    CHECK(std::find(unchanged_referenced.begin(), unchanged_referenced.end(), a1.raw()) ==
+    CHECK(std::find(unchanged_referenced.begin(), unchanged_referenced.end(), a1.id()) ==
           unchanged_referenced.end());  // stale target -- reading it would be a reconciliation bug
 }
 

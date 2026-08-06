@@ -56,7 +56,7 @@ TEST(cascade_nulls_nullable_referrers_instead_of_killing_them) {
     CHECK(s.find(c) != nullptr);  // c survives
     CHECK(!s.find(c)->parent);    // with its Opt<> nulled
     CHECK(s.resolve(s.find(c)->parent) == nullptr);
-    CHECK_EQ(s.resolve(s.find(c)->account).id, a.raw());  // its Ref<> is intact
+    CHECK_EQ(s.resolve(s.find(c)->account).id, a.id());  // its Ref<> is intact
 }
 
 // A chain of non-nullable Ref<> edges (o3 -> o2 -> o1 -> a) all die
@@ -257,7 +257,7 @@ TEST(a_create_may_reference_itself_within_its_own_transaction) {
     const Ref<Link> real = res.to_real(l);
     Snapshot s = m.snapshot();
     CHECK(s.find(real) != nullptr);
-    CHECK(s.find(real)->next.raw() == real.raw());  // resolved to itself, not mismapped
+    CHECK(s.find(real)->next.id() == real.id());  // resolved to itself, not mismapped
 }
 
 TEST(a_create_may_reference_a_later_create_in_the_same_transaction) {
@@ -297,8 +297,8 @@ TEST(two_creates_forming_a_non_nullable_cycle_commit_and_cascade_as_one) {
     const Ref<Link> r2 = res.to_real(l2);
     {
         Snapshot s = m.snapshot();
-        CHECK(s.find(r1)->next.raw() == r2.raw());
-        CHECK(s.find(r2)->next.raw() == r1.raw());
+        CHECK(s.find(r1)->next.id() == r2.id());
+        CHECK(s.find(r2)->next.id() == r1.id());
     }
 
     // A non-nullable cycle lives and dies as a unit: removing either link
@@ -342,8 +342,8 @@ TEST(removing_a_referenced_local_create_cascades_at_commit_like_a_committed_remo
     // trace of it.
     std::size_t victim_created = 0, victim_deleted = 0;
     for (const Change& c : res.changes) {
-        if (c.id == real_victim.raw() && c.kind == ChangeKind::Created) ++victim_created;
-        if (c.id == real_victim.raw() && c.kind == ChangeKind::Deleted) ++victim_deleted;
+        if (c.id == real_victim.id() && c.kind == ChangeKind::Created) ++victim_created;
+        if (c.id == real_victim.id() && c.kind == ChangeKind::Deleted) ++victim_deleted;
     }
     CHECK_EQ(victim_created, std::size_t{1});
     CHECK_EQ(victim_deleted, std::size_t{1});
@@ -595,7 +595,7 @@ TEST(cascade_does_not_double_process_a_referrer_with_both_a_non_nullable_and_nul
 
     std::size_t rec_changes = 0, rec_deleted = 0, rec_updated = 0;
     for (const Change& c : res.changes) {
-        if (c.id != rec.raw()) continue;
+        if (c.id != rec.id()) continue;
         ++rec_changes;
         if (c.kind == ChangeKind::Deleted) ++rec_deleted;
         if (c.kind == ChangeKind::Updated) ++rec_updated;
@@ -660,7 +660,7 @@ TEST(cascade_does_not_double_process_a_referrer_whose_nullable_and_non_nullable_
     for (const Ref<Record>& rec : recs) {
         std::size_t rec_changes = 0, rec_deleted = 0, rec_updated = 0;
         for (const Change& c : res.changes) {
-            if (c.id != rec.raw()) continue;
+            if (c.id != rec.id()) continue;
             ++rec_changes;
             if (c.kind == ChangeKind::Deleted) ++rec_deleted;
             if (c.kind == ChangeKind::Updated) ++rec_updated;

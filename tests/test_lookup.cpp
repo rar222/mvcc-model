@@ -142,8 +142,8 @@ TEST(external_keys_are_scoped_per_type_not_global) {
     const Ref<Widget> w = make_widget(m, "ord:X");  // same raw string, different type
 
     Snapshot s = m.snapshot();
-    CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:X")->id, o.raw());
-    CHECK_EQ(s.find_by_key<&Widget::computed_key>("ord:X")->id, w.raw());
+    CHECK_EQ(s.find_by_key<&Order::computed_key>("ord:X")->id, o.id());
+    CHECK_EQ(s.find_by_key<&Widget::computed_key>("ord:X")->id, w.id());
     CHECK(s.find_by_key<&Account::name>("ord:X") == nullptr);
     CHECK_EQ(s.size(), std::size_t{3});
 
@@ -197,8 +197,8 @@ TEST(find_referrers_answers_who_points_at_me) {
     CHECK_EQ(children.size(), std::size_t{2});
     std::vector<Id> ids;
     for (const Order* o : children) ids.push_back(o->id);
-    CHECK(std::find(ids.begin(), ids.end(), c1.raw()) != ids.end());
-    CHECK(std::find(ids.begin(), ids.end(), c2.raw()) != ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), c1.id()) != ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), c2.id()) != ids.end());
 
     const Ref<Account> lonely = make_account(m, "LONELY");
     s = m.snapshot();
@@ -335,8 +335,8 @@ TEST(find_by_key_looks_up_define_keys_declared_fields) {
     const Ref<Gadget> g2 = make_gadget(m, "Sprocket", 222);
 
     Snapshot s = m.snapshot();
-    CHECK_EQ(s.find_by_key<&Gadget::label>("Widget")->id, g1.raw());
-    CHECK_EQ(s.find_by_key<&Gadget::serial>(222)->id, g2.raw());
+    CHECK_EQ(s.find_by_key<&Gadget::label>("Widget")->id, g1.id());
+    CHECK_EQ(s.find_by_key<&Gadget::serial>(222)->id, g2.id());
     CHECK(s.find_by_key<&Gadget::label>("nope") == nullptr);
     CHECK(s.find_by_key<&Gadget::serial>(999) == nullptr);
     CHECK(s.find_by_key<&Order::code>("anything") == nullptr);
@@ -354,8 +354,8 @@ TEST(field_index_tracks_a_reassigned_indexed_field) {
 
     Snapshot s = m.snapshot();
     CHECK(s.find_by_key<&Gadget::label>("Widget") == nullptr);
-    CHECK_EQ(s.find_by_key<&Gadget::label>("Renamed")->id, g.raw());
-    CHECK_EQ(s.find_by_key<&Gadget::serial>(111)->id, g.raw());
+    CHECK_EQ(s.find_by_key<&Gadget::label>("Renamed")->id, g.id());
+    CHECK_EQ(s.find_by_key<&Gadget::serial>(111)->id, g.id());
 }
 
 // Removing an object drops every one of its define_keys() index
@@ -388,7 +388,7 @@ TEST(field_index_duplicate_value_is_rejected) {
     CHECK(!res.error->bad_target);  // key collisions have no single target to classify against base
 
     Snapshot s = m.snapshot();
-    CHECK_EQ(s.find_by_key<&Gadget::label>("Same")->id, g1.raw());  // first write still stands
+    CHECK_EQ(s.find_by_key<&Gadget::label>("Same")->id, g1.id());  // first write still stands
     CHECK(s.find_by_key<&Gadget::serial>(2) == nullptr);            // rejected create never installed
 }
 
@@ -402,7 +402,7 @@ TEST(a_deleted_keys_value_can_be_reclaimed_by_a_different_record) {
     const Ref<Gadget> g2 = make_gadget(m, "Same", 2);  // different record, same label
 
     Snapshot s = m.snapshot();
-    CHECK_EQ(s.find_by_key<&Gadget::label>("Same")->id, g2.raw());
+    CHECK_EQ(s.find_by_key<&Gadget::label>("Same")->id, g2.id());
     CHECK(s.find(g1) == nullptr);
 }
 
@@ -448,8 +448,8 @@ TEST(a_key_vacated_and_reclaimed_in_the_same_transaction_is_not_a_collision) {
 
     Snapshot s = m.snapshot();
     CHECK(s.find_by_key<&Gadget::label>("KeyA") != nullptr);
-    CHECK_EQ(s.find_by_key<&Gadget::label>("KeyA")->id, g_b.raw());
-    CHECK_EQ(s.find_by_key<&Gadget::label>("KeyA-moved")->id, g_a.raw());
+    CHECK_EQ(s.find_by_key<&Gadget::label>("KeyA")->id, g_b.id());
+    CHECK_EQ(s.find_by_key<&Gadget::label>("KeyA-moved")->id, g_a.id());
     CHECK(s.find_by_key<&Gadget::label>("KeyB") == nullptr);  // g_b vacated it
 }
 
@@ -668,7 +668,7 @@ TEST(range_by_field_visits_the_same_matches_as_for_each_by_field) {
     // cache-hit path since computed_key is tagged LookupType::Cache.
     int computed_hits = 0;
     for (const Order& o : s.range_by_field<&Order::computed_key>("ord:O1")) {
-        CHECK(o.id == o1.raw());
+        CHECK(o.id == o1.id());
         ++computed_hits;
     }
     CHECK_EQ(computed_hits, 1);
@@ -877,7 +877,7 @@ TEST(cache_hit_and_scan_fallback_agree_after_a_mutate_and_a_create_in_one_transa
     // o1's own Id still resolves in s1 -- proving update() mutated the SAME
     // logical object rather than deleting it and something else (e.g. o3)
     // landing in a recycled slot. A remove+recreate would bump Id::gen and
-    // make o1.raw() a stale Id that find() rejects; see invariant 5.
+    // make o1.id() a stale Id that find() rejects; see invariant 5.
     const Order* o1_in_s1 = s1.find(o1);
     CHECK(o1_in_s1 != nullptr);
     CHECK_EQ(o1_in_s1->qty, std::int64_t{9});
@@ -891,9 +891,9 @@ TEST(cache_hit_and_scan_fallback_agree_after_a_mutate_and_a_create_in_one_transa
     for (const Order* o : cache_hit) cache_hit_ids.push_back(o->id);
     for (const Order* o : scan_fallback) scan_fallback_ids.push_back(o->id);
     for (std::vector<Id>* ids : {&cache_hit_ids, &scan_fallback_ids}) {
-        CHECK(std::find(ids->begin(), ids->end(), o2.raw()) != ids->end());
-        CHECK(std::find(ids->begin(), ids->end(), o3_real.raw()) != ids->end());
-        CHECK(std::find(ids->begin(), ids->end(), o1.raw()) == ids->end());
+        CHECK(std::find(ids->begin(), ids->end(), o2.id()) != ids->end());
+        CHECK(std::find(ids->begin(), ids->end(), o3_real.id()) != ids->end());
+        CHECK(std::find(ids->begin(), ids->end(), o1.id()) == ids->end());
     }
 }
 

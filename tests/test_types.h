@@ -63,8 +63,8 @@ public:
             return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
         };
         return "Order{id=" + ref_str(id) + ", code=" + code + ", qty=" + std::to_string(qty) +
-               ", account=" + ref_str(account.raw()) +
-               ", parent=" + (parent ? ref_str(parent.raw()) : "null") + "}";
+               ", account=" + ref_str(account.id()) +
+               ", parent=" + (parent ? ref_str(parent.id()) : "null") + "}";
     }
 
     template <class Self, class V>

@@ -284,7 +284,7 @@ TEST(resolve_asserts_when_ref_type_does_not_match_the_resolved_object) {
     Model m;
     const Ref<Account> acc = make_account(m, "A1");
     Snapshot s = m.snapshot();
-    const Ref<Order> wrong_type(acc.raw());  // same id, wrong static type
+    const Ref<Order> wrong_type(acc.id());  // same id, wrong static type
 
     CHECK_ASSERT_FAILURE((void)s.resolve(wrong_type));
 }

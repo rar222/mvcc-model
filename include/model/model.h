@@ -292,7 +292,7 @@ public:
 
     /// The untyped Id, for correlating with Change events or storing in
     /// heterogeneous containers. Type information is deliberately dropped.
-    Id raw() const noexcept { return id_; }
+    Id id() const noexcept { return id_; }
     explicit operator bool() const noexcept { return static_cast<bool>(id_); }  ///< non-null?
 
     /// Same-target comparison, by Id value (index AND generation) -- not by
@@ -316,13 +316,13 @@ public:
     explicit Opt(Id id) noexcept : id_(id) {}  ///< unchecked wrap, same caveat as Ref(Id)
 
     /// A non-null Ref is always a valid Opt. Not the reverse.
-    Opt(Ref<T> r) noexcept : id_(r.raw()) {}
+    Opt(Ref<T> r) noexcept : id_(r.id()) {}
 
     /// Clear to null by hand -- the same state a cascade null produces.
     /// (Ref<T> has no equivalent; that asymmetry IS the integrity guarantee.)
     void reset() noexcept { id_ = Id{}; }
 
-    Id raw() const noexcept { return id_; }  ///< the untyped Id; see Ref::raw()
+    Id id() const noexcept { return id_; }  ///< the untyped Id; see Ref::id()
     explicit operator bool() const noexcept { return static_cast<bool>(id_); }  ///< non-null?
 
     /// Same-target comparison, by Id value -- see Ref::operator==. Two nulls
@@ -405,11 +405,11 @@ struct RefReader {
     const RefFn& fn;
     template <class T>
     void operator()(const void* field, const Ref<T>& r, LookupType, const char* name) const {
-        fn(field, name, r.raw(), false);
+        fn(field, name, r.id(), false);
     }
     template <class T>
     void operator()(const void* field, const Opt<T>& r, LookupType, const char* name) const {
-        fn(field, name, r.raw(), true);
+        fn(field, name, r.id(), true);
     }
 };
 
@@ -467,11 +467,11 @@ struct RefRemapper {
 
     template <class T>
     void operator()(const void*, Ref<T>& r, LookupType, const char*) const {
-        if (is_local(r.raw())) r = Ref<T>(translate(r.raw()));
+        if (is_local(r.id())) r = Ref<T>(translate(r.id()));
     }
     template <class T>
     void operator()(const void*, Opt<T>& r, LookupType, const char*) const {
-        if (r.raw() && is_local(r.raw())) r = Opt<T>(translate(r.raw()));
+        if (r.id() && is_local(r.id())) r = Opt<T>(translate(r.id()));
     }
 };
 
@@ -498,11 +498,11 @@ struct UndoRemapper {
 
     template <class T>
     void operator()(const void*, Ref<T>& r, LookupType, const char*) const {
-        r = Ref<T>(translate(r.raw()));
+        r = Ref<T>(translate(r.id()));
     }
     template <class T>
     void operator()(const void*, Opt<T>& r, LookupType, const char*) const {
-        if (r.raw()) r = Opt<T>(translate(r.raw()));
+        if (r.id()) r = Opt<T>(translate(r.id()));
     }
 };
 
@@ -589,13 +589,13 @@ struct CachedRefReader {
     void operator()(const void* field, const Ref<T>& r, LookupType type, const char* name) const {
         if (type != LookupType::Cache) return;
         if (name) detail::register_field_name(field, name);
-        fn(field, name, r.raw(), false);
+        fn(field, name, r.id(), false);
     }
     template <class T>
     void operator()(const void* field, const Opt<T>& r, LookupType type, const char* name) const {
         if (type != LookupType::Cache) return;
         if (name) detail::register_field_name(field, name);
-        fn(field, name, r.raw(), true);
+        fn(field, name, r.id(), true);
     }
 };
 
@@ -1359,7 +1359,7 @@ public:
     /// invariant guarantees it resolves. Never null.
     template <class T>
     const T& resolve(Ref<T> r) const noexcept {
-        const ObjectBase* p = find_raw(r.raw());
+        const ObjectBase* p = find_raw(r.id());
         // If this fires, a commit published a dangling Ref -- always a writer
         // bug, since validate() is supposed to make it impossible.
         assert(p && "Ref dangled -- referential integrity is broken");
@@ -1370,7 +1370,7 @@ public:
     /// Resolve an Opt. Deliberately nullable.
     template <class T>
     const T* resolve(Opt<T> r) const noexcept {
-        return cast<T>(find_raw(r.raw()));
+        return cast<T>(find_raw(r.id()));
     }
 
     /// Look up a handle that came from *outside* this snapshot -- one you stored
@@ -1378,11 +1378,11 @@ public:
     /// recycled. Checked; returns null if so.
     template <class T>
     const T* find(Ref<T> r) const noexcept {
-        return cast<T>(find_raw(r.raw()));
+        return cast<T>(find_raw(r.id()));
     }
     template <class T>
     const T* find(Opt<T> r) const noexcept {
-        return cast<T>(find_raw(r.raw()));
+        return cast<T>(find_raw(r.id()));
     }
 
     /// Fast lookup by a field declared via define_keys() (zero or more per
@@ -1858,7 +1858,7 @@ public:
     /// Range-based-for support for for_each_referrers/all_of_referrers/
     /// find_referrers -- ReferrerRange<Field> walks either the WHOLE
     /// by_type[ClassT] population (`filtered_` true, O(#ClassT objects),
-    /// filtering by `(o.*Field).raw() == target_` per element -- same shape
+    /// filtering by `(o.*Field).id() == target_` per element -- same shape
     /// as FieldRange's value comparison) or an already-exact
     /// Root::by_cached_reference bucket (`filtered_` false, O(log n +
     /// matches), no per-element check) -- see for_each_referrers's own doc
@@ -1903,7 +1903,7 @@ public:
             void advance_to_match() {
                 for (; it_ != end_; ++it_) {
                     const ClassT* p = cast<ClassT>(s_->find_raw(*it_));
-                    if (p && (!filtered_ || (p->*Field).raw() == target_)) {
+                    if (p && (!filtered_ || (p->*Field).id() == target_)) {
                         ptr_ = p;
                         return;
                     }
@@ -1968,7 +1968,7 @@ public:
             void advance_to_match() {
                 for (; it_ != end_; ++it_) {
                     const ClassT* p = cast<ClassT>(s_->find_raw(*it_));
-                    if (p && (!filtered_ || (p->*Field).raw() == target_)) {
+                    if (p && (!filtered_ || (p->*Field).id() == target_)) {
                         ptr_ = p;
                         return;
                     }
@@ -2081,7 +2081,7 @@ public:
     /// persistent multimap, just like Root::by_cached_field, so the same
     /// "several UNRELATED concrete types registering the identical field
     /// tag" case applies here too. `target` is the untyped Id being
-    /// referenced (a Ref<T>/Opt<T>::raw()); the return is every referencing
+    /// referenced (a Ref<T>/Opt<T>::id()); the return is every referencing
     /// object, regardless of concrete type, tag() left for the caller to
     /// check. Genuinely cache-only, no scan fallback: unlike the typed
     /// find_referrers<Field>, there is no ClassT here to walk by_type with,
@@ -2321,7 +2321,7 @@ private:
     /// half of both for_each_referrers<Field> and all_of_referrers<Field> --
     /// same role scan_field_short_circuit plays for the by-field family,
     /// just walking all_of<ClassT> with a reference-equality match
-    /// (`(o.*Field).raw() == target.raw()`) instead of a value comparison.
+    /// (`(o.*Field).id() == target.id()`) instead of a value comparison.
     /// Reads `o.*Field` directly, bypassing define_references() entirely --
     /// so unlike a scan-tagged value field (gated by declares_scan_field),
     /// this fallback works for ANY Ref<>/Opt<> pointer-to-member, whether or
@@ -4516,7 +4516,7 @@ bool Snapshot::referrer_short_circuit(
     Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
     return all_of<ClassT>([&](const ClassT& o) {
-        return (o.*Field).raw() != target.raw() || f(o);
+        return (o.*Field).id() != target.id() || f(o);
     });
 }
 
@@ -4526,7 +4526,7 @@ void Snapshot::for_each_referrers(Ref<typename member_value_t<decltype(Field)>::
     using ClassT = member_class_t<decltype(Field)>;
     if (cached_referrer_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-        cached_referrer_short_circuit_raw(field_tag<Field>(), target.raw(), [&](Id id) {
+        cached_referrer_short_circuit_raw(field_tag<Field>(), target.id(), [&](Id id) {
             if (const ClassT* p = cast<ClassT>(find_raw(id))) f(*p);
             return true;  // for_each_referrers never stops early
         });
@@ -4545,7 +4545,7 @@ bool Snapshot::all_of_referrers(Ref<typename member_value_t<decltype(Field)>::ta
     using ClassT = member_class_t<decltype(Field)>;
     if (cached_referrer_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-        return cached_referrer_short_circuit_raw(field_tag<Field>(), target.raw(), [&](Id id) {
+        return cached_referrer_short_circuit_raw(field_tag<Field>(), target.id(), [&](Id id) {
             const ClassT* p = cast<ClassT>(find_raw(id));
             return !p || pred(*p);
         });
@@ -4569,11 +4569,11 @@ Snapshot::ReferrerRange<Field> Snapshot::range_referrers(
     using ClassT = member_class_t<decltype(Field)>;
     if (cached_referrer_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-        return ReferrerRange<Field>(this, cached_referrer_bucket_raw(field_tag<Field>(), target.raw()),
-                                    target.raw(), /*filtered=*/false);
+        return ReferrerRange<Field>(this, cached_referrer_bucket_raw(field_tag<Field>(), target.id()),
+                                    target.id(), /*filtered=*/false);
     }
     register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
-    return ReferrerRange<Field>(this, type_bucket_raw(type_tag<ClassT>()), target.raw(), /*filtered=*/true);
+    return ReferrerRange<Field>(this, type_bucket_raw(type_tag<ClassT>()), target.id(), /*filtered=*/true);
 }
 
 // ---------------------------------------------------------------------------
@@ -4704,8 +4704,8 @@ struct CommitResult {
     /// comment.
     template <class T>
     Ref<T> to_real(Ref<T> local) const {
-        if (!is_local(local.raw())) return local;
-        auto it = local_remap.find(local.raw().index);
+        if (!is_local(local.id())) return local;
+        auto it = local_remap.find(local.id().index);
         return Ref<T>(it == local_remap.end() ? Id{} : it->second);
     }
     /// Factories for the five shapes try_commit()'s various exit points
@@ -4735,8 +4735,8 @@ struct CommitResult {
     /// Opt<T> form. Null passes through as null.
     template <class T>
     Opt<T> to_real(Opt<T> local) const {
-        if (!local || !is_local(local.raw())) return local;
-        auto it = local_remap.find(local.raw().index);
+        if (!local || !is_local(local.id())) return local;
+        auto it = local_remap.find(local.id().index);
         return Opt<T>(it == local_remap.end() ? Id{} : it->second);
     }
 };
@@ -4807,11 +4807,11 @@ public:
     /// by this same batch, or is out of range.
     template <class T>
     T* update(Ref<T> r) const {
-        return static_cast<T*>(update_raw(r.raw()));
+        return static_cast<T*>(update_raw(r.id()));
     }
     template <class T>
     T* update(Opt<T> r) const {
-        return static_cast<T*>(update_raw(r.raw()));
+        return static_cast<T*>(update_raw(r.id()));
     }
 
     /// Untyped counterpart of update<T> -- same reasoning as Transaction's
@@ -4934,11 +4934,11 @@ public:
     /// (if it's a local id) was removed earlier in this same transaction.
     template <class T>
     T* update(Ref<T> r) {
-        return static_cast<T*>(update_raw(r.raw()));
+        return static_cast<T*>(update_raw(r.id()));
     }
     template <class T>
     T* update(Opt<T> r) {
-        return static_cast<T*>(update_raw(r.raw()));
+        return static_cast<T*>(update_raw(r.id()));
     }
 
     /// Untyped counterpart of update<T> -- same reasoning as create_raw.
@@ -4983,11 +4983,11 @@ public:
     /// build bug and still rejects as Invalid at commit.)
     template <class T>
     void remove(Ref<T> r) {
-        remove_raw(r.raw());
+        remove_raw(r.id());
     }
     template <class T>
     void remove(Opt<T> r) {
-        remove_raw(r.raw());
+        remove_raw(r.id());
     }
 
     /// Untyped counterpart of remove<T> -- same reasoning as create_raw.
@@ -5039,12 +5039,12 @@ public:
     /// only tells you what this transaction can currently see.
     template <class T>
     const T* peek(Ref<T> r) const {
-        const ObjectBase* o = peek_raw(r.raw());
+        const ObjectBase* o = peek_raw(r.id());
         return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
     }
     template <class T>
     const T* peek(Opt<T> r) const {
-        const ObjectBase* o = peek_raw(r.raw());
+        const ObjectBase* o = peek_raw(r.id());
         return (o && o->tag() == type_tag<T>()) ? static_cast<const T*>(o) : nullptr;
     }
 
@@ -5409,7 +5409,7 @@ template <auto Field, class F>
 void Snapshot::for_each_view_referrers(
     Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
     // Delegates to for_each_referrers<Field> rather than re-walking
-    // for_each_view<ClassT> and re-checking `(o.*Field).raw() == target.raw()`
+    // for_each_view<ClassT> and re-checking `(o.*Field).id() == target.id()`
     // independently (a prior version of this function did that, and as a
     // result never called register_field_lookup -- every lookup made through
     // the View-returning referrer API was silently invisible to
@@ -5452,11 +5452,11 @@ Snapshot::ReferrerViewRange<Field> Snapshot::range_view_referrers(
     using ClassT = member_class_t<decltype(Field)>;
     if (cached_referrer_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-        return ReferrerViewRange<Field>(this, cached_referrer_bucket_raw(field_tag<Field>(), target.raw()),
-                                        target.raw(), /*filtered=*/false);
+        return ReferrerViewRange<Field>(this, cached_referrer_bucket_raw(field_tag<Field>(), target.id()),
+                                        target.id(), /*filtered=*/false);
     }
     register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
-    return ReferrerViewRange<Field>(this, type_bucket_raw(type_tag<ClassT>()), target.raw(),
+    return ReferrerViewRange<Field>(this, type_bucket_raw(type_tag<ClassT>()), target.id(),
                                     /*filtered=*/true);
 }
 

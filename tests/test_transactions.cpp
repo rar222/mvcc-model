@@ -137,7 +137,7 @@ TEST(a_local_id_that_collides_with_another_transactions_own_local_index_silently
     // counter) -- across transactions the same raw Id can name two completely
     // different objects. Nothing here can tell them apart: no exception, no
     // null, just the wrong object.
-    CHECK(a_local.raw() == own_local.raw());
+    CHECK(a_local.id() == own_local.id());
     CHECK(txn2.peek(a_local) == txn2.peek(own_local));
     CHECK_EQ(txn2.peek(a_local)->name, std::string("TXN2-OWN"));  // NOT txn1's "FROM-TXN1"
 
@@ -209,8 +209,8 @@ TEST(remove_intent_is_not_yet_visible_as_deleted_in_pending_changes) {
     Transaction txn = m.begin();
     txn.remove(o);
     CHECK_EQ(txn.remove_intents().size(), std::size_t{1});
-    CHECK(txn.remove_intents().count(o.raw()) == 1);
-    for (const Change& c : txn.pending_changes()) CHECK(c.id != o.raw());
+    CHECK(txn.remove_intents().count(o.id()) == 1);
+    for (const Change& c : txn.pending_changes()) CHECK(c.id != o.id());
     // `o` itself is masked locally the instant remove() is called on it --
     // that's immediate, unlike cascade fan-out (a DIFFERENT object that
     // would die as a side effect of this remove, which stays visible
@@ -262,8 +262,8 @@ TEST(estimate_changes_with_cascades_estimates_a_non_nullable_cascade_delete) {
     for (const Change& c : estimate) {
         if (c.kind != ChangeKind::Deleted) continue;
         ++deletes;
-        if (c.id == a.raw()) saw_account = true;
-        if (c.id == o.raw()) saw_order = true;
+        if (c.id == a.id()) saw_account = true;
+        if (c.id == o.id()) saw_order = true;
     }
     CHECK_EQ(deletes, std::size_t{2});
     CHECK(saw_account);
@@ -292,9 +292,9 @@ TEST(estimate_changes_with_cascades_estimates_a_nullable_cascade_null_as_updated
 
     bool saw_parent_deleted = false, saw_child_updated = false, saw_child_deleted = false;
     for (const Change& c : estimate) {
-        if (c.id == parent.raw() && c.kind == ChangeKind::Deleted) saw_parent_deleted = true;
-        if (c.id == child.raw() && c.kind == ChangeKind::Updated) saw_child_updated = true;
-        if (c.id == child.raw() && c.kind == ChangeKind::Deleted) saw_child_deleted = true;
+        if (c.id == parent.id() && c.kind == ChangeKind::Deleted) saw_parent_deleted = true;
+        if (c.id == child.id() && c.kind == ChangeKind::Updated) saw_child_updated = true;
+        if (c.id == child.id() && c.kind == ChangeKind::Deleted) saw_child_deleted = true;
     }
     CHECK(saw_parent_deleted);
     CHECK(saw_child_updated);  // nullable ref -> estimated null-out, not a delete
@@ -413,7 +413,7 @@ TEST(
     m.set_pre_commit({});
 
     CHECK_EQ(seen.size(), std::size_t{1});
-    CHECK(seen[0].id == a.raw());
+    CHECK(seen[0].id == a.id());
     CHECK(seen[0].kind == ChangeKind::Deleted);
 
     // The estimate (2 deletes, computed before the repoint) and reality (1
@@ -523,7 +523,7 @@ TEST(to_real_passes_through_a_ref_that_was_never_local) {
     const Account* from_base = txn.base().find(a);
     CHECK(from_base != nullptr);
     const Ref<Account> a_from_base(from_base->id);
-    CHECK_EQ(a_from_base.raw(), a.raw());
+    CHECK_EQ(a_from_base.id(), a.id());
 
     // Unrelated create, so the commit actually does something (to_real() on
     // an empty-transaction fast path is a degenerate case tested elsewhere).
@@ -537,13 +537,13 @@ TEST(to_real_passes_through_a_ref_that_was_never_local) {
 
     // Neither `a` nor `a_from_base` was ever a local id -- to_real() must
     // hand each straight back, unchanged.
-    CHECK(res.to_real(a).raw() == a.raw());
-    CHECK(res.to_real(a_from_base).raw() == a.raw());
+    CHECK(res.to_real(a).id() == a.id());
+    CHECK(res.to_real(a_from_base).id() == a.id());
 
     // Opt<T> form, same guarantee: a non-local Opt passes through unchanged,
     // whether it's null or set.
-    const Opt<Account> opt_set(a.raw());
-    CHECK(res.to_real(opt_set).raw() == a.raw());
+    const Opt<Account> opt_set(a.id());
+    CHECK(res.to_real(opt_set).id() == a.id());
     const Opt<Account> opt_null{};
     CHECK(!res.to_real(opt_null));
 }
@@ -648,23 +648,23 @@ TEST(transaction_peek_before_returns_the_pre_edit_baseline_and_null_in_every_doc
 
     Transaction txn = m.begin();
     txn.update(a)->balance = 999;
-    CHECK_EQ(txn.peek_before<Account>(a.raw())->balance, std::int64_t{100});
+    CHECK_EQ(txn.peek_before<Account>(a.id())->balance, std::int64_t{100});
     CHECK_EQ(txn.peek(a)->balance, std::int64_t{999});
 
     // (1) An id never update()'d this transaction: nothing to show.
     const Ref<Account> untouched = make_account(m, "A2", 1);
-    CHECK(txn.peek_before<Account>(untouched.raw()) == nullptr);
+    CHECK(txn.peek_before<Account>(untouched.id()) == nullptr);
 
     // (2) A local create has nothing to show as "before" either.
     auto fresh = std::make_unique<Account>();
     fresh->name = "FRESH";
     const Ref<Account> local = txn.create(std::move(fresh));
     txn.update(local)->balance = 1;
-    CHECK(txn.peek_before<Account>(local.raw()) == nullptr);
+    CHECK(txn.peek_before<Account>(local.id()) == nullptr);
 
     // (3) Wrong T: the tag() check rejects it even though the slot is real
     // and was genuinely update()'d.
-    CHECK(txn.peek_before<Order>(a.raw()) == nullptr);
+    CHECK(txn.peek_before<Order>(a.id()) == nullptr);
 
     CHECK(m.try_commit(txn).status == CommitStatus::Committed);
 
@@ -673,16 +673,16 @@ TEST(transaction_peek_before_returns_the_pre_edit_baseline_and_null_in_every_doc
     // confirm peek_before against the OLD id (dead generation, same index)
     // is null rather than aliasing the new object's baseline.
     const Ref<Order> o1 = make_order(m, "O1", a);
-    const std::uint32_t slot = o1.raw().index;
+    const std::uint32_t slot = o1.id().index;
     remove_and_commit(m, o1);
     const Ref<Order> o2 = make_order(m, "O2", a);
-    CHECK_EQ(o2.raw().index, slot);
-    CHECK(o2.raw().gen != o1.raw().gen);
+    CHECK_EQ(o2.id().index, slot);
+    CHECK(o2.id().gen != o1.id().gen);
 
     Transaction txn2 = m.begin();
     txn2.update(o2)->qty = 42;
-    CHECK(txn2.peek_before<Order>(o1.raw()) == nullptr);  // stale generation of the SAME slot
-    CHECK_EQ(txn2.peek_before<Order>(o2.raw())->qty, std::int64_t{1});
+    CHECK(txn2.peek_before<Order>(o1.id()) == nullptr);  // stale generation of the SAME slot
+    CHECK_EQ(txn2.peek_before<Order>(o2.id())->qty, std::int64_t{1});
 }
 
 // Transaction::peek_as<T>: a safe typed read from an untyped Id (e.g. one
@@ -701,7 +701,7 @@ TEST(transaction_peek_as_reads_an_untyped_id_typed_and_returns_null_for_mismatch
     txn.update(a)->balance = 7;
 
     for (const Change& c : txn.pending_changes()) {
-        const bool is_order_id = (c.id == o_local.raw());
+        const bool is_order_id = (c.id == o_local.id());
         const Order* as_order = txn.peek_as<Order>(c.id);
         const Account* as_account = txn.peek_as<Account>(c.id);
         CHECK((as_order != nullptr) == is_order_id);
@@ -711,7 +711,7 @@ TEST(transaction_peek_as_reads_an_untyped_id_typed_and_returns_null_for_mismatch
     const Ref<Order> o_removed = make_order(m, "O2", a);
     Transaction txn2 = m.begin();
     txn2.remove(o_removed);
-    CHECK(txn2.peek_as<Order>(o_removed.raw()) == nullptr);  // masked by its own remove() intent
+    CHECK(txn2.peek_as<Order>(o_removed.id()) == nullptr);  // masked by its own remove() intent
 
     CHECK(txn2.peek_as<Account>(Id{}) == nullptr);  // never-existent id
 }

@@ -110,7 +110,7 @@ public:
     /// for why `id` comes first and parent prints as raw index:gen instead
     /// of being resolved.
     std::string to_string() const {
-        const model::Id parent_id = parent.raw();
+        const model::Id parent_id = parent.id();
         return "Node{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
                ", parent=" +
                (parent ? std::to_string(parent_id.index) + ":" + std::to_string(parent_id.gen) : "null") +
@@ -192,8 +192,8 @@ public:
             return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
         };
         return "Record{id=" + ref_str(id) + ", label=" + label + ", value=" + std::to_string(value) +
-               ", flag=" + (flag ? "true" : "false") + ", owner=" + ref_str(owner.raw()) +
-               ", related=" + (related ? ref_str(related.raw()) : "null") + "}";
+               ", flag=" + (flag ? "true" : "false") + ", owner=" + ref_str(owner.id()) +
+               ", related=" + (related ? ref_str(related.id()) : "null") + "}";
     }
 
     template <class Self, class V>
@@ -236,7 +236,7 @@ public:
     /// for why `id` comes first and next prints as raw index:gen instead of
     /// being resolved.
     std::string to_string() const {
-        const model::Id next_id = next.raw();
+        const model::Id next_id = next.id();
         return "Link{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
                ", next=" + std::to_string(next_id.index) + ":" + std::to_string(next_id.gen) + "}";
     }

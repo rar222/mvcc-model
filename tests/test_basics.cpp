@@ -56,7 +56,7 @@ TEST(create_and_find_by_id_and_key) {
     CHECK(s.find_by_key<&Order::computed_key>("ord:O1") != nullptr);
     CHECK(s.find_by_key<&Order::computed_key>("ord:nope") == nullptr);
     CHECK(s.find_by_key<&Account::name>("ord:O1") == nullptr);  // right key, wrong type
-    CHECK_EQ(s.find_by_key<&Account::name>("A1")->id, a.raw());
+    CHECK_EQ(s.find_by_key<&Account::name>("A1")->id, a.id());
 }
 
 // Ref<>/Opt<> resolve correctly through a Snapshot: a non-null Opt
@@ -72,9 +72,9 @@ TEST(refs_resolve_through_snapshot) {
     const Order* child = s.find(c);
 
     const Account& acct = s.resolve(child->account);
-    CHECK_EQ(acct.id, a.raw());
+    CHECK_EQ(acct.id, a.id());
     CHECK(s.resolve(child->parent) != nullptr);
-    CHECK_EQ(s.resolve(child->parent)->id, p.raw());
+    CHECK_EQ(s.resolve(child->parent)->id, p.id());
     CHECK(s.resolve(s.find(p)->parent) == nullptr);
 }
 
@@ -191,8 +191,8 @@ TEST(stale_id_does_not_alias_a_recycled_slot) {
     const Ref<Order> o2 = make_order(m, "O2", a);
 
     Snapshot s = m.snapshot();
-    CHECK_EQ(o2.raw().index, o1.raw().index);  // slot was recycled
-    CHECK(o2.raw().gen != o1.raw().gen);       // but the generation moved
+    CHECK_EQ(o2.id().index, o1.id().index);  // slot was recycled
+    CHECK(o2.id().gen != o1.id().gen);       // but the generation moved
     CHECK(s.find(o1) == nullptr);              // the stale handle must NOT resolve to O2
     CHECK(s.find(o2) != nullptr);
 }
@@ -213,13 +213,13 @@ TEST(transaction_local_update_does_not_alias_a_stale_generation_of_the_same_slot
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o1 = make_order(m, "O1", a);
-    const std::uint32_t slot = o1.raw().index;
+    const std::uint32_t slot = o1.id().index;
 
     remove_and_commit(m, o1);
     const Ref<Order> o2 =
         make_order(m, "O2", a);  // reuses `a` -- nothing else steals the freed slot
-    CHECK_EQ(o2.raw().index, slot);
-    CHECK(o2.raw().gen != o1.raw().gen);
+    CHECK_EQ(o2.id().index, slot);
+    CHECK(o2.id().gen != o1.id().gen);
 
     Transaction txn = m.begin();
     txn.update(o2)->qty = 42;  // populates local_updated_[slot], keyed by o2's generation
@@ -243,7 +243,7 @@ TEST(an_exhausted_slot_is_retired_not_reused) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o1 = make_order(m, "O1", a);
-    const std::uint32_t slot = o1.raw().index;
+    const std::uint32_t slot = o1.id().index;
 
     remove_and_commit(m, o1);
     m.debug_set_generation(slot, kGenMax);
@@ -251,8 +251,8 @@ TEST(an_exhausted_slot_is_retired_not_reused) {
     const Ref<Order> o2 = make_order(m, "O2", a);
 
     CHECK_EQ(m.exhausted_slots(), std::size_t{1});
-    CHECK(o2.raw().index != slot);
-    CHECK(o2.raw().gen != 0);
+    CHECK(o2.id().index != slot);
+    CHECK(o2.id().gen != 0);
     CHECK(m.snapshot().find(o2) != nullptr);
 }
 
@@ -264,7 +264,7 @@ TEST(a_stale_handle_never_aliases_across_exhaustion) {
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o1 = make_order(m, "O1", a);
     const Ref<Order> stale = o1;
-    const std::uint32_t slot = o1.raw().index;
+    const std::uint32_t slot = o1.id().index;
 
     remove_and_commit(m, o1);
     m.debug_set_generation(slot, kGenMax);
@@ -353,7 +353,7 @@ TEST(concurrent_alloc_slot_under_exhaustion_never_double_hands_out_a_withdrawn_s
     {
         std::vector<Ref<Account>> temp;
         for (int i = 0; i < kPoisoned; ++i) temp.push_back(make_account(m, "TEMP" + std::to_string(i)));
-        for (const Ref<Account>& r : temp) poisoned_slots.push_back(r.raw().index);
+        for (const Ref<Account>& r : temp) poisoned_slots.push_back(r.id().index);
         for (const Ref<Account>& r : temp) remove_and_commit(m, r);
     }
     CHECK_EQ(poisoned_slots.size(), static_cast<std::size_t>(kPoisoned));
@@ -499,14 +499,14 @@ TEST(find_raw_is_generation_checked_and_null_for_absent_or_stale_ids) {
     const Ref<Order> o = make_order(m, "O1", a);
 
     Snapshot s = m.snapshot();
-    CHECK(s.find_raw(a.raw()) != nullptr);
-    CHECK(s.find_raw(a.raw())->tag() == type_tag<Account>());
-    CHECK(s.find_raw(o.raw())->tag() == type_tag<Order>());
+    CHECK(s.find_raw(a.id()) != nullptr);
+    CHECK(s.find_raw(a.id())->tag() == type_tag<Account>());
+    CHECK(s.find_raw(o.id())->tag() == type_tag<Order>());
 
     CHECK(s.find_raw(Id{}) == nullptr);                              // default-constructed Id
     CHECK(s.find_raw(Id{999999, 1}) == nullptr);                     // index past the spine
-    CHECK(s.find_raw(Id{a.raw().index, a.raw().gen + 1}) == nullptr);  // stale generation, same slot
-    CHECK(Snapshot{}.find_raw(a.raw()) == nullptr);                  // null Snapshot: nothing to see
+    CHECK(s.find_raw(Id{a.id().index, a.id().gen + 1}) == nullptr);  // stale generation, same slot
+    CHECK(Snapshot{}.find_raw(a.id()) == nullptr);                  // null Snapshot: nothing to see
 
     // The documented use case: dispatch on tag() with no typed Snapshot
     // access at all, e.g. walking a heterogeneous CommitResult::changes.
@@ -571,15 +571,15 @@ TEST(is_local_identifies_a_transaction_scoped_placeholder_id_by_its_top_bit) {
     auto a = std::make_unique<Account>();
     a->name = "A1";
     const Ref<Account> local = txn.create(std::move(a));
-    CHECK(is_local(local.raw()));
+    CHECK(is_local(local.id()));
 
     const CommitResult res = m.try_commit(txn);
     CHECK(res.status == CommitStatus::Committed);
     const Ref<Account> real = res.to_real(local);
-    CHECK(!is_local(real.raw()));
+    CHECK(!is_local(real.id()));
 
     CHECK(!is_local(Id{}));                      // null id
-    CHECK(!is_local(real.raw()));                // an ordinary, already-real handle
+    CHECK(!is_local(real.id()));                // an ordinary, already-real handle
     CHECK(is_local(Id{kLocalIdBit, 1}));         // exactly the boundary bit
     CHECK(!is_local(Id{kLocalIdBit - 1, 1}));    // one below it: an ordinary (huge) real index
 
@@ -591,9 +591,9 @@ TEST(is_local_identifies_a_transaction_scoped_placeholder_id_by_its_top_bit) {
     auto a2 = std::make_unique<Account>();
     a2->name = "A2";
     const Ref<Account> bulk_local = bt.create(std::move(a2));
-    CHECK(is_local(bulk_local.raw()));
+    CHECK(is_local(bulk_local.id()));
     const CommitResult bres = m2.commit_bulk_without_undo(bt);
     CHECK(bres.status == CommitStatus::Committed);
-    CHECK(!is_local(bres.to_real(bulk_local).raw()));
+    CHECK(!is_local(bres.to_real(bulk_local).id()));
 }
 

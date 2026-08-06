@@ -127,7 +127,7 @@ TEST(two_concurrent_transactions_updating_the_same_id_one_conflicts_with_id_set_
     CHECK(r2.status == CommitStatus::Conflict);
     CHECK(r2.conflict.has_value());
     CHECK(r2.conflict->reason == ConflictReason::IdSetOverlap);
-    CHECK(std::find(r2.conflict->ids.begin(), r2.conflict->ids.end(), a.raw()) !=
+    CHECK(std::find(r2.conflict->ids.begin(), r2.conflict->ids.end(), a.id()) !=
           r2.conflict->ids.end());
 
     // The loser can retry cleanly against the new base.
@@ -217,7 +217,7 @@ TEST(conflict_info_ids_names_the_dangling_target_for_ref_integrity) {
     CHECK(ra.conflict.has_value());
     CHECK(ra.conflict->reason == ConflictReason::RefIntegrity);
     CHECK_EQ(ra.conflict->ids.size(), std::size_t{1});
-    CHECK(std::find(ra.conflict->ids.begin(), ra.conflict->ids.end(), a.raw()) !=
+    CHECK(std::find(ra.conflict->ids.begin(), ra.conflict->ids.end(), a.id()) !=
           ra.conflict->ids.end());
 }
 
@@ -249,12 +249,12 @@ TEST(id_set_overlap_conflict_reports_every_overlapping_id_not_just_one) {
     CHECK(res.status == CommitStatus::Conflict);
     CHECK(res.conflict.has_value());
     CHECK(res.conflict->reason == ConflictReason::IdSetOverlap);
-    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a1.raw()) !=
+    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a1.id()) !=
           res.conflict->ids.end());
-    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a2.raw()) !=
+    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a2.id()) !=
           res.conflict->ids.end());
     // a3 never collided -- it must NOT be reported as an overlap id.
-    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a3.raw()) ==
+    CHECK(std::find(res.conflict->ids.begin(), res.conflict->ids.end(), a3.id()) ==
           res.conflict->ids.end());
 }
 
@@ -310,7 +310,7 @@ TEST(diagnostics_slots_free_and_slots_exhausted_track_recycling) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
     const Ref<Order> o1 = make_order(m, "O1", a);
-    const std::uint32_t slot = o1.raw().index;
+    const std::uint32_t slot = o1.id().index;
 
     const std::size_t free_before = m.diagnostics().slots_free;
     remove_and_commit(m, o1);
