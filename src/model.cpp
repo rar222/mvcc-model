@@ -397,21 +397,23 @@ void Subscription::force_close() {
 // Model
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<const Root> Model::load_root(std::memory_order order) const {
 #if MODEL_HAS_ATOMIC_SHARED_PTR
+std::shared_ptr<const Root> Model::load_root(std::memory_order order) const {
     return root_.load(order);
-#else
-    return std::atomic_load_explicit(&root_, order);
-#endif
 }
 
 void Model::store_root(std::shared_ptr<const Root> r, std::memory_order order) {
-#if MODEL_HAS_ATOMIC_SHARED_PTR
     root_.store(std::move(r), order);
-#else
-    std::atomic_store_explicit(&root_, std::move(r), order);
-#endif
 }
+#else
+std::shared_ptr<const Root> Model::load_root(std::memory_order order) const {
+    return std::atomic_load_explicit(&root_, order);
+}
+
+void Model::store_root(std::shared_ptr<const Root> r, std::memory_order order) {
+    std::atomic_store_explicit(&root_, std::move(r), order);
+}
+#endif
 
 Model::Model() {
     // Version 0 is never used -- the very first published state is version 1,
