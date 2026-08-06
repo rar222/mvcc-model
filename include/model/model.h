@@ -4202,7 +4202,9 @@ private:
     std::thread reaper_;               ///< started by the ctor, joined by the dtor
     std::mutex reap_mu_;               ///< guards everything below except reap_backlog_
     std::condition_variable reap_cv_;  ///< wakes the reaper: work arrived, or stopping
-    std::condition_variable reap_done_cv_;  ///< wakes wait_for_reclamation(): a pass finished
+    std::condition_variable reap_done_cv_;  ///< wakes wait_for_reclamation() when a pass finishes,
+                                             ///< AND wakes ~Model() when reap_waiters_ reaches
+                                             ///< zero (see both functions' comments in model.cpp)
     std::deque<std::pair<std::uint64_t, const ObjectBase*>> reap_queue_;
     ///< ^ (version at which each object became invisible, object); freed once
     ///< the live watermark reaches that version. ALWAYS sorted ascending by
@@ -4220,8 +4222,9 @@ private:
     bool dirty_reap_ = false;                      ///< a reap pass is due
     bool reaper_stop_ = false;                     ///< dtor -> reaper: drain and exit
     std::size_t reap_waiters_ = 0;  ///< count of threads currently blocked in wait_for_reclamation();
-                                     ///< ~Model() asserts this is zero -- a waiter holds no Snapshot,
-                                     ///< so live_.empty() can't catch a caller still blocked here
+                                     ///< ~Model() waits for this to reach zero (a waiter holds no
+                                     ///< Snapshot, so live_.empty() can't catch one still blocked
+                                     ///< here) before stopping the reaper out from under it
 
     // ---- commit-lock-protected state ----------------------------------------
     // Touched ONLY by whichever thread currently holds commit_mu_, only from

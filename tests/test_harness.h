@@ -66,6 +66,18 @@ struct Registrar {
 /// macro every test actually uses, matching CHECK/CHECK_EQ's shape.
 bool dies_of_assert(const std::function<void()>& fn);
 
+/// Sibling to dies_of_assert(), for the opposite claim: that `fn` returns
+/// normally -- no assert failure, no hang -- within the same bounded
+/// deadline. Runs `fn` in a forked child under the same fork()-and-wait
+/// technique; true = the child ran fn() to completion and exited 0. False =
+/// the child was killed by a signal (an assert firing is SIGABRT) or didn't
+/// finish before the deadline and was SIGKILLed (a real hang). Don't use
+/// dies_of_assert() and just invert the result for this: its `false` return
+/// conflates "returned normally" with "hung and got killed" -- a real
+/// deadlock in `fn` would silently read as a passing test instead of the
+/// failure it is.
+bool completes_cleanly(const std::function<void()>& fn);
+
 #define CHECK_ASSERT_FAILURE(expr)                                                        \
     do {                                                                                   \
         if (!dies_of_assert([&] { expr; })) {                                              \

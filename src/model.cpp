@@ -442,15 +442,28 @@ Model::~Model() {
     // also be touching (reap_queue_): joining guarantees reaper_loop() has
     // fully returned, so there is no concurrent access to race against below.
     {
-        std::lock_guard lk(reap_mu_);
+        std::unique_lock lk(reap_mu_);
 
-        // A wait_for_reclamation() caller holds no Snapshot, so the live_ check above
-        // can't catch one still blocked here -- assert it directly instead of letting
-        // it dangle on a condition variable this destructor is about to free.
-        assert(reap_waiters_ == 0 &&
-               "~Model(): a thread is still blocked in wait_for_reclamation() -- "
-               "every caller must return before the Model is destroyed");
-
+        // A wait_for_reclamation() caller holds no Snapshot, so the live_ check
+        // above can't catch one still blocked here. Wait for reap_waiters_ to
+        // reach zero -- do NOT replace this with an assert that it's already
+        // zero, and do NOT flip reaper_stop_ outside this same lock: the
+        // reaper is still running at this point, so every already-registered
+        // waiter's target round genuinely will complete and
+        // wait_for_reclamation() will notify reap_done_cv_ as it returns (see
+        // there), waking this wait to recheck. Checking-then-flipping under
+        // two separate critical sections (or flipping without waiting at all)
+        // reopens the gap: a caller could register itself between the check
+        // and the flip and then block forever on a round the now-permanently-
+        // stopped reaper will never produce -- which then hangs THIS
+        // destructor too, since it's about to destroy a condition_variable
+        // with that caller still parked on it (UB). A caller that hasn't even
+        // reached wait_for_reclamation() yet when reaper_stop_ flips is a
+        // different, unfixable-from-in-here problem: calling any method
+        // concurrently with the owning object's destructor beginning is a
+        // caller bug in C++ generally. wait_for_reclamation()'s own
+        // !reaper_stop_ assert is what catches that half.
+        reap_done_cv_.wait(lk, [&] { return reap_waiters_ == 0; });
         reaper_stop_ = true;
     }
     reap_cv_.notify_all();
@@ -549,22 +562,18 @@ std::size_t Model::wait_for_reclamation() {
     // Nudge the reaper and wait for it to complete at least one full round after
     // this point, so anything reclaimable at the current watermark is freed.
     std::unique_lock lk(reap_mu_);
-    // ~Model()'s reap_waiters_ check and its reaper_stop_ = true assignment are
-    // one atomic reap_mu_ critical section (see ~Model()) -- but that alone
-    // still leaves a gap: a caller that reaches THIS function after that
-    // section has already completed would sail past a reap_waiters_ check
-    // that already passed, register itself anyway, and wait on reap_done_cv_
-    // for a round the now-permanently-exited reaper will never produce --
-    // blocking forever, and then blocking ~Model()'s own reap_done_cv_
-    // destructor right along with it (destroying a condition_variable with a
-    // live waiter is UB; observed in practice as exactly this hang, not a
-    // crash). Checking reaper_stop_ HERE, under the same reap_mu_ ~Model()
-    // sets it under, closes the gap: whichever of the two critical sections
-    // -- this one, or ~Model()'s -- runs first is authoritative, and the
-    // other one's check (this assert, or ~Model()'s reap_waiters_ one) is
-    // guaranteed to observe it, because both the read and the write happen
-    // strictly inside the same mutex's critical sections with no gap between
-    // them on either side.
+    // ~Model() waits for reap_waiters_ to reach zero, under this same lock,
+    // before flipping reaper_stop_ (see ~Model()'s own comment) -- so this
+    // check is exact, not a best-effort narrowing of a window: reap_mu_ makes
+    // "reaper_stop_ is true" and "~Model() has fully finished waiting out
+    // every already-registered caller" the same fact, with no gap between
+    // them a new registration could land in. If this assert is ever weakened
+    // (e.g. to a warning, or removed on the theory that ~Model()'s own wait
+    // makes it redundant) a caller that starts only after ~Model() has
+    // already finished tearing down -- i.e. calling a method on an object
+    // concurrently with its own destructor completing -- silently registers
+    // itself anyway and blocks on reap_done_cv_ forever, since the reaper
+    // that would ever complete its target round has already exited.
     assert(!reaper_stop_ &&
            "wait_for_reclamation(): called concurrently with (or after) ~Model() -- "
            "every caller must return before the Model is destroyed");
@@ -574,10 +583,14 @@ std::size_t Model::wait_for_reclamation() {
     // next pass to complete from here on.
     const std::uint64_t target = reap_done_round_ + 1;
     dirty_reap_ = true;  // force a pass even if nothing new was enqueued since the last one
-    ++reap_waiters_;  // ~Model() asserts this is zero -- see reap_waiters_'s own comment
+    ++reap_waiters_;  // ~Model() waits for this to reach zero before stopping the reaper
     reap_cv_.notify_one();
     reap_done_cv_.wait(lk, [&] { return reap_done_round_ >= target; });
     --reap_waiters_;
+    // reap_done_cv_ is shared between "a pass finished" (above) and ~Model()'s
+    // "every in-flight waiter has returned" wait -- nudge the latter here too;
+    // harmless if nothing's waiting on it.
+    if (reap_waiters_ == 0) reap_done_cv_.notify_all();
     return reap_queue_.size();  // whatever is still pinned by live snapshots
 }
 

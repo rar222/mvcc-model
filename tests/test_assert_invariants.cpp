@@ -18,6 +18,7 @@
 // test here, and why.
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
@@ -227,50 +228,62 @@ TEST(commit_bulk_without_undo_asserts_if_a_snapshot_is_still_live) {
     CHECK_ASSERT_FAILURE((void)m.commit_bulk_without_undo(bt));
 }
 
-// Two complementary asserts guard this, both required: ~Model()'s
-// reap_waiters_ == 0 check (catches a caller already registered when
-// ~Model() runs) and wait_for_reclamation()'s own !reaper_stop_ check
-// (catches a caller that starts AFTER ~Model() has already begun tearing
-// the reaper down). This test originally only had the first one -- writing
-// it is what found the gap: a caller landing in the window between those
-// two events would sail past the (already-passed, now-stale) reap_waiters_
-// check, register itself anyway, and wait forever on a round the
-// permanently-exited reaper thread will never produce -- which then hangs
-// ~Model() right along with it, destroying a condition_variable with a live
-// waiter (UB, observed in practice as a hang under ASan, not a crash). See
-// both asserts' own comments in model.cpp for the full reasoning.
+// ~Model() waits for reap_waiters_ to reach zero (under reap_mu_) before
+// flipping reaper_stop_, rather than asserting the count is already zero --
+// see its comment in model.cpp for why an assert-and-proceed there is a
+// hang waiting to happen: the reaper is still alive at that point, so every
+// already-registered caller's target round genuinely will complete, and
+// wait_for_reclamation() wakes this wait as each one returns. This test
+// pins that down: kWaiters threads racing m.reset() must complete cleanly
+// EVERY attempt, not just usually -- a flake here means the wait/notify
+// pairing between ~Model() and wait_for_reclamation() has a gap again.
 //
-// Inherently racy to reproduce either half of -- unlike a Snapshot, a
-// wait_for_reclamation() caller holds nothing registered in live_, so
-// there's no way to synchronize this precisely from outside. Stacked deck
-// (several threads, several retries) rather than a single lucky
-// interleaving: each attempt spawns threads that make exactly ONE
-// wait_for_reclamation() call each (never looping past a possibly-already-
-// destroyed Model) and races them against m.reset() with no delay. If
-// EITHER assert has been removed, this reliably starts hanging instead of
-// failing cleanly -- a property worth knowing before it happens in a real
-// process, not a CI run.
-TEST(model_destructor_asserts_if_a_wait_for_reclamation_caller_is_still_in_flight) {
-    constexpr int kAttempts = 30;
+// wait_for_reclamation() keeps its own !reaper_stop_ assert for a narrower
+// case this test can't reach: a caller that starts only after ~Model() has
+// already finished tearing down. Provoking that deliberately means calling
+// a method on an already-dead/freed Model -- not something a test can do
+// safely, so it stays unverified by a test and relies on the reasoning in
+// that assert's own comment instead.
+//
+// Unlike a Snapshot, a wait_for_reclamation() caller holds nothing
+// registered in live_ until it's actually inside the call, so there's no
+// external signal for "every thread has registered." The sleep below after
+// every waiter thread signals readiness is a bias, not a guarantee: too
+// short (or removed) and an unlucky thread can still land in the OTHER,
+// genuinely-unfixable half of the race -- calling wait_for_reclamation() on
+// a Model that's already fully torn down -- which crashes for a reason
+// unrelated to whatever this test is meant to be checking, and would show
+// up as a flaky, confusing failure here rather than a clean signal.
+TEST(wait_for_reclamation_callers_in_flight_when_model_is_destroyed_complete_safely) {
+    constexpr int kAttempts = 10;
     constexpr int kWaiters = 8;
-    bool caught = false;
-    for (int attempt = 0; attempt < kAttempts && !caught; ++attempt) {
-        caught = dies_of_assert([] {
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        const bool ok = completes_cleanly([] {
             auto m = std::make_unique<Model>();
+            // Waiter threads call through this raw pointer, never through `m`
+            // itself: std::unique_ptr's own control state (the pointer it
+            // holds) is NOT thread-safe, so reading it via m->... on one
+            // thread concurrently with m.reset() writing it on another is a
+            // data race in its own right, independent of anything Model does
+            // -- exactly what this test must NOT be exercising. raw is set
+            // once, before any thread starts, so every thread sees the same
+            // valid, unchanging value.
+            Model* const raw = m.get();
             std::atomic<int> ready{0};
             std::vector<std::thread> waiters;
             waiters.reserve(kWaiters);
             for (int i = 0; i < kWaiters; ++i)
                 waiters.emplace_back([&] {
                     ready.fetch_add(1, std::memory_order_relaxed);
-                    (void)m->wait_for_reclamation();
+                    (void)raw->wait_for_reclamation();
                 });
             while (ready.load(std::memory_order_relaxed) < kWaiters) std::this_thread::yield();
-            m.reset();  // races the waiters above
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            m.reset();  // races the waiters above -- must now resolve safely, not hang or assert
             for (auto& t : waiters) t.join();
         });
+        CHECK(ok);
     }
-    CHECK(caught);
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +437,17 @@ TEST(assign_from_rejects_a_type_mismatch) {
 //   perfect_actually_collides: set_in has no equivalent leaf_get-style
 //   double-check before calling chain_set, which is exactly why THAT assert
 //   is reachable and this one isn't.)
+// - model.cpp's wait_for_reclamation() !reaper_stop_ assert only has ONE of
+//   its two triggers covered by a test: a caller already registered when
+//   ~Model() runs -- see wait_for_reclamation_callers_in_flight_when_model_
+//   is_destroyed_complete_safely above, which actually exercises ~Model()'s
+//   fix for that case (it now waits for such a caller to finish rather than
+//   racing a stale check) and expects it to resolve WITHOUT the assert
+//   firing. The other trigger -- a call that starts only after ~Model() has
+//   already finished tearing down -- has no test and can't safely get one:
+//   provoking it means calling a method on an object concurrently with (or
+//   after) its own destructor completing, which is calling into a
+//   dying/freed Model, not a distinct bug this class could catch.
 // - persistent_map.h:886 (iterator depth_ < kMaxDepth) is structurally
 //   guaranteed by the write side: set_in's own "ran out of hash bits"
 //   handling (see above) means a trie built entirely through set_in()/

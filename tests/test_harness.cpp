@@ -64,6 +64,32 @@ bool dies_of_assert(const std::function<void()>& fn) {
     }
 }
 
+bool completes_cleanly(const std::function<void()>& fn) {
+    std::fflush(nullptr);  // same reasoning as dies_of_assert(): don't let the child re-dump
+                            // the parent's buffered, piped-under-ctest stdout on exit
+    const pid_t pid = fork();
+    if (pid == 0) {
+        fn();
+        _exit(0);
+    }
+    // Same bounded-wait/SIGKILL contract as dies_of_assert(): a real hang here
+    // is exactly the failure mode this helper exists to report as a normal,
+    // fast test FAILURE instead of a stuck process.
+    using namespace std::chrono;
+    const auto deadline = steady_clock::now() + seconds(3);
+    int status = 0;
+    for (;;) {
+        const pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (steady_clock::now() >= deadline) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return false;
+        }
+        std::this_thread::sleep_for(milliseconds(5));
+    }
+}
+
 Registrar::Registrar(const char* name, const char* filename, int linenum, std::function<void()> fn) {
     registry().push_back({name, filename, linenum, std::move(fn)});
 }
