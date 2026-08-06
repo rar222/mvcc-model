@@ -34,13 +34,26 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "MODEL_TSAN": "ON"
       }
+    },
+    {
+      "name": "m32",
+      "displayName": "32-bit (ILP32, RelWithDebInfo, asserts on) -- needs gcc-multilib/glibc-devel.i686",
+      "binaryDir": "${sourceDir}/build/m32",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g",
+        "CMAKE_CXX_FLAGS": "-m32",
+        "CMAKE_EXE_LINKER_FLAGS": "-m32",
+        "CMAKE_SHARED_LINKER_FLAGS": "-m32"
+      }
     }
   ],
   "buildPresets": [
     { "name": "default", "configurePreset": "default" },
     { "name": "debug", "configurePreset": "debug" },
     { "name": "asan", "configurePreset": "asan" },
-    { "name": "tsan", "configurePreset": "tsan" }
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "m32", "configurePreset": "m32" }
   ],
   "testPresets": [
     {
@@ -56,6 +69,11 @@
     {
       "name": "tsan",
       "configurePreset": "tsan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "m32",
+      "configurePreset": "m32",
       "output": { "outputOnFailure": true }
     }
   ]

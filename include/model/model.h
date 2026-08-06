@@ -4849,7 +4849,13 @@ public:
         // Transaction, there is no remove() to cancel an earlier entry and
         // leave a hole, so "how many objects exist so far" and "the next
         // free local index" are always the same number.
-        const Id local_id{kLocalIdBit | static_cast<std::uint32_t>(objects_.size()), 1};
+        // Not static_cast<uint32_t>(...) inline: objects_.size() is
+        // already uint32_t-width on ILP32 targets, which makes an
+        // explicit cast there a (correctly flagged) useless-cast. Going
+        // through a same-width local instead of a braced narrowing
+        // conversion keeps both LP64 and ILP32 warning-clean.
+        const std::uint32_t local_idx = kLocalIdBit | objects_.size();
+        const Id local_id{local_idx, 1};
         o->id = local_id;
         objects_.push_back(std::move(o));
         return Ref<T>(local_id);

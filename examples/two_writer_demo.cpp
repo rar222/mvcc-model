@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cinttypes>
 #include <cstdio>
 #include <memory>
 #include <random>
@@ -89,10 +90,8 @@ void subscriber_thread(std::shared_ptr<Subscription> sub) {
     Snapshot prev;  // null until the first Update is drained
     while (auto u = sub->wait_for_update()) {
         ++batch;
-        std::printf("[subscriber] batch %llu v%llu%s: %zu change(s)\n",
-                    static_cast<unsigned long long>(batch),
-                    static_cast<unsigned long long>(u->snapshot.version()),
-                    u->coalesced ? " (coalesced)" : "", u->changes->size());
+        std::printf("[subscriber] batch %" PRIu64 " v%" PRIu64 "%s: %zu change(s)\n", batch,
+                    u->snapshot.version(), u->coalesced ? " (coalesced)" : "", u->changes->size());
 
         for (const Change& c : *u->changes) {
             if (c.tag == type_tag<Account>()) {
@@ -103,7 +102,7 @@ void subscriber_thread(std::shared_ptr<Subscription> sub) {
         }
         prev = u->snapshot;
     }
-    std::printf("[subscriber] done: %llu batches\n", static_cast<unsigned long long>(batch));
+    std::printf("[subscriber] done: %" PRIu64 " batches\n", batch);
 }
 
 /// One writer thread: loops begin() / ~10 random mutations / try_commit(),
@@ -176,9 +175,8 @@ void writer_thread(Model& m, int tid, std::vector<Ref<Account>> accounts,
             g_committed.fetch_add(1, std::memory_order_relaxed);
             for (const Ref<Account>& r : new_accounts) accounts.push_back(res.to_real(r));
             for (const Ref<Order>& r : new_orders) orders.push_back(res.to_real(r));
-            std::printf("[writer %d] attempt %2d: COMMITTED v%llu (%zu changes)\n", tid, attempt,
-                        static_cast<unsigned long long>(res.snapshot.version()),
-                        res.changes.size());
+            std::printf("[writer %d] attempt %2d: COMMITTED v%" PRIu64 " (%zu changes)\n", tid,
+                        attempt, res.snapshot.version(), res.changes.size());
         } else {
             // Conflict: this attempt's local overlay (including new_accounts/
             // new_orders) is discarded outright -- it was never installed
@@ -272,9 +270,8 @@ int main() {
     subt.join();
 
     const std::size_t still_pinned = m.wait_for_reclamation();
-    std::printf("\n[summary] %llu commits, %llu conflicts across both writers\n",
-                static_cast<unsigned long long>(g_committed.load()),
-                static_cast<unsigned long long>(g_conflicts.load()));
+    std::printf("\n[summary] %" PRIu64 " commits, %" PRIu64 " conflicts across both writers\n",
+                g_committed.load(), g_conflicts.load());
     std::printf("[reclaim] after barrier: %zu still pinned, %zu backlog\n", still_pinned,
                 m.reap_backlog());
 

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -375,7 +376,13 @@ TEST(string_keyed_map_with_struct_value_matches_unordered_map) {
     for (int i = 0; i < 8000 && g_failures == base; i++) {
         std::string k = "f" + std::to_string(rng() % 800);
         if (rng() % 3) {
-            FakeId v{static_cast<std::uint32_t>(rng() % 1000), next_gen++};
+            // Implicit narrowing (rng()'s result_type is wider than
+            // uint32_t on LP64, exactly uint32_t on ILP32): a same-width
+            // local avoids a braced narrowing conversion into FakeId{...}
+            // while staying a no-op static_cast<uint32_t>(...) would be
+            // flagged as useless on ILP32.
+            const std::uint32_t idx = rng() % 1000;
+            FakeId v{idx, next_gen++};
             pm = pm.set(k, v);
             ref[k] = v;
         } else {
@@ -545,7 +552,7 @@ TEST(uint64_keyed_map_random_churn_matches_unordered_map) {
         for (auto& [k, v] : ref2) {
             const int* p = pm2.get(k);
             if (!p || *p != v) {
-                std::printf("U64 GET MISMATCH at %s key=%llu\n", where, static_cast<unsigned long long>(k));
+                std::printf("U64 GET MISMATCH at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
                 return;
             }
@@ -554,7 +561,7 @@ TEST(uint64_keyed_map_random_churn_matches_unordered_map) {
         pm2.for_each([&](std::uint64_t k, int v) {
             auto it = ref2.find(k);
             if (it == ref2.end() || it->second != v) {
-                std::printf("U64 ITER EXTRA at %s key=%llu\n", where, static_cast<unsigned long long>(k));
+                std::printf("U64 ITER EXTRA at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
             }
             ++seen;
@@ -594,7 +601,7 @@ TEST(uint64_keyed_set_random_churn_matches_unordered_set) {
         }
         for (std::uint64_t k : refs) {
             if (!ps.contains(k)) {
-                std::printf("SET CONTAINS MISMATCH at %s key=%llu\n", where, static_cast<unsigned long long>(k));
+                std::printf("SET CONTAINS MISMATCH at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
                 return;
             }
@@ -602,7 +609,7 @@ TEST(uint64_keyed_set_random_churn_matches_unordered_set) {
         size_t seen = 0;
         ps.for_each([&](std::uint64_t k) {
             if (refs.find(k) == refs.end()) {
-                std::printf("SET ITER EXTRA at %s key=%llu\n", where, static_cast<unsigned long long>(k));
+                std::printf("SET ITER EXTRA at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
             }
             ++seen;
@@ -636,7 +643,7 @@ TEST(uint64_keyed_set_persists_old_version_across_derived_edits) {
     // sa must be pristine
     for (std::uint64_t i = 0; i < 1000; i++) {
         if (!sa.contains(i)) {
-            std::printf("SET PERSIST FAIL: sa missing %llu\n", static_cast<unsigned long long>(i));
+            std::printf("SET PERSIST FAIL: sa missing %" PRIu64 "\n", i);
             ++g_failures;
             break;
         }
@@ -665,7 +672,7 @@ TEST(collision_chain_map_random_churn_matches_unordered_map) {
         for (auto& [k, v] : cref) {
             const int* p = cm.get(k);
             if (!p || *p != v) {
-                std::printf("CLASH-MAP GET MISMATCH at %s key=%llu\n", where, static_cast<unsigned long long>(k));
+                std::printf("CLASH-MAP GET MISMATCH at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
                 return;
             }
@@ -674,7 +681,7 @@ TEST(collision_chain_map_random_churn_matches_unordered_map) {
         cm.for_each([&](std::uint64_t k, int v) {
             auto it = cref.find(k);
             if (it == cref.end() || it->second != v) {
-                std::printf("CLASH-MAP ITER EXTRA at %s key=%llu\n", where, static_cast<unsigned long long>(k));
+                std::printf("CLASH-MAP ITER EXTRA at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
             }
             ++seen;
@@ -712,8 +719,7 @@ TEST(collision_chain_set_random_churn_matches_unordered_set) {
         }
         for (std::uint64_t k : cref) {
             if (!cs.contains(k)) {
-                std::printf("CLASH-SET CONTAINS MISMATCH at %s key=%llu\n", where,
-                            static_cast<unsigned long long>(k));
+                std::printf("CLASH-SET CONTAINS MISMATCH at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
                 return;
             }
@@ -721,7 +727,7 @@ TEST(collision_chain_set_random_churn_matches_unordered_set) {
         size_t seen = 0;
         cs.for_each([&](std::uint64_t k) {
             if (cref.find(k) == cref.end()) {
-                std::printf("CLASH-SET ITER EXTRA at %s key=%llu\n", where, static_cast<unsigned long long>(k));
+                std::printf("CLASH-SET ITER EXTRA at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
             }
             ++seen;
@@ -754,7 +760,7 @@ TEST(collision_chain_set_persists_old_version_across_chain_edits) {
     for (std::uint64_t i = 0; i < 90; i += 2) cb = cb.erase(i);  // gut half of every chain
     for (std::uint64_t i = 0; i < 90; i++) {
         if (!ca.contains(i)) {
-            std::printf("CLASH PERSIST FAIL: ca missing %llu\n", static_cast<unsigned long long>(i));
+            std::printf("CLASH PERSIST FAIL: ca missing %" PRIu64 "\n", i);
             ++g_failures;
             break;
         }
@@ -783,8 +789,7 @@ TEST(perfect_hash_map_random_churn_matches_unordered_map) {
         for (auto& [k, v] : ref3) {
             const int* p = pm3.get(k);
             if (!p || *p != v) {
-                std::printf("PERFECT-MAP GET MISMATCH at %s key=%llu\n", where,
-                            static_cast<unsigned long long>(k));
+                std::printf("PERFECT-MAP GET MISMATCH at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
                 return;
             }
@@ -793,8 +798,7 @@ TEST(perfect_hash_map_random_churn_matches_unordered_map) {
         pm3.for_each([&](std::uint64_t k, int v) {
             auto it = ref3.find(k);
             if (it == ref3.end() || it->second != v) {
-                std::printf("PERFECT-MAP ITER EXTRA at %s key=%llu\n", where,
-                            static_cast<unsigned long long>(k));
+                std::printf("PERFECT-MAP ITER EXTRA at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
             }
             ++seen;
@@ -833,7 +837,7 @@ TEST(perfect_hash_map_persists_old_version_across_derived_edits) {
     for (std::uint64_t i = 0; i < 1000; i++) {
         const int* p = pa.get(i);
         if (!p || *p != static_cast<int>(i)) {
-            std::printf("PERFECT-MAP PERSIST FAIL: pa[%llu] changed\n", static_cast<unsigned long long>(i));
+            std::printf("PERFECT-MAP PERSIST FAIL: pa[%" PRIu64 "] changed\n", i);
             ++g_failures;
             break;
         }
@@ -863,8 +867,7 @@ TEST(perfect_hash_set_random_churn_matches_unordered_set) {
         }
         for (std::uint64_t k : refs2) {
             if (!ps2.contains(k)) {
-                std::printf("PERFECT-SET CONTAINS MISMATCH at %s key=%llu\n", where,
-                            static_cast<unsigned long long>(k));
+                std::printf("PERFECT-SET CONTAINS MISMATCH at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
                 return;
             }
@@ -872,8 +875,7 @@ TEST(perfect_hash_set_random_churn_matches_unordered_set) {
         size_t seen = 0;
         ps2.for_each([&](std::uint64_t k) {
             if (refs2.find(k) == refs2.end()) {
-                std::printf("PERFECT-SET ITER EXTRA at %s key=%llu\n", where,
-                            static_cast<unsigned long long>(k));
+                std::printf("PERFECT-SET ITER EXTRA at %s key=%" PRIu64 "\n", where, k);
                 ++g_failures;
             }
             ++seen;
@@ -909,7 +911,7 @@ TEST(perfect_hash_set_persists_old_version_after_draining_to_empty) {
     sb2 = sb2.insert(9999);
     for (std::uint64_t i = 0; i < 1000; i++) {
         if (!sa2.contains(i)) {
-            std::printf("PERFECT-SET PERSIST FAIL: sa2 missing %llu\n", static_cast<unsigned long long>(i));
+            std::printf("PERFECT-SET PERSIST FAIL: sa2 missing %" PRIu64 "\n", i);
             ++g_failures;
             break;
         }

@@ -14,19 +14,20 @@
 // that never exercises the conflict path hasn't proven anything about a
 // multi-writer design.
 
-#include "example/types.h"
-#include "model/model.h"
-
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <memory>
 #include <random>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "example/types.h"
+#include "model/model.h"
 
 using namespace model;
 using namespace example;
@@ -85,8 +86,9 @@ void reader_thread(Model& m, int tid) {
         g_null_parents += nulls;
 
         if (rng() % 40 == 0)
-            std::printf("[reader %d] v%llu: %zu orders, %zu refs resolved, %zu null parents\n", tid,
-                        static_cast<unsigned long long>(s.version()), orders, resolved, nulls);
+            std::printf("[reader %d] v%" PRIu64
+                        ": %zu orders, %zu refs resolved, %zu null parents\n",
+                        tid, s.version(), orders, resolved, nulls);
 
         std::this_thread::sleep_for(std::chrono::microseconds(200 + rng() % 800));
     }
@@ -106,11 +108,9 @@ void subscriber_thread(std::shared_ptr<Subscription> sub) {
         }
         std::this_thread::sleep_for(3ms);  // deliberately slow: forces coalescing
     }
-    std::printf(
-        "\n[subscriber] %llu batches (%llu coalesced): %llu created, %llu updated, %llu deleted\n",
-        static_cast<unsigned long long>(batches), static_cast<unsigned long long>(coalesced),
-        static_cast<unsigned long long>(created), static_cast<unsigned long long>(updated),
-        static_cast<unsigned long long>(deleted));
+    std::printf("\n[subscriber] %" PRIu64 " batches (%" PRIu64 " coalesced): %" PRIu64
+                " created, %" PRIu64 " updated, %" PRIu64 " deleted\n",
+                batches, coalesced, created, updated, deleted);
 }
 
 /// Pick a handle this transaction still believes is live -- checked against
@@ -338,19 +338,13 @@ int main() {
 
     const std::size_t still_pinned = m.wait_for_reclamation();
 
-    std::printf(
-        "\n[writers] %llu commits, %llu conflicts: %llu created, %llu updated, %llu deleted (%llu "
-        "cascades)\n",
-        static_cast<unsigned long long>(g_committed.load()),
-        static_cast<unsigned long long>(g_conflicts.load()),
-        static_cast<unsigned long long>(g_created.load()),
-        static_cast<unsigned long long>(g_updated.load()),
-        static_cast<unsigned long long>(g_deleted.load()),
-        static_cast<unsigned long long>(g_cascades.load()));
-    std::printf("[readers] %llu snapshots, %llu refs resolved, %llu null OptRefs\n",
-                static_cast<unsigned long long>(g_snapshots.load()),
-                static_cast<unsigned long long>(g_refs_resolved.load()),
-                static_cast<unsigned long long>(g_null_parents.load()));
+    std::printf("\n[writers] %" PRIu64 " commits, %" PRIu64 " conflicts: %" PRIu64
+                " created, %" PRIu64 " updated, %" PRIu64 " deleted (%" PRIu64 " cascades)\n",
+                g_committed.load(), g_conflicts.load(), g_created.load(), g_updated.load(),
+                g_deleted.load(), g_cascades.load());
+    std::printf("[readers] %" PRIu64 " snapshots, %" PRIu64 " refs resolved, %" PRIu64
+                " null OptRefs\n",
+                g_snapshots.load(), g_refs_resolved.load(), g_null_parents.load());
     std::printf("[reclaim] after barrier: %zu still pinned, %zu backlog\n", still_pinned,
                 m.reap_backlog());
 

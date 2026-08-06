@@ -2792,8 +2792,11 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     std::unordered_map<std::uint32_t, Id> remap;
     remap.reserve(txn.objects_.size());
     for (std::size_t i = 0; i < txn.objects_.size(); ++i)
-        remap[kLocalIdBit | static_cast<std::uint32_t>(i)] =
-            Id{next_slot_++, 1};
+        // Not static_cast<uint32_t>(i): i is already uint32_t-width on
+        // ILP32 targets, which makes an explicit cast there a (correctly
+        // flagged) useless-cast; the implicit narrowing here is exactly as
+        // safe on LP64, where objects_.size() still fits in 32 bits.
+        remap[kLocalIdBit | i] = Id{next_slot_++, 1};
 
     for (std::size_t i = 0; i < txn.objects_.size(); ++i) {
         ObjectBase* raw = txn.objects_[i].release();
@@ -2801,7 +2804,9 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
         raw->remap_refs(RefRemapper{remap, &unmapped});
         assert(!unmapped && "pass 1 already validated every ref resolves within the batch");
 
-        const Id id = remap[kLocalIdBit | static_cast<std::uint32_t>(i)];
+        // Implicit size_t -> uint32_t narrowing, same as the loop above
+        // that filled remap -- see its comment.
+        const Id id = remap[kLocalIdBit | i];
         raw->id = id;
 
         set_slot_no_log(id.index, raw, id.gen);
