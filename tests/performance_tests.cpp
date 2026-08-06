@@ -415,6 +415,24 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 // tests below do: a sub-microsecond O(log n) call only predicts a ~x1.07
 // change per step, so ordinary jitter swamps a two-sided 20% band -- see
 // kSmallIndexedRead's own comment.
+//
+// WARNING: KNOWN TO BE UNRELIABLE
+// The find_by_key half of this test (check_scaling's 50000->100000 step) has been
+// observed to fail even against kSmallIndexedRead's already-widened 1.3x ceiling --
+// e.g. actual=0.0285 us/call vs a computed hi of 0.0153 us/call (measured x2.57 against
+// a x1.06 prediction). Mechanism: at these per-call costs (tens of nanoseconds) the
+// entire signal is smaller than one scheduler quantum, so a single unlucky preemption,
+// cache eviction, or CPU frequency-scaling transition during best_of()'s 15 trials is
+// enough to blow the ceiling on its own -- no code-level slowdown required. Confirmed
+// environmental: rerunning this exact binary with no rebuild passed cleanly twice in a
+// row immediately after the failure. More likely when something else on the machine is
+// competing for CPU (e.g. right after a full `-j` build or another test binary running
+// concurrently); rare when this test is run alone on an idle machine. To tell a real
+// regression apart from this flake: rerun just this test in isolation
+// (`ctest -R find_by_key_stays_near_flat`) a few times -- the known flake clears within
+// a rerun or two with the printed find_by_key us/call figures staying in the same
+// tens-of-nanoseconds range throughout; a real regression fails consistently and shows
+// find_by_key's own us/call figure climbing, not just the ratio against a tiny baseline.
 TEST(find_by_key_stays_near_flat_while_find_by_field_scan_fallback_grows_with_population) {
     const std::vector<int> sizes = {scaled(25000), scaled(50000), scaled(100000)};
     std::vector<double> key_us, scan_us;

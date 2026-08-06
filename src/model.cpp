@@ -397,6 +397,22 @@ void Subscription::force_close() {
 // Model
 // ---------------------------------------------------------------------------
 
+std::shared_ptr<const Root> Model::load_root(std::memory_order order) const {
+#if MODEL_HAS_ATOMIC_SHARED_PTR
+    return root_.load(order);
+#else
+    return std::atomic_load_explicit(&root_, order);
+#endif
+}
+
+void Model::store_root(std::shared_ptr<const Root> r, std::memory_order order) {
+#if MODEL_HAS_ATOMIC_SHARED_PTR
+    root_.store(std::move(r), order);
+#else
+    std::atomic_store_explicit(&root_, std::move(r), order);
+#endif
+}
+
 Model::Model() {
     // Version 0 is never used -- the very first published state is version 1,
     // empty (no objects). Building it here rather than lazily on the first
@@ -405,7 +421,7 @@ Model::Model() {
     // Root, not a special-cased nullptr.
     auto r = std::make_shared<Root>();
     r->version = 1;
-    root_.store(r, std::memory_order_release);
+    store_root(r, std::memory_order_release);
     version_ = 1;  // the writer's own copy of "latest version" (commit_mu_-protected); try_commit()
                    // increments this, then builds the next Root from it
     reaper_ = std::thread([this] { reaper_loop(); });
@@ -608,7 +624,7 @@ Snapshot Model::snapshot() {
     // is what makes begin() (a thin wrapper over this) fully contention-free
     // with respect to try_commit().
     std::lock_guard lk(ver_mu_);
-    s.root_ = root_.load(std::memory_order_acquire);
+    s.root_ = load_root(std::memory_order_acquire);
     live_[s.root_->version]++;
     s.lease_ = std::make_shared<Snapshot::Lease>(this, s.root_->version);
     return s;
@@ -2179,7 +2195,7 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
         // under ver_mu_, so a concurrent snapshot()/begin() sees a consistent
         // (root, live_) pair and the reaper never frees this version early.
         std::lock_guard lk(ver_mu_);
-        root_.store(r, std::memory_order_release);
+        store_root(r, std::memory_order_release);
         pub.root_ = r;
         live_[r->version]++;
         pub.lease_ = std::make_shared<Snapshot::Lease>(this, r->version);

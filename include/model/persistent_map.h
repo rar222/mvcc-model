@@ -45,6 +45,23 @@
 #include <utility>
 #include <vector>
 
+// [[no_unique_address]] is standardized in C++20. This project targets C++20 (see
+// CLAUDE.md) and uses it below (Leaf::next) to let an empty ChainLink (NoChain, under a
+// perfect Hash) overlap storage with Leaf::entry instead of costing its own byte of
+// padding -- see Leaf's own comment for the full reasoning. Under C++17 the attribute
+// doesn't exist at all; MODEL_NO_UNIQUE_ADDRESS degrades to nothing there, so the build
+// still succeeds (CMakeLists.txt's -Werror would otherwise turn "unrecognized attribute"
+// into a hard error), just without the size optimization -- correctness is unaffected
+// either way, since NoChain::get() always returns null regardless of where it's stored.
+#if defined(__has_cpp_attribute)
+#if __has_cpp_attribute(no_unique_address) >= 201803L
+#define MODEL_NO_UNIQUE_ADDRESS [[no_unique_address]]
+#endif
+#endif
+#ifndef MODEL_NO_UNIQUE_ADDRESS
+#define MODEL_NO_UNIQUE_ADDRESS
+#endif
+
 namespace model::pmap {
 
 /// Hasher for a std::string key. FNV-1a, 64-bit -- adequate for dispersing
@@ -191,7 +208,7 @@ class TrieCore {
         /// this project's Model maintains at 100k-1M objects. Same
         /// cost-consciousness as the two comments above (no cached `hash`
         /// field; unique_ptr, not shared_ptr, for the real chain case).
-        [[no_unique_address]] ChainLink next;
+        MODEL_NO_UNIQUE_ADDRESS ChainLink next;
     };
 
     // Each occupied bit in `bitmap` has exactly one child, either a Node or

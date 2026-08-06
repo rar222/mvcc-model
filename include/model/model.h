@@ -62,6 +62,22 @@
 
 #include "model/persistent_map.h"
 
+// std::atomic<std::shared_ptr<T>> -- the class-template specialization used below for
+// Model::root_, not the older free-function overload set -- is a C++20 library addition
+// (P0718R2). This project targets C++20 (see CLAUDE.md) and uses it because it can be
+// genuinely lock-free on platforms that support it, unlike the free functions it
+// replaces, which every implementation serializes internally (historically via a hidden
+// spinlock keyed off the pointer's address). Where it isn't available (building under
+// C++17), Model::root_ falls back to a plain shared_ptr accessed through
+// atomic_load_explicit/atomic_store_explicit -- deprecated by C++20 in favor of the type
+// above, but still valid, and equivalent for our purposes: same memory-order arguments,
+// same happens-before guarantees, just not guaranteed lock-free.
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+#define MODEL_HAS_ATOMIC_SHARED_PTR 1
+#else
+#define MODEL_HAS_ATOMIC_SHARED_PTR 0
+#endif
+
 namespace model {
 
 // ---------------------------------------------------------------------------
@@ -103,7 +119,16 @@ struct Id {
     /// the same slot but different generations name DIFFERENT objects (one
     /// dead, recycled since) and must never compare equal -- that's the
     /// whole reason gen exists (see the struct comment).
-    friend bool operator==(Id, Id) noexcept = default;
+    ///
+    /// Hand-written, not `= default`: a defaulted `operator==` can only be
+    /// `noexcept = default` since C++20 (pre-C++20 it's not something you can
+    /// default at all), and C++20 also synthesizes `operator!=` FROM it via
+    /// rewritten candidates -- something C++17 never does, so every `!=` use
+    /// on Id elsewhere in this codebase would otherwise silently stop
+    /// compiling under C++17. Writing both by hand keeps this identical
+    /// (same comparison, same codegen) under either standard.
+    friend bool operator==(Id a, Id b) noexcept { return a.index == b.index && a.gen == b.gen; }
+    friend bool operator!=(Id a, Id b) noexcept { return !(a == b); }
 
     /// Lossless pack into one 64-bit integer (gen in the high 32 bits, index
     /// in the low 32) -- for handing an Id across an interface that only
@@ -299,7 +324,12 @@ public:
     /// which object each side happens to currently resolve to (there may be
     /// none, if either side is stale). Two Refs from different snapshots can
     /// legitimately compare equal or unequal without either being resolved.
-    friend bool operator==(Ref, Ref) noexcept = default;
+    ///
+    /// Hand-written, not `= default`: see Id::operator== for why (same
+    /// reasoning -- C++20-only defaulting, and `!=` needs to exist on its
+    /// own for C++17, which doesn't synthesize it from `==`).
+    friend bool operator==(Ref a, Ref b) noexcept { return a.id_ == b.id_; }
+    friend bool operator!=(Ref a, Ref b) noexcept { return !(a == b); }
 
 private:
     Id id_{};
@@ -327,7 +357,10 @@ public:
 
     /// Same-target comparison, by Id value -- see Ref::operator==. Two nulls
     /// (both default-constructed, or one reset()) always compare equal.
-    friend bool operator==(Opt, Opt) noexcept = default;
+    ///
+    /// Hand-written, not `= default`: see Id::operator== for why.
+    friend bool operator==(Opt a, Opt b) noexcept { return a.id_ == b.id_; }
+    friend bool operator!=(Opt a, Opt b) noexcept { return !(a == b); }
 
 private:
     Id id_{};
@@ -1308,7 +1341,11 @@ struct LookupCounts {
 struct FieldLookupKey {
     const std::type_info* type;
     const void* field;
-    friend bool operator==(FieldLookupKey, FieldLookupKey) noexcept = default;
+    // Hand-written, not `= default`: see Id::operator== for why.
+    friend bool operator==(FieldLookupKey a, FieldLookupKey b) noexcept {
+        return a.type == b.type && a.field == b.field;
+    }
+    friend bool operator!=(FieldLookupKey a, FieldLookupKey b) noexcept { return !(a == b); }
 };
 
 /// Hasher for FieldLookupKey. Unlike IdHash, this makes no collision-free
@@ -4123,7 +4160,24 @@ private:
     // reclamation watermark) still needs a short critical section, but it is
     // split onto its own small mutex (ver_mu_) so it never contends with a
     // commit's apply work or a reader's actual traversal.
+    //
+    // Under C++17 (MODEL_HAS_ATOMIC_SHARED_PTR == 0) this is a plain shared_ptr instead
+    // of std::atomic<shared_ptr<...>> -- see the macro's own comment near the top of this
+    // file. All access goes through load_root()/store_root() below so the two shapes stay
+    // interchangeable at every call site.
+#if MODEL_HAS_ATOMIC_SHARED_PTR
     std::atomic<std::shared_ptr<const Root>> root_;
+#else
+    std::shared_ptr<const Root> root_;
+#endif
+
+    /// Load root_ with the given memory order. See root_'s own comment for why this
+    /// indirection exists: under C++20 it's root_.load(order); under C++17 it's the
+    /// atomic_load_explicit free function over the same plain shared_ptr.
+    std::shared_ptr<const Root> load_root(std::memory_order order) const;
+
+    /// Store a new root_ with the given memory order. See load_root().
+    void store_root(std::shared_ptr<const Root> r, std::memory_order order);
 
     /// Mints Transaction::id(). Deliberately its own plain atomic, NOT
     /// commit_mu_-protected: Transaction construction (begin()) must stay

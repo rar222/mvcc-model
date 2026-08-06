@@ -106,7 +106,12 @@ struct ExplicitlyImperfectHash {
 struct FakeId {
     std::uint32_t index = 0;
     std::uint32_t gen = 0;
-    friend bool operator==(FakeId, FakeId) noexcept = default;
+    // Hand-written, not `= default`: defaulting an operator== is C++20-only, and C++20
+    // also synthesizes operator!= from it (rewritten candidates) -- something C++17
+    // doesn't do, so any `!=` use elsewhere would silently stop compiling under C++17.
+    // See model::Id::operator== (model.h) for the same reasoning.
+    friend bool operator==(FakeId a, FakeId b) noexcept { return a.index == b.index && a.gen == b.gen; }
+    friend bool operator!=(FakeId a, FakeId b) noexcept { return !(a == b); }
 };
 
 // Compile-time-only coverage of the trait-detection machinery itself
