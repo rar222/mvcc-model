@@ -176,6 +176,22 @@ TEST(run_pre_transaction_called_again_after_an_earlier_failure_in_the_same_attem
 // non-recursive, so a hook calling back into try_commit()/
 // try_commit_without_undo() on the same Model, same thread, would deadlock
 // (or hit UB) without commit_owner_'s check.
+//
+// WARNING: KNOWN TO BE UNRELIABLE. dies_of_assert() forks the whole test
+// binary while `m`'s background reaper thread is still alive in the parent
+// -- a classic POSIX fork()-in-a-multithreaded-process hazard: fork() clones
+// only the calling thread, so if the reaper happens to be mid-allocation,
+// holding an allocator lock (glibc's arena lock, or under --preset asan,
+// ASan's own allocator lock), at the exact instant of fork(), the child
+// inherits that lock permanently held and deadlocks the moment
+// make_account() tries to allocate -- never reaching the assert at all.
+// Reproduced under --preset asan on a loaded, shared machine; not observed
+// under --preset default or --preset tsan. Take a failure seriously only if
+// it fails FAST: a real assert failure aborts in single-digit milliseconds.
+// A failure that instead takes ~3s (dies_of_assert()'s own SIGKILL deadline)
+// is this hang, not a regression -- confirm by rerunning `model_tests --exact
+// pre_commit_hook_calling_try_commit_reentrantly_asserts` alone on an
+// otherwise-idle machine, where it should pass in well under 100ms.
 // ---------------------------------------------------------------------------
 
 TEST(pre_commit_hook_calling_try_commit_reentrantly_asserts) {
@@ -321,6 +337,21 @@ TEST(resolve_asserts_on_a_ref_that_does_not_resolve_at_all) {
 // so these two throwaway types must never be touched outside a
 // dies_of_assert child, or the static's one-time check would already have
 // run (and passed or failed) in the parent process before the intended test.
+//
+// WARNING: KNOWN TO BE UNRELIABLE (both tests below). Same shape as
+// pre_commit_hook_calling_try_commit_reentrantly_asserts' warning: `m` is
+// constructed, with its own live background reaper thread, before
+// dies_of_assert() forks -- if fork() lands while that thread holds an
+// allocator lock (more likely under --preset asan, and under general system
+// load/scheduling jitter), the forked child deadlocks on its first
+// allocation instead of ever reaching the assert. Directly reproduced for
+// creating_a_type_with_a_field_declared_twice_in_define_fields_asserts on a
+// loaded, shared machine; _define_references_asserts below has the identical
+// construction and is equally exposed, though it hasn't separately been
+// caught flaking. A failure that takes ~3s (dies_of_assert()'s SIGKILL
+// deadline) rather than failing fast is this hang, not a real regression --
+// confirm by rerunning the single test in isolation on an otherwise-idle
+// machine, where it should pass in well under 100ms.
 // ---------------------------------------------------------------------------
 
 namespace {
