@@ -213,6 +213,60 @@ again. No separate bookkeeping; the existing reclamation machinery already prove
   touching a shared reverse-index-shaped structure" problem this whole design exists to
   avoid.
 
+### Scaling past target scale: what breaks first, and the fix
+
+At target scale (100k–1M objects), `Root::spine`'s per-commit cost is negligible:
+`publish_now()` republishes the *whole* spine — `r->spine = spine_`, one `shared_ptr<const
+Chunk>` copy per chunk, `O(total_slots / kChunkSize)` — regardless of how many objects the
+commit actually touched. At 1M objects and `kChunkBits = 8` (256 slots/chunk) that's under
+4,000 chunks: cheap enough to not show up.
+
+That cost does not stay flat as the model grows past target scale, and it becomes the
+dominant cost well before 100M objects. Measured (default preset, `Order` — the heaviest
+example type, touching all four index families — `try_commit`, `try_commit_without_undo`
+against a pre-populated model; "clustered" = 20 updates to objects created together, ~1-2
+chunks touched; "scattered" = 20 updates to objects sampled uniformly across the whole id
+range, ~20 distinct chunks touched; both medians of 5 runs), comparing the default
+`kChunkBits = 8` (256 slots/chunk) against `kChunkBits = 12` (4,096 slots/chunk):
+
+| Objects | Chunks 8-bit / 12-bit | RSS 8-bit / 12-bit | Clustered latency 8-bit / 12-bit | Scattered latency 8-bit / 12-bit | Throughput (1→8 threads) 8-bit | Throughput (1→8 threads) 12-bit |
+|---|---|---|---|---|---|---|
+| 500k | 1,954 / 123 | 498 / 498 MB | 234 / 75 μs | 156 / 93 μs | 7,285→13,309/s | 69,867→113,559/s |
+| 1M | 3,907 / 245 | 967 / 969 MB | 6,737* / 2,819 μs | 307 / 332 μs | 5,593→5,447/s | 42,887→79,957/s |
+| 2M | 7,813 / 489 | 1,979 / 1,979 MB | 3,337 / 2,884 μs | 2,457 / 507 μs | 2,511→3,056/s | 26,003→50,640/s |
+| 4M | 15,625 / 977 | 3,816 / 3,798 MB | 3,677 / 3,240 μs | 30,341 / 28,211 μs | 1,221→1,390/s | 16,850→43,293/s |
+| 8M | 31,250 / 1,954 | 6,859 / 6,853 MB | 8,956 / 15,004 μs | 34,175 / 36,039 μs | 494→659/s | 7,826→9,733/s |
+| 12M | 46,875 / 2,930 | 10,123 / 10,107 MB | 8,718 / 5,298 μs | 39,905 / 33,398 μs | 445→460/s (flat) | 4,299→5,887/s (still scales) |
+
+*(\*1M clustered, 8-bit is a noisy outlier — 5 samples is a small sample.)*
+
+By 4M objects at `kChunkBits = 8`, more writer threads stop helping at all — the "What this
+buys, and what it costs" sub-linear scaling above degrades to *flat* scaling: `commit_mu_`'s apply step is by
+then dominated by the spine copy, not by per-object index maintenance. Extrapolating
+(commits/sec × chunk-count is roughly constant across this range) to 50M objects: **~90
+commits/sec, independent of thread count** — inside this project's 10–100 commits/sec target,
+but with no headroom left.
+
+**The fix, measured, is retuning `kChunkBits`, not restructuring `Root::spine`.** Raising it
+from 8 to 12 (256 → 4,096 slots/chunk) cuts total chunk count 16×; measured throughput
+improves 8–16× across the same range (12M objects: 445 → 4,299 commits/sec single-threaded),
+and thread scaling stops being flat (1→8 threads still buys ~37%, instead of nothing).
+Extrapolated to 50M objects, the ceiling moves to roughly 1,000–1,600 commits/sec —
+comfortably above target, with real headroom. Memory cost of the bigger chunk was negligible
+in measurement (<0.3% difference at every checkpoint from 500k to 12M): the internal-
+fragmentation downside of a bigger `kChunkSize` (a mostly-empty chunk still pays for its full
+`obj[]`/`gen[]` arrays) never materializes for a workload that creates in large sequential
+batches, since sequential `alloc_slot()` packs each chunk full before moving to the next.
+
+**What retuning `kChunkBits` does *not* fix**: a single small transaction touching objects
+scattered across the whole id space (not clustered from a recent create) costs 30–40ms once
+the model is multi-GB, and that cost is roughly the *same* at `kChunkBits = 8` and `= 12` —
+the 16×-fewer-chunks case barely moved it. It is therefore not the spine-copy cost; the
+likely cause is cold-memory access (cache/TLB misses touching ~20 widely-separated
+multi-kilobyte chunks scattered across a multi-gigabyte heap), a cost `Root::spine`'s
+per-commit copy was never the source of. Not yet root-caused — would need a profiler (`perf
+stat` / cachegrind), not a throughput benchmark, to pin down.
+
 ## Referential integrity
 
 Unchanged in mechanism from the single-writer sibling, just re-homed: `Model::validate()`
