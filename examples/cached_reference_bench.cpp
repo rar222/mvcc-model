@@ -391,7 +391,7 @@ int main() {
     }
     std::printf(
         "\nNeither column is perfectly flat: try_commit() copies the whole spine vector per\n"
-        "commit (see DESIGN.md's Structure diagram -- O(#chunks), i.e. O(model size / 256),\n"
+        "commit (see DESIGN.md's Structure diagram -- O(#chunks), i.e. O(model size / kChunkSize),\n"
         "shared_ptr bumps, not a deep copy), so BOTH grow slowly with items/type regardless of\n"
         "caching. What matters is that neither grows anywhere near as fast as the read-side\n"
         "SCAN above -- the gap between the two write columns stays a small, roughly-constant\n"

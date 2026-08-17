@@ -1199,12 +1199,18 @@ private:
 // ---------------------------------------------------------------------------
 
 /// Slots per chunk = 2^kChunkBits. An Id::index splits into (chunk = index
-/// >> kChunkBits, slot = index & kChunkMask). 256 balances the two costs
-/// that pull in opposite directions: a bigger chunk means a bigger memcpy
-/// every time a commit COWs it (a chunk is ~3KB at 256), a smaller chunk
-/// means a longer spine to copy into every published Root.
-inline constexpr std::uint32_t kChunkBits = 8;
-inline constexpr std::uint32_t kChunkSize = 1u << kChunkBits;  // 256 slots
+/// >> kChunkBits, slot = index & kChunkMask). This balances two costs that
+/// pull in opposite directions: a bigger chunk means a bigger memcpy every
+/// time a commit COWs it (a chunk is ~48KB at 4096), a smaller chunk means a
+/// longer spine to copy into every published Root -- and the second cost
+/// dominates well before the first one bites: measured throughput at
+/// several million objects is 8-16x higher at kChunkBits=12 than at the
+/// smaller kChunkBits=8 this project started with, because publish_now()
+/// copies the whole spine (O(model size / kChunkSize)) on every commit
+/// regardless of changeset size. See DESIGN.md's "Scaling past target
+/// scale" for the measured numbers across a size sweep.
+inline constexpr std::uint32_t kChunkBits = 12;
+inline constexpr std::uint32_t kChunkSize = 1u << kChunkBits;  // 4096 slots
 inline constexpr std::uint32_t kChunkMask = kChunkSize - 1;    // low bits: slot within chunk
 
 /// The last usable generation. A slot that reaches this is retired rather than

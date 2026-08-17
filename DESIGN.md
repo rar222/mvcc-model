@@ -218,16 +218,17 @@ again. No separate bookkeeping; the existing reclamation machinery already prove
 At target scale (100k–1M objects), `Root::spine`'s per-commit cost is negligible:
 `publish_now()` republishes the *whole* spine — `r->spine = spine_`, one `shared_ptr<const
 Chunk>` copy per chunk, `O(total_slots / kChunkSize)` — regardless of how many objects the
-commit actually touched. At 1M objects and `kChunkBits = 8` (256 slots/chunk) that's under
-4,000 chunks: cheap enough to not show up.
+commit actually touched. At 1M objects and `kChunkBits = 8` (256 slots/chunk, the value this
+project started with) that's under 4,000 chunks: cheap enough to not show up.
 
 That cost does not stay flat as the model grows past target scale, and it becomes the
 dominant cost well before 100M objects. Measured (default preset, `Order` — the heaviest
 example type, touching all four index families — `try_commit`, `try_commit_without_undo`
 against a pre-populated model; "clustered" = 20 updates to objects created together, ~1-2
 chunks touched; "scattered" = 20 updates to objects sampled uniformly across the whole id
-range, ~20 distinct chunks touched; both medians of 5 runs), comparing the default
-`kChunkBits = 8` (256 slots/chunk) against `kChunkBits = 12` (4,096 slots/chunk):
+range, ~20 distinct chunks touched; both medians of 5 runs), comparing the original
+`kChunkBits = 8` (256 slots/chunk) against `kChunkBits = 12` (4,096 slots/chunk, since adopted
+as the default):
 
 | Objects | Chunks 8-bit / 12-bit | RSS 8-bit / 12-bit | Clustered latency 8-bit / 12-bit | Scattered latency 8-bit / 12-bit | Throughput (1→8 threads) 8-bit | Throughput (1→8 threads) 12-bit |
 |---|---|---|---|---|---|---|
@@ -248,15 +249,16 @@ commits/sec, independent of thread count** — inside this project's 10–100 co
 but with no headroom left.
 
 **The fix, measured, is retuning `kChunkBits`, not restructuring `Root::spine`.** Raising it
-from 8 to 12 (256 → 4,096 slots/chunk) cuts total chunk count 16×; measured throughput
-improves 8–16× across the same range (12M objects: 445 → 4,299 commits/sec single-threaded),
-and thread scaling stops being flat (1→8 threads still buys ~37%, instead of nothing).
-Extrapolated to 50M objects, the ceiling moves to roughly 1,000–1,600 commits/sec —
-comfortably above target, with real headroom. Memory cost of the bigger chunk was negligible
-in measurement (<0.3% difference at every checkpoint from 500k to 12M): the internal-
-fragmentation downside of a bigger `kChunkSize` (a mostly-empty chunk still pays for its full
-`obj[]`/`gen[]` arrays) never materializes for a workload that creates in large sequential
-batches, since sequential `alloc_slot()` packs each chunk full before moving to the next.
+from 8 to 12 (256 → 4,096 slots/chunk — `kChunkBits`'s current value) cuts total chunk count
+16×; measured throughput improves 8–16× across the same range (12M objects: 445 → 4,299
+commits/sec single-threaded), and thread scaling stops being flat (1→8 threads still buys
+~37%, instead of nothing). Extrapolated to 50M objects, the ceiling moves to roughly
+1,000–1,600 commits/sec — comfortably above target, with real headroom. Memory cost of the
+bigger chunk was negligible in measurement (<0.3% difference at every checkpoint from 500k to
+12M): the internal-fragmentation downside of a bigger `kChunkSize` (a mostly-empty chunk still
+pays for its full `obj[]`/`gen[]` arrays) never materializes for a workload that creates in
+large sequential batches, since sequential `alloc_slot()` packs each chunk full before moving
+to the next.
 
 **What retuning `kChunkBits` does *not* fix**: a single small transaction touching objects
 scattered across the whole id space (not clustered from a recent create) costs 30–40ms once
