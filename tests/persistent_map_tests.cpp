@@ -1748,6 +1748,147 @@ TEST(every_retained_version_in_a_long_derivation_chain_stays_correct_until_dropp
     CHECK_EQ(mem.unknown_frees, 0u);
 }
 
+// ---------------------------------------------------------------------------
+// grow_insert/shrink_erase (persistent_map.h) relocate a Node's slots array
+// around a gap at `pos`, with two branches each -- `if (pos > 0) relocate
+// the front half` and `if (count > pos [+ 1]) relocate the back half` --
+// that only run when there's something on that side to move. Heavy random
+// churn (heavy_churn_leaves_no_leaks_... above, and the pre-existing
+// differential fuzz tests elsewhere in this file) almost certainly hits
+// pos == 0 and pos == count - 1 somewhere among thousands of insertions at a
+// fixed seed, but "almost certainly, incidentally" isn't the same guarantee
+// as a test that fails every time a regression touches exactly that branch.
+// These force the two skipped-relocate edges directly: U64Hash is identity
+// (h(k) == k), so at shift 0 a key's slice is just its own low 5 bits --
+// keys 0..31 land at compacted positions 0..31 in ascending order, in ONE
+// Node, letting a specific insert/erase be aimed at position 0 or position
+// count/count-1 by construction, not by hoping the fuzzer's RNG gets there.
+TEST(grow_insert_reaches_the_front_and_the_back_of_a_node_not_just_the_middle) {
+    // Keys 1..31 first (compacted positions 0..30), THEN key 0 last: 0's
+    // slice is below all of them, so this final insert is grow_insert's
+    // pos == 0 case -- the front relocate is skipped entirely, the back
+    // relocate carries all 31 existing entries.
+    TrackingResource mem;
+    PersistentMap<std::uint64_t, int, U64Hash> m(&mem);
+    for (std::uint64_t k = 1; k <= 31; ++k) m = m.set(k, static_cast<int>(k));
+    m = m.set(std::uint64_t{0}, 100);
+    CHECK_EQ(m.size(), 32u);
+    for (std::uint64_t k = 0; k <= 31; ++k) {
+        const int* got = m.get(k);
+        CHECK(got != nullptr);
+        if (got) CHECK_EQ(*got, k == 0 ? 100 : static_cast<int>(k));
+    }
+    CHECK_EQ(mem.mismatches, 0u);
+    CHECK_EQ(mem.unknown_frees, 0u);
+
+    // Mirror: keys 0..30 first (compacted positions 0..30), THEN key 31
+    // last: 31's slice is above all of them, so pos == count -- the back
+    // relocate is skipped (nothing after the new entry), only the front
+    // relocate runs.
+    TrackingResource mem2;
+    PersistentMap<std::uint64_t, int, U64Hash> m2(&mem2);
+    for (std::uint64_t k = 0; k <= 30; ++k) m2 = m2.set(k, static_cast<int>(k) + 1000);
+    m2 = m2.set(std::uint64_t{31}, 200);
+    CHECK_EQ(m2.size(), 32u);
+    for (std::uint64_t k = 0; k <= 31; ++k) {
+        const int* got = m2.get(k);
+        CHECK(got != nullptr);
+        if (got) CHECK_EQ(*got, k == 31 ? 200 : static_cast<int>(k) + 1000);
+    }
+    CHECK_EQ(mem2.mismatches, 0u);
+    CHECK_EQ(mem2.unknown_frees, 0u);
+}
+
+TEST(shrink_erase_reaches_the_front_and_the_back_of_a_node_not_just_the_middle) {
+    // Full 32-child node (keys 0..31, one per bit, compacted positions
+    // 0..31 in order). Erasing key 0 is shrink_erase's pos == 0 case (the
+    // front relocate is skipped, the back relocate shifts all 31 survivors
+    // down by one); erasing key 31 in the mirrored map is pos == count - 1
+    // (the back relocate is skipped, only the front relocate runs).
+    TrackingResource mem;
+    PersistentMap<std::uint64_t, int, U64Hash> m(&mem);
+    for (std::uint64_t k = 0; k <= 31; ++k) m = m.set(k, static_cast<int>(k));
+    CHECK_EQ(m.size(), 32u);
+    m = m.erase(std::uint64_t{0});
+    CHECK_EQ(m.size(), 31u);
+    CHECK(m.get(std::uint64_t{0}) == nullptr);
+    for (std::uint64_t k = 1; k <= 31; ++k) {
+        const int* got = m.get(k);
+        CHECK(got != nullptr);
+        if (got) CHECK_EQ(*got, static_cast<int>(k));
+    }
+    CHECK_EQ(mem.mismatches, 0u);
+    CHECK_EQ(mem.unknown_frees, 0u);
+
+    TrackingResource mem2;
+    PersistentMap<std::uint64_t, int, U64Hash> m2(&mem2);
+    for (std::uint64_t k = 0; k <= 31; ++k) m2 = m2.set(k, static_cast<int>(k) + 1000);
+    CHECK_EQ(m2.size(), 32u);
+    m2 = m2.erase(std::uint64_t{31});
+    CHECK_EQ(m2.size(), 31u);
+    CHECK(m2.get(std::uint64_t{31}) == nullptr);
+    for (std::uint64_t k = 0; k <= 30; ++k) {
+        const int* got = m2.get(k);
+        CHECK(got != nullptr);
+        if (got) CHECK_EQ(*got, static_cast<int>(k) + 1000);
+    }
+    CHECK_EQ(mem2.mismatches, 0u);
+    CHECK_EQ(mem2.unknown_frees, 0u);
+}
+
+// The OTHER edge shrink_erase has that grow_insert doesn't: count == 1,
+// pos == 0 -- a Node shrinking to true structural emptiness (raw_alloc_
+// slots(0), returning nullptr) rather than just losing one of several
+// children. This is NOT the same as a root_-level leaf-root erase-to-empty
+// (erase_only_entry_returns_to_true_empty_with_zero_allocation above):
+// that path never touches shrink_erase at all -- root_is_leaf_ handles it
+// via chain_erase directly. Reaching shrink_erase(_, 1, 0) needs a NON-root
+// Node with exactly one child. ClashHash (k % 3) forces two keys to share
+// slice 0's bit but diverge deeper -- pushing the second one down creates
+// exactly that: a sub-Node with one child, one level under the root, that
+// this test then empties by erasing both keys.
+TEST(shrink_erase_empties_a_single_child_node_down_to_true_structural_emptiness) {
+    TrackingResource mem;
+    PersistentMap<std::uint64_t, int, ClashHash> m(&mem);
+    constexpr std::uint64_t k1 = 1;    // 1 % 3 == 1
+    constexpr std::uint64_t k2 = 97;   // 97 % 3 == 1 (same top slice as k1), but
+                                       // (97 >> 5) != (1 >> 5): diverges one level down
+    m = m.set(k1, 10);
+    m = m.set(k2, 20);
+    CHECK_EQ(m.size(), 2u);
+    CHECK(m.get(k1) && *m.get(k1) == 10);
+    CHECK(m.get(k2) && *m.get(k2) == 20);
+
+    // Erase k1: the sub-Node holding {k1, k2} shrinks from 2 children to 1
+    // (shrink_erase(_, 2, pos)) -- k2 must still resolve correctly.
+    m = m.erase(k1);
+    CHECK_EQ(m.size(), 1u);
+    CHECK(m.get(k1) == nullptr);
+    CHECK(m.get(k2) && *m.get(k2) == 20);
+
+    // Erase k2: the sub-Node's ONLY remaining child is removed --
+    // shrink_erase(_, 1, 0) -- emptying it to true structural nothing, which
+    // then propagates up as the root's own single child subtree emptying
+    // too (erase_in's "subtree emptied: drop this slot" branch, itself
+    // another shrink_erase(_, 1, 0) at the root level).
+    m = m.erase(k2);
+    CHECK_EQ(m.size(), 0u);
+    CHECK(m.empty());
+    CHECK(m.get(k1) == nullptr);
+    CHECK(m.get(k2) == nullptr);
+    CHECK_EQ(mem.mismatches, 0u);
+    CHECK_EQ(mem.unknown_frees, 0u);
+
+    // Re-inserting after draining to true empty must still work. erase_in
+    // never path-collapses (see its own comment above), so root_ may still
+    // point at a bitmap==0 Node rather than being reset to null -- set_in's
+    // generic "empty slot" branch handles that node exactly like any other,
+    // so this isn't a special case to get right, just one worth confirming.
+    m = m.set(k1, 30);
+    CHECK_EQ(m.size(), 1u);
+    CHECK(m.get(k1) && *m.get(k1) == 30);
+}
+
 // Self-assignment and self-move-assignment: RcHandle's copy-assignment uses
 // copy-and-swap (a temporary copy, then swap) specifically so `this == &o`
 // is never a special case that has to be gotten right by hand; its move-

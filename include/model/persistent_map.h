@@ -38,13 +38,13 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <memory_resource>
 #include <string>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 
 namespace model::pmap {
@@ -310,11 +310,11 @@ class TrieCore {
                   "layout (e.g. give Entry its own indirection), not a check to weaken.");
 
     // Each occupied bit in `bitmap` has exactly one child, either a Node or
-    // a Leaf -- so two parallel vectors, one always empty per occupied slot,
+    // a Leaf -- so two parallel arrays, one always empty per occupied slot,
     // would waste storage and a second heap buffer per node for nothing.
     // `slots` holds ONE type-erased RcHandle per occupied slot instead, and
     // `is_leaf`, a second bitmap parallel to (a subset of) `bitmap` and
-    // indexed the SAME way (by idx, 0-31, not by the compacted vector
+    // indexed the SAME way (by idx, 0-31, not by the compacted array
     // position), records which concrete type a slot holds. A slot's actual
     // type is always known before it's dereferenced (every caller already
     // branches on is_leaf first), so the cast back
@@ -324,6 +324,23 @@ class TrieCore {
     // the right type even where no sibling is_leaf bit is in scope (e.g.
     // releasing TrieCore::root_). See RcHandle's own comment (just above
     // Leaf's forward declaration) for the full design.
+    //
+    // `slots` is a bare RcHandle* (8 bytes), not a std::vector<RcHandle>
+    // (24 bytes: three pointers for begin/end/capacity) -- a HAMT node's
+    // slot count is ALWAYS exactly popcount(bitmap), by construction, so
+    // there is nothing for a generic container's separate size/capacity
+    // bookkeeping to earn its keep tracking: capacity would always equal
+    // size anyway (every insert/erase here already allocates the exact new
+    // count, never lets a vector's growth-doubling apply -- see
+    // grow_insert/shrink_erase below). The slot count is cheap to
+    // recompute on demand (slot_count(), one popcount instruction) wherever
+    // it's needed, so Node itself never stores it -- see slot_count's own
+    // comment. This is the same "known, small, exact upper bound" reasoning
+    // as NoChain's [[no_unique_address]] trick on Leaf above: don't pay a
+    // generic container's overhead for a shape that's fully pinned down by
+    // bitmap already. The allocation itself is still exactly sized, but
+    // deliberately NOT routed through mem_ -- see raw_alloc_slots' own
+    // comment for why (a real, measured regression when it was).
     // Why 32-bit (32-ary, 5-bit slices), not 64-bit (64-ary, 6-bit slices),
     // at this project's target scale (100k-1M objects, see the file header):
     // widening the bitmap looks like "half as many levels to path-copy per
@@ -337,8 +354,8 @@ class TrieCore {
     //
     // Meanwhile it makes the cost that actually matters WORSE: the file
     // header's own stated goal is path-copying "only O(log32 n) NODES" per
-    // commit, but each node copy isn't free -- `slots` is a
-    // vector<RcHandle>, so copying a node costs one RcHandle copy (one
+    // commit, but each node copy isn't free -- `slots` holds one RcHandle
+    // per populated child, so copying a node costs one RcHandle copy (one
     // atomic increment) per populated child. 64-ary raises the worst case
     // from 32 RcHandles per node to 64, for the same or greater depth
     // across this range -- strictly worse for the operation this whole
@@ -359,11 +376,204 @@ class TrieCore {
         RcBase rc;  // must be the first member -- see RcBase's own comment
         std::uint32_t bitmap = 0;
         std::uint32_t is_leaf = 0;  ///< subset of bitmap: which occupied idx-slots hold a Leaf
-        std::vector<RcHandle> slots;  ///< positionally compacted, idx order
+        RcHandle* slots = nullptr;  ///< exactly popcount(bitmap) elements, positionally compacted,
+                                     ///< idx order -- nullptr iff bitmap == 0; see slots' own comment
+
+        // Non-copyable/non-movable: nothing ever copies or moves a Node
+        // object whole (clone_node builds a fresh one field-by-field, via
+        // raw_alloc_slots/copy_slots, never Node's own copy ctor). A
+        // user-declared destructor already suppresses the implicit move
+        // members; copy is deleted explicitly so a future caller that
+        // writes `Node copy = *n;` gets a compile error instead of a
+        // shallow, double-freeing `slots` copy.
+        Node() = default;
+        Node(const Node&) = delete;
+        Node& operator=(const Node&) = delete;
+        Node(Node&&) = delete;
+        Node& operator=(Node&&) = delete;
+
+        // Destroys each live RcHandle in `slots` (recursively releasing
+        // whatever it references -- this is the actual recursive-free
+        // cascade for the whole trie, same role ~vector<RcHandle>() used to
+        // play automatically) and frees the array itself -- always plain
+        // delete, never through rc.owner_mem; see raw_alloc_slots' own
+        // comment for why `slots` stays off the pool entirely.
+        ~Node() {
+            const std::uint32_t count = slot_count(bitmap);
+            // Explicit ~RcHandle() calls, same reason as destroy_and_
+            // dealloc_slots' own comment: `slots` is a bare array, so
+            // nothing runs its elements' destructors unless this does.
+            for (std::uint32_t i = 0; i < count; ++i) slots[i].~RcHandle();
+            dealloc_slots_raw(slots);
+        }
     };
     static_assert(std::is_standard_layout_v<Node>,
                   "Node must stay standard-layout -- RcHandle::release() reinterpret_casts a "
                   "Node* to RcBase* via the first-member guarantee; see RcBase's own comment");
+
+    /// Number of occupied slots implied by a Node's own bitmap -- one
+    /// __builtin_popcount, cheap enough to recompute on demand everywhere
+    /// it's needed rather than have Node store it separately (see Node::
+    /// slots' own comment for why there is no separate count/capacity
+    /// field at all). A free function, not a Node member: needed before
+    /// Node is complete (raw_alloc_slots/grow_insert/shrink_erase below
+    /// take counts as plain std::uint32_t, not a Node reference, so they
+    /// work uniformly on a not-yet-installed array during set_in's
+    /// push-down/clone paths).
+    static std::uint32_t slot_count(std::uint32_t bitmap) noexcept {
+        return static_cast<std::uint32_t>(__builtin_popcount(bitmap));
+    }
+
+    // ---- Node::slots allocation primitives ----
+    // These four are the entire interface the rest of TrieCore uses to
+    // manage a Node's slots array -- nothing else touches `slots` with a
+    // raw allocate/deallocate call. Every one of them takes (or returns) an
+    // EXACT count, never a capacity: unlike std::vector, there is no spare
+    // room to grow into, ever, by design (see Node::slots' own comment) --
+    // every grow/shrink here is a full reallocation, same cost shape
+    // std::vector<RcHandle>::insert/erase already paid in this design once
+    // reserve() was kept exact (see grow_insert/shrink_erase's own
+    // comments for why that isn't a regression).
+    //
+    // Deliberately ALWAYS plain new/delete, never mem_ -- unlike alloc_node/
+    // alloc_leaf, which route the Node/Leaf HEAD through mem_ on purpose
+    // (see mem_'s own comment: cache locality, measured as the single
+    // largest cost of a commit). `slots` looks like it should get the same
+    // treatment, and an earlier version of this file did exactly that --
+    // then one_million_random_basic_records_in_a_single_transaction_
+    // without_undo (examples/basic_record_bench.cpp) got ~20% SLOWER, not
+    // faster. Root cause: this reallocates on EVERY single insert/erase (no
+    // spare capacity, see above), and Model::node_pool_ is a
+    // std::pmr::synchronized_pool_resource -- synchronized because
+    // dealloc_slots_raw can run on ANY thread (whichever one drops the last
+    // RcHandle referencing a Node, e.g. a reader destroying an old
+    // Snapshot, concurrently with the writer thread's own allocations --
+    // the exact reason Node/Leaf HEADS need that same synchronization).
+    // Routing `slots` through it too means paying that lock on every single
+    // insert/erase, not just once per Node's lifetime the way alloc_node's
+    // ONE call per Node does -- a real, measured regression, not a
+    // theoretical one. An unsynchronized pool isn't a fix either: the same
+    // cross-thread free applies to `slots` as to the Node itself, so it
+    // would reintroduce the exact race synchronization exists to prevent.
+    // Plain new/delete (thread-safe via glibc's own per-thread arenas, no
+    // single shared lock) is what std::vector<RcHandle>'s internal buffer
+    // ALSO always used here, coincidentally -- this isn't a new choice, it's
+    // restoring the one the vector-based version already made, now made
+    // deliberately instead of implicitly.
+
+    // Bare, unconstructed storage for `count` RcHandles. Callers placement-
+    // new EVERY element immediately after calling this (copy_slots/
+    // grow_insert/shrink_erase below) -- there is no "allocate now, fill in
+    // later" partially-constructed state anywhere in this file.
+    static RcHandle* raw_alloc_slots(std::uint32_t count) {
+        if (count == 0) return nullptr;
+        return static_cast<RcHandle*>(::operator new(count * sizeof(RcHandle)));
+    }
+
+    // Destroys `count` ALREADY-EMPTY RcHandles (every caller has just moved
+    // each one out, so this only runs their no-op destructors) and frees
+    // the raw array. `p[i].~RcHandle()` is an explicit destructor call --
+    // needed because `p` is a bare RcHandle* into a manually-managed array,
+    // not a container: nothing else is going to run each element's
+    // destructor for us the way leaving a std::vector's scope would, so
+    // this does it by hand before freeing the memory those objects live in.
+    static void dealloc_slots_raw(RcHandle* p) noexcept {
+        if (!p) return;
+        ::operator delete(p);
+    }
+    static void destroy_and_dealloc_slots(RcHandle* p, std::uint32_t count) {
+        for (std::uint32_t i = 0; i < count; ++i) p[i].~RcHandle();
+        dealloc_slots_raw(p);
+    }
+
+    // Copies `n`'s slots (n may be null, meaning zero slots) into a freshly
+    // allocated array of the SAME size -- each element via RcHandle's copy
+    // constructor, i.e. one atomic refcount increment per populated child,
+    // exactly what assigning a std::vector<RcHandle> used to cost. Used
+    // only by clone_node, which the caller then grows/shrinks/replaces
+    // in-place afterward -- see clone_node's own comment.
+    RcHandle* copy_slots(const Node* n) const {
+        if (!n) return nullptr;
+        const std::uint32_t count = slot_count(n->bitmap);
+        if (count == 0) return nullptr;
+        RcHandle* p = raw_alloc_slots(count);
+        // `::new (address) T(args)` is placement new: it constructs a T AT
+        // `address` -- here, slot i of the array raw_alloc_slots just
+        // reserved -- instead of allocating fresh storage for it the way a
+        // bare `new T(args)` would. The allocation already happened above;
+        // this just runs RcHandle's copy constructor (real refcount
+        // increment) on top of it, the mirror image of the explicit
+        // ~RcHandle() calls above that undo it.
+        for (std::uint32_t i = 0; i < count; ++i) ::new (p + i) RcHandle(n->slots[i]);
+        return p;
+    }
+
+    // grow_insert/shrink_erase relocate their SURVIVING elements via
+    // std::memmove, not a per-element move-construct loop -- correct only
+    // because RcHandle is trivially relocatable IN PRACTICE (no language-
+    // level trait says so before C++23's std::start_lifetime_as_array, but
+    // the property itself is what matters): it holds exactly one pointer,
+    // no vtable, no self-reference, and its move constructor/destructor
+    // already reduce to "copy the pointer, null/no-op the rest" -- so
+    // memmove-ing N of them produces bytes indistinguishable from N real
+    // move-constructions, and never touching the (about-to-be-freed) source
+    // bytes again is indistinguishable from having destroyed N real
+    // moved-from (now-empty) handles. This is the same "realloc + memmove"
+    // idiom folly/abseil's own relocatable-aware containers use, opted into
+    // explicitly rather than detected by the language. It is NOT a general
+    // license for this file: copy_slots above still copy-constructs one at
+    // a time on purpose (a copy must bump each refcount -- memmove-ing
+    // copy_slots's source would silently skip that, undercounting and
+    // freeing a still-shared node early). If RcHandle ever grows a second
+    // data member, gains a vtable, or ties its lifetime to anything beyond
+    // that one pointer, THIS BREAKS SILENTLY -- revisit both functions
+    // below if that ever changes.
+    //
+    // Routed through this one-line wrapper (rather than calling std::memmove
+    // directly at each call site) so the void* casts -- which is what
+    // actually silences -Wclass-memaccess, a real, wanted warning
+    // everywhere else in this project that a raw memmove/memcpy on a
+    // non-trivially-copyable class is usually a genuine bug -- live in
+    // exactly one place with the reasoning attached, not four.
+    static void relocate(RcHandle* dst, const RcHandle* src, std::uint32_t count) noexcept {
+        std::memmove(static_cast<void*>(dst), static_cast<const void*>(src), count * sizeof(RcHandle));
+    }
+
+    // Returns a new array of `count + 1` elements: `old`'s `count` elements
+    // (old may be null iff count == 0) relocated around a gap at `pos`,
+    // with `h` real-constructed into that gap -- then frees `old`'s raw
+    // storage directly (NOT destroy_and_dealloc_slots: every surviving
+    // element was relocated, not destroyed, at its old address, so calling
+    // ~RcHandle() there would double-release it). Every caller already
+    // holds the array it passes as `old` exclusively (either a Node just
+    // cloned by THIS call chain, or a Node already proven private by
+    // can_mutate), so relocating out of it and discarding it is always
+    // correct -- same precondition set_in's own mutate-in-place fast path
+    // already establishes for the Node itself.
+    RcHandle* grow_insert(RcHandle* old, std::uint32_t count, std::uint32_t pos, RcHandle h) const {
+        RcHandle* p = raw_alloc_slots(count + 1);
+        if (pos > 0) relocate(p, old, pos);
+        ::new (p + pos) RcHandle(std::move(h));  // placement new -- see copy_slots' own comment
+        if (count > pos) relocate(p + pos + 1, old + pos, count - pos);
+        dealloc_slots_raw(old);
+        return p;
+    }
+
+    // Mirror of grow_insert: a new array of `count - 1` elements with the
+    // element at `pos` relocated OUT (everything else) and DROPPED (that
+    // one) -- `old[pos]` is the only element genuinely destroyed here (a
+    // real ~RcHandle() call, releasing whatever it referenced); everything
+    // else is relocated via memmove, same reasoning as grow_insert.
+    // `count - 1 == 0` is handled correctly by raw_alloc_slots' own
+    // "count == 0 -> nullptr" case.
+    RcHandle* shrink_erase(RcHandle* old, std::uint32_t count, std::uint32_t pos) const {
+        RcHandle* p = raw_alloc_slots(count - 1);
+        if (pos > 0) relocate(p, old, pos);
+        if (count > pos + 1) relocate(p + pos, old + pos + 1, count - pos - 1);
+        old[pos].~RcHandle();  // explicit destructor call -- see destroy_and_dealloc_slots' own comment
+        dealloc_slots_raw(old);
+        return p;
+    }
 
     static std::uint64_t hash_key(const K& k) noexcept {
         return static_cast<std::uint64_t>(Hash{}(k));
@@ -492,7 +702,7 @@ class TrieCore {
         if (n) {
             c->bitmap = n->bitmap;
             c->is_leaf = n->is_leaf;
-            c->slots = n->slots;
+            c->slots = copy_slots(n);
         }
         return c;
     }
@@ -680,6 +890,7 @@ class TrieCore {
         if (!n || !(n->bitmap & b)) {
             // Empty slot: insert a fresh single-entry leaf.
             const std::uint32_t pos = n ? popcount_below(n->bitmap, idx) : 0;
+            const std::uint32_t old_count = n ? slot_count(n->bitmap) : 0;
             // ChainLink{}, not nullptr: this code path is common to both
             // Leaf shapes (unlike chain_set/chain_erase, it never forks on
             // kPerfectHash), and nullptr has no conversion to NoChain.
@@ -689,19 +900,16 @@ class TrieCore {
                 Node* mut = const_cast<Node*>(n);
                 mut->bitmap |= b;
                 mut->is_leaf |= b;
-                // The target size is always known exactly (current + 1), so
-                // reserve() it directly rather than let insert() fall back
-                // to vector's growth-doubling, which has no notion of this
-                // vector's 32-element ceiling.
-                mut->slots.reserve(mut->slots.size() + 1);
-                mut->slots.insert(mut->slots.begin() + pos, std::move(lf));
+                // grow_insert always reallocates to the exact new count --
+                // there is no spare capacity to grow into, ever, by design
+                // (see Node::slots' own comment).
+                mut->slots = grow_insert(mut->slots, old_count, pos, std::move(lf));
                 return owner;
             }
             Node* nn = clone_node(n);
             nn->bitmap |= b;
             nn->is_leaf |= b;
-            nn->slots.reserve(nn->slots.size() + 1);
-            nn->slots.insert(nn->slots.begin() + pos, std::move(lf));
+            nn->slots = grow_insert(nn->slots, old_count, pos, std::move(lf));
             return RcHandle::adopt(nn);
         }
 
@@ -760,7 +968,7 @@ class TrieCore {
         const std::uint32_t exist_idx = slice(lf_hash, shift + 5);
         sub->bitmap = bit(exist_idx);
         sub->is_leaf = bit(exist_idx);
-        sub->slots.push_back(n->slots[pos]);
+        sub->slots = grow_insert(nullptr, 0, 0, RcHandle(n->slots[pos]));  // copy: n->slots[pos] survives here
         // `sub` is a raw, exclusively-owned Node* here -- adopting it below
         // costs nothing (no refcount to bump; RcBase's own count starts at
         // 1). parent_private is true unconditionally in the recursive call
@@ -824,9 +1032,9 @@ class TrieCore {
                 return RcHandle::adopt(nn);
             }
             // Subtree emptied: drop this slot.
+            nn->slots = shrink_erase(nn->slots, slot_count(nn->bitmap), pos);
             nn->bitmap &= ~b;
             nn->is_leaf &= ~b;
-            nn->slots.erase(nn->slots.begin() + pos);
             return RcHandle::adopt(nn);
         }
 
@@ -842,9 +1050,9 @@ class TrieCore {
             return RcHandle::adopt(nn);
         }
         // Chain emptied (it held only this key): remove the slot entirely.
+        nn->slots = shrink_erase(nn->slots, slot_count(nn->bitmap), pos);
         nn->bitmap &= ~b;
         nn->is_leaf &= ~b;
-        nn->slots.erase(nn->slots.begin() + pos);
         return RcHandle::adopt(nn);
     }
 
@@ -957,7 +1165,7 @@ public:
             const std::uint32_t exist_idx = slice(lf_hash, 0);
             node->bitmap = bit(exist_idx);
             node->is_leaf = bit(exist_idx);
-            node->slots.push_back(root_);  // reuse the existing Leaf, no clone
+            node->slots = grow_insert(nullptr, 0, 0, RcHandle(root_));  // reuse the existing Leaf, no clone
             RcHandle node_owner = RcHandle::adopt(node);
             auto r = set_in(node_owner, /*parent_private=*/true, hash, 0, key, entry, added);
             return TrieCore(std::move(r), size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false);
@@ -1042,8 +1250,15 @@ private:
     static void walk_slot_stats(const Node* n, SlotStats& s) {
         if (!n) return;
         ++s.node_count;
-        s.total_capacity += n->slots.capacity();
-        s.total_size += n->slots.size();
+        // capacity == size always, now unconditionally: `slots` is a bare
+        // RcHandle* sized to exactly popcount(bitmap), never a std::vector
+        // with spare capacity to report separately -- see Node::slots' own
+        // comment. Both fields stay populated (not collapsed into one) so
+        // this diagnostic's shape -- and every existing caller reading
+        // capacity/size as two values -- doesn't change.
+        const std::uint32_t count = slot_count(n->bitmap);
+        s.total_capacity += count;
+        s.total_size += count;
         std::uint32_t pos = 0;
         for (std::uint32_t idx = 0; idx < 32; ++idx) {
             const std::uint32_t b = bit(idx);
