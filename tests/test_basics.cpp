@@ -393,7 +393,7 @@ TEST(concurrent_alloc_slot_under_exhaustion_never_double_hands_out_a_withdrawn_s
     // in circulation, none silently lost or double-counted.
     CHECK_EQ(m.exhausted_slots(), static_cast<std::size_t>(kPoisoned));
 
-    const Model::Diagnostics d = m.diagnostics();
+    const Model::Diagnostics::Status d = m.diagnostics();
     CHECK_EQ(d.slots_exhausted, m.exhausted_slots());
     CHECK_EQ(d.slots_free, std::size_t{0});  // no removes happened during the concurrent phase
     CHECK_EQ(d.live_object_count, static_cast<std::size_t>(kThreads * kCreatesPerThread));

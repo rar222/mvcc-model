@@ -552,7 +552,7 @@ namespace detail {
 /// still works everywhere (find_by_field, the reverse index, ...) -- it
 /// just falls back to being identified by its declaring type and its
 /// opaque address wherever something tries to display it for a human (see
-/// Model::LookupDiagnostics::to_string()).
+/// Model::Diagnostics::Lookups::to_string()).
 inline std::mutex g_field_name_mu;
 inline std::unordered_map<const void*, std::string>& field_names() {
     static std::unordered_map<const void*, std::string> names;
@@ -604,7 +604,7 @@ inline void register_field_name_once(const char* name) noexcept {
 ///
 /// Registers `name` (if supplied) here, not in RefReader: only a
 /// Cache-tagged reference field ever gets a display name; a Scan-only one
-/// never does (see Model::LookupDiagnostics::to_string()'s "falls back to an
+/// never does (see Model::Diagnostics::Lookups::to_string()'s "falls back to an
 /// address" case). Unlike FieldKeyReader::key<Field>()/LookupFieldReader::
 /// field<Field>(), there's no `Field` NTTP available here to feed
 /// detail::register_field_name_once<Field>() -- `field` arrives as an
@@ -678,7 +678,7 @@ std::string to_field_key(const V& v) {
 /// directly, with no int to keep in sync between declaration and lookup.
 ///
 /// `name`, if supplied, is registered (once, see detail::
-/// register_field_name_once) for display in Model::LookupDiagnostics::
+/// register_field_name_once) for display in Model::Diagnostics::Lookups::
 /// to_string() -- purely cosmetic; nothing correctness-critical reads it. A
 /// field also declared in define_fields() (like Order::computed_key, both a
 /// unique key AND a cached multi-match field) only needs a name once --
@@ -1340,7 +1340,7 @@ struct LookupCounts {
 /// Identifies one looked-up field: its declaring type (captured as
 /// `typeid(ClassT)` at the call site -- see Model::register_field_lookup) plus
 /// the field itself (`field_tag<Field>()`). At namespace scope, not nested
-/// in Model, because it's also the key type of Model::LookupDiagnostics::
+/// in Model, because it's also the key type of Model::Diagnostics::Lookups::
 /// stats -- a PUBLIC-facing shape -- and there's nothing Model-specific
 /// about it: it's just "which field," the same identity field_tag<Field>()
 /// itself already carries.
@@ -3015,7 +3015,7 @@ public:
 
     /// Objects retired but not yet freed, because a reader might still see them.
     /// Serviced by the background reaper, so this counts its backlog --
-    /// exactly the same quantity Diagnostics::reap_backlog reports, just
+    /// exactly the same quantity Diagnostics::Status::reap_backlog reports, just
     /// without diagnostics()'s cost of also copying spine/index sizes and
     /// the live-snapshot/subscriber sections. retired_ is commit_mu_-
     /// protected (unlike the single-writer sibling, where it was safe to
@@ -3080,88 +3080,152 @@ public:
     /// raw address to disambiguate two looked-up fields on the same type
     /// that were never given a name (see FieldKeyReader::key()/
     /// LookupFieldReader::field()/CachedRefReader's own `name` parameter).
-    class LookupDiagnostics {
-    public:
-        std::unordered_map<FieldLookupKey, LookupCounts, FieldLookupKeyHash> stats;
-
-        /// Human-readable table, sorted by total calls (descending) so the
-        /// fields that matter most for a caching decision sort to the top.
-        std::string to_string() const;
-    };
-
-    /// A point-in-time readout of internal state, for observability and
-    /// debugging -- nothing here is part of the model's published data, and
-    /// nothing here is versioned. See diagnostics()'s own doc comment for
-    /// exactly what each field means and how stale it can be.
+    /// Namespace-like grouping for every Model::*diagnostics() return type
+    /// (Status for diagnostics(), Lookups for lookup_diagnostics(), SlotStats
+    /// for slot_stats_diagnostics()) -- a plain struct used purely to scope
+    /// related types (never instantiated itself), the same "struct as
+    /// namespace" idiom used here because a real `namespace` cannot nest
+    /// inside a class. Status is the cheap, bounded, always-safe-to-call
+    /// one; Lookups and SlotStats are each deliberately kept as SEPARATE
+    /// calls rather than folded into Status's fields -- see their own doc
+    /// comments for why (each is an unbounded or O(#trie nodes) query that
+    /// a plain diagnostics() call should never have to pay for).
     struct Diagnostics {
-        std::uint64_t version = 0;              ///< == current_version() at the moment of the call
-        std::uint64_t transactions_begun = 0;    ///< next_txn_id_ - 1: Transactions minted so far via
-                                                 ///< begin(), committed or not -- NOT a commit count
+        /// A point-in-time readout of internal state, for observability and
+        /// debugging -- nothing here is part of the model's published data,
+        /// and nothing here is versioned. See Model::diagnostics()'s own doc
+        /// comment for exactly what each field means and how stale it can be.
+        struct Status {
+            std::uint64_t version = 0;  ///< == current_version() at the moment of the call
+            std::uint64_t transactions_begun = 0;    ///< next_txn_id_ - 1: Transactions minted so far via
+                                                     ///< begin(), committed or not -- NOT a commit count
 
-        /// Live object count for one type, plus its demangled name. The name
-        /// comes from a live representative object (ObjectBase::type()) --
-        /// TypeTag alone (see model::TypeTag) carries no name, so a type
-        /// whose every object has since been deleted (its by_type_ entry
-        /// still exists, just empty) has no representative to name it.
-        struct TypeCount {
-            std::string type_name;  ///< "<no live object of this type>" if live_count == 0
-            std::size_t live_count = 0;
+            /// Live object count for one type, plus its demangled name. The name
+            /// comes from a live representative object (ObjectBase::type()) --
+            /// TypeTag alone (see model::TypeTag) carries no name, so a type
+            /// whose every object has since been deleted (its by_type_ entry
+            /// still exists, just empty) has no representative to name it.
+            struct TypeCount {
+                std::string type_name;  ///< "<no live object of this type>" if live_count == 0
+                std::size_t live_count = 0;
+            };
+            std::size_t live_object_count = 0;  ///< sum of live_by_type[*].live_count
+            std::vector<TypeCount> live_by_type;
+
+            std::size_t chunk_count = 0;      ///< spine_.size() -- allocated Chunks, kChunkSize slots each
+            std::size_t slots_allocated = 0;  ///< next_slot_ -- high-water mark of ever-allocated slots
+            std::size_t slots_free = 0;       ///< free_slots_.size() -- recycled slots ready for reuse
+            std::size_t slots_exhausted = 0;  ///< == exhausted_slots()
+
+            std::size_t key_indexed_fields = 0;               ///< by_key_.size()
+            std::size_t cached_value_indexed_fields = 0;       ///< by_cached_field_.size()
+            std::size_t cached_reference_indexed_fields = 0;   ///< by_cached_reference_.size()
+            std::size_t reverse_index_targets = 0;  ///< referrers_.size() -- slots with >=1 referrer
+            std::size_t reverse_index_edges = 0;    ///< total referrer edges, summed across all targets
+
+            bool pre_transactions_hook_installed = false;  ///< see set_pre_transactions()
+            bool pre_commit_hook_installed = false;        ///< see set_pre_commit()
+
+            std::size_t live_snapshot_versions = 0;   ///< live_.size() -- distinct pinned versions
+            std::size_t live_snapshot_refs = 0;       ///< total Snapshots + open Transaction bases pinned
+            std::uint64_t reclamation_watermark = 0;  ///< oldest version anything still needs;
+                                                      ///< == version (above) if nothing is pinned
+            std::size_t reap_backlog = 0;             ///< == reap_backlog()
+
+            std::size_t subscriber_count = 0;  ///< live Subscriptions (see subscribe())
+
+            /// One (version, change count) pair per commit still retained for
+            /// try_commit()'s id-overlap conflict check -- NOT the changes
+            /// themselves, so this stays cheap regardless of how large any one
+            /// commit was. Oldest first. Pruned the same way changelog_ is
+            /// (prune_changelog): once no live Transaction base / Snapshot could
+            /// still need an entry, it's gone -- so seeing fewer entries on a
+            /// later call is normal, not a bug.
+            std::vector<std::pair<std::uint64_t, std::size_t>> retained_commit_history;
+
+            /// Cumulative try_commit()/try_commit_without_undo() outcome counts
+            /// since this Model was constructed -- monotonically increasing,
+            /// never reset, never pruned (unlike retained_commit_history above,
+            /// which only covers the still-live changelog window). This is the
+            /// number to watch for whether writers are thrashing against each
+            /// other at this Model's target scale (many writer threads racing
+            /// try_commit()): a rising commits_conflicted relative to
+            /// commits_succeeded means real contention, not a bug. Does NOT
+            /// include run_pre_transaction()/run_pre_transaction_without_undo()
+            /// calls (their outcome is folded into the enclosing try_commit()
+            /// call's own PrecommitConflict, exactly once) or
+            /// commit_bulk_without_undo() (a single-writer, exclusive-access
+            /// path with no OCC contention to observe).
+            std::uint64_t commits_succeeded = 0;
+            std::uint64_t commits_conflicted = 0;
+            std::uint64_t commits_vetoed = 0;
+            std::uint64_t commits_invalid = 0;
+            std::uint64_t commits_precommit_conflicted = 0;
         };
-        std::size_t live_object_count = 0;  ///< sum of live_by_type[*].live_count
-        std::vector<TypeCount> live_by_type;
 
-        std::size_t chunk_count = 0;      ///< spine_.size() -- allocated Chunks, kChunkSize slots each
-        std::size_t slots_allocated = 0;  ///< next_slot_ -- high-water mark of ever-allocated slots
-        std::size_t slots_free = 0;       ///< free_slots_.size() -- recycled slots ready for reuse
-        std::size_t slots_exhausted = 0;  ///< == exhausted_slots()
+        /// Every field looked up at least once, for the life of this Model,
+        /// each labeled with its declaring type's demangled name (see
+        /// register_field_lookup's comment on why demangling happens here
+        /// and nowhere hotter). Order is unspecified; to_string() sorts it
+        /// for display. Deliberately a SEPARATE call
+        /// (Model::lookup_diagnostics()) from Status/Model::diagnostics():
+        /// this is an unbounded, separately-locked (field_lookup_mu_)
+        /// collection that can grow for the life of the Model -- folding it
+        /// into Status would make every diagnostics() call pay for a query
+        /// nobody asked for.
+        class Lookups {
+        public:
+            std::unordered_map<FieldLookupKey, LookupCounts, FieldLookupKeyHash> stats;
 
-        std::size_t key_indexed_fields = 0;               ///< by_key_.size()
-        std::size_t cached_value_indexed_fields = 0;       ///< by_cached_field_.size()
-        std::size_t cached_reference_indexed_fields = 0;   ///< by_cached_reference_.size()
-        std::size_t reverse_index_targets = 0;  ///< referrers_.size() -- slots with >=1 referrer
-        std::size_t reverse_index_edges = 0;    ///< total referrer edges, summed across all targets
+            /// Human-readable table, sorted by total calls (descending) so
+            /// the fields that matter most for a caching decision sort to
+            /// the top.
+            std::string to_string() const;
+        };
 
-        bool pre_transactions_hook_installed = false;  ///< see set_pre_transactions()
-        bool pre_commit_hook_installed = false;        ///< see set_pre_commit()
+        /// pmap::SlotStats (Node::slots capacity() vs size(), summed across
+        /// every Node) for each of Model's four persistent-map-backed
+        /// indices -- lets a caller check whether TrieCore's compacted-
+        /// vector slots buffer is tracking real occupancy or padded by
+        /// libstdc++'s generic growth-doubling (see persistent_map.h's
+        /// TrieCore::slot_stats). Deliberately a SEPARATE call
+        /// (Model::slot_stats_diagnostics()) from Status: same reasoning as
+        /// Lookups above -- this walks every Node in every trie (O(#trie
+        /// nodes), not a bounded counter read), so folding it into Status
+        /// would make every diagnostics() call pay for a query nobody asked
+        /// for.
+        struct SlotStats {
+            /// One by_type_ entry, named the same way Status::TypeCount is:
+            /// from a live sample object, since TypeTag alone carries no name.
+            struct TypeEntry {
+                std::string type_name;
+                pmap::SlotStats stats;
+            };
+            /// Same key/hash Lookups::stats uses. Unlike there, `type` can be
+            /// null: by_key_/by_cached_field_/by_cached_reference_ store only
+            /// a field's address, so slot_stats_diagnostics() can't always
+            /// recover its declaring type (no live sample left to check).
+            using FieldMap = std::unordered_map<FieldLookupKey, pmap::SlotStats, FieldLookupKeyHash>;
 
-        std::size_t live_snapshot_versions = 0;   ///< live_.size() -- distinct pinned versions
-        std::size_t live_snapshot_refs = 0;       ///< total Snapshots + open Transaction bases pinned
-        std::uint64_t reclamation_watermark = 0;  ///< oldest version anything still needs;
-                                                  ///< == version (above) if nothing is pinned
-        std::size_t reap_backlog = 0;             ///< == reap_backlog()
+            pmap::SlotStats by_type;  ///< summed across every by_type_ entry (one per live type)
+            std::vector<TypeEntry> by_type_detail;
 
-        std::size_t subscriber_count = 0;  ///< live Subscriptions (see subscribe())
+            pmap::SlotStats by_key;  ///< summed across every by_key_ entry (one per define_keys() field)
+            FieldMap by_key_detail;
 
-        /// One (version, change count) pair per commit still retained for
-        /// try_commit()'s id-overlap conflict check -- NOT the changes
-        /// themselves, so this stays cheap regardless of how large any one
-        /// commit was. Oldest first. Pruned the same way changelog_ is
-        /// (prune_changelog): once no live Transaction base / Snapshot could
-        /// still need an entry, it's gone -- so seeing fewer entries on a
-        /// later call is normal, not a bug.
-        std::vector<std::pair<std::uint64_t, std::size_t>> retained_commit_history;
+            /// by_cached_field_/by_cached_reference_ are two-level (an outer
+            /// map's values are themselves PersistentSet buckets), so each
+            /// of these -- aggregate AND per-field -- sums the outer map's
+            /// own Nodes AND every inner bucket's Nodes.
+            pmap::SlotStats by_cached_field;
+            FieldMap by_cached_field_detail;
 
-        /// Cumulative try_commit()/try_commit_without_undo() outcome counts
-        /// since this Model was constructed -- monotonically increasing,
-        /// never reset, never pruned (unlike retained_commit_history above,
-        /// which only covers the still-live changelog window). This is the
-        /// number to watch for whether writers are thrashing against each
-        /// other at this Model's target scale (many writer threads racing
-        /// try_commit()): a rising commits_conflicted relative to
-        /// commits_succeeded means real contention, not a bug. Does NOT
-        /// include run_pre_transaction()/run_pre_transaction_without_undo()
-        /// calls (their outcome is folded into the enclosing try_commit()
-        /// call's own PrecommitConflict, exactly once) or
-        /// commit_bulk_without_undo() (a single-writer, exclusive-access
-        /// path with no OCC contention to observe).
-        std::uint64_t commits_succeeded = 0;
-        std::uint64_t commits_conflicted = 0;
-        std::uint64_t commits_vetoed = 0;
-        std::uint64_t commits_invalid = 0;
-        std::uint64_t commits_precommit_conflicted = 0;
+            pmap::SlotStats by_cached_reference;
+            FieldMap by_cached_reference_detail;
+        };
     };
 
-    /// Builds a Diagnostics readout. Not a hot-path call: takes commit_mu_
+    /// Builds a Diagnostics::Status readout. Not a hot-path call: takes commit_mu_
     /// long enough to copy writer-private state (spine/index sizes,
     /// referrers_, changelog_ summaries), THEN (fully released first)
     /// ver_mu_ for live_, THEN (also released first) subs_mu_ for the
@@ -3175,7 +3239,7 @@ public:
     /// moment if a commit lands in between. That's the right tradeoff here:
     /// a diagnostics call should never hold up a live commit for longer than
     /// copying one of these sections takes.
-    Diagnostics diagnostics() const;
+    Diagnostics::Status diagnostics() const;
 
     /// Records one call to find_by_field/for_each_referrers (or a sibling
     /// entry point in either family), noting whether it resolved via the
@@ -3197,7 +3261,7 @@ public:
     /// `type` is `typeid(ClassT)` at the call site -- a stable, process-wide
     /// address (see FieldLookupKeyHash) -- deliberately NOT demangled here:
     /// that string work happens only in lookup_diagnostics()/
-    /// LookupDiagnostics::to_string(), which run rarely, off this path. The
+    /// Diagnostics::Lookups::to_string(), which run rarely, off this path. The
     /// lock taken here is a std::shared_mutex, held SHARED for the
     /// (steady-state, after the first call for any given field) case where
     /// the entry already exists, and exclusively only to insert a field
@@ -3223,17 +3287,13 @@ public:
     /// builds its report from.
     LookupCounts lookup_stats_raw(const std::type_info& type, const void* field) const;
 
-    /// Every field looked up at least once, for the life of this Model, each
-    /// labeled with its declaring type's demangled name (see
-    /// register_field_lookup's comment on why demangling happens here and
-    /// nowhere hotter). Order is unspecified; LookupDiagnostics::to_string()
-    /// sorts it for display. Deliberately NOT part of Model::Diagnostics/
-    /// diagnostics(): that call is documented as a bounded, point-in-time
-    /// snapshot of a handful of small, fixed-size counters, and this is an
-    /// unbounded, separately-locked (field_lookup_mu_) collection that can
-    /// grow for the life of the Model -- folding it in would make every
-    /// diagnostics() call pay for a query nobody asked for.
-    LookupDiagnostics lookup_diagnostics() const;
+    /// See Diagnostics::Lookups's own doc comment for what this returns and
+    /// why it's a separate call from diagnostics().
+    Diagnostics::Lookups lookup_diagnostics() const;
+
+    /// See Diagnostics::SlotStats's own doc comment for what this returns
+    /// and why it's a separate call from diagnostics().
+    Diagnostics::SlotStats slot_stats_diagnostics() const;
 
     /// One step of a committed transaction's inverse, captured for free at
     /// the exact point apply already reads the relevant pre-image pointer
@@ -4200,7 +4260,7 @@ private:
     /// empty-transaction fast path returns Committed before commit_mu_ is
     /// ever taken), so a lock-free counter is the only shape that covers
     /// both call sites without extending the locked region just for
-    /// bookkeeping. See Diagnostics' commits_* fields and
+    /// bookkeeping. See Diagnostics::Status's commits_* fields and
     /// record_commit_outcome().
     std::atomic<std::uint64_t> commits_succeeded_{0};
     std::atomic<std::uint64_t> commits_conflicted_{0};
@@ -4239,7 +4299,7 @@ private:
     /// serializing against each other, only against a never-seen-before
     /// field's insert. LookupCounts itself stays a plain (non-atomic) value
     /// type because it's also the return type callers see (lookup_stats(),
-    /// LookupDiagnostics::stats), copied out once, after the atomics are read.
+    /// Diagnostics::Lookups::stats), copied out once, after the atomics are read.
     struct FieldLookupCounters {
         std::atomic<std::uint64_t> cached{0};
         std::atomic<std::uint64_t> uncached{0};

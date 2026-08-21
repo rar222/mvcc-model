@@ -1058,7 +1058,7 @@ TEST(lookup_diagnostics_is_labeled_by_declaring_type) {
     (void)s.find_by_field<&Order::qty>(5);
     (void)s.find_by_field<&Order::qty_scan>(9);
 
-    const Model::LookupDiagnostics diag = m.lookup_diagnostics();
+    const Model::Diagnostics::Lookups diag = m.lookup_diagnostics();
     CHECK_EQ(diag.stats.size(), std::size_t{2});
     // stats stores a raw type_info pointer, not a demangled name (that only
     // happens in to_string(), see its own test below) -- so the precise,

@@ -522,7 +522,7 @@ TEST(commit_bulk_without_undo_never_fires_hooks_and_leaves_the_undo_list_untouch
     make_account(m, "PRE1");
     make_account(m, "PRE2");
     CHECK_EQ(m.list_undo().size(), std::size_t{2});
-    const Model::Diagnostics before_bulk = m.diagnostics();
+    const Model::Diagnostics::Status before_bulk = m.diagnostics();
 
     int pre_transactions_calls = 0, pre_commit_calls = 0, post_commit_calls = 0;
     m.set_pre_transactions([&](Model&, const Transaction&) { ++pre_transactions_calls; });

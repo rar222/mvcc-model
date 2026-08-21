@@ -175,6 +175,13 @@ target_link_libraries(basic_record_bench_with_undo PRIVATE model)
 target_precompile_headers(basic_record_bench_with_undo REUSE_FROM model)
 target_compile_definitions(basic_record_bench_with_undo PRIVATE MODEL_BENCH_CALLGRIND)
 
+# Node::slots' vector capacity() vs size() at steady state, single-threaded
+# vs. under concurrent snapshot() pressure vs. one bulk transaction -- backed
+# by Model::slot_stats_diagnostics(). See the file's own header comment.
+add_executable(slot_stats_probe examples/slot_stats_probe.cpp)
+target_link_libraries(slot_stats_probe PRIVATE model)
+target_precompile_headers(slot_stats_probe REUSE_FROM model)
+
 # Same shape as large_txn_bench.cpp's bench_bulk_create, isolated into its
 # own binary (build/commit phase split, argv count override) so it can be
 # profiled the same way as basic_record_bench -- Order touches every index

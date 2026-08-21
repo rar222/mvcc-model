@@ -65,6 +65,18 @@ struct StringHash {
     }
 };
 
+/// Node::slots capacity() vs size() summed across every Node in one trie --
+/// see TrieCore::slot_stats. Namespace-scope (not nested in TrieCore) so
+/// every instantiation (by_type_'s Id-keyed set, by_key_'s string-keyed
+/// map, ...) reports through the same concrete type, poolable into one
+/// Model-level diagnostic without a per-instantiation type each.
+struct SlotStats {
+    std::size_t node_count = 0;
+    std::size_t leaf_count = 0;
+    std::size_t total_capacity = 0;  ///< sum of slots.capacity() across every Node
+    std::size_t total_size = 0;      ///< sum of slots.size() across every Node (== child count)
+};
+
 namespace detail {
 
 /// Entry = std::pair<K,V> (PersistentMap's shape): the comparison key is the
@@ -531,12 +543,18 @@ class TrieCore {
                 Node* mut = const_cast<Node*>(n);
                 mut->bitmap |= b;
                 mut->is_leaf |= b;
+                // The target size is always known exactly (current + 1), so
+                // reserve() it directly rather than let insert() fall back
+                // to vector's growth-doubling, which has no notion of this
+                // vector's 32-element ceiling.
+                mut->slots.reserve(mut->slots.size() + 1);
                 mut->slots.insert(mut->slots.begin() + pos, std::move(lf));
                 return owner;
             }
             auto nn = clone_node(n);
             nn->bitmap |= b;
             nn->is_leaf |= b;
+            nn->slots.reserve(nn->slots.size() + 1);
             nn->slots.insert(nn->slots.begin() + pos, std::move(lf));
             return nn;
         }
@@ -803,6 +821,39 @@ public:
         return each_in_short_circuit(as_node(root_), f);
     }
 
+    /// capacity() vs size() of every Node::slots buffer in this trie -- see
+    /// Model::slot_stats_diagnostics(), the diagnostic this backs. Kept
+    /// separate from the trie's own hot paths (get/set/erase never call
+    /// this): an O(#trie nodes) walk, the same reason lookup_diagnostics()
+    /// is kept off Model::diagnostics()'s path -- see that method's own
+    /// doc comment in model.h.
+    SlotStats slot_stats() const {
+        SlotStats s;
+        walk_slot_stats(as_node(root_), s);
+        return s;
+    }
+
+private:
+    static void walk_slot_stats(const Node* n, SlotStats& s) {
+        if (!n) return;
+        ++s.node_count;
+        s.total_capacity += n->slots.capacity();
+        s.total_size += n->slots.size();
+        std::uint32_t pos = 0;
+        for (std::uint32_t idx = 0; idx < 32; ++idx) {
+            const std::uint32_t b = bit(idx);
+            if (!(n->bitmap & b)) continue;
+            if (n->is_leaf & b) {
+                ++s.leaf_count;
+            } else {
+                walk_slot_stats(as_node(n->slots[pos]), s);
+            }
+            ++pos;
+        }
+    }
+
+public:
+
     // Frame stack depth needed to walk this trie externally (one Node per
     // level). 13 levels of 5-bit hash slices exhaust all 64 hash bits (shift
     // = 0, 5, ..., 60) -- see persistent_map_tests.cpp's comment on the
@@ -990,6 +1041,10 @@ public:
     using const_iterator = iterator;
     iterator begin() const { return core_.begin(); }
     iterator end() const { return core_.end(); }
+
+    /// Node::slots capacity() vs size(), summed across this map -- see
+    /// Model::slot_stats_diagnostics(), the diagnostic this backs.
+    SlotStats slot_stats() const { return core_.slot_stats(); }
 };
 
 /// A persistent SET: like PersistentMap, but there is no value -- the key IS
@@ -1052,6 +1107,10 @@ public:
     using const_iterator = iterator;
     iterator begin() const { return core_.begin(); }
     iterator end() const { return core_.end(); }
+
+    /// Node::slots capacity() vs size(), summed across this map -- see
+    /// Model::slot_stats_diagnostics(), the diagnostic this backs.
+    SlotStats slot_stats() const { return core_.slot_stats(); }
 };
 
 /// Add `v` to the persistent-SET bucket at `key` of a PersistentMap<K,

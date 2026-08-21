@@ -1201,13 +1201,108 @@ std::size_t Model::debug_changelog_size() const {
     return changelog_.size();
 }
 
+namespace {
+void accumulate(pmap::SlotStats& into, const pmap::SlotStats& ss) {
+    into.node_count += ss.node_count;
+    into.leaf_count += ss.leaf_count;
+    into.total_capacity += ss.total_capacity;
+    into.total_size += ss.total_size;
+}
+}  // namespace
+
+Model::Diagnostics::SlotStats Model::slot_stats_diagnostics() const {
+    using SlotStats = Diagnostics::SlotStats;
+    std::lock_guard lk(commit_mu_);
+    SlotStats s;
+
+    // Recovers a field's declaring type from a live sample, since
+    // by_key_/by_cached_field_/by_cached_reference_ store only its address.
+    auto owning_type_key = [&](const void* field,
+                               const std::function<bool(const ObjectBase&)>& declares) {
+        for (const auto& [tag, ids] : by_type_) {
+            (void)tag;
+            Id sample;
+            bool found = false;
+            ids.for_each([&](const Id& id) {
+                if (!found) {
+                    sample = id;
+                    found = true;
+                }
+            });
+            const ObjectBase* obj = found ? peek_raw(sample) : nullptr;
+            if (obj && declares(*obj)) return FieldLookupKey{&typeid(*obj), field};
+        }
+        return FieldLookupKey{nullptr, field};
+    };
+
+    for (const auto& [tag, ids] : by_type_) {
+        (void)tag;
+        const pmap::SlotStats ss = ids.slot_stats();
+        accumulate(s.by_type, ss);
+
+        SlotStats::TypeEntry te;
+        te.stats = ss;
+        Id sample;
+        bool found = false;
+        ids.for_each([&](const Id& id) {
+            if (!found) {
+                sample = id;
+                found = true;
+            }
+        });
+        const ObjectBase* obj = found ? peek_raw(sample) : nullptr;
+        te.type_name = obj ? obj->type() : "<no live object of this type>";
+        s.by_type_detail.push_back(std::move(te));
+    }
+    for (const auto& [field, m] : by_key_) {
+        const pmap::SlotStats ss = m.slot_stats();
+        accumulate(s.by_key, ss);
+        const auto key = owning_type_key(field, [field](const ObjectBase& obj) {
+            bool hit = false;
+            obj.each_field_key([&](const void* f, const std::string&) { hit |= (f == field); });
+            return hit;
+        });
+        s.by_key_detail.emplace(key, ss);
+    }
+    for (const auto& [field, m] : by_cached_field_) {
+        pmap::SlotStats ss = m.slot_stats();
+        m.for_each([&](const std::string& value, const pmap::PersistentSet<Id, IdHash>& bucket) {
+            (void)value;
+            accumulate(ss, bucket.slot_stats());
+        });
+        accumulate(s.by_cached_field, ss);
+        const auto key = owning_type_key(field, [field](const ObjectBase& obj) {
+            bool hit = false;
+            obj.each_field([&](const void* f, const std::string&, LookupType) { hit |= (f == field); });
+            return hit;
+        });
+        s.by_cached_field_detail.emplace(key, ss);
+    }
+    for (const auto& [field, m] : by_cached_reference_) {
+        pmap::SlotStats ss = m.slot_stats();
+        m.for_each([&](Id target, const pmap::PersistentSet<Id, IdHash>& bucket) {
+            (void)target;
+            accumulate(ss, bucket.slot_stats());
+        });
+        accumulate(s.by_cached_reference, ss);
+        const auto key = owning_type_key(field, [field](const ObjectBase& obj) {
+            bool hit = false;
+            obj.each_cached_reference(
+                [&](const void* f, const char*, Id, bool) { hit |= (f == field); });
+            return hit;
+        });
+        s.by_cached_reference_detail.emplace(key, ss);
+    }
+    return s;
+}
+
 std::vector<std::pair<std::uint64_t, int>> Model::debug_live_versions() const {
     std::lock_guard lk(ver_mu_);
     return {live_.begin(), live_.end()};
 }
 
-Model::Diagnostics Model::diagnostics() const {
-    Diagnostics diag;
+Model::Diagnostics::Status Model::diagnostics() const {
+    Diagnostics::Status diag;
     diag.transactions_begun = next_txn_id_.load(std::memory_order_relaxed) - 1;
 
     diag.commits_succeeded = commits_succeeded_.load(std::memory_order_relaxed);
@@ -1224,7 +1319,7 @@ Model::Diagnostics Model::diagnostics() const {
         diag.live_by_type.reserve(by_type_.size());
         for (const auto& [tag, ids] : by_type_) {
             (void)tag;  // TypeTag carries no name of its own -- see TypeCount's doc comment
-            Diagnostics::TypeCount tc;
+            Diagnostics::Status::TypeCount tc;
             tc.live_count = ids.size();
             if (tc.live_count > 0) {
                 Id sample;
@@ -1324,8 +1419,8 @@ LookupCounts Model::lookup_stats_raw(const std::type_info& type, const void* fie
            it->second.uncached.load(std::memory_order_relaxed)};
 }
 
-Model::LookupDiagnostics Model::lookup_diagnostics() const {
-    LookupDiagnostics report;
+Model::Diagnostics::Lookups Model::lookup_diagnostics() const {
+    Diagnostics::Lookups report;
     std::shared_lock lk(field_lookup_mu_);
     report.stats.reserve(field_lookup_counts_.size());
     for (const auto& [key, counters] : field_lookup_counts_) {
@@ -1335,12 +1430,12 @@ Model::LookupDiagnostics Model::lookup_diagnostics() const {
     return report;
 }
 
-std::string Model::LookupDiagnostics::to_string() const {
+std::string Model::Diagnostics::Lookups::to_string() const {
     // A plain vector copy for sorting -- unordered_map itself can't be
     // sorted in place. This is also the only place demangling `type` (a
     // real string-allocating, non-trivial operation) ever happens: `stats`
     // itself stores nothing but a type_info pointer, a field_tag address,
-    // and two integers, so building a LookupDiagnostics never pays for a
+    // and two integers, so building a Diagnostics::Lookups never pays for a
     // name nobody asked to print yet.
     std::vector<std::pair<FieldLookupKey, LookupCounts>> sorted(stats.begin(), stats.end());
     std::sort(sorted.begin(), sorted.end(),
@@ -2530,7 +2625,7 @@ CommitResult Model::commit_main_locked(Transaction& txn, bool keep_undo) {
     return publish_now(std::move(remap), txn.name(), txn.data(), keep_undo, txn.id());
 }
 
-// One counter per CommitStatus (see the Diagnostics::commits_* doc
+// One counter per CommitStatus (see the Diagnostics::Status::commits_* doc
 // comment); noexcept because it's called from try_commit_core()'s hot
 // path and must never be a reason a commit attempt could throw under
 // -fno-exceptions.

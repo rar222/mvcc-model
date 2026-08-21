@@ -380,7 +380,7 @@ TEST(diagnostics_reports_object_population_storage_and_indexes) {
     const Ref<Account> a = make_account(m, "A1");
     make_order(m, "O1", a, Opt<Order>{}, 5);
 
-    const Model::Diagnostics d = m.diagnostics();
+    const Model::Diagnostics::Status d = m.diagnostics();
     CHECK_EQ(d.version, m.current_version());
     CHECK_EQ(d.live_object_count, std::size_t{2});
     CHECK_EQ(d.live_by_type.size(), std::size_t{2});
@@ -415,12 +415,12 @@ TEST(diagnostics_reports_live_snapshot_pins_and_the_reclamation_watermark) {
     Model m;
     make_account(m, "A1");
 
-    const Model::Diagnostics before_pin = m.diagnostics();
+    const Model::Diagnostics::Status before_pin = m.diagnostics();
     CHECK_EQ(before_pin.live_snapshot_versions, std::size_t{0});
 
     {
         Snapshot pin = m.snapshot();
-        const Model::Diagnostics pinned = m.diagnostics();
+        const Model::Diagnostics::Status pinned = m.diagnostics();
         CHECK_EQ(pinned.live_snapshot_versions, std::size_t{1});
         CHECK(pinned.live_snapshot_refs >= std::size_t{1});
         CHECK_EQ(pinned.reclamation_watermark, pin.version());
@@ -437,7 +437,7 @@ TEST(diagnostics_reports_installed_hooks_and_subscriber_count) {
     m.set_pre_transactions([](Model&, const Transaction&) {});
     auto sub = m.subscribe();
 
-    const Model::Diagnostics d = m.diagnostics();
+    const Model::Diagnostics::Status d = m.diagnostics();
     CHECK(d.pre_commit_hook_installed);
     CHECK(d.pre_transactions_hook_installed);
     CHECK_EQ(d.subscriber_count, std::size_t{1});
@@ -453,7 +453,7 @@ TEST(diagnostics_retained_commit_history_tracks_the_changelog) {
     make_account(m, "A2");
     make_account(m, "A3");
 
-    const Model::Diagnostics d = m.diagnostics();
+    const Model::Diagnostics::Status d = m.diagnostics();
     CHECK_EQ(d.retained_commit_history.size(), m.debug_changelog_size());
     for (const auto& [version, change_count] : d.retained_commit_history) {
         CHECK(version <= d.version);
@@ -513,7 +513,7 @@ TEST(object_base_type_reports_a_readable_per_type_name_and_is_stable_across_inst
 // cross-contamination between them.
 TEST(diagnostics_commit_outcome_counters_tally_every_status_independently) {
     Model m;
-    const Model::Diagnostics before = m.diagnostics();
+    const Model::Diagnostics::Status before = m.diagnostics();
 
     // Committed.
     const Ref<Account> a = make_account(m, "A1", 0);
@@ -570,7 +570,7 @@ TEST(diagnostics_commit_outcome_counters_tally_every_status_independently) {
         m.set_pre_transactions({});
     }
 
-    const Model::Diagnostics after = m.diagnostics();
+    const Model::Diagnostics::Status after = m.diagnostics();
     // Several Committed calls happen along the way as setup (seeding `a`,
     // t1's winning update, VICTIM's create and remove) -- assert only that
     // it moved, not an exact count, so this stays independent of exactly
