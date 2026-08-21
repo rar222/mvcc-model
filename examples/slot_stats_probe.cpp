@@ -39,10 +39,14 @@ using namespace example;
 namespace {
 
 void report(const char* label, const Model::Diagnostics::SlotStats& d) {
+    // 8 bytes/slot: sizeof(pmap::detail::TrieCore<...>::RcHandle), a single
+    // intrusively-refcounted raw pointer -- see persistent_map.h's RcHandle
+    // (was shared_ptr<const void>, 16 bytes, before that type was replaced).
+    constexpr double kBytesPerSlot = 8.0;
     auto line = [](const char* name, const model::pmap::SlotStats& s) {
-        const double waste_bytes = static_cast<double>(s.total_capacity - s.total_size) * 16.0;
-        const double fixed32_bytes = static_cast<double>(s.node_count) * 32.0 * 16.0;
-        const double vector_bytes = static_cast<double>(s.total_capacity) * 16.0;
+        const double waste_bytes = static_cast<double>(s.total_capacity - s.total_size) * kBytesPerSlot;
+        const double fixed32_bytes = static_cast<double>(s.node_count) * 32.0 * kBytesPerSlot;
+        const double vector_bytes = static_cast<double>(s.total_capacity) * kBytesPerSlot;
         std::printf(
             "  %-8s nodes=%8zu leaves=%8zu  size(sum)=%9zu  capacity(sum)=%9zu  "
             "avg_fill=%.1f%%  vector_buf=%.2fMB  fixed32_buf=%.2fMB  slack=%.2fMB\n",

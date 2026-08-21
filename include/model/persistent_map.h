@@ -35,6 +35,7 @@
 // exactly one place rather than duplicated between a map and a set version.
 
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <iterator>
@@ -152,9 +153,9 @@ class TrieCore {
     // needs a full 64-bit hash collision (impossible for distinct Ids under
     // model::IdHash -- a perfect hash -- and astronomically rare for
     // StringHash), so the chains being copied essentially never have more
-    // than the one link that is being edited anyway. Heads stay shared_ptr
-    // (in Node::leaves): heads ARE genuinely shared, across every node
-    // clone and push-down that path-copying produces.
+    // than the one link that is being edited anyway. Heads stay RcHandle-
+    // backed (in Node::slots): heads ARE genuinely shared, across every
+    // node clone and push-down that path-copying produces.
     //
     // For a Hash that DECLARES itself collision-free (hash_is_perfect_v --
     // e.g. model::IdHash), "impossible" above is exact, not just likely: a
@@ -172,6 +173,93 @@ class TrieCore {
     // out to be false at runtime.
     struct Leaf;  // forward declaration: NoChain::get()'s return type needs the name,
                   // not a complete type (it never dereferences it)
+    struct Node;  // forward declaration: RcHandle::release() names it, but only in its
+                  // out-of-line definition below (after Node/Leaf are complete) -- the
+                  // declaration inside RcHandle's own class body needs neither name.
+
+    // One shared refcounted header, embedded as the FIRST member of both Node and
+    // Leaf (composition, not a base class -- see RcHandle's own comment for why).
+    // [basic.compound]/[class.mem] guarantee that a pointer to a standard-layout
+    // class, reinterpret_cast to a pointer to its first member, is the SAME address
+    // (and vice versa) -- that's what lets RcHandle read/decrement the count and
+    // read is_leaf_self without first knowing whether the pointee is a Node or a
+    // Leaf. is_leaf_self/owner_mem are set once, at construction, strictly before
+    // the object is ever shared (see alloc_node/alloc_leaf below) -- never mutated
+    // again, so no synchronization is needed to read them from another thread
+    // later: the same "immutable after construction, safe once published" property
+    // every other field this project publishes to readers already relies on.
+    struct RcBase {
+        std::atomic<std::uint32_t> refcount{1};
+        bool is_leaf_self = false;
+        std::pmr::memory_resource* owner_mem = nullptr;  ///< nullptr => plain new/delete
+    };
+
+    // Intrusively refcounted, type-erased handle: ONE raw pointer (8 bytes) --
+    // replacing shared_ptr<const void>'s 16 (an object pointer PLUS a pointer to a
+    // separate control block). The refcount, the Node-or-Leaf tag, and the owning
+    // pmr resource all live in the pointee's own RcBase instead of a side
+    // allocation, so the allocation count per Node/Leaf is unchanged (RcBase is a
+    // plain member, not a second `new`) -- the saving is purely in the HANDLE
+    // stored at every Node::slots element and at TrieCore::root_, which is what
+    // this project has many more of than it has actual Node/Leaf objects, any time
+    // more than one published Root (or a live reader's snapshot, or an open
+    // Transaction's base) still shares a subtree. Copy: one relaxed atomic
+    // increment. Last release: one acq_rel decrement, and only on the thread that
+    // actually observes the count hit zero, the real destroy+deallocate -- same
+    // thread-safety contract shared_ptr already gave this design, which is what
+    // set_in's mutate-in-place fast path (see its own long comment) depends on via
+    // use_count().
+    class RcHandle {
+    public:
+        RcHandle() noexcept = default;
+        RcHandle(std::nullptr_t) noexcept {}
+
+        /// Wraps a FRESHLY allocated Node/Leaf -- RcBase's own default member
+        /// initializer already left refcount at 1, so this never increments.
+        static RcHandle adopt(void* p) noexcept {
+            RcHandle h;
+            h.ptr_ = p;
+            return h;
+        }
+
+        RcHandle(const RcHandle& o) noexcept : ptr_(o.ptr_) {
+            if (ptr_) base()->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+        RcHandle(RcHandle&& o) noexcept : ptr_(o.ptr_) { o.ptr_ = nullptr; }
+        RcHandle& operator=(const RcHandle& o) noexcept {
+            if (this != &o) {
+                RcHandle tmp(o);
+                swap(tmp);
+            }
+            return *this;
+        }
+        RcHandle& operator=(RcHandle&& o) noexcept {
+            if (this != &o) {
+                release();
+                ptr_ = o.ptr_;
+                o.ptr_ = nullptr;
+            }
+            return *this;
+        }
+        ~RcHandle() { release(); }
+
+        void swap(RcHandle& o) noexcept { std::swap(ptr_, o.ptr_); }
+        void* get() const noexcept { return ptr_; }
+        explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+        /// Relaxed load -- same "approximate outside external synchronization"
+        /// contract as shared_ptr::use_count(); see set_in's can_mutate check for
+        /// the one place this project actually depends on that contract.
+        std::uint32_t use_count() const noexcept {
+            return ptr_ ? base()->refcount.load(std::memory_order_relaxed) : 0;
+        }
+
+    private:
+        RcBase* base() const noexcept { return reinterpret_cast<RcBase*>(ptr_); }
+        void release() noexcept;  // out-of-line: needs Node and Leaf complete, see below
+
+        void* ptr_ = nullptr;
+    };
 
     struct NoChain {
         const Leaf* get() const noexcept { return nullptr; }
@@ -180,6 +268,7 @@ class TrieCore {
     using ChainLink = std::conditional_t<kPerfectHash, NoChain, std::unique_ptr<const Leaf>>;
 
     struct Leaf {
+        RcBase rc;  // must be the first member -- see RcBase's own comment
         Leaf(Entry e, ChainLink n) : entry(std::move(e)), next(std::move(n)) {}
         Entry entry;
 
@@ -214,23 +303,27 @@ class TrieCore {
         ChainLink next;
 #endif
     };
+    static_assert(std::is_standard_layout_v<Leaf>,
+                  "Leaf must stay standard-layout -- RcHandle::release() reinterpret_casts a "
+                  "Leaf* to RcBase* via the first-member guarantee; see RcBase's own comment. "
+                  "If some Entry type ever breaks this, that is a real problem to fix in Leaf's "
+                  "layout (e.g. give Entry its own indirection), not a check to weaken.");
 
     // Each occupied bit in `bitmap` has exactly one child, either a Node or
-    // a Leaf -- so two parallel vector<shared_ptr<...>>, one always null per
-    // occupied slot, would waste a whole shared_ptr's worth of storage (16
-    // bytes) on every slot, AND pay for two separate vector headers (24
-    // bytes each) and two separate heap buffers per node, when one of each
-    // would do. `slots` holds ONE type-erased shared_ptr<const void> per
-    // occupied slot instead -- still correctly destructing as a Node or Leaf
-    // regardless of the erasure, since shared_ptr's control block fixes the
-    // deleter at CONSTRUCTION (make_shared<Node>/make_shared<Leaf>), not at
-    // whatever type the pointer is later held as -- and `is_leaf`, a second
-    // bitmap parallel to (a subset of) `bitmap` and indexed the SAME way (by
-    // idx, 0-31, not by the compacted vector position), records which. A
-    // slot's actual type is always known before it's dereferenced (every
-    // caller already branches on is_leaf first), so the cast back
+    // a Leaf -- so two parallel vectors, one always empty per occupied slot,
+    // would waste storage and a second heap buffer per node for nothing.
+    // `slots` holds ONE type-erased RcHandle per occupied slot instead, and
+    // `is_leaf`, a second bitmap parallel to (a subset of) `bitmap` and
+    // indexed the SAME way (by idx, 0-31, not by the compacted vector
+    // position), records which concrete type a slot holds. A slot's actual
+    // type is always known before it's dereferenced (every caller already
+    // branches on is_leaf first), so the cast back
     // (static_cast<const Node*>/static_cast<const Leaf*>) is never
-    // ambiguous.
+    // ambiguous -- RcBase itself is ALSO self-describing
+    // (RcBase::is_leaf_self), which is what lets RcHandle::release() free
+    // the right type even where no sibling is_leaf bit is in scope (e.g.
+    // releasing TrieCore::root_). See RcHandle's own comment (just above
+    // Leaf's forward declaration) for the full design.
     // Why 32-bit (32-ary, 5-bit slices), not 64-bit (64-ary, 6-bit slices),
     // at this project's target scale (100k-1M objects, see the file header):
     // widening the bitmap looks like "half as many levels to path-copy per
@@ -245,9 +338,9 @@ class TrieCore {
     // Meanwhile it makes the cost that actually matters WORSE: the file
     // header's own stated goal is path-copying "only O(log32 n) NODES" per
     // commit, but each node copy isn't free -- `slots` is a
-    // vector<shared_ptr<const void>>, so copying a node costs one
-    // shared_ptr copy per populated child. 64-ary raises the worst case
-    // from 32 shared_ptrs per node to 64, for the same or greater depth
+    // vector<RcHandle>, so copying a node costs one RcHandle copy (one
+    // atomic increment) per populated child. 64-ary raises the worst case
+    // from 32 RcHandles per node to 64, for the same or greater depth
     // across this range -- strictly worse for the operation this whole
     // structure exists to keep cheap, not better.
     //
@@ -263,10 +356,14 @@ class TrieCore {
     // "widen" this without new numbers showing this project's scale target
     // has actually grown past where 32-ary stops being enough.
     struct Node {
+        RcBase rc;  // must be the first member -- see RcBase's own comment
         std::uint32_t bitmap = 0;
         std::uint32_t is_leaf = 0;  ///< subset of bitmap: which occupied idx-slots hold a Leaf
-        std::vector<std::shared_ptr<const void>> slots;  ///< positionally compacted, idx order
+        std::vector<RcHandle> slots;  ///< positionally compacted, idx order
     };
+    static_assert(std::is_standard_layout_v<Node>,
+                  "Node must stay standard-layout -- RcHandle::release() reinterpret_casts a "
+                  "Node* to RcBase* via the first-member guarantee; see RcBase's own comment");
 
     static std::uint64_t hash_key(const K& k) noexcept {
         return static_cast<std::uint64_t>(Hash{}(k));
@@ -284,14 +381,15 @@ class TrieCore {
         return static_cast<std::uint32_t>(__builtin_popcount(bitmap & (bit(idx) - 1)));
     }
 
-    // shared_ptr<const void>, not shared_ptr<const Node>: set_in's in-place
-    // mutation fast path (see its own comment) needs to pass this exact
-    // handle down to set_in without any type-converting copy along the way
-    // -- a conversion (Node* -> void*) constructs a temporary shared_ptr,
-    // which bumps use_count() for the temporary's lifetime and would make
-    // the very check that fast path relies on always see "shared." Keeping
-    // root_ pre-erased means passing it costs nothing beyond a reference.
-    std::shared_ptr<const void> root_;
+    // RcHandle, already type-erased -- see RcHandle's own comment for the
+    // full design. Passing root_ by const reference into set_in/erase_in
+    // costs nothing beyond that reference: RcHandle never implicitly
+    // converts between a "typed" and an "erased" form (there is only the
+    // one, always-erased form), so there is no equivalent of a
+    // shared_ptr<Node>-to-shared_ptr<const void> conversion that could
+    // construct a temporary and skew use_count() -- the bug the old
+    // shared_ptr<const void> choice existed specifically to avoid.
+    RcHandle root_;
 
     // uint32_t, not size_t: every TrieCore instance counts some subset of
     // the model's live objects or distinct field values, so it's bounded by
@@ -308,7 +406,7 @@ class TrieCore {
     // Whether `root_` is a bare Leaf rather than a Node -- the fast path
     // for a trie holding exactly one entry (or, under a non-perfect Hash,
     // one hash-colliding chain), which otherwise pays for a whole Node
-    // (bitmap + is_leaf + a vector<shared_ptr<const void>>) just to hold a
+    // (bitmap + is_leaf + a vector<RcHandle>) just to hold a
     // single child. Every entry point that walks from root_ (set_entry,
     // erase_key, get_entry, each_entry/each_entry_short_circuit,
     // slot_stats, begin()) branches on this before falling back to the
@@ -317,16 +415,16 @@ class TrieCore {
     bool root_is_leaf_ = false;
 
     /// Where this instance's Node/Leaf HEAD allocations come
-    /// from (the shared_ptr ones stored in Node::slots -- never the
+    /// from (the RcHandle ones stored in Node::slots -- never the
     /// unique_ptr tail links, which stay on plain new; see chain_copy/
     /// chain_set_links/chain_erase_links). nullptr (the default, and every
     /// existing caller's behavior -- persistent_map_tests.cpp included) means
-    /// "use ordinary make_shared".
+    /// "use ordinary plain new/delete".
     ///
     /// Profiling one_million_random_basic_records_in_a_single_transaction_
     /// without_undo (examples/basic_record_bench.cpp) found cloning
-    /// by_type_'s Node chain -- make_shared<Node>/make_shared<Leaf> plus the
-    /// shared_ptr<const void> vector copy/dispose that comes with it -- to
+    /// by_type_'s Node chain -- Node/Leaf allocation plus the RcHandle
+    /// vector copy/dispose that comes with it -- to
     /// be the single largest cost of a commit, ahead of the model's own
     /// apply logic: ~27% of instructions, and a LARGER share of last-level
     /// cache misses once measured with cache simulation (callgrind
@@ -352,28 +450,45 @@ class TrieCore {
     /// recursive call.
     std::pmr::memory_resource* mem_ = nullptr;
 
-    explicit TrieCore(std::shared_ptr<const void> r, std::uint32_t n, std::pmr::memory_resource* mem,
-                       bool leaf_root)
+    explicit TrieCore(RcHandle r, std::uint32_t n, std::pmr::memory_resource* mem, bool leaf_root)
         : root_(std::move(r)), size_(n), root_is_leaf_(leaf_root), mem_(mem) {
         // Compiler-checked, not just reasoned about: root_/size_/
-        // root_is_leaf_/mem_ pack into exactly 32 bytes (root_ 16B + size_
+        // root_is_leaf_/mem_ pack into exactly 24 bytes (root_ 8B + size_
         // 4B + root_is_leaf_ 1B + 3B alignment padding before mem_'s 8B --
         // see size_/root_is_leaf_'s own comments). sizeof(TrieCore) needs a
         // complete-class context, which a constructor body is and the
         // member-declaration region above is not -- hence checking it here
         // rather than immediately after the members.
-        static_assert(sizeof(TrieCore) == 32,
-                      "root_/size_/root_is_leaf_/mem_ no longer pack into 32B -- see their own "
+        static_assert(sizeof(TrieCore) == 24,
+                      "root_/size_/root_is_leaf_/mem_ no longer pack into 24B -- see their own "
                       "comments before adding padding back");
     }
 
+    // mem_ == nullptr => plain `new`; otherwise routed through that resource
+    // via `mem_->allocate` + placement-new. One allocation each, same as
+    // before -- RcBase costs nothing extra to allocate, it's a plain member.
+    Node* alloc_node() const {
+        Node* n = mem_ ? ::new (mem_->allocate(sizeof(Node), alignof(Node))) Node() : new Node();
+        n->rc.owner_mem = mem_;  // is_leaf_self stays false, RcBase's own default -- correct for Node
+        return n;
+    }
+    Leaf* alloc_leaf(Entry e, ChainLink n) const {
+        Leaf* lf = mem_ ? ::new (mem_->allocate(sizeof(Leaf), alignof(Leaf)))
+                               Leaf(std::move(e), std::move(n))
+                       : new Leaf(std::move(e), std::move(n));
+        lf->rc.is_leaf_self = true;
+        lf->rc.owner_mem = mem_;
+        return lf;
+    }
+
     // Return a new node equal to `n` but with slot `pos` replaced/inserted.
-    // mem_ == nullptr => plain make_shared (today's behavior, and every
-    // existing caller's); otherwise routed through that resource via
-    // allocate_shared.
-    std::shared_ptr<Node> clone_node(const Node* n) const {
-        auto c = mem_ ? std::allocate_shared<Node>(std::pmr::polymorphic_allocator<Node>(mem_))
-                     : std::make_shared<Node>();
+    // Returns the raw, exclusively-owned Node* rather than an RcHandle:
+    // every caller mutates bitmap/is_leaf/slots on it AFTER this returns, so
+    // wrapping it here would be immediately unwrapped again -- callers wrap
+    // it in an RcHandle via RcHandle::adopt() exactly once, at whichever
+    // return statement finalizes it.
+    Node* clone_node(const Node* n) const {
+        Node* c = alloc_node();
         if (n) {
             c->bitmap = n->bitmap;
             c->is_leaf = n->is_leaf;
@@ -382,10 +497,10 @@ class TrieCore {
         return c;
     }
 
-    static const Node* as_node(const std::shared_ptr<const void>& s) noexcept {
+    static const Node* as_node(const RcHandle& s) noexcept {
         return static_cast<const Node*>(s.get());
     }
-    static const Leaf* as_leaf(const std::shared_ptr<const void>& s) noexcept {
+    static const Leaf* as_leaf(const RcHandle& s) noexcept {
         return static_cast<const Leaf*>(s.get());
     }
 
@@ -433,23 +548,21 @@ class TrieCore {
 
     // Returns `lf`'s chain, rebuilt, with `entry` replacing the link whose
     // key matches or appended as a fresh link if none does (reported via
-    // `added`). The head is built with make_shared (Node holds heads by
-    // shared_ptr, and the fused control block keeps it one allocation);
-    // tail links go through the unique_ptr helpers above.
+    // `added`). The head is built via alloc_leaf (Node holds heads by
+    // RcHandle, whose refcount lives inline in the Leaf itself -- one
+    // allocation, same as before); tail links go through the unique_ptr
+    // helpers above.
     //
     // Only ever called (see set_in) when lf_hash == hash. Under a perfect
     // Hash that equality IMPLIES KeyOf{}(lf->entry) == key -- distinct keys
     // can't share a hash -- so this is always a replace of the one entry
     // this slot can ever hold, never an append to a chain that (by
     // construction) never exists.
-    std::shared_ptr<Leaf> make_leaf(Entry e, ChainLink n) const {
-        if (mem_) return std::allocate_shared<Leaf>(std::pmr::polymorphic_allocator<Leaf>(mem_),
-                                                    std::move(e), std::move(n));
-        return std::make_shared<Leaf>(std::move(e), std::move(n));
+    RcHandle make_leaf(Entry e, ChainLink n) const {
+        return RcHandle::adopt(alloc_leaf(std::move(e), std::move(n)));
     }
 
-    std::shared_ptr<const Leaf> chain_set(const Leaf* lf, const K& key, const Entry& entry,
-                                          bool& added) const {
+    RcHandle chain_set(const Leaf* lf, const K& key, const Entry& entry, bool& added) const {
         if constexpr (kPerfectHash) {
             assert(lf && KeyOf{}(lf->entry) == key &&
                   "Hash declared is_perfect but produced a real collision");
@@ -482,7 +595,7 @@ class TrieCore {
     // Under a perfect Hash, `lf` (found via the same hash slice as `key`)
     // IS the entry for `key` -- same reasoning as chain_set -- so erasing
     // it always empties the slot; there is no tail that could survive.
-    std::shared_ptr<const Leaf> chain_erase(const Leaf* lf, const K& key) const {
+    RcHandle chain_erase(const Leaf* lf, const K& key) const {
         assert(lf && "caller verified the key is present in this chain");
         if constexpr (kPerfectHash) {
             assert(KeyOf{}(lf->entry) == key &&
@@ -500,7 +613,7 @@ class TrieCore {
 
     // ---- set ----
     // Returns the new subtree root for the node currently held by `owner`
-    // (aliasing a Node, or a null shared_ptr for an empty subtree at this
+    // (aliasing a Node, or a null RcHandle for an empty subtree at this
     // position), and reports whether the key was newly inserted (vs
     // replaced) via `added`.
     //
@@ -514,7 +627,7 @@ class TrieCore {
     // `owner.use_count() == 1` is necessary but NOT sufficient on its own:
     // if `pb = pa` copies a whole map/set, the shared TOP node's refcount
     // correctly reads 2 and forces a clone there -- but each of ITS
-    // children is still referenced by exactly ONE shared_ptr (the single
+    // children is still referenced by exactly ONE RcHandle (the single
     // shared top node's own slots vector), so a child's OWN use_count()
     // reads 1 even though it is only reachable through that still-shared
     // parent, and mutating it in place would corrupt what `pa` sees through
@@ -532,8 +645,8 @@ class TrieCore {
     // that passes BOTH checks genuinely cannot be observed by anything
     // else, at any point before this function returns and replaces it.
     // That's what turns clone_node's O(fanout) cost (a fresh Node/Leaf
-    // allocation plus a full shared_ptr<const void> vector copy -- measured
-    // as the single largest cost of a commit, see clone_node's own comment)
+    // allocation plus a full RcHandle vector copy -- measured as the single
+    // largest cost of a commit, see clone_node's own comment)
     // into an O(1) in-place field write for every touch after the first of
     // a given node within the SAME apply -- e.g. every insert past the
     // first into the same bulk-create transaction's by_type_ set.
@@ -557,9 +670,8 @@ class TrieCore {
     // parent was cloned would see the clone's extra reference and wrongly
     // report "shared" for a child that was still private one statement
     // earlier.
-    std::shared_ptr<const void> set_in(const std::shared_ptr<const void>& owner, bool parent_private,
-                                       std::uint64_t hash, int shift, const K& key, const Entry& entry,
-                                       bool& added) const {
+    RcHandle set_in(const RcHandle& owner, bool parent_private, std::uint64_t hash, int shift,
+                    const K& key, const Entry& entry, bool& added) const {
         const Node* n = as_node(owner);
         const std::uint32_t idx = slice(hash, shift);
         const std::uint32_t b = bit(idx);
@@ -585,12 +697,12 @@ class TrieCore {
                 mut->slots.insert(mut->slots.begin() + pos, std::move(lf));
                 return owner;
             }
-            auto nn = clone_node(n);
+            Node* nn = clone_node(n);
             nn->bitmap |= b;
             nn->is_leaf |= b;
             nn->slots.reserve(nn->slots.size() + 1);
             nn->slots.insert(nn->slots.begin() + pos, std::move(lf));
-            return nn;
+            return RcHandle::adopt(nn);
         }
 
         const std::uint32_t pos = popcount_below(n->bitmap, idx);
@@ -606,9 +718,9 @@ class TrieCore {
                 const_cast<Node*>(n)->slots[pos] = std::move(new_child);
                 return owner;
             }
-            auto nn = clone_node(n);
+            Node* nn = clone_node(n);
             nn->slots[pos] = std::move(new_child);
-            return nn;
+            return RcHandle::adopt(nn);
         }
 
         // Slot holds a leaf. Its hash isn't stored -- rederive it from its
@@ -624,9 +736,9 @@ class TrieCore {
                 const_cast<Node*>(n)->slots[pos] = std::move(new_slot);
                 return owner;
             }
-            auto nn = clone_node(n);
+            Node* nn = clone_node(n);
             nn->slots[pos] = std::move(new_slot);
-            return nn;
+            return RcHandle::adopt(nn);
         }
 
         // Different hash sharing this slot: push the existing leaf down into a
@@ -640,24 +752,22 @@ class TrieCore {
                 const_cast<Node*>(n)->slots[pos] = std::move(new_slot);
                 return owner;
             }
-            auto nn = clone_node(n);
+            Node* nn = clone_node(n);
             nn->slots[pos] = std::move(new_slot);
-            return nn;
+            return RcHandle::adopt(nn);
         }
-        auto sub = clone_node(nullptr);
+        Node* sub = clone_node(nullptr);
         const std::uint32_t exist_idx = slice(lf_hash, shift + 5);
         sub->bitmap = bit(exist_idx);
         sub->is_leaf = bit(exist_idx);
         sub->slots.push_back(n->slots[pos]);
-        // Move, not copy: `sub` is exclusively owned (nothing else can name
-        // it yet), and a copy here -- even a temporary one -- would bump
-        // its use_count to 2 for the recursive call below, permanently
-        // hiding the fact that this brand-new subtree was actually free to
-        // mutate in place for its own insert. parent_private is true
-        // unconditionally here (not `can_mutate`): `sub` is freshly
-        // allocated by THIS call no matter whether the current level itself
-        // is shared, so it starts a brand new private lineage regardless.
-        std::shared_ptr<const void> sub_owner = std::move(sub);
+        // `sub` is a raw, exclusively-owned Node* here -- adopting it below
+        // costs nothing (no refcount to bump; RcBase's own count starts at
+        // 1). parent_private is true unconditionally in the recursive call
+        // (not `can_mutate`): `sub` is freshly allocated by THIS call no
+        // matter whether the current level itself is shared, so it starts a
+        // brand new private lineage regardless.
+        RcHandle sub_owner = RcHandle::adopt(sub);
         auto sub2 = set_in(sub_owner, /*parent_private=*/true, hash, shift + 5, key, entry, added);
         if (can_mutate) {
             Node* mut = const_cast<Node*>(n);
@@ -665,10 +775,10 @@ class TrieCore {
             mut->is_leaf &= ~b;  // this slot now holds a Node, not a Leaf
             return owner;
         }
-        auto nn = clone_node(n);
+        Node* nn = clone_node(n);
         nn->slots[pos] = std::move(sub2);
         nn->is_leaf &= ~b;  // this slot now holds a Node, not a Leaf
-        return nn;
+        return RcHandle::adopt(nn);
     }
 
     // ---- erase ----
@@ -682,9 +792,9 @@ class TrieCore {
     // one level deeper than the live entry count alone would need. Not a
     // correctness issue, just a depth (and therefore path-copy cost) that
     // never shrinks back down on its own.
-    // Takes (and, on a no-op, returns) the OWNING shared_ptr -- not just a raw
+    // Takes (and, on a no-op, returns) the OWNING RcHandle -- not just a raw
     // Node* -- for the same reason set_in does: it's what lets a "key not
-    // found" result propagate back up as `return owner` (a cheap shared_ptr
+    // found" result propagate back up as `return owner` (a cheap RcHandle
     // copy, one atomic refcount bump) instead of cloning every node on the
     // way down before discovering, at the bottom, that nothing needed to
     // change. Each level below detects "no-op" by pointer-comparing its
@@ -694,8 +804,8 @@ class TrieCore {
     // node on its path -- same O(log32 n) cost as set() -- this only removes
     // the cost for the no-op case, which used to pay that same price for
     // nothing: see persistent_map_tests.cpp's erase_absent_key_* tests.)
-    std::shared_ptr<const void> erase_in(const std::shared_ptr<const void>& owner, std::uint64_t hash,
-                                         int shift, const K& key, bool& removed) const {
+    RcHandle erase_in(const RcHandle& owner, std::uint64_t hash, int shift, const K& key,
+                      bool& removed) const {
         const Node* n = as_node(owner);
         if (!n) return owner;  // empty subtree: nothing to erase
         const std::uint32_t idx = slice(hash, shift);
@@ -707,17 +817,17 @@ class TrieCore {
         if (!(n->is_leaf & b)) {
             auto sub = erase_in(n->slots[pos], hash, shift + 5, key, removed);
             if (sub.get() == n->slots[pos].get()) return owner;  // unchanged below: unchanged here too
-            auto nn = clone_node(n);
+            Node* nn = clone_node(n);
             const Node* subnode = as_node(sub);
             if (subnode && subnode->bitmap != 0) {
                 nn->slots[pos] = std::move(sub);
-                return nn;
+                return RcHandle::adopt(nn);
             }
             // Subtree emptied: drop this slot.
             nn->bitmap &= ~b;
             nn->is_leaf &= ~b;
             nn->slots.erase(nn->slots.begin() + pos);
-            return nn;
+            return RcHandle::adopt(nn);
         }
 
         // Leaf slot.
@@ -726,16 +836,16 @@ class TrieCore {
 
         removed = true;
         auto nl = chain_erase(lf, key);
-        auto nn = clone_node(n);
+        Node* nn = clone_node(n);
         if (nl) {
             nn->slots[pos] = std::move(nl);
-            return nn;
+            return RcHandle::adopt(nn);
         }
         // Chain emptied (it held only this key): remove the slot entirely.
         nn->bitmap &= ~b;
         nn->is_leaf &= ~b;
         nn->slots.erase(nn->slots.begin() + pos);
-        return nn;
+        return RcHandle::adopt(nn);
     }
 
     static const Entry* get_in(const Node* n, std::uint64_t hash, int shift,
@@ -843,18 +953,18 @@ public:
                 return TrieCore(std::move(new_leaf), size_ + (added ? 1 : 0), mem_,
                                 /*leaf_root=*/true);
             }
-            auto node = clone_node(nullptr);
+            Node* node = clone_node(nullptr);
             const std::uint32_t exist_idx = slice(lf_hash, 0);
             node->bitmap = bit(exist_idx);
             node->is_leaf = bit(exist_idx);
             node->slots.push_back(root_);  // reuse the existing Leaf, no clone
-            std::shared_ptr<const void> node_owner = std::move(node);
+            RcHandle node_owner = RcHandle::adopt(node);
             auto r = set_in(node_owner, /*parent_private=*/true, hash, 0, key, entry, added);
             return TrieCore(std::move(r), size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false);
         }
 
         // root_ itself, NOT root_.get()/as_node(root_): set_in needs the
-        // actual shared_ptr (by reference, no copy) to check use_count() --
+        // actual RcHandle (by reference, no copy) to check use_count() --
         // see its own doc comment. parent_private=true: there is no
         // ancestor above the root to be shared with.
         auto r = set_in(root_, /*parent_private=*/true, hash, 0, key, entry, added);
@@ -864,7 +974,7 @@ public:
     /// Returns a new core without `key` (or, if absent, THE SAME core,
     /// sharing root_ unchanged -- not just structurally equal, actually
     /// aliasing it: erase_in returns `owner` untouched all the way up when
-    /// nothing was found, so an absent key costs one shared_ptr copy, zero
+    /// nothing was found, so an absent key costs one RcHandle copy, zero
     /// node allocations, same as get()'s cost shape. See erase_in's own
     /// comment. Does NOT collapse an interior Node back into a leaf-root
     /// when erase shrinks it to one entry -- matches this trie's existing
@@ -1061,6 +1171,34 @@ public:
     }
     iterator end() const { return iterator(); }
 };
+
+// Out-of-line: needs Node and Leaf complete (sizeof/alignof, and to call the
+// right destructor), which they only are once TrieCore's whole body -- Node
+// and Leaf included -- has been parsed. RcHandle::release() has access to
+// TrieCore's other private nested types the same way any RcHandle member
+// would from inside the class body: nested-class access to the enclosing
+// class's private members doesn't depend on where the member is defined.
+template <class K, class Entry, class Hash, class KeyOf>
+inline void TrieCore<K, Entry, Hash, KeyOf>::RcHandle::release() noexcept {
+    if (!ptr_) return;
+    RcBase* b = reinterpret_cast<RcBase*>(ptr_);
+    if (b->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (b->is_leaf_self) {
+            Leaf* lf = static_cast<Leaf*>(ptr_);
+            std::pmr::memory_resource* m = lf->rc.owner_mem;
+            lf->~Leaf();
+            if (m) m->deallocate(lf, sizeof(Leaf), alignof(Leaf));
+            else ::operator delete(lf);
+        } else {
+            Node* nd = static_cast<Node*>(ptr_);
+            std::pmr::memory_resource* m = nd->rc.owner_mem;
+            nd->~Node();
+            if (m) m->deallocate(nd, sizeof(Node), alignof(Node));
+            else ::operator delete(nd);
+        }
+    }
+    ptr_ = nullptr;
+}
 
 }  // namespace detail
 

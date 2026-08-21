@@ -46,6 +46,11 @@ ALLOWED_PATTERNS = [
     # instantiation error). See gen_extern_templates.py's docstring.
     r'^model::pmap::detail::TrieCore<model::Id, model::Id, model::IdHash, '
     r'model::pmap::detail::IdentityKeyOf<model::Id> >::iterator::advance\(\)$',
+    # Same category as iterator::advance() above: RcHandle::release() is
+    # TrieCore's own intrusive-refcounted-handle implementation (see
+    # persistent_map.h), not parameterized on the user type T either.
+    r'^model::pmap::detail::TrieCore<model::Id, model::Id, model::IdHash, '
+    r'model::pmap::detail::IdentityKeyOf<model::Id> >::RcHandle::release\(\)$',
     # type_tag<T>()/Snapshot::cast<T> are tiny one-liners the optimizer
     # inlines straight into hot range-for loops (e.g. advance_to_match() ->
     # cast<ClassT>() -> type_tag<ClassT>()) -- desirable, it's why range-for

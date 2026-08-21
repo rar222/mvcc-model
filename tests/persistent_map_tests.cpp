@@ -22,17 +22,21 @@
 // own main()) works identically either way.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <memory_resource>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "model/persistent_map.h"
 #include "test_harness.h"
@@ -1498,4 +1502,401 @@ TEST(speed_callback_vs_range_for_full_scan) {
     if (kSlowSanitizedBuild) {
         std::printf("(sanitizer build -- ratio above is not representative, see kSlowSanitizedBuild)\n");
     }
+}
+
+// ---------------------------------------------------------------------------
+// RcHandle (persistent_map.h's intrusively refcounted handle, replacing
+// shared_ptr<const void> in Node::slots/TrieCore::root_) -- coverage for
+// every failure mode that hand-rolled refcounting can introduce which
+// std::shared_ptr got for free: leaks, double-frees, mismatched
+// allocate/deallocate size or alignment, freeing a still-shared node, and
+// data races on the refcount itself. RcHandle is a private nested type, so
+// none of this touches it directly -- every test below goes through
+// PersistentMap/PersistentSet's public API, the same way every other test in
+// this file does, and lets a stricter memory_resource (TrackingResource,
+// below) and ThreadSanitizer (ctest --preset tsan runs this whole file) do
+// the actual catching.
+
+// Stricter than CountingResource above: CountingResource proves ALLOCATION
+// COUNT (how many times, not whether each was later freed correctly).
+// TrackingResource additionally records every live allocation's exact
+// (size, alignment) and asserts, on deallocate, that the SAME address comes
+// back with the EXACT SAME (size, alignment) it was given at allocate time --
+// exactly what a bug in alloc_node/alloc_leaf/RcHandle::release() would get
+// wrong (e.g. releasing a Leaf's storage using sizeof(Node), or vice versa,
+// since is_leaf_self picked the wrong branch). At the end of a TEST(), once
+// every PersistentMap/PersistentSet holding a reference has gone out of
+// scope, `live.empty()` proves zero leaks -- the RcHandle chain of releases
+// actually ran all the way down, for every Node and every Leaf.
+struct TrackingResource : std::pmr::memory_resource {
+    struct Alloc {
+        std::size_t bytes;
+        std::size_t align;
+    };
+    std::unordered_map<void*, Alloc> live;
+    std::size_t mismatches = 0;
+    std::size_t unknown_frees = 0;
+
+    void* do_allocate(std::size_t bytes, std::size_t align) override {
+        void* p = std::pmr::new_delete_resource()->allocate(bytes, align);
+        live.emplace(p, Alloc{bytes, align});
+        return p;
+    }
+    void do_deallocate(void* p, std::size_t bytes, std::size_t align) noexcept override {
+        auto it = live.find(p);
+        if (it == live.end()) {
+            ++unknown_frees;
+        } else {
+            if (it->second.bytes != bytes || it->second.align != align) ++mismatches;
+            live.erase(it);
+        }
+        std::pmr::new_delete_resource()->deallocate(p, bytes, align);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+};
+
+// Heavy random churn (insert/replace/erase, in random order, against a
+// std::unordered_map reference model exactly like the differential tests
+// above) across every Entry SHAPE this project actually instantiates:
+// Id-like value (perfect hash, NoChain), string-keyed with a real collision
+// chain (ClashHash forces it), and the two-level bucket_insert/bucket_erase
+// shape model.h's by_cached_field_/by_cached_reference_ actually use
+// (PersistentMap<string, PersistentSet<uint64_t, Hash>, StringHash>). Each
+// runs against its OWN TrackingResource; the CHECK_EQ(live.size(), 0) at the
+// end of each is the leak proof, and mismatches/unknown_frees catch a
+// size/alignment bug directly rather than relying on ASan to notice.
+TEST(heavy_churn_leaves_no_leaks_and_every_deallocation_matches_its_allocation) {
+    std::mt19937_64 rng(0xC0FFEE);
+
+    // Shape 1: perfect-hash Id-like set (NoChain Leaf, model::by_type_'s shape).
+    {
+        TrackingResource mem;
+        PersistentSet<std::uint64_t, PerfectU64Hash> s(&mem);
+        std::unordered_set<std::uint64_t> ref;
+        for (int i = 0; i < 20000; ++i) {
+            std::uint64_t k = rng() % 3000;
+            if (rng() % 3 == 0 && !ref.empty()) {
+                s = s.erase(k);
+                ref.erase(k);
+            } else {
+                s = s.insert(k);
+                ref.insert(k);
+            }
+        }
+        for (std::uint64_t k : ref) CHECK(s.contains(k));
+        CHECK_EQ(s.size(), ref.size());
+        CHECK_EQ(mem.mismatches, 0u);
+        CHECK_EQ(mem.unknown_frees, 0u);
+
+        // Drop the last reference explicitly (mem outlives s by declaration
+        // order, so its own destructor can't see this) -- proves every Node
+        // and every Leaf this run built was actually freed, not just that
+        // allocate/deallocate counts matched.
+        s = PersistentSet<std::uint64_t, PerfectU64Hash>(&mem);
+        CHECK_EQ(mem.live.size(), 0u);
+    }
+
+    // Shape 2: string-keyed map forced into real collision chains (ClashHash
+    // -- non-perfect Hash, real unique_ptr<const Leaf> tail links, and
+    // RcHandle heads built via chain_set/chain_erase's non-perfect branch).
+    {
+        struct ClashStringHash {
+            std::uint64_t operator()(const std::string& k) const noexcept {
+                return StringHash{}(k) % 5;
+            }
+        };
+        TrackingResource mem;
+        PersistentMap<std::string, int, ClashStringHash> m(&mem);
+        std::unordered_map<std::string, int> ref;
+        for (int i = 0; i < 20000; ++i) {
+            std::string k = std::to_string(rng() % 2000);
+            if (rng() % 3 == 0 && !ref.empty()) {
+                m = m.erase(k);
+                ref.erase(k);
+            } else {
+                int v = static_cast<int>(rng() % 1000000);
+                m = m.set(k, v);
+                ref[k] = v;
+            }
+        }
+        for (auto& [k, v] : ref) {
+            const int* got = m.get(k);
+            CHECK(got != nullptr);
+            if (got) CHECK_EQ(*got, v);
+        }
+        CHECK_EQ(m.size(), ref.size());
+        CHECK_EQ(mem.mismatches, 0u);
+        CHECK_EQ(mem.unknown_frees, 0u);
+
+        m = PersistentMap<std::string, int, ClashStringHash>(&mem);
+        CHECK_EQ(mem.live.size(), 0u);
+    }
+
+    // Shape 3: the two-level bucket_insert/bucket_erase shape model.h's
+    // by_cached_field_/by_cached_reference_ actually use -- outer leaves are
+    // pair<string, PersistentSet<...>> (a real chain link, non-perfect outer
+    // Hash), inner leaves are perfect-hash Id-like. Both TrieCore
+    // instantiations (outer map, inner sets) share ONE TrackingResource, so
+    // a bug that only shows up when outer and inner allocations interleave
+    // through the same resource (e.g. a stale mem_ carried into the wrong
+    // lineage) would show up here even if the single-level shapes above
+    // don't catch it.
+    {
+        TrackingResource mem;
+        using Bucket = PersistentSet<std::uint64_t, PerfectU64Hash>;
+        PersistentMap<std::string, Bucket, StringHash> outer(&mem);
+        std::unordered_map<std::string, std::unordered_set<std::uint64_t>> ref;
+        for (int i = 0; i < 20000; ++i) {
+            std::string key = "bucket" + std::to_string(rng() % 50);
+            std::uint64_t v = rng() % 5000;
+            if (rng() % 3 == 0) {
+                outer = bucket_erase(outer, key, v);
+                ref[key].erase(v);
+            } else {
+                outer = bucket_insert(outer, key, v, &mem);
+                ref[key].insert(v);
+            }
+        }
+        for (auto& [key, members] : ref) {
+            const Bucket* b = outer.get(key);
+            if (members.empty()) {
+                CHECK(b == nullptr || b->empty());
+                continue;
+            }
+            CHECK(b != nullptr);
+            if (!b) continue;
+            CHECK_EQ(b->size(), members.size());
+            for (std::uint64_t v : members) CHECK(b->contains(v));
+        }
+        CHECK_EQ(mem.mismatches, 0u);
+        CHECK_EQ(mem.unknown_frees, 0u);
+
+        outer = PersistentMap<std::string, Bucket, StringHash>(&mem);
+        CHECK_EQ(mem.live.size(), 0u);
+    }
+}
+
+// Structural sharing under TrackingResource: keep EVERY intermediate version
+// of a long derivation chain alive (in a vector, so none of them can be
+// mutated in place -- see PersistentMap::set's own "NOT ALWAYS A REAL CLONE"
+// warning), verify every one of them still reads back correctly at the end
+// (proving no version was corrupted by a later one's in-place mutation
+// leaking across a shared node), THEN drop them one at a time and confirm
+// `live` only ever shrinks (never grows, never goes negative/inconsistent)
+// and reaches exactly zero once the last one drops. A refcount bug that
+// frees a still-shared node early would corrupt an EARLIER entry in
+// `versions` before this loop ever gets to it; a refcount bug that never
+// frees would leave `live` non-empty at the very end.
+TEST(every_retained_version_in_a_long_derivation_chain_stays_correct_until_dropped) {
+    TrackingResource mem;
+    using PMap = PersistentMap<std::uint64_t, std::uint64_t, PerfectU64Hash>;
+    std::vector<PMap> versions;
+    PMap cur(&mem);
+    constexpr int kSteps = 4000;
+    versions.reserve(kSteps + 1);
+    versions.push_back(cur);  // version 0: empty
+    for (int i = 0; i < kSteps; ++i) {
+        cur = cur.set(static_cast<std::uint64_t>(i), static_cast<std::uint64_t>(i) * 2);
+        if (i % 5 == 4) cur = cur.erase(static_cast<std::uint64_t>(i - 3));
+        versions.push_back(cur);  // retained: cur is never reused for the next .set() in place
+    }
+
+    // Every retained version must still show EXACTLY the keys it should:
+    // version[i] holds i .set() calls' worth of history (0..i-1), with the
+    // same erases applied up through step i-1 -- reconstruct the same
+    // reference incrementally and compare at each step, so a corruption of
+    // version[500] by something that happens at step 1000 would be caught
+    // right here, not masked by only checking the final version.
+    std::unordered_map<std::uint64_t, std::uint64_t> ref;
+    CHECK_EQ(versions[0].size(), 0u);
+    for (int i = 0; i < kSteps; ++i) {
+        ref[static_cast<std::uint64_t>(i)] = static_cast<std::uint64_t>(i) * 2;
+        if (i % 5 == 4) ref.erase(static_cast<std::uint64_t>(i - 3));
+        const PMap& v = versions[static_cast<std::size_t>(i) + 1];
+        CHECK_EQ(v.size(), ref.size());
+        for (auto& [k, val] : ref) {
+            const std::uint64_t* got = v.get(k);
+            CHECK(got != nullptr);
+            if (got) CHECK_EQ(*got, val);
+        }
+    }
+
+    const std::size_t live_before_drop = mem.live.size();
+    CHECK(live_before_drop > 0);  // the whole point: versions ARE sharing real allocations
+
+    // Drop from the front: the OLDEST versions typically hold the nodes with
+    // the fewest other versions still referencing them (later versions'
+    // path-copies replaced their own ancestors' nodes, not the oldest
+    // shared spine), so this ordering exercises "free while many later
+    // siblings still hold the same deep-shared nodes" -- the scenario
+    // set_in's mutate-in-place fast path exists specifically to never
+    // corrupt (see its own long comment in persistent_map.h).
+    for (auto& v : versions) {
+        v = PMap(&mem);  // drop this slot's reference; replace with a fresh empty (still same mem)
+        CHECK(mem.live.size() <= live_before_drop);
+    }
+    versions.clear();
+    // `cur` still aliases the same final version `versions.back()` held
+    // (every PersistentMap::set() call reassigned it, never copied away
+    // from it) -- drop its reference too, or the last version's nodes look
+    // like a leak when they're actually just still reachable from here.
+    cur = PMap(&mem);
+    CHECK_EQ(mem.live.size(), 0u);
+    CHECK_EQ(mem.mismatches, 0u);
+    CHECK_EQ(mem.unknown_frees, 0u);
+}
+
+// Self-assignment and self-move-assignment: RcHandle's copy-assignment uses
+// copy-and-swap (a temporary copy, then swap) specifically so `this == &o`
+// is never a special case that has to be gotten right by hand; its move-
+// assignment DOES check `this != &o` explicitly (persistent_map.h). Both
+// paths are only reachable through PersistentMap/PersistentSet's own
+// (implicitly defaulted) copy/move assignment, which is what this test
+// actually calls -- proving the guard is real, not just present in the
+// source, by making self-assignment through the public API leave the value
+// unchanged and still fully correct afterward.
+TEST(self_assignment_and_self_move_assignment_are_safe_and_leave_the_map_unchanged) {
+    PersistentMap<std::uint64_t, int, PerfectU64Hash> m;
+    for (std::uint64_t k = 0; k < 200; ++k) m = m.set(k, static_cast<int>(k) * 3);
+
+    m = m;  // self copy-assignment
+    CHECK_EQ(m.size(), 200u);
+    for (std::uint64_t k = 0; k < 200; ++k) {
+        const int* got = m.get(k);
+        CHECK(got != nullptr);
+        if (got) CHECK_EQ(*got, static_cast<int>(k) * 3);
+    }
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wself-move"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
+#endif
+    m = std::move(m);  // self move-assignment
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    CHECK_EQ(m.size(), 200u);
+    for (std::uint64_t k = 0; k < 200; ++k) {
+        const int* got = m.get(k);
+        CHECK(got != nullptr);
+        if (got) CHECK_EQ(*got, static_cast<int>(k) * 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: RcHandle's refcount is a hand-rolled std::atomic<uint32_t>
+// (relaxed increment on copy, acq_rel decrement-and-maybe-free on release --
+// persistent_map.h), unlike shared_ptr's standard-library implementation,
+// which never needed a project-level concurrency test of its own. These two
+// tests are new coverage that didn't need to exist before this type did.
+// Both are meaningful only under ThreadSanitizer (ctest --preset tsan builds
+// and runs this whole file) -- that is what actually proves "no data race,"
+// not passing under the default preset, which only proves "didn't crash."
+
+// Pure copy/destroy race, no writer at all: many threads repeatedly COPY the
+// SAME already-published PersistentSet, read every entry, and let their copy
+// drop -- hammering concurrent increment (copy) and decrement (destroy) of
+// the identical shared Node/Leaf chain from every thread simultaneously, the
+// most direct exercise of RcHandle's atomic correctness there is. If the
+// refcount's memory ordering were wrong (e.g. a relaxed decrement instead of
+// acq_rel, or no acquire fence before the final free), this is the shape of
+// test that would show it: under TSan as a reported race, or in principle
+// (though not reliably) as a use-after-free/corrupted read under ASan.
+TEST(concurrent_copy_and_destroy_of_the_same_published_set_from_many_threads_never_races) {
+    using PSet = PersistentSet<std::uint64_t, PerfectU64Hash>;
+    PSet base;
+    constexpr std::uint64_t kN = 3000;
+    for (std::uint64_t i = 0; i < kN; ++i) base = base.insert(i);
+
+    constexpr int kThreads = 8;
+    constexpr int kItersPerThread = 200;
+    std::atomic<std::uint64_t> total_seen{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            for (int i = 0; i < kItersPerThread; ++i) {
+                PSet copy = base;  // concurrent RcHandle copy (refcount increment) with every other thread
+                std::uint64_t count = 0;
+                for (std::uint64_t k : copy) {
+                    (void)k;
+                    ++count;
+                }
+                CHECK_EQ(count, kN);
+                total_seen.fetch_add(count, std::memory_order_relaxed);
+                // `copy` drops here: concurrent RcHandle release (refcount
+                // decrement, and on some thread eventually the real free)
+                // with every other thread doing the same.
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    CHECK_EQ(total_seen.load(), static_cast<std::uint64_t>(kThreads) * kItersPerThread * kN);
+
+    // base itself must still be fully intact: nothing any reader thread did
+    // (each held its OWN copy) should have touched the original.
+    CHECK_EQ(base.size(), kN);
+    for (std::uint64_t i = 0; i < kN; ++i) CHECK(base.contains(i));
+}
+
+// Realistic end-to-end pattern: ONE writer thread sequentially derives new
+// versions (set()/erase(), one at a time -- never two derivations of the
+// same lineage running concurrently, matching Model's own commit_mu_
+// serialization) and publishes each via an atomic shared_ptr swap, while
+// several reader threads concurrently load the CURRENT published version,
+// copy it, verify it's internally consistent, and drop it -- exactly
+// Model's actual contract (readers only ever see a version AFTER it was
+// fully derived and published, never mid-derivation), reproduced here
+// without Model at all so a race is attributable to RcHandle specifically
+// rather than to anything Model's own locking does.
+TEST(concurrent_writer_publishing_new_versions_and_readers_copying_them_never_races) {
+    using PSet = PersistentSet<std::uint64_t, PerfectU64Hash>;
+    constexpr std::uint64_t kWriterSteps = 4000;
+    std::atomic<std::shared_ptr<const PSet>> published{std::make_shared<const PSet>()};
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> reader_iterations{0};
+
+    constexpr int kReaders = 6;
+    std::vector<std::thread> readers;
+    readers.reserve(kReaders);
+    for (int r = 0; r < kReaders; ++r) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_acquire)) {
+                std::shared_ptr<const PSet> snap = published.load(std::memory_order_acquire);
+                PSet copy = *snap;  // RcHandle copy, racing the writer's own derivation
+                // Internal consistency: every element in [0, size) that the
+                // writer's monotonic insert sequence guarantees was inserted
+                // by the time `size` reached its current value must still be
+                // present -- a corrupted/partially-freed copy would show up
+                // here as a missing or wrong member, not just a crash.
+                std::uint64_t seen = 0;
+                for (std::uint64_t k : copy) {
+                    CHECK(k < kWriterSteps);
+                    ++seen;
+                }
+                CHECK_EQ(seen, copy.size());
+                reader_iterations.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    PSet cur;
+    for (std::uint64_t i = 0; i < kWriterSteps; ++i) {
+        cur = cur.insert(i);
+        published.store(std::make_shared<const PSet>(cur), std::memory_order_release);
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& th : readers) th.join();
+
+    CHECK(reader_iterations.load() > 0);  // sanity: readers actually raced the writer, not a no-op
+    std::shared_ptr<const PSet> final_snap = published.load();
+    CHECK_EQ(final_snap->size(), kWriterSteps);
+    for (std::uint64_t i = 0; i < kWriterSteps; ++i) CHECK(final_snap->contains(i));
 }

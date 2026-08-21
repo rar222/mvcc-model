@@ -270,6 +270,15 @@ TEST(commit_bulk_without_undo_asserts_if_a_snapshot_is_still_live) {
 // a Model that's already fully torn down -- which crashes for a reason
 // unrelated to whatever this test is meant to be checking, and would show
 // up as a flaky, confusing failure here rather than a clean signal.
+// WARNING: KNOWN TO BE UNRELIABLE
+// Observed failing once under `ctest --preset asan` on 2026-08-21, while running
+// alongside the rest of the suite; 15/15 reruns of this test alone (same asan
+// binary) then passed cleanly. Matches the race this test's own comment above
+// already describes as inherent and unfixable (the 5ms sleep is a bias, not a
+// guarantee) -- not caused by whatever change prompted the run that saw it fail.
+// A real regression would fail repeatedly when rerun alone, not just once under
+// system load; if it does, suspect Model's reaper/wait_for_reclamation lifecycle,
+// not whatever unrelated change happened to be in flight when this was last seen.
 TEST(wait_for_reclamation_callers_in_flight_when_model_is_destroyed_complete_safely) {
     constexpr int kAttempts = 10;
     constexpr int kWaiters = 8;

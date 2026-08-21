@@ -629,10 +629,22 @@ TEST(single_field_commit_latency_stays_bounded_as_total_model_size_grows) {
     // with a huge constant -- at n=100,000 that is milliseconds, ~1000x the
     // smallest-size reading. A 20x ceiling over a 16x size increase clears
     // the observed noise and still fails that outright.
-    std::printf("    %-24s %7d -> %7d objects (16x): %.5f ms -> %.5f ms (ceiling %.5f)\n",
+    //
+    // Same escape hatch as the hub-referrer test below, for the same reason:
+    // ms_per_commit.front() is itself a best-of-5 reading of a ~us-scale
+    // quantity, so it can occasionally land anomalously low and tighten a
+    // ratio-only ceiling instead of loosening it. kAbsoluteCeilingMs is well
+    // above the documented normal range (6-15 us total per this comment) but
+    // orders of magnitude below the "milliseconds" a real regression would
+    // produce.
+    constexpr double kAbsoluteCeilingMs = 0.05;
+    std::printf("    %-24s %7d -> %7d objects (16x): %.5f ms -> %.5f ms (ceiling %.5f or <= %.3f ms)\n",
                 "single-field commit", sizes.front(), sizes.back(), ms_per_commit.front(),
-                ms_per_commit.back(), ms_per_commit.front() * 20.0);
-    if (kAssertTimings) CHECK(ms_per_commit.back() <= ms_per_commit.front() * 20.0);
+                ms_per_commit.back(), ms_per_commit.front() * 20.0, kAbsoluteCeilingMs);
+    if (kAssertTimings) {
+        CHECK(ms_per_commit.back() <= ms_per_commit.front() * 20.0 ||
+              ms_per_commit.back() <= kAbsoluteCeilingMs);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -992,10 +1004,29 @@ TEST(worst_case_removing_one_referrer_of_a_hub_scales_with_hub_fanout) {
     // not produce a blowup: quadratic would be ~256x. A 10x ceiling clears
     // the observed noise by a wide margin and still fails loudly on a real
     // complexity regression.
-    std::printf("    %-24s %7d -> %7d fanout (16x): %.4f ms -> %.4f ms (ceiling %.4f)\n",
+    //
+    // That ceiling is relative to times_ms.front() -- the small-fanout
+    // baseline -- which is itself a best-of-5 measurement and therefore
+    // occasionally landing anomalously LOW (an unusually lucky trial: no
+    // preemption, warm cache) rather than high. When that happens the ratio
+    // ceiling tightens instead of loosening, and a completely ordinary
+    // times_ms.back() fails it -- observed directly: front() at ~0.017-0.018
+    // ms (about half its usual ~0.03 ms) against a back() of ~0.18 ms, its
+    // normal value every other run. So the real question this test asks --
+    // "did the worst case get dramatically worse?" -- is already answered
+    // once times_ms.back() itself is still small in absolute terms,
+    // independent of what the noisy baseline happened to do. kAbsoluteCeilingMs
+    // is a generous multiple of every observed times_ms.back() (~0.17-0.33 ms
+    // across repeated runs) -- comfortably below where a real quadratic
+    // blowup would land (~256x front, i.e. tens of ms) but well above any
+    // baseline-jitter false failure.
+    constexpr double kAbsoluteCeilingMs = 2.0;
+    std::printf("    %-24s %7d -> %7d fanout (16x): %.4f ms -> %.4f ms (ceiling %.4f or <= %.1f ms)\n",
                 "remove one hub referrer", fanouts.front(), fanouts.back(), times_ms.front(),
-                times_ms.back(), times_ms.front() * 10.0);
-    if (kAssertTimings) CHECK(times_ms.back() <= times_ms.front() * 10.0);
+                times_ms.back(), times_ms.front() * 10.0, kAbsoluteCeilingMs);
+    if (kAssertTimings) {
+        CHECK(times_ms.back() <= times_ms.front() * 10.0 || times_ms.back() <= kAbsoluteCeilingMs);
+    }
 }
 
 // Removing the hub ITSELF (rather than one of its referrers, as the test
