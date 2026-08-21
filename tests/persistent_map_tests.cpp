@@ -999,6 +999,85 @@ TEST(erase_of_absent_key_allocates_nothing_and_shares_the_original_root) {
     CHECK(after_real.get(std::uint64_t{7}) == nullptr);
 }
 
+// Leaf-root fast path (persistent_map.h's root_is_leaf_): a trie holding
+// exactly one entry stores it as a bare Leaf, no Node -- proven here the
+// same way the no-op-erase test above proves its own allocation shape, via
+// CountingResource.
+TEST(single_entry_set_and_insert_cost_exactly_one_allocation) {
+    CountingResource mem;
+    PersistentMap<std::uint64_t, int, U64Hash> m(&mem);
+    m = m.set(std::uint64_t{1}, 100);
+    CHECK_EQ(mem.allocations, 1u);  // just the Leaf; no Node
+    CHECK(m.get(std::uint64_t{1}) && *m.get(std::uint64_t{1}) == 100);
+    CHECK_EQ(m.size(), 1u);
+
+    CountingResource smem;
+    PersistentSet<std::uint64_t, U64Hash> s(&smem);
+    s = s.insert(std::uint64_t{1});
+    CHECK_EQ(smem.allocations, 1u);
+    CHECK(s.contains(std::uint64_t{1}));
+}
+
+// A second insert must push the leaf-root down into a proper Node -- both
+// entries still resolve regardless of whether the new key's top-level hash
+// slice differs from the existing leaf's (U64Hash) or collides with it,
+// forcing a further push-down one level deeper (ClashHash: 1 % 3 == 4 % 3).
+TEST(second_distinct_key_pushes_leaf_root_into_a_node_both_entries_found) {
+    PersistentMap<std::uint64_t, int, U64Hash> m;
+    m = m.set(std::uint64_t{1}, 100);
+    m = m.set(std::uint64_t{2}, 200);
+    CHECK_EQ(m.size(), 2u);
+    CHECK(m.get(std::uint64_t{1}) && *m.get(std::uint64_t{1}) == 100);
+    CHECK(m.get(std::uint64_t{2}) && *m.get(std::uint64_t{2}) == 200);
+
+    PersistentMap<std::uint64_t, int, ClashHash> cm;
+    cm = cm.set(std::uint64_t{1}, 10);
+    cm = cm.set(std::uint64_t{4}, 40);  // same hash as 1 under ClashHash
+    CHECK_EQ(cm.size(), 2u);
+    CHECK(cm.get(std::uint64_t{1}) && *cm.get(std::uint64_t{1}) == 10);
+    CHECK(cm.get(std::uint64_t{4}) && *cm.get(std::uint64_t{4}) == 40);
+}
+
+TEST(erase_only_entry_returns_to_true_empty_with_zero_allocation) {
+    CountingResource mem;
+    PersistentMap<std::uint64_t, int, U64Hash> m(&mem);
+    m = m.set(std::uint64_t{1}, 100);
+    const std::size_t before = mem.allocations;
+    m = m.erase(std::uint64_t{1});
+    CHECK_EQ(mem.allocations, before);  // erase-to-empty allocates nothing
+    CHECK_EQ(m.size(), 0u);
+    CHECK(m.empty());
+    CHECK(m.get(std::uint64_t{1}) == nullptr);
+
+    // Re-inserting after draining to empty must still take the 1-allocation
+    // leaf-root fast path -- proves root_is_leaf_ was reset to false on the
+    // true-empty transition, not left stale.
+    const std::size_t before2 = mem.allocations;
+    m = m.set(std::uint64_t{2}, 200);
+    CHECK_EQ(mem.allocations, before2 + 1);
+}
+
+TEST(erase_absent_key_from_leaf_root_is_zero_allocation_noop) {
+    CountingResource mem;
+    PersistentMap<std::uint64_t, int, U64Hash> m(&mem);
+    m = m.set(std::uint64_t{1}, 100);
+    const std::size_t before = mem.allocations;
+    PersistentMap<std::uint64_t, int, U64Hash> after = m.erase(std::uint64_t{999999});
+    CHECK_EQ(mem.allocations, before);
+    CHECK_EQ(after.size(), m.size());
+    CHECK(after.get(std::uint64_t{1}) && *after.get(std::uint64_t{1}) == 100);
+}
+
+TEST(slot_stats_reports_leaf_root_as_zero_nodes_one_leaf) {
+    PersistentMap<std::uint64_t, int, U64Hash> m;
+    m = m.set(std::uint64_t{1}, 100);
+    SlotStats ss = m.slot_stats();
+    CHECK_EQ(ss.node_count, 0u);
+    CHECK_EQ(ss.leaf_count, 1u);
+    CHECK_EQ(ss.total_capacity, 0u);
+    CHECK_EQ(ss.total_size, 0u);
+}
+
 // chain_set's kPerfectHash branch trusts its caller's promise (Hash::
 // is_perfect == true) unconditionally -- no per-entry key comparison, unlike
 // erase_in, which only ever calls chain_erase() after leaf_get() has already
@@ -1247,6 +1326,27 @@ TEST(range_for_set_perfect_u64_hash_matches_for_each) {
 TEST(range_for_set_clash_hash_matches_for_each) {
     check_set_range_for_matches_for_each<std::uint64_t, ClashHash>(
         "ClashHash", 500, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+
+// n=1: the leaf-root case (root_is_leaf_) -- begin()/iterator's dedicated
+// Leaf-chain constructor (persistent_map.h), not exercised by the n=500
+// runs above, which never leave root_ as a bare Leaf. Same three Leaf/chain
+// shapes (ordinary, perfect/NoChain, colliding) as the n=500 block.
+TEST(range_for_map_u64_hash_single_entry_matches_for_each) {
+    check_map_range_for_matches_for_each<std::uint64_t, U64Hash>(
+        "U64Hash/n=1", 1, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(range_for_map_perfect_u64_hash_single_entry_matches_for_each) {
+    check_map_range_for_matches_for_each<std::uint64_t, PerfectU64Hash>(
+        "PerfectU64Hash/n=1", 1, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(range_for_map_clash_hash_single_entry_matches_for_each) {
+    check_map_range_for_matches_for_each<std::uint64_t, ClashHash>(
+        "ClashHash/n=1", 1, [](int i) { return static_cast<std::uint64_t>(i); });
+}
+TEST(range_for_set_u64_hash_single_entry_matches_for_each) {
+    check_set_range_for_matches_for_each<std::uint64_t, U64Hash>(
+        "U64Hash/n=1", 1, [](int i) { return static_cast<std::uint64_t>(i); });
 }
 
 // Speed: set()/contains() latency must grow like O(log32 n), not O(n), as

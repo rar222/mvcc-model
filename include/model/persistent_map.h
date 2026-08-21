@@ -292,7 +292,29 @@ class TrieCore {
     // the very check that fast path relies on always see "shared." Keeping
     // root_ pre-erased means passing it costs nothing beyond a reference.
     std::shared_ptr<const void> root_;
-    std::size_t size_ = 0;
+
+    // uint32_t, not size_t: every TrieCore instance counts some subset of
+    // the model's live objects or distinct field values, so it's bounded by
+    // the SAME 2^31 ceiling Id::index already imposes (model.h's own
+    // comment on Id: "index gives 2^31 usable slots... Do not 'future-
+    // proof' this"). A uint32_t ceiling (2^32) sits above that structural
+    // limit, so Id::index exhausts first -- size_ can never be the binding
+    // constraint. Narrowing it (paired with root_is_leaf_ right below)
+    // costs nothing: the 3 bytes of alignment padding before mem_ (which
+    // still needs 8-byte alignment) absorb both fields for free -- see the
+    // static_assert below TrieCore's members.
+    std::uint32_t size_ = 0;
+
+    // Whether `root_` is a bare Leaf rather than a Node -- the fast path
+    // for a trie holding exactly one entry (or, under a non-perfect Hash,
+    // one hash-colliding chain), which otherwise pays for a whole Node
+    // (bitmap + is_leaf + a vector<shared_ptr<const void>>) just to hold a
+    // single child. Every entry point that walks from root_ (set_entry,
+    // erase_key, get_entry, each_entry/each_entry_short_circuit,
+    // slot_stats, begin()) branches on this before falling back to the
+    // existing as_node(root_)-based path; set_in/erase_in themselves are
+    // never called with a leaf root -- see set_entry/erase_key.
+    bool root_is_leaf_ = false;
 
     /// Where this instance's Node/Leaf HEAD allocations come
     /// from (the shared_ptr ones stored in Node::slots -- never the
@@ -330,8 +352,20 @@ class TrieCore {
     /// recursive call.
     std::pmr::memory_resource* mem_ = nullptr;
 
-    explicit TrieCore(std::shared_ptr<const void> r, std::size_t n, std::pmr::memory_resource* mem)
-        : root_(std::move(r)), size_(n), mem_(mem) {}
+    explicit TrieCore(std::shared_ptr<const void> r, std::uint32_t n, std::pmr::memory_resource* mem,
+                       bool leaf_root)
+        : root_(std::move(r)), size_(n), root_is_leaf_(leaf_root), mem_(mem) {
+        // Compiler-checked, not just reasoned about: root_/size_/
+        // root_is_leaf_/mem_ pack into exactly 32 bytes (root_ 16B + size_
+        // 4B + root_is_leaf_ 1B + 3B alignment padding before mem_'s 8B --
+        // see size_/root_is_leaf_'s own comments). sizeof(TrieCore) needs a
+        // complete-class context, which a constructor body is and the
+        // member-declaration region above is not -- hence checking it here
+        // rather than immediately after the members.
+        static_assert(sizeof(TrieCore) == 32,
+                      "root_/size_/root_is_leaf_/mem_ no longer pack into 32B -- see their own "
+                      "comments before adding padding back");
+    }
 
     // Return a new node equal to `n` but with slot `pos` replaced/inserted.
     // mem_ == nullptr => plain make_shared (today's behavior, and every
@@ -784,15 +818,47 @@ public:
     bool empty() const noexcept { return size_ == 0; }
 
     /// Returns a new core with key -> entry. O(log32 n) node allocations;
-    /// shares the rest of the structure with `*this`.
+    /// shares the rest of the structure with `*this`. Two fast paths avoid
+    /// ever allocating a Node to hold a single child -- see root_is_leaf_'s
+    /// own comment: a true-empty root promotes straight to a bare Leaf, and
+    /// an existing leaf-root either updates in place (same hash) or gets
+    /// wrapped in a freshly synthesized one-slot Node before handing off to
+    /// the UNMODIFIED set_in() (different hash) -- the exact push-down
+    /// set_in already performs for an interior leaf slot (see its "Slot
+    /// holds a leaf... different hash" branch), just rooted at shift 0.
     TrieCore set_entry(const K& key, const Entry& entry) const {
         bool added = false;
+        const std::uint64_t hash = hash_key(key);
+
+        if (!root_) {
+            auto lf = make_leaf(entry, ChainLink{});
+            return TrieCore(std::move(lf), 1, mem_, /*leaf_root=*/true);
+        }
+
+        if (root_is_leaf_) {
+            const Leaf* lf = as_leaf(root_);
+            const std::uint64_t lf_hash = entry_hash(lf->entry);
+            if (lf_hash == hash) {
+                auto new_leaf = chain_set(lf, key, entry, added);
+                return TrieCore(std::move(new_leaf), size_ + (added ? 1 : 0), mem_,
+                                /*leaf_root=*/true);
+            }
+            auto node = clone_node(nullptr);
+            const std::uint32_t exist_idx = slice(lf_hash, 0);
+            node->bitmap = bit(exist_idx);
+            node->is_leaf = bit(exist_idx);
+            node->slots.push_back(root_);  // reuse the existing Leaf, no clone
+            std::shared_ptr<const void> node_owner = std::move(node);
+            auto r = set_in(node_owner, /*parent_private=*/true, hash, 0, key, entry, added);
+            return TrieCore(std::move(r), size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false);
+        }
+
         // root_ itself, NOT root_.get()/as_node(root_): set_in needs the
         // actual shared_ptr (by reference, no copy) to check use_count() --
         // see its own doc comment. parent_private=true: there is no
         // ancestor above the root to be shared with.
-        auto r = set_in(root_, /*parent_private=*/true, hash_key(key), 0, key, entry, added);
-        return TrieCore(r, size_ + (added ? 1 : 0), mem_);
+        auto r = set_in(root_, /*parent_private=*/true, hash, 0, key, entry, added);
+        return TrieCore(r, size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false);
     }
 
     /// Returns a new core without `key` (or, if absent, THE SAME core,
@@ -800,24 +866,49 @@ public:
     /// aliasing it: erase_in returns `owner` untouched all the way up when
     /// nothing was found, so an absent key costs one shared_ptr copy, zero
     /// node allocations, same as get()'s cost shape. See erase_in's own
-    /// comment.
+    /// comment. Does NOT collapse an interior Node back into a leaf-root
+    /// when erase shrinks it to one entry -- matches this trie's existing
+    /// policy of never path-collapsing on erase (see erase_in's own
+    /// comment); a leaf-root only ever arises via set_entry's 0->1
+    /// transition.
     TrieCore erase_key(const K& key) const {
         bool removed = false;
-        auto r = erase_in(root_, hash_key(key), 0, key, removed);
-        return TrieCore(std::move(r), size_ - (removed ? 1 : 0), mem_);
+        const std::uint64_t hash = hash_key(key);
+
+        if (root_is_leaf_) {
+            const Leaf* lf = as_leaf(root_);
+            if (!leaf_get(lf, key)) return *this;  // absent: no-op, zero allocation
+            removed = true;
+            auto nl = chain_erase(lf, key);
+            if (nl) return TrieCore(std::move(nl), size_ - 1, mem_, /*leaf_root=*/true);
+            return TrieCore(nullptr, 0, mem_, /*leaf_root=*/false);
+        }
+
+        auto r = erase_in(root_, hash, 0, key, removed);
+        return TrieCore(std::move(r), size_ - (removed ? 1 : 0), mem_, /*leaf_root=*/false);
     }
 
     const Entry* get_entry(const K& key) const {
+        if (root_is_leaf_) return leaf_get(as_leaf(root_), key);
         return get_in(as_node(root_), hash_key(key), 0, key);
     }
 
     template <class F>
     void each_entry(F&& f) const {
+        if (root_is_leaf_) {
+            for (const Leaf* l = as_leaf(root_); l; l = l->next.get()) f(l->entry);
+            return;
+        }
         each_in(as_node(root_), f);
     }
 
     template <class F>
     bool each_entry_short_circuit(F&& f) const {
+        if (root_is_leaf_) {
+            for (const Leaf* l = as_leaf(root_); l; l = l->next.get())
+                if (!f(l->entry)) return false;
+            return true;
+        }
         return each_in_short_circuit(as_node(root_), f);
     }
 
@@ -829,6 +920,10 @@ public:
     /// doc comment in model.h.
     SlotStats slot_stats() const {
         SlotStats s;
+        if (root_is_leaf_) {
+            ++s.leaf_count;  // no Node at all -- that's the entire point of root_is_leaf_
+            return s;
+        }
         walk_slot_stats(as_node(root_), s);
         return s;
     }
@@ -919,6 +1014,12 @@ public:
             }
         }
 
+        // root_is_leaf_ case: no Frame to push (there is no Node), so
+        // depth_ stays 0 -- advance()'s `while (depth_ > 0)` is then a
+        // no-op once the chain is exhausted, landing correctly on the same
+        // (chain_==nullptr, depth_==0) state end() already uses.
+        explicit iterator(const Leaf* chain) noexcept : chain_(chain) {}
+
         // Moves to the next entry (or to the end state -- chain_ == nullptr,
         // depth_ == 0 -- if none remain). Exactly each_in_short_circuit's
         // walk, just paused/resumed via `stack_`/`chain_` instead of
@@ -954,7 +1055,10 @@ public:
         const Leaf* chain_ = nullptr;
     };
 
-    iterator begin() const { return iterator(as_node(root_)); }
+    iterator begin() const {
+        if (root_is_leaf_) return iterator(as_leaf(root_));
+        return iterator(as_node(root_));
+    }
     iterator end() const { return iterator(); }
 };
 
