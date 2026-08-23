@@ -1015,6 +1015,65 @@ TEST(perfect_hash_map_persists_old_version_across_derived_edits) {
     CHECK_EQ(pb.size(), std::size_t{1000});
 }
 
+// pmap::IdentityHash64 (persistent_map.h) is production code, not a test-local
+// stand-in like PerfectU64Hash above -- model.h's cached-field bucket-merge
+// keys its merged map by a precomputed uint64_t prefix via exactly this Hash.
+// Same differential-churn shape as perfect_hash_map_random_churn_matches_
+// unordered_map, proving it behaves correctly as an ordinary perfect Hash
+// (identity is trivially injective, so this is really confirming the
+// plumbing, not the injectivity claim itself).
+TEST(identity_hash64_map_random_churn_matches_unordered_map) {
+    std::mt19937 rng(2024);
+    PersistentMap<std::uint64_t, int, IdentityHash64> pm;
+    std::unordered_map<std::uint64_t, int> ref;
+    const int base = g_failures;
+    auto check_equal = [&](const char* where) {
+        if (pm.size() != ref.size()) {
+            std::printf("IDENTITY64-MAP SIZE MISMATCH at %s: pm=%zu ref=%zu\n", where, pm.size(),
+                        ref.size());
+            ++g_failures;
+        }
+        for (auto& [k, v] : ref) {
+            const int* p = pm.get(k);
+            if (!p || *p != v) {
+                std::printf("IDENTITY64-MAP GET MISMATCH at %s key=%" PRIu64 "\n", where, k);
+                ++g_failures;
+                return;
+            }
+        }
+    };
+    for (int i = 0; i < 20000 && g_failures == base; i++) {
+        const std::uint64_t k = rng() % 2000;
+        if (rng() % 3) {
+            const int v = static_cast<int>(rng());
+            pm = pm.set(k, v);
+            ref[k] = v;
+        } else {
+            pm = pm.erase(k);
+            ref.erase(k);
+        }
+        if (i % 500 == 0) check_equal("churn");
+    }
+    check_equal("final");
+}
+
+// chain_set's perfect-hash-violation assert (persistent_map.h) fires for any
+// Hash that lies about is_perfect -- LyingPerfectHash above already proves
+// this generically; this confirms IdentityHash64 itself, being a genuine
+// identity function, never trips it across real churn (i.e. that declaring
+// is_perfect on it wasn't a mistake this file can catch).
+TEST(identity_hash64_never_trips_the_perfect_hash_collision_assert) {
+    PersistentMap<std::uint64_t, int, IdentityHash64> pm;
+    for (std::uint64_t i = 0; i < 5000; i++) pm = pm.set(i, static_cast<int>(i));
+    for (std::uint64_t i = 0; i < 5000; i += 2) pm = pm.erase(i);
+    CHECK_EQ(pm.size(), std::size_t{2500});
+    for (std::uint64_t i = 1; i < 5000; i += 2) {
+        const int* p = pm.get(i);
+        CHECK(p != nullptr);
+        if (p) CHECK_EQ(*p, static_cast<int>(i));
+    }
+}
+
 TEST(perfect_hash_set_random_churn_matches_unordered_set) {
     std::mt19937 rng(99);
     PersistentSet<std::uint64_t, PerfectU64Hash> ps2;

@@ -10,6 +10,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "model/model.h"
@@ -1202,6 +1203,16 @@ public:
     std::string code;
     std::int64_t bucket = 0;
 
+    // Many-distinct-value fields for exercising by_cached_field_merged_'s
+    // bucket-merge specifically -- `bucket` above only ever holds 10 real
+    // values across a whole test run, too low-cardinality to reliably force
+    // two DIFFERENT values to land in the same coarse-routed leaf
+    // (~10*9/2/32768 chance at Coarse). These mirror `code`'s "one distinct
+    // value per object" pattern instead, at Coarse's 15-bit and VeryCoarse's
+    // 10-bit prefixes respectively -- see coarse_field_bucket_merge_actually_merges_leaves.
+    std::string coarse_field;
+    std::string very_coarse_field;
+
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
         v.key<&CoarseKeyed::code>(s.code, model::KeyLookupType::Coarse, "code");
@@ -1210,6 +1221,9 @@ public:
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
         v.field<&CoarseKeyed::bucket>(s.bucket, model::LookupType::Coarse, "bucket");
+        v.field<&CoarseKeyed::coarse_field>(s.coarse_field, model::LookupType::Coarse, "coarse_field");
+        v.field<&CoarseKeyed::very_coarse_field>(s.very_coarse_field, model::LookupType::VeryCoarse,
+                                                 "very_coarse_field");
     }
 };
 }  // namespace
@@ -1323,6 +1337,167 @@ TEST(coarse_routing_reconciles_reassigned_keys_correctly_under_forced_collisions
         const CoarseKeyed* found = after.find_by_key<&CoarseKeyed::code>("code" + std::to_string(i));
         CHECK(found != nullptr);
         if (found) CHECK_EQ(found->bucket, static_cast<std::int64_t>(i % 10));
+    }
+}
+
+// coarse_field/very_coarse_field (CoarseKeyed) are high-cardinality --
+// unlike `bucket`'s 10 real values, 2000 distinct values against Coarse's
+// 15-bit / VeryCoarse's 10-bit prefix space reliably force real
+// by_cached_field_merged_ merging (birthday-paradox expectation ~61
+// colliding pairs at Coarse, and VeryCoarse's 1024 buckets mean MOST of
+// 2000 values collide with something). Confirms find_by_field/
+// for_each_by_field/all_of_by_field/range_by_field/range_view_by_field all
+// stay exact -- no false positives from bucket-mates sharing a coarse
+// prefix -- for both fields simultaneously (proving by_cached_field_merged_
+// _shift_ keeps their two different widths from being mixed up, the one
+// correctness risk specific to sharing one map across levels).
+TEST(coarse_field_bucket_merge_stays_exact_with_real_merging) {
+    Model m;
+    constexpr int n = 2000;
+    Transaction txn = m.begin();
+    std::vector<Ref<CoarseKeyed>> local;
+    std::vector<std::string> coarse_values, very_coarse_values;
+    for (int i = 0; i < n; ++i) {
+        auto o = std::make_unique<CoarseKeyed>();
+        o->code = "code" + std::to_string(i);
+        o->coarse_field = "cf" + std::to_string(i);
+        o->very_coarse_field = "vcf" + std::to_string(i);
+        coarse_values.push_back(o->coarse_field);
+        very_coarse_values.push_back(o->very_coarse_field);
+        local.push_back(txn.create(std::move(o)));
+    }
+    const CommitResult res = commit_ok(m, txn);
+    std::vector<Ref<CoarseKeyed>> created;
+    for (auto& r : local) created.push_back(res.to_real(r));
+
+    // Sanity: confirm the chosen values actually force real prefix
+    // collisions -- otherwise this test would exercise the same path as
+    // the Exact case and prove nothing about merging specifically.
+    auto count_distinct_prefixes = [](const std::vector<std::string>& values, int shift) {
+        std::unordered_set<std::uint64_t> prefixes;
+        const std::uint64_t mask = (std::uint64_t{1} << shift) - 1;
+        for (const auto& v : values) prefixes.insert(pmap::StringHash{}(v) & mask);
+        return prefixes.size();
+    };
+    CHECK(count_distinct_prefixes(coarse_values, 15) < coarse_values.size());
+    CHECK(count_distinct_prefixes(very_coarse_values, 10) < very_coarse_values.size());
+
+    Snapshot s = m.snapshot();
+    for (int i = 0; i < n; ++i) {
+        const Id want = created[static_cast<std::size_t>(i)].id();
+
+        const auto by_coarse = s.find_by_field<&CoarseKeyed::coarse_field>(coarse_values[static_cast<std::size_t>(i)]);
+        CHECK_EQ(by_coarse.size(), std::size_t{1});
+        if (by_coarse.size() == 1) CHECK(by_coarse.front()->id == want);
+
+        const auto by_very_coarse =
+            s.find_by_field<&CoarseKeyed::very_coarse_field>(very_coarse_values[static_cast<std::size_t>(i)]);
+        CHECK_EQ(by_very_coarse.size(), std::size_t{1});
+        if (by_very_coarse.size() == 1) CHECK(by_very_coarse.front()->id == want);
+
+        // range_by_field/range_view_by_field exercise the OTHER filter path
+        // (FieldRange's filtered_/native comparison instead of a string
+        // resolve) -- needs its own direct coverage, not just find_by_field.
+        int range_count = 0;
+        for (const CoarseKeyed& o : s.range_by_field<&CoarseKeyed::coarse_field>(
+                 coarse_values[static_cast<std::size_t>(i)])) {
+            CHECK(o.id == want);
+            ++range_count;
+        }
+        CHECK_EQ(range_count, 1);
+    }
+
+    // for_each_by_field/all_of_by_field share cached_field_short_circuit_raw
+    // with find_by_field, but exercise it through their own entry points --
+    // spot-check a sample rather than all 2000 to keep this fast.
+    for (int i = 0; i < n; i += 137) {
+        int hits = 0;
+        s.for_each_by_field<&CoarseKeyed::coarse_field>(coarse_values[static_cast<std::size_t>(i)],
+                                                         [&](const CoarseKeyed& o) {
+                                                             CHECK(o.id == created[static_cast<std::size_t>(i)].id());
+                                                             ++hits;
+                                                         });
+        CHECK_EQ(hits, 1);
+        CHECK(s.all_of_by_field<&CoarseKeyed::coarse_field>(
+            coarse_values[static_cast<std::size_t>(i)],
+            [&](const CoarseKeyed& o) { return o.id == created[static_cast<std::size_t>(i)].id(); }));
+    }
+
+    CHECK(s.find_by_field<&CoarseKeyed::coarse_field>("no-such-value").empty());
+    CHECK(s.find_by_field<&CoarseKeyed::very_coarse_field>("no-such-value").empty());
+}
+
+// Reassignment under real merging: reconcile_cached_fields' merged branch
+// must correctly move an id from its old prefix's bucket to its new one
+// (possibly the SAME bucket, if old and new happen to share a prefix)
+// without disturbing unrelated bucket-mates, and removal must shrink/drop
+// merged buckets the same way.
+TEST(coarse_field_bucket_merge_reconciles_reassignment_and_removal_correctly) {
+    Model m;
+    constexpr int n = 500;
+    Transaction txn = m.begin();
+    std::vector<Ref<CoarseKeyed>> local;
+    for (int i = 0; i < n; ++i) {
+        auto o = std::make_unique<CoarseKeyed>();
+        o->code = "rcode" + std::to_string(i);
+        o->coarse_field = "rcf" + std::to_string(i);
+        local.push_back(txn.create(std::move(o)));
+    }
+    const CommitResult res = commit_ok(m, txn);
+    std::vector<Ref<CoarseKeyed>> created;
+    for (auto& r : local) created.push_back(res.to_real(r));
+
+    // Reassign every 3rd object's coarse_field to a brand new value.
+    std::vector<int> reassigned;
+    std::vector<std::string> new_values;
+    Transaction txn2 = m.begin();
+    for (int i = 0; i < n; i += 3) {
+        CoarseKeyed* clone = txn2.update(created[static_cast<std::size_t>(i)]);
+        CHECK(clone != nullptr);
+        if (!clone) continue;
+        std::string nv = "reassigned" + std::to_string(i);
+        clone->coarse_field = nv;
+        reassigned.push_back(i);
+        new_values.push_back(nv);
+    }
+    commit_ok(m, txn2);
+
+    Snapshot after_reassign = m.snapshot();
+    for (std::size_t k = 0; k < reassigned.size(); ++k) {
+        const int i = reassigned[k];
+        CHECK(after_reassign.find_by_field<&CoarseKeyed::coarse_field>("rcf" + std::to_string(i)).empty());
+        const auto found = after_reassign.find_by_field<&CoarseKeyed::coarse_field>(new_values[k]);
+        CHECK_EQ(found.size(), std::size_t{1});
+        if (found.size() == 1) CHECK(found.front()->id == created[static_cast<std::size_t>(i)].id());
+    }
+    // Untouched objects (not a multiple of 3) are still findable and correct.
+    for (int i = 0; i < n; ++i) {
+        if (i % 3 == 0) continue;
+        const auto found = after_reassign.find_by_field<&CoarseKeyed::coarse_field>("rcf" + std::to_string(i));
+        CHECK_EQ(found.size(), std::size_t{1});
+        if (found.size() == 1) CHECK(found.front()->id == created[static_cast<std::size_t>(i)].id());
+    }
+
+    // Remove every 5th of the UNTOUCHED objects; confirm they vacate their
+    // bucket without disturbing anyone else sharing it.
+    Transaction txn3 = m.begin();
+    std::vector<int> removed;
+    for (int i = 1; i < n; i += 5) {
+        if (i % 3 == 0) continue;
+        txn3.remove(created[static_cast<std::size_t>(i)]);
+        removed.push_back(i);
+    }
+    commit_ok(m, txn3);
+
+    Snapshot after_remove = m.snapshot();
+    for (int i : removed)
+        CHECK(after_remove.find_by_field<&CoarseKeyed::coarse_field>("rcf" + std::to_string(i)).empty());
+    for (int i = 0; i < n; ++i) {
+        if (i % 3 == 0) continue;  // reassigned, checked above
+        if (std::find(removed.begin(), removed.end(), i) != removed.end()) continue;
+        const auto found = after_remove.find_by_field<&CoarseKeyed::coarse_field>("rcf" + std::to_string(i));
+        CHECK_EQ(found.size(), std::size_t{1});
+        if (found.size() == 1) CHECK(found.front()->id == created[static_cast<std::size_t>(i)].id());
     }
 }
 

@@ -1420,6 +1420,33 @@ struct Root {
                                      pmap::StringHash, DedupBucketKeyOf>>
         by_cached_field;
 
+    /// The bucket-merged counterpart of by_cached_field, for every
+    /// LookupType::Coarse/VeryCoarse-declared field (Exact/Cache-declared
+    /// fields stay in by_cached_field above, unaffected). Keyed by a coarse
+    /// hash PREFIX (see model.cpp's coarse_prefix) instead of the real field
+    /// value -- unlike by_cached_field's leaves, a bucket here may hold Ids
+    /// belonging to several different real values that happen to share a
+    /// prefix, so a reader must verify each candidate's actual value before
+    /// trusting a match (see Snapshot::cached_field_short_circuit_raw /
+    /// FieldRange's filtered_ flag). This trades find_by_field's O(log n +
+    /// exact matches) for O(log n + everyone sharing this coarse prefix) on
+    /// these fields specifically, in exchange for collapsing what would
+    /// otherwise be one leaf per distinct value into one leaf per prefix.
+    std::unordered_map<const void*,
+                       pmap::PersistentMap<std::uint64_t, pmap::PersistentSet<Id, IdHash>,
+                                          pmap::IdentityHash64>>
+        by_cached_field_merged;
+
+    /// Each by_cached_field_merged-declared field's own shift (15 for
+    /// Coarse, 10 for VeryCoarse, see model.cpp's max_shift_for) -- needed
+    /// because Coarse and VeryCoarse fields now share ONE map, so a reader
+    /// can no longer tell them apart just by which map an entry lives in.
+    /// Fixed for a field's whole lifetime (LookupType is a compile-time
+    /// declaration, never changes), so this needs no rollback tracking the
+    /// way by_cached_field_merged's own mutations do -- see
+    /// Model::add_cached_fields' write-side comment.
+    std::unordered_map<const void*, std::uint8_t> by_cached_field_merged_shift;
+
     /// One persistent MULTIMAP per define_references()-declared Ref<>/Opt<>
     /// field tagged RefLookupType::Exact: TARGET's Id -> a persistent set of
     /// every REFERRER's Id whose field currently points there. Same bucket
@@ -2453,7 +2480,21 @@ private:
     /// same reason declares_scan_field/scan_field_is_declared exist as named
     /// helpers instead of an inline map lookup repeated at every call site.
     bool cached_field_is_declared(const void* field) const {
-        return root_ && root_->by_cached_field.find(field) != root_->by_cached_field.end();
+        return root_ && (root_->by_cached_field.find(field) != root_->by_cached_field.end() ||
+                         root_->by_cached_field_merged.find(field) != root_->by_cached_field_merged.end());
+    }
+
+    /// Whether `field` specifically lives in the bucket-merged index
+    /// (LookupType::Coarse/VeryCoarse) rather than the exact one
+    /// (Exact/Cache) -- both are already known to be cache-indexed by the
+    /// time this is asked (see cached_field_is_declared), so this only
+    /// needs to distinguish which of the two. Used by range_by_field/
+    /// range_view_by_field to pick FieldRange/FieldViewRange's filtered_
+    /// flag: a merged bucket may hold Ids belonging to several different
+    /// real values, so the range must verify each one natively (o.*Field ==
+    /// value) rather than trusting bucket membership outright.
+    bool cached_field_is_merged(const void* field) const {
+        return root_ && root_->by_cached_field_merged.find(field) != root_->by_cached_field_merged.end();
     }
 
     /// Same role as cached_field_is_declared, for the referrer family:
@@ -4578,6 +4619,11 @@ private:
                                      pmap::StringHash, DedupBucketKeyOf>>
         by_cached_field_;
     std::unordered_map<const void*,
+                       pmap::PersistentMap<std::uint64_t, pmap::PersistentSet<Id, IdHash>,
+                                          pmap::IdentityHash64>>
+        by_cached_field_merged_;
+    std::unordered_map<const void*, std::uint8_t> by_cached_field_merged_shift_;
+    std::unordered_map<const void*,
                        pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>>
         by_cached_reference_;
 
@@ -4812,8 +4858,13 @@ Snapshot::FieldRange<Field> Snapshot::range_by_field(
     using ClassT = member_class_t<decltype(Field)>;
     if (cached_field_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+        // A merged (Coarse/VeryCoarse) field's bucket may hold Ids from
+        // several different real values sharing a coarse prefix -- filtered
+        // tells the range to verify each one natively (o.*Field == value)
+        // instead of trusting membership outright, same as the scan-fallback
+        // case below.
         return FieldRange<Field>(this, cached_field_bucket_raw(field_tag<Field>(), to_field_key(value)),
-                                 value, /*filtered=*/false);
+                                 value, /*filtered=*/cached_field_is_merged(field_tag<Field>()));
     }
     register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
     // A field declared in neither lookup family must behave exactly like
@@ -5682,8 +5733,10 @@ Snapshot::FieldViewRange<Field> Snapshot::range_view_by_field(
     using ClassT = member_class_t<decltype(Field)>;
     if (cached_field_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+        // See range_by_field's own comment on why a merged field needs
+        // filtered_ true here.
         return FieldViewRange<Field>(this, cached_field_bucket_raw(field_tag<Field>(), to_field_key(value)),
-                                     value, /*filtered=*/false);
+                                     value, /*filtered=*/cached_field_is_merged(field_tag<Field>()));
     }
     register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
     // See range_by_field's own comment for why a field declared in neither

@@ -77,6 +77,16 @@ std::uint8_t max_shift_for(LookupType t) noexcept {
     return 64;
 }
 
+/// The bucket-merge key for a value already hashed via StringHash: the low
+/// `shift` bits, exactly the bits TrieCore::slice-based routing would still
+/// be discriminating on before max_shift_for's own truncation forces a
+/// collision merge (persistent_map.h's `if (shift + 5 >= max_shift_)`
+/// branch) -- not a new truncation scheme, just computing that same prefix
+/// outside the trie so by_cached_field_merged_ can key on it directly.
+std::uint64_t coarse_prefix(std::uint64_t hash, std::uint8_t shift) noexcept {
+    return shift >= 64 ? hash : (hash & ((std::uint64_t{1} << shift) - 1));
+}
+
 std::uint8_t max_shift_for(KeyLookupType t) noexcept {
     switch (t) {
         case KeyLookupType::Coarse: return 15;      // 3 levels
@@ -160,41 +170,72 @@ const ObjectBase* Snapshot::find_by_key_raw(const void* field, const std::string
     return id ? find_raw(*id) : nullptr;
 }
 
+namespace {
+// Resolves `r` to its live value for `field` via each_field_for -- shared by
+// the exact and merged cached-field read paths below.
+std::string resolve_cached_field_value_raw(const std::vector<std::shared_ptr<const Chunk>>& spine,
+                                           const void* field, Id r) {
+    const ObjectBase* obj = slot_lookup(spine, r);
+    assert(obj && "by_cached_field never indexes an Id that doesn't resolve in this Root");
+    std::string out;
+    obj->each_field_for(field, [&](const void*, std::string k, LookupType) { out = std::move(k); });
+    return out;
+}
+}  // namespace
+
 bool Snapshot::cached_field_short_circuit_raw(const void* field, const std::string& key,
                                               const std::function<bool(Id)>& f) const {
     if (!root_) return true;  // default-constructed Snapshot: nothing to look up, vacuously complete
     // by_cached_field maps field-tag -> that field's own persistent multimap
     // of value -> set of every Id currently holding it -- same two-level
     // shape as by_key/find_by_key_raw above, just multi-match per value.
-    auto it = root_->by_cached_field.find(field);
-    if (it == root_->by_cached_field.end()) return true;  // never indexed (non-Scan): vacuous
-    // Same dedup'd-leaf resolve as find_by_key_raw above, just reading the
-    // matched field via each_field_for instead of each_field_key_for.
-    auto resolve = [&](Id r) -> std::string {
-        const ObjectBase* obj = slot_lookup(root_->spine, r);
-        assert(obj && "by_cached_field never indexes an Id that doesn't resolve in this Root");
-        std::string out;
-        obj->each_field_for(field, [&](const void*, std::string k, LookupType) { out = std::move(k); });
-        return out;
-    };
-    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key, resolve);
-    if (!bucket) return true;  // no live object currently holds this exact value: vacuous
-    return bucket->for_each_short_circuit(f);
+    if (auto it = root_->by_cached_field.find(field); it != root_->by_cached_field.end()) {
+        auto resolve = [&](Id r) { return resolve_cached_field_value_raw(root_->spine, field, r); };
+        const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key, resolve);
+        if (!bucket) return true;  // no live object currently holds this exact value: vacuous
+        return bucket->for_each_short_circuit(f);
+    }
+    // Coarse/VeryCoarse: by_cached_field_merged's bucket for this value's
+    // coarse prefix may hold Ids belonging to several DIFFERENT real values
+    // that happen to share it -- unlike the exact path above, membership
+    // alone doesn't prove a match, so every candidate is resolved and
+    // compared against `key` before ever reaching `f`.
+    auto mit = root_->by_cached_field_merged.find(field);
+    if (mit == root_->by_cached_field_merged.end()) return true;  // never indexed (non-Scan): vacuous
+    const auto sit = root_->by_cached_field_merged_shift.find(field);
+    assert(sit != root_->by_cached_field_merged_shift.end() &&
+          "a field in by_cached_field_merged always has a recorded shift");
+    const std::uint64_t prefix = coarse_prefix(pmap::StringHash{}(key), sit->second);
+    const pmap::PersistentSet<Id, IdHash>* bucket = mit->second.get(prefix);
+    if (!bucket) return true;  // nothing shares this coarse prefix: vacuous
+    return bucket->for_each_short_circuit([&](Id candidate) {
+        if (resolve_cached_field_value_raw(root_->spine, field, candidate) != key)
+            return true;  // false positive from the merge: keep scanning
+        return f(candidate);
+    });
 }
 
 pmap::PersistentSet<Id, IdHash> Snapshot::cached_field_bucket_raw(const void* field,
                                                                   const std::string& key) const {
     if (!root_) return {};
-    auto it = root_->by_cached_field.find(field);
-    if (it == root_->by_cached_field.end()) return {};
-    auto resolve = [&](Id r) -> std::string {
-        const ObjectBase* obj = slot_lookup(root_->spine, r);
-        assert(obj && "by_cached_field never indexes an Id that doesn't resolve in this Root");
-        std::string out;
-        obj->each_field_for(field, [&](const void*, std::string k, LookupType) { out = std::move(k); });
-        return out;
-    };
-    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key, resolve);
+    if (auto it = root_->by_cached_field.find(field); it != root_->by_cached_field.end()) {
+        auto resolve = [&](Id r) { return resolve_cached_field_value_raw(root_->spine, field, r); };
+        const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key, resolve);
+        return bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{};
+    }
+    // Merged field: return the raw (possibly-mixed) bucket unfiltered --
+    // FieldRange/FieldViewRange's filtered_ flag (set by range_by_field/
+    // range_view_by_field via cached_field_is_merged) does the verification
+    // natively (o.*Field == value) instead, cheaper than a string resolve
+    // here and reusing code already proven correct for the scan-fallback
+    // case.
+    auto mit = root_->by_cached_field_merged.find(field);
+    if (mit == root_->by_cached_field_merged.end()) return {};
+    const auto sit = root_->by_cached_field_merged_shift.find(field);
+    assert(sit != root_->by_cached_field_merged_shift.end() &&
+          "a field in by_cached_field_merged always has a recorded shift");
+    const std::uint64_t prefix = coarse_prefix(pmap::StringHash{}(key), sit->second);
+    const pmap::PersistentSet<Id, IdHash>* bucket = mit->second.get(prefix);
     return bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{};
 }
 
@@ -1158,6 +1199,22 @@ void Model::add_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field([&](const void* field, std::string key, LookupType type) {
         if (type == LookupType::Scan) return;  // no index to maintain
+        if (type == LookupType::Coarse || type == LookupType::VeryCoarse) {
+            // by_cached_field_merged_'s leaves are keyed by a coarse hash
+            // PREFIX, not the real value -- max_shift stays 64 (full
+            // precision on the already-truncated prefix domain); passing
+            // max_shift_for(type) here would truncate a second time. The
+            // shift side-table write is unconditional and untracked: a
+            // field's shift is fixed by its LookupType declaration and never
+            // changes, so it needs no rollback capture (see Root::
+            // by_cached_field_merged_shift's doc comment).
+            auto& sub =
+                logged_index_entry(by_cached_field_merged_, dirty_by_cached_field_, field, 64);
+            by_cached_field_merged_shift_.try_emplace(field, max_shift_for(type));
+            const std::uint64_t prefix = coarse_prefix(pmap::StringHash{}(key), max_shift_for(type));
+            sub = pmap::bucket_insert(sub, prefix, id, &node_pool_);
+            return;
+        }
         // Two-level structure: by_cached_field_[field] is the OUTER map (key
         // string -> bucket); logged_index_entry pool-seeds it on first touch
         // and captures its pre-attempt state, once, for the rollback log.
@@ -1175,6 +1232,13 @@ void Model::drop_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field([&](const void* field, std::string key, LookupType type) {
         if (type == LookupType::Scan) return;
+        if (type == LookupType::Coarse || type == LookupType::VeryCoarse) {
+            auto& sub =
+                logged_index_entry(by_cached_field_merged_, dirty_by_cached_field_, field, 64);
+            const std::uint64_t prefix = coarse_prefix(pmap::StringHash{}(key), max_shift_for(type));
+            sub = pmap::bucket_erase(sub, prefix, id);
+            return;
+        }
         auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field,
                                        max_shift_for(type));
         auto resolve = [this, field](Id r) { return resolve_cached_field_value(field, r); };
@@ -1199,6 +1263,26 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
         const auto it = std::find_if(old_keys.begin(), old_keys.end(),
                                      [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
+
+        if (type == LookupType::Coarse || type == LookupType::VeryCoarse) {
+            // No old-vs-new resolve hazard here (unlike the exact path
+            // below): both old_value and new_key come directly from
+            // before/after's own raw pointers via each_field(), never from
+            // resolving an Id through spine_ -- the merged write path never
+            // resolves anything at all.
+            auto& sub =
+                logged_index_entry(by_cached_field_merged_, dirty_by_cached_field_, field, 64);
+            by_cached_field_merged_shift_.try_emplace(field, max_shift_for(type));
+            if (it != old_keys.end()) {
+                const std::uint64_t old_prefix =
+                    coarse_prefix(pmap::StringHash{}(it->second), max_shift_for(type));
+                sub = pmap::bucket_erase(sub, old_prefix, id);
+            }
+            const std::uint64_t new_prefix =
+                coarse_prefix(pmap::StringHash{}(new_key), max_shift_for(type));
+            sub = pmap::bucket_insert(sub, new_prefix, id, &node_pool_);
+            return;
+        }
 
         // logged_index_entry captures the OUTER map's pre-attempt state
         // (once) -- what the rollback log restores wholesale on rollback.
@@ -1416,6 +1500,28 @@ Model::Diagnostics::SlotStats Model::slot_stats_diagnostics() const {
         });
         s.by_cached_field_detail.emplace(key, ss);
     }
+    // by_cached_field_merged_ is a separate map (Coarse/VeryCoarse fields
+    // only) but conceptually still "the by_cached_field index," just
+    // organized differently for those fields -- folded into the same
+    // s.by_cached_field/s.by_cached_field_detail accumulation rather than
+    // reported separately. Unlike by_cached_field_'s DedupMap, this is a
+    // plain PersistentMap, so for_each yields (prefix, bucket) -- the prefix
+    // itself carries no per-type information, so it's discarded the same
+    // way by_cached_reference_'s target Id is below.
+    for (const auto& [field, m] : by_cached_field_merged_) {
+        pmap::SlotStats ss = m.slot_stats();
+        m.for_each([&](std::uint64_t prefix, const pmap::PersistentSet<Id, IdHash>& bucket) {
+            (void)prefix;
+            accumulate_structure_only(ss, bucket.slot_stats());
+        });
+        accumulate(s.by_cached_field, ss);
+        const auto key = owning_type_key(field, [field](const ObjectBase& obj) {
+            bool hit = false;
+            obj.each_field([&](const void* f, const std::string&, LookupType) { hit |= (f == field); });
+            return hit;
+        });
+        s.by_cached_field_detail.emplace(key, ss);
+    }
     for (const auto& [field, m] : by_cached_reference_) {
         pmap::SlotStats ss = m.slot_stats();
         m.for_each([&](Id target, const pmap::PersistentSet<Id, IdHash>& bucket) {
@@ -1483,7 +1589,7 @@ Model::Diagnostics::Status Model::diagnostics() const {
         diag.slots_exhausted = exhausted_slots_;
 
         diag.key_indexed_fields = by_key_.size();
-        diag.cached_value_indexed_fields = by_cached_field_.size();
+        diag.cached_value_indexed_fields = by_cached_field_.size() + by_cached_field_merged_.size();
         diag.cached_reference_indexed_fields = by_cached_reference_.size();
 
         diag.reverse_index_targets = referrers_.size();
@@ -2417,6 +2523,8 @@ CommitResult Model::publish_now(std::unordered_map<std::uint32_t, Id> remap, std
     r->by_type = by_type_;    // O(#types): each per-type submap is shared, not copied.
     r->by_key = by_key_;  // O(#indexed fields): same reasoning.
     r->by_cached_field = by_cached_field_;          // O(#cached fields): ditto.
+    r->by_cached_field_merged = by_cached_field_merged_;              // O(#merged fields): ditto.
+    r->by_cached_field_merged_shift = by_cached_field_merged_shift_;  // O(#merged fields): tiny.
     r->by_cached_reference = by_cached_reference_;  // O(#cached ref fields): ditto.
 
     // pub: this new version's own Snapshot, pinned (via its Lease) in the
@@ -2899,6 +3007,13 @@ void Model::add_cached_fields_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field([&](const void* field, std::string key, LookupType type) {
         if (type == LookupType::Scan) return;
+        if (type == LookupType::Coarse || type == LookupType::VeryCoarse) {
+            auto& sub = seed_index_entry(by_cached_field_merged_, field, 64);
+            by_cached_field_merged_shift_.try_emplace(field, max_shift_for(type));
+            const std::uint64_t prefix = coarse_prefix(pmap::StringHash{}(key), max_shift_for(type));
+            sub = pmap::bucket_insert(sub, prefix, id, &node_pool_);
+            return;
+        }
         // seed_index_entry + pool-seeded bucket: see add_cached_fields's
         // identical seeding (no rollback capture needed on this bulk-load
         // path, but still needs to seed the pool on first touch).
@@ -3003,6 +3118,8 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
     by_type_.clear();
     by_key_.clear();
     by_cached_field_.clear();
+    by_cached_field_merged_.clear();
+    by_cached_field_merged_shift_.clear();
     by_cached_reference_.clear();
     referrers_.clear();
     free_slots_.clear();

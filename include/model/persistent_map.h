@@ -68,6 +68,17 @@ struct StringHash {
     }
 };
 
+/// Identity hash over an already-bounded/precomputed 64-bit key (e.g. model.h's
+/// coarse-routing prefixes, the low bits of a real hash kept after the rest are
+/// discarded on purpose). Genuinely injective regardless of the key domain --
+/// identity never maps two different inputs to the same output -- unlike a real
+/// hash function over unbounded input, so declaring is_perfect here is always a
+/// true claim, not a probabilistic one, the same bar model.h's IdHash meets.
+struct IdentityHash64 {
+    std::uint64_t operator()(std::uint64_t k) const noexcept { return k; }
+    static constexpr bool is_perfect = true;
+};
+
 /// Node::slots capacity() vs size() summed across every Node in one trie --
 /// see TrieCore::slot_stats. Namespace-scope (not nested in TrieCore) so
 /// every instantiation (by_type_'s Id-keyed set, by_key_'s string-keyed

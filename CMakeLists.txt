@@ -119,6 +119,21 @@ add_executable(cached_reference_bench examples/cached_reference_bench.cpp)
 target_link_libraries(cached_reference_bench PRIVATE model)
 target_precompile_headers(cached_reference_bench REUSE_FROM model)
 
+# Ad hoc RSS measurement for the string-key-dedup (pmap::DedupMap) and
+# cached-field bucket-merge (by_cached_field_merged_) work -- see the file's
+# own top comment. Not run by ctest; built and diffed by hand across two
+# checkouts of the tree.
+add_executable(dedup_bucket_merge_memory_probe examples/dedup_bucket_merge_memory_probe.cpp)
+target_link_libraries(dedup_bucket_merge_memory_probe PRIVATE model)
+target_precompile_headers(dedup_bucket_merge_memory_probe REUSE_FROM model)
+
+# Demonstrates how to use Model::slot_stats_diagnostics() and measured
+# find_by_field cost to decide between LookupType::Exact/Coarse/VeryCoarse
+# for a field -- see the file's own top comment.
+add_executable(lookup_type_tuning_demo examples/lookup_type_tuning_demo.cpp)
+target_link_libraries(lookup_type_tuning_demo PRIVATE model)
+target_precompile_headers(lookup_type_tuning_demo REUSE_FROM model)
+
 # range_by_cached_field/range_cached_referrers (range-based for) vs.
 # for_each_by_cached_field/for_each_cached_referrers (callback, never stops
 # early) vs. all_of_by_cached_field/all_of_cached_referrers stopping after

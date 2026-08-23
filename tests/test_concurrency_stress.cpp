@@ -31,9 +31,23 @@ class CoarseThing final : public model::Object<CoarseThing> {
 public:
     std::string code;
 
+    // Second, high-cardinality field so the same concurrent create/
+    // reassign/find traffic that stresses by_key_'s Coarse first-touch race
+    // also stresses by_cached_field_merged_'s (LookupType::Coarse) --
+    // several writer threads racing to construct/merge the SAME field's
+    // merged bucket for the first time, and readers concurrently filtering
+    // it via find_by_field, is exactly the scenario the single-threaded
+    // coarse_field_bucket_merge_* tests (test_lookup.cpp) can't exercise.
+    std::string tag;
+
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
         v.key<&CoarseThing::code>(s.code, model::KeyLookupType::Coarse, "code");
+    }
+
+    template <class Self>
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.field<&CoarseThing::tag>(s.tag, model::LookupType::Coarse, "tag");
     }
 };
 }  // namespace
@@ -96,6 +110,11 @@ TEST(
             }
             for (const Order* o : s.find_by_field<&Order::qty>(0)) (void)o->code;
             (void)s.find_by_key<&CoarseThing::code>("C0");
+            // by_cached_field_merged_'s filtered read path (a merged bucket
+            // may hold candidates from several different real `tag` values
+            // sharing a coarse prefix -- see cached_field_short_circuit_raw),
+            // racing the writer's CoarseThing create/reassign branches above.
+            for (const CoarseThing* c : s.find_by_field<&CoarseThing::tag>("T0")) (void)c->code;
         }
     };
 
@@ -131,7 +150,9 @@ TEST(
                 // testing that racing to be first through that gate is safe,
                 // not that concurrent mutation of the index itself is.
                 auto c = std::make_unique<CoarseThing>();
-                c->code = "C" + std::to_string(next_coarse_id.fetch_add(1));
+                const int cid = next_coarse_id.fetch_add(1);
+                c->code = "C" + std::to_string(cid);
+                c->tag = "T" + std::to_string(cid);
                 const Ref<CoarseThing> local = txn.create(std::move(c));
                 const CommitResult res = m.try_commit(txn);
                 if (res.status == CommitStatus::Committed) {
@@ -157,8 +178,14 @@ TEST(
                     }
                 }
                 if (have_target) {
-                    if (CoarseThing* c = txn.update(target))
-                        c->code = "C" + std::to_string(next_coarse_id.fetch_add(1));
+                    if (CoarseThing* c = txn.update(target)) {
+                        const int cid = next_coarse_id.fetch_add(1);
+                        c->code = "C" + std::to_string(cid);
+                        // by_cached_field_merged_'s reconcile branch, under
+                        // the same concurrent contention as code's by_key_
+                        // reassignment above.
+                        c->tag = "T" + std::to_string(cid);
+                    }
                 } else {
                     continue;  // nothing committed yet to reassign: retry
                 }
