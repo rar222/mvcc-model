@@ -92,7 +92,7 @@ struct SlotStats {
 
     /// Collision-chain shape: how many chain heads (leaf slots) there are,
     /// and the longest/shortest real chain length among them -- what tells a
-    /// caller whether a Coarse/VeryCoarse field's chains are the small,
+    /// caller whether a Coarse field's chains are the small,
     /// bounded scan the trade-off promises or have grown large enough to
     /// reconsider. average length is leaf_count / chain_slot_count (derived,
     /// not stored -- same "recompute, don't cache" discipline entry_hash's

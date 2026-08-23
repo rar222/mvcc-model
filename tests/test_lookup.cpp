@@ -1203,15 +1203,14 @@ public:
     std::string code;
     std::int64_t bucket = 0;
 
-    // Many-distinct-value fields for exercising by_cached_field_merged_'s
+    // Many-distinct-value field for exercising by_cached_field_merged_'s
     // bucket-merge specifically -- `bucket` above only ever holds 10 real
     // values across a whole test run, too low-cardinality to reliably force
     // two DIFFERENT values to land in the same coarse-routed leaf
-    // (~10*9/2/32768 chance at Coarse). These mirror `code`'s "one distinct
-    // value per object" pattern instead, at Coarse's 15-bit and VeryCoarse's
-    // 10-bit prefixes respectively -- see coarse_field_bucket_merge_actually_merges_leaves.
+    // (~10*9/2/32768 chance at Coarse). Mirrors `code`'s "one distinct
+    // value per object" pattern instead -- see
+    // coarse_field_bucket_merge_actually_merges_leaves.
     std::string coarse_field;
-    std::string very_coarse_field;
 
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
@@ -1221,9 +1220,8 @@ public:
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
         v.field<&CoarseKeyed::bucket>(s.bucket, model::LookupType::Coarse, "bucket");
-        v.field<&CoarseKeyed::coarse_field>(s.coarse_field, model::LookupType::Coarse, "coarse_field");
-        v.field<&CoarseKeyed::very_coarse_field>(s.very_coarse_field, model::LookupType::VeryCoarse,
-                                                 "very_coarse_field");
+        v.field<&CoarseKeyed::coarse_field>(s.coarse_field, model::LookupType::Coarse,
+                                            "coarse_field");
     }
 };
 }  // namespace
@@ -1340,30 +1338,23 @@ TEST(coarse_routing_reconciles_reassigned_keys_correctly_under_forced_collisions
     }
 }
 
-// coarse_field/very_coarse_field (CoarseKeyed) are high-cardinality --
-// unlike `bucket`'s 10 real values, 2000 distinct values against Coarse's
-// 15-bit / VeryCoarse's 10-bit prefix space reliably force real
-// by_cached_field_merged_ merging (birthday-paradox expectation ~61
-// colliding pairs at Coarse, and VeryCoarse's 1024 buckets mean MOST of
-// 2000 values collide with something). Confirms find_by_field/
-// for_each_by_field/all_of_by_field/range_by_field/range_view_by_field all
-// stay exact -- no false positives from bucket-mates sharing a coarse
-// prefix -- for both fields simultaneously (proving by_cached_field_merged_
-// _shift_ keeps their two different widths from being mixed up, the one
-// correctness risk specific to sharing one map across levels).
+// coarse_field (CoarseKeyed) is high-cardinality -- unlike `bucket`'s 10
+// real values, 2000 distinct values against Coarse's 15-bit prefix space
+// reliably force real by_cached_field_merged_ merging (birthday-paradox
+// expectation ~61 colliding pairs). Confirms find_by_field/for_each_by_field/
+// all_of_by_field/range_by_field/range_view_by_field all stay exact -- no
+// false positives from bucket-mates sharing a coarse prefix.
 TEST(coarse_field_bucket_merge_stays_exact_with_real_merging) {
     Model m;
     constexpr int n = 2000;
     Transaction txn = m.begin();
     std::vector<Ref<CoarseKeyed>> local;
-    std::vector<std::string> coarse_values, very_coarse_values;
+    std::vector<std::string> coarse_values;
     for (int i = 0; i < n; ++i) {
         auto o = std::make_unique<CoarseKeyed>();
         o->code = "code" + std::to_string(i);
         o->coarse_field = "cf" + std::to_string(i);
-        o->very_coarse_field = "vcf" + std::to_string(i);
         coarse_values.push_back(o->coarse_field);
-        very_coarse_values.push_back(o->very_coarse_field);
         local.push_back(txn.create(std::move(o)));
     }
     const CommitResult res = commit_ok(m, txn);
@@ -1380,7 +1371,6 @@ TEST(coarse_field_bucket_merge_stays_exact_with_real_merging) {
         return prefixes.size();
     };
     CHECK(count_distinct_prefixes(coarse_values, 15) < coarse_values.size());
-    CHECK(count_distinct_prefixes(very_coarse_values, 10) < very_coarse_values.size());
 
     Snapshot s = m.snapshot();
     for (int i = 0; i < n; ++i) {
@@ -1389,11 +1379,6 @@ TEST(coarse_field_bucket_merge_stays_exact_with_real_merging) {
         const auto by_coarse = s.find_by_field<&CoarseKeyed::coarse_field>(coarse_values[static_cast<std::size_t>(i)]);
         CHECK_EQ(by_coarse.size(), std::size_t{1});
         if (by_coarse.size() == 1) CHECK(by_coarse.front()->id == want);
-
-        const auto by_very_coarse =
-            s.find_by_field<&CoarseKeyed::very_coarse_field>(very_coarse_values[static_cast<std::size_t>(i)]);
-        CHECK_EQ(by_very_coarse.size(), std::size_t{1});
-        if (by_very_coarse.size() == 1) CHECK(by_very_coarse.front()->id == want);
 
         // range_by_field/range_view_by_field exercise the OTHER filter path
         // (FieldRange's filtered_/native comparison instead of a string
@@ -1424,7 +1409,6 @@ TEST(coarse_field_bucket_merge_stays_exact_with_real_merging) {
     }
 
     CHECK(s.find_by_field<&CoarseKeyed::coarse_field>("no-such-value").empty());
-    CHECK(s.find_by_field<&CoarseKeyed::very_coarse_field>("no-such-value").empty());
 }
 
 // Reassignment under real merging: reconcile_cached_fields' merged branch

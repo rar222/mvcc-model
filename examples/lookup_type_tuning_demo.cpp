@@ -1,13 +1,15 @@
 // Demonstrates the workflow this project's own docs point at but never show
 // end to end: given a define_fields() entry, how do you actually decide
-// between LookupType::Exact/Coarse/VeryCoarse/Scan for it, and -- just as
-// important -- how do you check, on a REAL running Model, whether that
-// choice is still earning its keep? model.h's LookupType comment states the
-// shape of the tradeoff ("memory cost and lookup speed both decrease
-// monotonically Exact -> Coarse -> VeryCoarse -> Scan") and says
-// Coarse/VeryCoarse's routing depths are "starting points to tune against
-// slot_stats_diagnostics()'s chain-length fields, not fixed forever" -- this
-// example is that tuning pass, made concrete and reusable.
+// between LookupType::Exact/Coarse/Scan for it, and -- just as important --
+// how do you check, on a REAL running Model, whether that choice is still
+// earning its keep? model.h's LookupType comment states the shape of the
+// tradeoff ("memory cost and lookup speed both decrease monotonically
+// Exact -> Coarse -> Scan") and says Coarse's routing depth is a "starting
+// point to tune against slot_stats_diagnostics()'s chain-length fields, not
+// fixed forever" -- this example is that tuning pass, made concrete and
+// reusable. (VeryCoarse existed alongside Coarse until it was removed:
+// measured to have no defensible use case at this project's target scale --
+// see CLAUDE.md's "things that look like improvements but are not".)
 //
 // THE RULE OF THUMB (read this if you only read one part of this comment):
 // two numbers are ALWAYS derivable from ONE Model::slot_stats_diagnostics()
@@ -15,12 +17,12 @@
 // object count for the type that owns the field (n, below; see
 // field_stats' own comment for why slot_stats_diagnostics() doesn't hand
 // that to you for free, and get it from one Snapshot::for_each<T> count if
-// you truly don't already track it). For a Coarse/VeryCoarse field:
+// you truly don't already track it). For a Coarse field:
 //     field_leaves  = diag.by_cached_field_detail[{&typeid(YourType),
 //                                                   field_tag<&YourType::f>()}].leaf_count
 //     outer_leaves  = field_leaves - n            // every object contributes exactly one INNER leaf
 //     candidates_per_query = n / outer_leaves     // the number find_by_field has to resolve+filter
-//     saturation    = outer_leaves / bucket_ceiling   // 32768.0 for Coarse, 1024.0 for VeryCoarse
+//     saturation    = outer_leaves / bucket_ceiling   // 32768.0 for Coarse
 // candidates_per_query is meaningful on its own, with no twin field and no
 // benchmark: it's the number a real find_by_field call resolves and filters
 // -- decide for yourself whether that's acceptable for how often you query
@@ -28,7 +30,7 @@
 // ~50% of the bucket ceiling, outer_leaves is a good stand-in for the
 // field's true cardinality K, which means candidates_per_query is ALREADY
 // close to what Exact would give too -- there's essentially no crowding to
-// worry about, whatever this LookupType is saving is close to free.
+// worry about, whatever Coarse is saving is close to free.
 //
 // A THIRD number -- how many times worse than Exact's own unavoidable floor
 // (crowding_factor, printed below) -- answers "is the crowding tax actually
@@ -37,41 +39,34 @@
 // point, either a real Exact-tagged twin (what this demo has) or, below
 // saturation only, outer_leaves standing in for K well enough to compute it
 // anyway. Once saturated and without a twin, K is not recoverable from a
-// lone Coarse/VeryCoarse field's own stats at all -- crowding_factor and
+// lone Coarse field's own stats at all -- crowding_factor and
 // est_bytes_if_exact both become genuinely unanswerable, not just
 // inconvenient, and this program says so rather than printing a fabricated
 // number.
 //
-// THE OTHER DIRECTION -- starting from Exact, predicting Coarse/VeryCoarse
-// -- has no such gap: an Exact field's own outer_leaves IS K, exactly,
-// always (Exact never merges, so there's no saturation to worry about).
-// predict_merged (below) turns that K into a real statistical estimate of
-// what a Coarse/VeryCoarse version of the SAME field would look like,
-// using the "balls into bins" occupancy formula for candidates_per_query
-// (measured accurate to within ~1% against this program's own build-and-
-// measure runs) and a calibrated struct-size model for est_bytes -- the
-// noisier of the two, and NOT close to ~1%: measured against this program's
-// own four scenarios, predicted bytes land at roughly 80-90% of the real
-// number every time, never over. See kNodeCountCorrectionFactor's own
-// comment for why a single constant can't do better than that band. Printed
-// right after each scenario's exact_field row, against that SAME scenario's
-// actually-measured coarse_field/very_coarse_field rows just below it, so
-// the prediction's accuracy is visible directly rather than just claimed.
+// THE OTHER DIRECTION -- starting from Exact, predicting Coarse -- has no
+// such gap: an Exact field's own outer_leaves IS K, exactly, always (Exact
+// never merges, so there's no saturation to worry about). predict_merged
+// (below) turns that K into a real statistical estimate of what a Coarse
+// version of the SAME field would look like, using the "balls into bins"
+// occupancy formula for candidates_per_query (measured accurate to within
+// ~1% against this program's own build-and-measure runs) and a calibrated
+// struct-size model for est_bytes, also measured accurate to within ~1%
+// against this program's own four scenarios once calibrated against Coarse
+// alone (see kNodeCountCorrectionFactor's own comment). Printed right after
+// each scenario's exact_field row, against that SAME scenario's actually-measured
+// coarse_field row just below it, so the prediction's accuracy is visible
+// directly rather than just claimed.
 //
-// **Measured below, and worth stating plainly since it corrected two naive
-// predictions this comment originally made**: there are two ADDITIVE read
-// costs Coarse/VeryCoarse pay that Exact never does, and structural memory
-// savings are NOT unconditional the way the read-cost tax is.
-//   1. A fixed per-real-match resolve-and-verify tax, paid on every
-//      Coarse/VeryCoarse call regardless of cardinality -- even at K=100
-//      against VeryCoarse's 1,024 buckets (few enough distinct values that
-//      almost none of them actually share a bucket, i.e. crowding_factor
-//      measures ~1.0x below), VeryCoarse still measured ~3x Exact's
-//      per-call time in the run this comment was written against, because
-//      a merged bucket's members are never trusted without verification,
-//      whether or not any OTHER value happens to land in that same bucket
-//      too. This tax is invisible to candidates_per_query/crowding_factor
-//      -- it's paid on every real match too, not just the extra ones.
+// **Measured below**: there are two ADDITIVE read costs Coarse pays that
+// Exact never does, and structural memory savings are NOT unconditional the
+// way the read-cost tax is.
+//   1. A fixed per-real-match resolve-and-verify tax, paid on every Coarse
+//      call regardless of cardinality, because a merged bucket's members
+//      are never trusted without verification, whether or not any OTHER
+//      value happens to land in that same bucket too. This tax is
+//      invisible to candidates_per_query/crowding_factor -- it's paid on
+//      every real match too, not just the extra ones.
 //   2. A crowding tax on top of that -- the part candidates_per_query DOES
 //      capture -- from genuinely different values sharing a bucket and
 //      having to be filtered out as false positives. Once merging is
@@ -79,28 +74,25 @@
 //      roughly n / bucket_count and stops depending on K at all: a bucket
 //      collects ~(K/buckets) distinct values, each bringing ~(n/K) objects
 //      along, and the K cancels. So past saturation, more objects (bigger
-//      n) means more crowding even if K never changes -- the earlier
-//      version of this comment claimed the crowding tax was "proportional
-//      to K/buckets," which is only true BELOW saturation; the measured
-//      MEDIUM and EXTREME scenarios below (same n, very different K, similar
-//      VeryCoarse crowding_factor once both are saturated) are what caught
-//      the error.
+//      n) means more crowding even if K never changes -- crowding tax is
+//      only proportional to K/buckets BELOW saturation; the HIGH and
+//      EXTREME scenarios below (same n, very different K, similar Coarse
+//      candidates/query once both are saturated) show this directly.
 // Structural memory (fewer/smaller index entries, see
 // Model::slot_stats_diagnostics()) tracks cost 2's condition, not cost 1's:
 // there is NOTHING to merge, hence nothing to save, until cardinality gets
 // close to the bucket count -- at K=100 the node/leaf counts below are
-// IDENTICAL across Exact/Coarse/VeryCoarse. So a field with genuinely low
-// cardinality relative to even VeryCoarse's 1,024 buckets has no reason to
-// ever be anything but Exact: Coarse/VeryCoarse would cost more to read and
-// save nothing.
+// IDENTICAL across Exact and Coarse. So a field with genuinely low
+// cardinality relative to Coarse's own 32,768 buckets has no reason to ever
+// be anything but Exact: Coarse would cost more to read and save nothing.
 //
-// This runs the identical workload through four parallel fields (Exact,
-// Coarse, VeryCoarse, Scan -- all four holding the SAME value per object, so
-// a query against any of them returns the identical real answer set) at
-// four cardinalities straddling the two bucket counts, and prints the
+// This runs the identical workload through three parallel fields (Exact,
+// Coarse, Scan -- all three holding the SAME value per object, so a query
+// against any of them returns the identical real answer set) at four
+// cardinalities straddling Coarse's own bucket ceiling, and prints the
 // memory-side signal and the speed-side signal together per scenario, plus
-// (for Coarse/VeryCoarse) the crowding diagnostic and memory-savings
-// estimate the rule of thumb above describes:
+// (for Coarse) the crowding diagnostic and memory-savings estimate the rule
+// of thumb above describes:
 //   - "leaves" / "est. bytes" -- structural leaf count and a byte estimate
 //     from struct-size constants (kNodeFixedBytes & co. below) -- an
 //     approximation, not a measured RSS number (see
@@ -114,36 +106,27 @@
 //     doesn't) predict the measured read-time gap.
 //
 // How to read the output:
-//   - LOW cardinality (well under both bucket counts): no structural
-//     savings at all (identical node/leaf counts across all three),
+//   - LOW cardinality (well under the bucket ceiling): no structural
+//     savings at all (identical node/leaf counts across Exact and Coarse),
 //     crowding_factor ~1.0x (nothing extra to filter), plus cost 1's fixed
 //     read-time tax with nothing to show for it either way. Exact wins
-//     outright here -- there's no case for Coarse or VeryCoarse.
-//   - MEDIUM cardinality (above VeryCoarse's ~1,024, still under Coarse's
-//     ~32,768): Coarse stays unsaturated -- a real, if modest, memory
-//     saving shows up, at a crowding_factor close to 1x. VeryCoarse is
-//     already saturated at this K -- real crowding, and the savings
-//     estimate correctly declines to guess rather than invent a number.
-//   - HIGH cardinality (above both bucket counts, but objects/value still >
+//     outright here -- there's no case for Coarse.
+//   - MEDIUM cardinality (still well under the ~32,768 ceiling, a realistic
+//     category-style field): Coarse stays unsaturated -- a real, if modest,
+//     memory saving shows up, at a crowding_factor close to 1x.
+//   - HIGH cardinality (above the bucket ceiling, but objects/value still >
 //     1, e.g. K=50,000 against n=100,000 -- two objects/value on average):
-//     both Coarse and VeryCoarse are saturated, but Coarse's absolute
+//     Coarse is saturated -- real crowding, and the savings estimate
+//     correctly declines to guess rather than invent a number. Its absolute
 //     candidates/query is already close to n/32,768 (~3) regardless of its
-//     own floor being 2 rather than 1 -- Coarse stays a real memory/latency
-//     middle ground here. VeryCoarse's crowding_factor is already severe
-//     (measured ~49x in the run this comment was written against) --
-//     already closer to Scan's own cost/precision trade than to Coarse's.
+//     own floor being 2 rather than 1.
 //   - EXTREME cardinality (fully unique per object, e.g. a serial number or
 //     computed key): Coarse's absolute candidates/query barely moves from
 //     the HIGH scenario (~3 either way -- the n/bucket_count convergence
 //     regardless of K, once saturated, described above) even though its
 //     crowding_factor reads higher (Exact's own floor dropped from ~2 to 1,
 //     shrinking the denominator, not because Coarse got meaningfully more
-//     crowded). VeryCoarse's crowding_factor lands close to MEDIUM's
-//     (~98x vs ~5x there, but both converge on the SAME absolute
-//     candidates/query, ~98, once saturated) -- the clearest evidence in
-//     this program's own output that "n/bucket_count once saturated,
-//     independent of K" is the real relationship, not "proportional to
-//     K/buckets".
+//     crowded).
 //
 // Run:  ./build/default/lookup_type_tuning_demo [N] [low_K] [medium_K] [high_K] [extreme_K]
 
@@ -162,7 +145,7 @@ using namespace model;
 
 namespace {
 
-// One field per LookupType, all four holding the SAME value per object --
+// One field per LookupType, all three holding the SAME value per object --
 // so find_by_field<&TuningThing::X>(v) returns the identical real answer
 // set regardless of which X you ask, and any difference in call time is
 // attributable entirely to routing precision, not to the data itself.
@@ -170,21 +153,18 @@ class TuningThing final : public Object<TuningThing> {
 public:
     std::string exact_field;
     std::string coarse_field;
-    std::string very_coarse_field;
     std::string scan_field;
 
     template <class Self>
     static void define_fields(Self& s, const LookupFieldReader& v) {
         v.field<&TuningThing::exact_field>(s.exact_field, LookupType::Exact, "exact_field");
         v.field<&TuningThing::coarse_field>(s.coarse_field, LookupType::Coarse, "coarse_field");
-        v.field<&TuningThing::very_coarse_field>(s.very_coarse_field, LookupType::VeryCoarse,
-                                                 "very_coarse_field");
         v.field<&TuningThing::scan_field>(s.scan_field, LookupType::Scan, "scan_field");
     }
 };
 
 // n objects, k distinct values (n/k objects per value on average) -- the
-// SAME value assigned to all four fields on a given object, so every
+// SAME value assigned to all three fields on a given object, so every
 // field's index sees the identical value distribution.
 void build(Model& m, int n, int k) {
     m.set_max_undo_list_size(0);
@@ -194,7 +174,6 @@ void build(Model& m, int n, int k) {
         const std::string value = "v" + std::to_string(i % k);
         o->exact_field = value;
         o->coarse_field = value;
-        o->very_coarse_field = value;
         o->scan_field = value;
         txn.create(std::move(o));
     }
@@ -252,7 +231,7 @@ double avg_find_time_us(const Snapshot& s, int k) {
 //   Outer leaf, Exact/Cache field (pmap::DedupMap<std::string,...>, StringHash
 //                is NOT declared perfect): RcBase(16B) + PersistentSet
 //                handle(24B) + a real ChainLink(8B) = 48B.
-//   Outer leaf, Coarse/VeryCoarse field (by_cached_field_merged_,
+//   Outer leaf, Coarse field (by_cached_field_merged_,
 //                pmap::IdentityHash64 IS declared perfect): RcBase(16B) +
 //                PersistentSet handle(24B) + NoChain(0B) = 40B.
 //   Inner leaf (every field alike -- PersistentSet<Id,IdHash>, IdHash is
@@ -263,10 +242,9 @@ constexpr double kExactOuterLeafBytes = 48.0;
 constexpr double kMergedOuterLeafBytes = 40.0;
 constexpr double kInnerLeafBytes = 24.0;
 
-// The two Coarse/VeryCoarse routing-precision ceilings (model.cpp's
-// max_shift_for: 15 bits, 10 bits) expressed as bucket counts.
+// Coarse's routing-precision ceiling (model.cpp's max_shift_for: 15 bits)
+// expressed as a bucket count.
 constexpr double kCoarseBucketCeiling = 32768.0;
-constexpr double kVeryCoarseBucketCeiling = 1024.0;
 
 // Below this fraction of the bucket ceiling, outer_leaves (below) is a
 // trustworthy stand-in for the field's real cardinality K -- few enough
@@ -343,7 +321,7 @@ struct MergedPrediction {
 // The FORWARD direction: given an EXACT field's own true cardinality k
 // (always exact -- Exact never merges, so its outer_leaves IS k, precisely,
 // with none of est_bytes_if_exact's saturation caveat), predict what a
-// Coarse/VeryCoarse version of the SAME field would look like, without
+// Coarse version of the SAME field would look like, without
 // having to build it and measure.
 //
 // The leaf-count half is real probability theory: throwing k distinct
@@ -391,24 +369,18 @@ struct MergedPrediction {
 // empirically against this program's own LOW/MEDIUM/HIGH/EXTREME output,
 // not derived from first principles.
 //
-// A single constant is a genuine ceiling on this model's accuracy, not just
-// an under-tuned one -- confirmed by directly inspecting real node_count
-// against predicted inputs while calibrating this value. very_coarse_field
-// at MEDIUM (1,020 merged buckets, ~98 objects/bucket on average) and at
-// HIGH/EXTREME (1,024 buckets, ~98 objects/bucket, an almost identical
-// input to this formula) measure real node counts 57% apart (21,073 vs.
-// ~33,000) -- because "inner nodes = (n - outer_leaves) / 31" only ever
-// sees the pooled totals, but real node count depends on HOW population
-// splits across the `outer_leaves` separate, independently-filling inner
-// tries, not just their sum: MEDIUM's fewer, more crowded buckets (K/buckets
-// ~4.9 average) fill less evenly than HIGH/EXTREME's more numerous, more
-// saturated ones. No single scalar can correct for a per-scenario
-// distribution shape it never sees. Given that ceiling, this constant is
-// fit as a compromise across all four scenarios (minimizing the worst gap,
-// not zeroing any one of them): predictions land consistently 80-90% of the
-// real measured bytes, never over -- a stable, conservative band, not
-// something further tuning will close.
-constexpr double kNodeCountCorrectionFactor = 3.2;
+// ideal_nodes (outer_ideal + inner_ideal, before this factor is applied)
+// telescopes to a constant, n/31, regardless of outer_leaves -- so at fixed
+// n, every one of this program's four Coarse scenarios needs almost exactly
+// the same correction factor to match its own real measured bytes (checked
+// directly: 7.7-8.2 across LOW/MEDIUM/HIGH/EXTREME, a ~7% spread). 8.0 lands
+// every scenario within ~1% of the real number. (An earlier version of this
+// constant, back when it also had to fit LookupType::VeryCoarse's very
+// differently-shaped bucket population -- a handful of buckets holding
+// hundreds of members each, vs Coarse's many buckets holding a handful each
+// -- could only manage an 80-90% compromise across both; removing
+// VeryCoarse removed that heterogeneity, not just the need to predict it.)
+constexpr double kNodeCountCorrectionFactor = 8.0;
 
 MergedPrediction predict_merged(double k, double n, double bucket_ceiling) {
     MergedPrediction p;
@@ -481,45 +453,35 @@ void run_scenario(const char* label, int n, int k) {
     const FieldStats exact = field_stats(m, field_tag<&TuningThing::exact_field>(), false, n, 0.0);
     const FieldStats coarse =
         field_stats(m, field_tag<&TuningThing::coarse_field>(), true, n, kCoarseBucketCeiling);
-    const FieldStats very_coarse = field_stats(m, field_tag<&TuningThing::very_coarse_field>(), true, n,
-                                               kVeryCoarseBucketCeiling);
     const FieldStats scan = field_stats(m, field_tag<&TuningThing::scan_field>(), false, n, 0.0);
 
     const double exact_us = avg_find_time_us<&TuningThing::exact_field>(s, k);
     const double coarse_us = avg_find_time_us<&TuningThing::coarse_field>(s, k);
-    const double very_coarse_us = avg_find_time_us<&TuningThing::very_coarse_field>(s, k);
     const double scan_us = avg_find_time_us<&TuningThing::scan_field>(s, k);
 
     // Memory vs speed, side by side -- est. bytes is the whole index for
     // this ONE field (structural node/slot memory + every outer and inner
     // leaf, per the constants above); read cost is the same best-of-5
     // average find_by_field measurement as before. Reading down a column
-    // shows the trade in isolation (bytes: Exact >= Coarse >= VeryCoarse,
-    // per LookupType's own doc comment); reading across a row shows what
-    // that trade actually costs or buys for THIS field's real cardinality.
+    // shows the trade in isolation (bytes: Exact >= Coarse, per LookupType's
+    // own doc comment); reading across a row shows what that trade actually
+    // costs or buys for THIS field's real cardinality.
     std::printf("  %-16s %10s  %12s  %13s\n", "field", "leaves", "est. bytes", "read (best-of-5)");
     print_row("exact_field", exact, exact_us, 0.0);
     // Forward prediction, FROM exact_field's own always-precise cardinality
     // -- see predict_merged's own comment. Printed against the SAME
-    // scenario's actually-measured coarse_field/very_coarse_field rows
-    // right below, so the prediction's accuracy is visible directly, not
-    // just asserted.
+    // scenario's actually-measured coarse_field row right below, so the
+    // prediction's accuracy is visible directly, not just asserted.
     if (exact.outer_leaves > 0.0) {
         const auto pred_coarse =
             predict_merged(exact.outer_leaves, static_cast<double>(n), kCoarseBucketCeiling);
-        const auto pred_very_coarse =
-            predict_merged(exact.outer_leaves, static_cast<double>(n), kVeryCoarseBucketCeiling);
         std::printf(
             "      if Coarse instead (predicted from exact_field's own K=%.0f): ~%.1f "
             "candidates/query, ~%.0f KB\n",
             exact.outer_leaves, pred_coarse.predicted_candidates_per_query,
             pred_coarse.predicted_est_bytes / 1024.0);
-        std::printf(
-            "      if VeryCoarse instead (predicted): ~%.1f candidates/query, ~%.0f KB\n",
-            pred_very_coarse.predicted_candidates_per_query, pred_very_coarse.predicted_est_bytes / 1024.0);
     }
     print_row("coarse_field", coarse, coarse_us, exact.avg_candidates_per_query);
-    print_row("very_coarse_field", very_coarse, very_coarse_us, exact.avg_candidates_per_query);
     print_row("scan_field", scan, scan_us, 0.0, "<- O(N objects)/call, no index memory at all");
 }
 
@@ -527,24 +489,37 @@ void run_scenario(const char* label, int n, int k) {
 
 int main(int argc, char** argv) {
     const int n = argc > 1 ? std::atoi(argv[1]) : 100'000;
-    // Straddling the two bucket counts (~1,024 for VeryCoarse, ~32,768 for
-    // Coarse, see model.cpp's max_shift_for) on purpose: LOW sits under
-    // both (nothing merges anywhere), MEDIUM sits between them (VeryCoarse
-    // merges for real, Coarse barely does), HIGH sits above both (both
-    // merge, but objects/value is still > 1), EXTREME is fully unique per
-    // object (objects/value == 1) -- the two saturated scenarios (HIGH,
-    // EXTREME) exist side by side specifically to show that once Coarse/
-    // VeryCoarse are both saturated, crowding_factor keeps climbing with n
-    // even though K alone doesn't obviously predict how much (see the
+    // Straddling Coarse's own ~32,768-bucket ceiling (model.cpp's
+    // max_shift_for) on purpose: LOW sits far under it (nothing merges),
+    // MEDIUM sits well under it too but high enough to be a realistic
+    // category-style field, HIGH sits above it (real crowding, still >1
+    // objects/value), EXTREME is fully unique per object (objects/value ==
+    // 1) -- HIGH and EXTREME exist side by side specifically to show that
+    // once Coarse is saturated, crowding_factor keeps climbing with n even
+    // though K alone doesn't obviously predict how much (see the
     // top-of-file comment's correction of its own earlier K/buckets claim).
     const int low_k = argc > 2 ? std::atoi(argv[2]) : 100;
     const int medium_k = argc > 3 ? std::atoi(argv[3]) : 5'000;
     const int high_k = argc > 4 ? std::atoi(argv[4]) : 50'000;
     const int extreme_k = argc > 5 ? std::atoi(argv[5]) : n;  // unique per object
 
+    // atoi() returns 0 for anything non-numeric (e.g. a blank/whitespace
+    // arg), and every K below is a divisor (candidates_per_query, the
+    // "objects/value" header) -- rejecting non-positive values here up
+    // front turns a would-be SIGFPE into a clear message.
+    for (const int v : {n, low_k, medium_k, high_k, extreme_k}) {
+        if (v <= 0) {
+            std::fprintf(stderr,
+                        "error: N and every K must be positive integers (got %d) -- usage: %s [N] "
+                        "[low_K] [medium_K] [high_K] [extreme_K]\n",
+                        v, argv[0]);
+            return 1;
+        }
+    }
+
     run_scenario("LOW cardinality (e.g. a status/category field)", n, low_k);
-    run_scenario("MEDIUM cardinality (between the two bucket counts)", n, medium_k);
-    run_scenario("HIGH cardinality (above both bucket counts, still several objects/value)", n, high_k);
+    run_scenario("MEDIUM cardinality (well under the bucket ceiling)", n, medium_k);
+    run_scenario("HIGH cardinality (above the bucket ceiling, still several objects/value)", n, high_k);
     run_scenario("EXTREME cardinality (e.g. a unique serial number / computed key)", n, extreme_k);
 
     std::printf(
@@ -553,7 +528,7 @@ int main(int argc, char** argv) {
         "  outer_leaves = field_leaf_count - n\n"
         "  candidates_per_query = n / outer_leaves   <- what a real find_by_field call resolves;\n"
         "                                                judge this alone against your own latency budget\n"
-        "  saturation = outer_leaves / bucket_ceiling (32,768 Coarse, 1,024 VeryCoarse)\n"
+        "  saturation = outer_leaves / bucket_ceiling (32,768 for Coarse)\n"
         "Below ~50%% saturation, candidates_per_query is ALREADY close to what Exact would give --\n"
         "little to no crowding, so whatever memory this LookupType is saving (est. bytes above) is\n"
         "close to free (see LOW: identical est. bytes across all three -- nothing merged, nothing\n"

@@ -19,13 +19,13 @@
 //   define_keys()           optional: zero or more fields (or computed methods) for fast
 //                           UNIQUE lookup (find_by_key; a create/update that would duplicate
 //                           another live object's value is rejected, CommitStatus::Invalid),
-//                           each optionally tagged model::KeyLookupType (Exact/Coarse/
-//                           VeryCoarse -- see its own doc comment; Exact if omitted)
+//                           each optionally tagged model::KeyLookupType (Exact/Coarse
+//                           -- see its own doc comment; Exact if omitted)
 //   define_fields()         optional: zero or more fields, each tagged model::LookupType::
-//                           Exact/Coarse/VeryCoarse or model::LookupType::Scan, that make
+//                           Exact/Coarse or model::LookupType::Scan, that make
 //                           find_by_field reachable -- the non-Scan tags resolve via an
 //                           INDEXED lookup (one index entry per object, maintained every
-//                           commit; Coarse/VeryCoarse trade index depth for a larger
+//                           commit; Coarse trades index depth for a larger
 //                           collision-chain scan, see LookupType's own doc comment); Scan
 //                           resolves via an UNINDEXED O(#objects) scan (zero write-side
 //                           cost). Declare an index only for what's queried often.

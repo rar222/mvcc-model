@@ -371,24 +371,41 @@ private:
 // ---------------------------------------------------------------------------
 
 /// Which multi-match lookup path a define_fields()/define_references() entry
-/// resolves through. Exact/Coarse/VeryCoarse all back the field with a
+/// resolves through. Exact/Coarse both back the field with a
 /// persistent index (O(log n + matches), one index entry per object
 /// maintained every commit) -- they differ only in how many trie levels
 /// that index is allowed to use before treating further distinct values as
 /// a collision (see TrieCore's max_shift_); Scan leaves it on the always-
 /// correct, zero-write-cost O(#objects) linear scan instead. Ordered as a
 /// spectrum: memory cost and lookup speed both decrease monotonically
-/// Exact -> Coarse -> VeryCoarse -> Scan. Exactly one per declared field:
+/// Exact -> Coarse -> Scan. Exactly one per declared field:
 /// define_fields()/define_references() each assert (see Object<Derived>::
 /// validate_field_declarations/validate_ref_declarations) that no field is
 /// declared twice, so there is no way for a field to be both -- the caller
 /// of find_by_field/find_referrers never has to know or care which one it
 /// got. See Object<Derived>'s class comment for the full cost model.
 enum class LookupType {
-    Exact,       ///< Full-precision routing -- one trie path per distinct value.
-    Coarse,      ///< Limits the depth of the trie at the cost of the size of the final possible chain.
-    VeryCoarse,  ///< Limits the depth of the trie further, at the cost of a larger final possible chain.
-    Scan,        ///< No persistent index -- find_by_field/find_referrers fall back to a linear scan.
+    Exact,  ///< Full-precision routing -- one trie path per distinct value.
+    /// Limits the depth of the trie at the cost of the size of the final possible chain.
+    ///
+    /// Rule of thumb for whether Coarse is worth it over Exact for a given field, all three
+    /// conditions required:
+    ///   1. Memory is a real concern for this field's index (otherwise Exact is strictly better:
+    ///      never slower to read, never larger).
+    ///   2. Cardinality -- the number of DISTINCT values the field takes across every live object
+    ///      of the type, NOT the object count itself -- is comparable to or above Coarse's bucket
+    ///      ceiling (32,768; TrieCore's max_shift_ for Coarse, model.cpp's max_shift_for). Below
+    ///      that, nothing merges, so Coarse costs more to read and saves nothing (checkable live,
+    ///      no benchmark needed: outer_leaves = diag.by_cached_field_detail[...].leaf_count -
+    ///      object_count; saturation = outer_leaves / 32768; well under ~50% saturation means no
+    ///      real savings yet).
+    ///   3. The field isn't queried often enough that Coarse's fixed per-call resolve-and-verify
+    ///      tax -- paid on EVERY find_by_field call against a Coarse field, even an uncrowded one,
+    ///      not just on the extra candidates a crowded bucket adds -- outweighs the memory saved.
+    /// See examples/lookup_type_tuning_demo.cpp for a runnable harness measuring all of this
+    /// against a real Model, including the live saturation/candidates-per-query check above.
+    Coarse,
+    Scan,  ///< No persistent index -- find_by_field/find_referrers fall back to a linear scan.
 };
 
 /// Same routing-precision spectrum as LookupType, for define_keys() fields
@@ -399,19 +416,23 @@ enum class LookupType {
 /// Scan would be syntactically legal but semantically empty here. A
 /// distinct type makes that a compile error instead of a runtime check.
 enum class KeyLookupType {
-    Exact,       ///< Full-precision routing -- one trie path per distinct value.
-    Coarse,      ///< Limits the depth of the trie at the cost of the size of the final possible chain.
-    VeryCoarse,  ///< Limits the depth of the trie further, at the cost of a larger final possible chain.
+    Exact,  ///< Full-precision routing -- one trie path per distinct value.
+    /// Limits the depth of the trie at the cost of the size of the final possible chain. Same
+    /// rule of thumb as LookupType::Coarse's own doc comment, with cardinality fixed at object
+    /// count (every key is unique by construction, so K == N always) -- worth it only when memory
+    /// pressure is real and this field isn't queried often enough for the fixed per-call
+    /// resolve-and-verify tax to matter.
+    Coarse,
 };
 
 /// Which path a define_references() entry resolves through -- Exact backs it
 /// with a persistent index (Root::by_cached_reference); Scan leaves it on the
-/// scan fallback. Deliberately NOT LookupType, and with no Coarse/VeryCoarse:
+/// scan fallback. Deliberately NOT LookupType, and with no Coarse:
 /// by_cached_reference_ is keyed by the TARGET's Id, via the perfect IdHash
 /// (see hash_is_perfect_v), on both its outer and inner levels -- distinct
 /// Ids can never collide, so there is no depth/chain trade-off to make, the
 /// same reason KeyLookupType has no Scan. A shared LookupType would make
-/// Coarse/VeryCoarse syntactically legal here and semantically empty (and,
+/// Coarse syntactically legal here and semantically empty (and,
 /// worse, live enough to trip TrieCore's perfect-hash guard the first time
 /// such a field were touched); a distinct type rules it out at compile time.
 enum class RefLookupType { Exact, Scan };
@@ -669,7 +690,7 @@ struct CachedRefReader {
 /// Callback shape for enumerating a type's define_keys() fields ONLY (see
 /// ObjectBase::each_field_key): the field's identity tag, its value in
 /// canonical string form (to_field_key), and its KeyLookupType (Exact/
-/// Coarse/VeryCoarse -- never Scan, see KeyLookupType's own comment).
+/// Coarse -- never Scan, see KeyLookupType's own comment).
 /// define_fields()'s multi-match family uses the LookupType-carrying
 /// LookupFieldFn below instead -- define_keys() is a genuinely different
 /// concept (a UNIQUE index, not a cache-or-scan multi-match one), so it
@@ -753,7 +774,7 @@ struct FieldKeyReader {
 /// field's identity tag, its value in canonical string form, and which
 /// LookupType it was declared with. One shape serves every caller of
 /// each_field -- the write side maintains Root::by_cached_field for every
-/// non-Scan value (Exact/Coarse/VeryCoarse), the read side's scan-fallback
+/// non-Scan value (Exact/Coarse), the read side's scan-fallback
 /// check filters to LookupType::Scan -- so declaring a field once, tagged, is
 /// enough for both.
 using LookupFieldFn = std::function<void(const void* field, std::string key, LookupType type)>;
@@ -1067,9 +1088,9 @@ public:
 ///       unique, indexed: O(log n); a duplicate value is rejected, not
 ///       overwritten.
 ///   define_fields()  -> find_by_field  / view_by_field
-///       every match. A field tagged LookupType::Exact/Coarse/VeryCoarse
+///       every match. A field tagged LookupType::Exact/Coarse
 ///       resolves via the index: O(log n + #matches) at Exact, trading index
-///       depth for a larger collision-chain scan at Coarse/VeryCoarse --
+///       depth for a larger collision-chain scan at Coarse --
 ///       paid for by one index entry per object per field, maintained on
 ///       every create/delete/value-change inside the serialized commit path
 ///       (each cached field costs about what by_type does). A field tagged
@@ -1096,7 +1117,7 @@ public:
 /// tagging it RefLookupType::Exact there instead upgrades that same call to
 /// the O(log n + #matches) index (define_references() already supplies the
 /// target and nullability, so nothing else needs declaring). Unlike
-/// define_fields()'s LookupType, RefLookupType has no Coarse/VeryCoarse --
+/// define_fields()'s LookupType, RefLookupType has no Coarse --
 /// by_cached_reference_ is keyed by Id via the perfect IdHash, so there is no
 /// depth/chain trade-off to make (see RefLookupType's own doc comment):
 ///
@@ -1421,7 +1442,7 @@ struct Root {
         by_cached_field;
 
     /// The bucket-merged counterpart of by_cached_field, for every
-    /// LookupType::Coarse/VeryCoarse-declared field (Exact/Cache-declared
+    /// LookupType::Coarse-declared field (Exact/Cache-declared
     /// fields stay in by_cached_field above, unaffected). Keyed by a coarse
     /// hash PREFIX (see model.cpp's coarse_prefix) instead of the real field
     /// value -- unlike by_cached_field's leaves, a bucket here may hold Ids
@@ -1436,16 +1457,6 @@ struct Root {
                        pmap::PersistentMap<std::uint64_t, pmap::PersistentSet<Id, IdHash>,
                                           pmap::IdentityHash64>>
         by_cached_field_merged;
-
-    /// Each by_cached_field_merged-declared field's own shift (15 for
-    /// Coarse, 10 for VeryCoarse, see model.cpp's max_shift_for) -- needed
-    /// because Coarse and VeryCoarse fields now share ONE map, so a reader
-    /// can no longer tell them apart just by which map an entry lives in.
-    /// Fixed for a field's whole lifetime (LookupType is a compile-time
-    /// declaration, never changes), so this needs no rollback tracking the
-    /// way by_cached_field_merged's own mutations do -- see
-    /// Model::add_cached_fields' write-side comment.
-    std::unordered_map<const void*, std::uint8_t> by_cached_field_merged_shift;
 
     /// One persistent MULTIMAP per define_references()-declared Ref<>/Opt<>
     /// field tagged RefLookupType::Exact: TARGET's Id -> a persistent set of
@@ -1478,7 +1489,7 @@ class View;
 
 /// Call counts for one field's find_by_field/for_each_referrers (and
 /// siblings) calls, split by which path a call actually took: resolved via
-/// the index (the field was indexed -- LookupType::Exact/Coarse/VeryCoarse or
+/// the index (the field was indexed -- LookupType::Exact/Coarse or
 /// RefLookupType::Exact), or fell back to the O(#T) scan (tagged Scan).
 /// Purely observational: lets a caller decide, from
 /// ACTUAL usage over the model's whole lifetime, whether declaring a field
@@ -2469,7 +2480,7 @@ private:
         return declared;
     }
 
-    /// Whether `field` has an indexed (Exact/Coarse/VeryCoarse) entry in
+    /// Whether `field` has an indexed (Exact/Coarse) entry in
     /// define_fields() at all -- i.e. whether find_by_field/for_each_by_field/
     /// all_of_by_field/range_by_field should take the cache-hit branch or
     /// fall back to the scan. A field's presence as a key in
@@ -2485,7 +2496,7 @@ private:
     }
 
     /// Whether `field` specifically lives in the bucket-merged index
-    /// (LookupType::Coarse/VeryCoarse) rather than the exact one
+    /// (LookupType::Coarse) rather than the exact one
     /// (Exact/Cache) -- both are already known to be cache-indexed by the
     /// time this is asked (see cached_field_is_declared), so this only
     /// needs to distinguish which of the two. Used by range_by_field/
@@ -3478,7 +3489,7 @@ public:
     /// this Model -- zero if Field was never looked up via find_by_field/
     /// for_each_referrers/find_referrers (or a sibling entry point in either
     /// family). The direct way to ask "is this field's index tag (LookupType::
-    /// Exact/Coarse/VeryCoarse, or RefLookupType::Exact) paying for itself"
+    /// Exact/Coarse, or RefLookupType::Exact) paying for itself"
     /// without needing lookup_diagnostics()'s
     /// enumerate-everything list.
     template <auto Field>
@@ -4622,7 +4633,6 @@ private:
                        pmap::PersistentMap<std::uint64_t, pmap::PersistentSet<Id, IdHash>,
                                           pmap::IdentityHash64>>
         by_cached_field_merged_;
-    std::unordered_map<const void*, std::uint8_t> by_cached_field_merged_shift_;
     std::unordered_map<const void*,
                        pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>>
         by_cached_reference_;
@@ -4858,7 +4868,7 @@ Snapshot::FieldRange<Field> Snapshot::range_by_field(
     using ClassT = member_class_t<decltype(Field)>;
     if (cached_field_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
-        // A merged (Coarse/VeryCoarse) field's bucket may hold Ids from
+        // A merged (Coarse) field's bucket may hold Ids from
         // several different real values sharing a coarse prefix -- filtered
         // tells the range to verify each one natively (o.*Field == value)
         // instead of trusting membership outright, same as the scan-fallback

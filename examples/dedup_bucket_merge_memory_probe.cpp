@@ -8,12 +8,11 @@
 // run once against a baseline checkout (git stash) and once against a
 // changed one (git stash pop), diffing VmHWM by hand.
 //
-// One type, four fields, each isolating exactly one LookupType/
+// One type, three fields, each isolating exactly one LookupType/
 // KeyLookupType path:
 //   key_exact        -- by_key_,          KeyLookupType::Exact
 //   field_exact      -- by_cached_field_,  LookupType::Exact   (DedupMap, unaffected by bucket-merge)
 //   field_coarse     -- by_cached_field_merged_, LookupType::Coarse
-//   field_verycoarse -- by_cached_field_merged_, LookupType::VeryCoarse
 // Every field's value is unique per object, so leaf/bucket counts are
 // directly comparable across fields at the same N.
 
@@ -43,7 +42,6 @@ public:
     std::string key_exact;
     std::string field_exact;
     std::string field_coarse;
-    std::string field_verycoarse;
 
     template <class Self>
     static void define_keys(Self& s, const FieldKeyReader& v) {
@@ -54,8 +52,6 @@ public:
     static void define_fields(Self& s, const LookupFieldReader& v) {
         v.field<&MeasureThing::field_exact>(s.field_exact, LookupType::Exact, "field_exact");
         v.field<&MeasureThing::field_coarse>(s.field_coarse, LookupType::Coarse, "field_coarse");
-        v.field<&MeasureThing::field_verycoarse>(s.field_verycoarse, LookupType::VeryCoarse,
-                                                 "field_verycoarse");
     }
 };
 
@@ -67,7 +63,6 @@ void build(Model& m, int n) {
         o->key_exact = "k" + std::to_string(i);
         o->field_exact = "f" + std::to_string(i);
         o->field_coarse = "c" + std::to_string(i);
-        o->field_verycoarse = "v" + std::to_string(i);
         txn.create(std::move(o));
     }
     m.try_commit(txn);

@@ -134,6 +134,15 @@ add_executable(lookup_type_tuning_demo examples/lookup_type_tuning_demo.cpp)
 target_link_libraries(lookup_type_tuning_demo PRIVATE model)
 target_precompile_headers(lookup_type_tuning_demo REUSE_FROM model)
 
+# Same question as lookup_type_tuning_demo, for KeyLookupType/by_key_
+# instead of LookupType/by_cached_field_ -- a structurally different
+# mechanism (chain-based, never bucket-merged, K == N always since keys are
+# unique) that needed its own measurement rather than reusing that one's
+# numbers. See the file's own top comment.
+add_executable(key_lookup_type_tuning_demo examples/key_lookup_type_tuning_demo.cpp)
+target_link_libraries(key_lookup_type_tuning_demo PRIVATE model)
+target_precompile_headers(key_lookup_type_tuning_demo REUSE_FROM model)
+
 # range_by_cached_field/range_cached_referrers (range-based for) vs.
 # for_each_by_cached_field/for_each_cached_referrers (callback, never stops
 # early) vs. all_of_by_cached_field/all_of_cached_referrers stopping after

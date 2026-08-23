@@ -154,6 +154,19 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
 - **"Why not let a slow subscriber's queue grow?"** Every queued event pins a snapshot,
   and every pinned snapshot pins the objects retired since. An unbounded queue is a
   memory leak with a slow fuse. Overflow coalesces; see `Subscription::collapse`.
+- **"Why not a `VeryCoarse` tier below `Coarse`, for even more memory savings?"** It existed
+  (`LookupType`/`KeyLookupType::VeryCoarse`, a 10-bit/1,024-bucket routing cap) and was
+  removed after measurement found no scale at which it earns its keep. Its bucket ceiling
+  is fixed regardless of object count, so once a field's cardinality is high enough for real
+  merging, structural savings plateau (buckets max out at 1,024 either way) while the read
+  cost keeps climbing with cardinality -- measured up to 40x `Coarse`'s own read time for a
+  memory edge of only 7-21%. For `by_key_` (keys, never bucket-merged, cardinality forced to
+  equal object count) it's worse: `Coarse` and `VeryCoarse` converge on nearly identical
+  memory once both saturate their routing tree, while `VeryCoarse`'s collision-chain walk
+  cost explodes -- measured 219x `Exact`'s read time at 500,000 objects, average chain
+  length 488. `Coarse` alone remains a real, defensible tradeoff in both cases. See
+  `examples/lookup_type_tuning_demo.cpp` and `examples/key_lookup_type_tuning_demo.cpp` to
+  re-run the numbers if this is ever reconsidered.
 - **Don't add gtest/Catch2.** The harness in `tests/tests.cpp` is deliberately
   dependency-free so the project builds anywhere with no network.
 
