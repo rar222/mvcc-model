@@ -34,12 +34,14 @@
 // push-down, and bucket shrink/drop-on-empty are tricky enough to want living in
 // exactly one place rather than duplicated between a map and a set version.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <memory_resource>
 #include <string>
@@ -73,9 +75,22 @@ struct StringHash {
 /// Model-level diagnostic without a per-instantiation type each.
 struct SlotStats {
     std::size_t node_count = 0;
-    std::size_t leaf_count = 0;
+    std::size_t leaf_count = 0;      ///< total entries -- every chained leaf counted, not just chain heads
     std::size_t total_capacity = 0;  ///< sum of slots.capacity() across every Node
     std::size_t total_size = 0;      ///< sum of slots.size() across every Node (== child count)
+
+    /// Collision-chain shape: how many chain heads (leaf slots) there are,
+    /// and the longest/shortest real chain length among them -- what tells a
+    /// caller whether a Coarse/VeryCoarse field's chains are the small,
+    /// bounded scan the trade-off promises or have grown large enough to
+    /// reconsider. average length is leaf_count / chain_slot_count (derived,
+    /// not stored -- same "recompute, don't cache" discipline entry_hash's
+    /// own comment applies). min_chain_len stays its initial max() when
+    /// chain_slot_count == 0 (an empty trie): there is no chain to report a
+    /// minimum for.
+    std::size_t chain_slot_count = 0;
+    std::size_t max_chain_len = 0;
+    std::size_t min_chain_len = std::numeric_limits<std::size_t>::max();
 };
 
 namespace detail {
@@ -624,6 +639,21 @@ class TrieCore {
     // never called with a leaf root -- see set_entry/erase_key.
     bool root_is_leaf_ = false;
 
+    /// How many bits of the 64-bit hash this instance's routing is allowed to
+    /// consume before treating any further distinct value as a collision
+    /// (set_in's "ran out of hash bits" merge-into-one-chain branch) --
+    /// limits the depth of the trie at the cost of the size of the final
+    /// possible chain. 64 (the default, and every existing caller's value)
+    /// reproduces today's unconditional-to-hash-exhaustion behavior exactly.
+    /// A smaller value deliberately triggers that same branch earlier,
+    /// forcing distinct values that would otherwise need a deeper Node to
+    /// instead share one collision chain -- see LookupType::Coarse/
+    /// KeyLookupType::Coarse's own doc comments in model.h, which this
+    /// backs. Nonsensical under a perfect Hash (kPerfectHash): there is
+    /// nothing to collide, so a value below 64 there is guarded against in
+    /// the constructor below rather than silently accepted.
+    std::uint8_t max_shift_ = 64;
+
     /// Where this instance's Node/Leaf HEAD allocations come
     /// from (the RcHandle ones stored in Node::slots -- never the
     /// unique_ptr tail links, which stay on plain new; see chain_copy/
@@ -660,18 +690,24 @@ class TrieCore {
     /// recursive call.
     std::pmr::memory_resource* mem_ = nullptr;
 
-    explicit TrieCore(RcHandle r, std::uint32_t n, std::pmr::memory_resource* mem, bool leaf_root)
-        : root_(std::move(r)), size_(n), root_is_leaf_(leaf_root), mem_(mem) {
+    explicit TrieCore(RcHandle r, std::uint32_t n, std::pmr::memory_resource* mem, bool leaf_root,
+                      std::uint8_t max_shift = 64)
+        : root_(std::move(r)), size_(n), root_is_leaf_(leaf_root), max_shift_(max_shift), mem_(mem) {
         // Compiler-checked, not just reasoned about: root_/size_/
-        // root_is_leaf_/mem_ pack into exactly 24 bytes (root_ 8B + size_
-        // 4B + root_is_leaf_ 1B + 3B alignment padding before mem_'s 8B --
-        // see size_/root_is_leaf_'s own comments). sizeof(TrieCore) needs a
-        // complete-class context, which a constructor body is and the
-        // member-declaration region above is not -- hence checking it here
-        // rather than immediately after the members.
+        // root_is_leaf_/max_shift_/mem_ pack into exactly 24 bytes (root_ 8B
+        // + size_ 4B + root_is_leaf_ 1B + max_shift_ 1B + 2B alignment
+        // padding before mem_'s 8B -- see size_/root_is_leaf_/max_shift_'s
+        // own comments). sizeof(TrieCore) needs a complete-class context,
+        // which a constructor body is and the member-declaration region
+        // above is not -- hence checking it here rather than immediately
+        // after the members.
         static_assert(sizeof(TrieCore) == 24,
-                      "root_/size_/root_is_leaf_/mem_ no longer pack into 24B -- see their own "
-                      "comments before adding padding back");
+                      "root_/size_/root_is_leaf_/max_shift_/mem_ no longer pack into 24B -- see "
+                      "their own comments before adding padding back");
+        assert((max_shift_ >= 64 || !kPerfectHash) &&
+              "coarsening a perfect-hash trie is nonsensical -- see kPerfectHash's own comment; "
+              "distinct Ids/keys under a perfect Hash never collide, so there is nothing for a "
+              "smaller max_shift to trade away");
     }
 
     // mem_ == nullptr => plain `new`; otherwise routed through that resource
@@ -951,9 +987,12 @@ class TrieCore {
 
         // Different hash sharing this slot: push the existing leaf down into a
         // new subtree, then insert the new key beside it.
-        if (shift + 5 >= 64) {
-            // Ran out of hash bits (astronomically unlikely with distinct hashes,
-            // but handle it): merge into one collision chain.
+        if (shift + 5 >= max_shift_) {
+            // Ran out of hash bits this instance is allowed to use -- at
+            // max_shift_==64 that's real exhaustion (astronomically unlikely
+            // with distinct hashes, but handled); below 64, this is
+            // max_shift_ deliberately triggering early (see max_shift_'s own
+            // comment). Either way: merge into one collision chain.
             auto new_slot = make_leaf(entry, chain_copy(lf));
             added = true;
             if (can_mutate) {
@@ -1130,7 +1169,12 @@ public:
     /// this places on the caller -- `mem` must outlive every Node/Leaf ever
     /// allocated through it, which is why Model seeds this only with a
     /// resource whose lifetime is tied to the Model itself.
-    explicit TrieCore(std::pmr::memory_resource* mem) : mem_(mem) {}
+    explicit TrieCore(std::pmr::memory_resource* mem, std::uint8_t max_shift = 64)
+        : max_shift_(max_shift), mem_(mem) {
+        assert((max_shift_ >= 64 || !kPerfectHash) &&
+              "coarsening a perfect-hash trie is nonsensical -- see the other constructor's "
+              "identical guard for why");
+    }
 
     std::size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
@@ -1150,7 +1194,7 @@ public:
 
         if (!root_) {
             auto lf = make_leaf(entry, ChainLink{});
-            return TrieCore(std::move(lf), 1, mem_, /*leaf_root=*/true);
+            return TrieCore(std::move(lf), 1, mem_, /*leaf_root=*/true, max_shift_);
         }
 
         if (root_is_leaf_) {
@@ -1159,7 +1203,7 @@ public:
             if (lf_hash == hash) {
                 auto new_leaf = chain_set(lf, key, entry, added);
                 return TrieCore(std::move(new_leaf), size_ + (added ? 1 : 0), mem_,
-                                /*leaf_root=*/true);
+                                /*leaf_root=*/true, max_shift_);
             }
             Node* node = clone_node(nullptr);
             const std::uint32_t exist_idx = slice(lf_hash, 0);
@@ -1168,7 +1212,7 @@ public:
             node->slots = grow_insert(nullptr, 0, 0, RcHandle(root_));  // reuse the existing Leaf, no clone
             RcHandle node_owner = RcHandle::adopt(node);
             auto r = set_in(node_owner, /*parent_private=*/true, hash, 0, key, entry, added);
-            return TrieCore(std::move(r), size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false);
+            return TrieCore(std::move(r), size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false, max_shift_);
         }
 
         // root_ itself, NOT root_.get()/as_node(root_): set_in needs the
@@ -1176,7 +1220,7 @@ public:
         // see its own doc comment. parent_private=true: there is no
         // ancestor above the root to be shared with.
         auto r = set_in(root_, /*parent_private=*/true, hash, 0, key, entry, added);
-        return TrieCore(r, size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false);
+        return TrieCore(r, size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false, max_shift_);
     }
 
     /// Returns a new core without `key` (or, if absent, THE SAME core,
@@ -1198,12 +1242,12 @@ public:
             if (!leaf_get(lf, key)) return *this;  // absent: no-op, zero allocation
             removed = true;
             auto nl = chain_erase(lf, key);
-            if (nl) return TrieCore(std::move(nl), size_ - 1, mem_, /*leaf_root=*/true);
-            return TrieCore(nullptr, 0, mem_, /*leaf_root=*/false);
+            if (nl) return TrieCore(std::move(nl), size_ - 1, mem_, /*leaf_root=*/true, max_shift_);
+            return TrieCore(nullptr, 0, mem_, /*leaf_root=*/false, max_shift_);
         }
 
         auto r = erase_in(root_, hash, 0, key, removed);
-        return TrieCore(std::move(r), size_ - (removed ? 1 : 0), mem_, /*leaf_root=*/false);
+        return TrieCore(std::move(r), size_ - (removed ? 1 : 0), mem_, /*leaf_root=*/false, max_shift_);
     }
 
     const Entry* get_entry(const K& key) const {
@@ -1239,7 +1283,10 @@ public:
     SlotStats slot_stats() const {
         SlotStats s;
         if (root_is_leaf_) {
-            ++s.leaf_count;  // no Node at all -- that's the entire point of root_is_leaf_
+            // A leaf-root can itself be a collision chain (chain_set at
+            // set_entry's root_is_leaf_ branch) -- walk it instead of
+            // assuming one leaf-root means one entry.
+            record_chain(as_leaf(root_), s);
             return s;
         }
         walk_slot_stats(as_node(root_), s);
@@ -1247,6 +1294,20 @@ public:
     }
 
 private:
+    /// Walks one chain (a leaf slot's Leaf::next list), folding its length
+    /// into leaf_count (total entries) and the chain-shape fields (one chain
+    /// head per call). Under kPerfectHash, next.get() is always null
+    /// (NoChain), so every chain here is length 1, same as before this
+    /// field existed.
+    static void record_chain(const Leaf* head, SlotStats& s) {
+        std::size_t len = 0;
+        for (const Leaf* l = head; l; l = l->next.get()) ++len;
+        s.leaf_count += len;
+        ++s.chain_slot_count;
+        s.max_chain_len = std::max(s.max_chain_len, len);
+        s.min_chain_len = std::min(s.min_chain_len, len);
+    }
+
     static void walk_slot_stats(const Node* n, SlotStats& s) {
         if (!n) return;
         ++s.node_count;
@@ -1264,7 +1325,7 @@ private:
             const std::uint32_t b = bit(idx);
             if (!(n->bitmap & b)) continue;
             if (n->is_leaf & b) {
-                ++s.leaf_count;
+                record_chain(as_leaf(n->slots[pos]), s);
             } else {
                 walk_slot_stats(as_node(n->slots[pos]), s);
             }
@@ -1430,8 +1491,11 @@ public:
     /// every one later derived from it via set()/erase()) are pooled
     /// through `mem` instead of plain new/delete. See detail::TrieCore::
     /// mem_'s own comment for the lifetime obligation this places on the
-    /// caller.
-    explicit PersistentMap(std::pmr::memory_resource* mem) : core_(mem) {}
+    /// caller. `max_shift` defaults to full precision (today's exact
+    /// behavior for every caller that doesn't pass one) -- see TrieCore::
+    /// max_shift_'s own comment.
+    explicit PersistentMap(std::pmr::memory_resource* mem, std::uint8_t max_shift = 64)
+        : core_(mem, max_shift) {}
 
     std::size_t size() const noexcept { return core_.size(); }
     bool empty() const noexcept { return core_.empty(); }
@@ -1522,8 +1586,13 @@ public:
     /// every one later derived from it via insert()/erase()) are pooled
     /// through `mem` instead of plain new/delete. See detail::TrieCore::
     /// mem_'s own comment for the lifetime obligation this places on the
-    /// caller.
-    explicit PersistentSet(std::pmr::memory_resource* mem) : core_(mem) {}
+    /// caller. `max_shift` defaults to full precision -- see PersistentMap's
+    /// identical parameter and TrieCore::max_shift_'s own comment. Every
+    /// PersistentSet in this project is Id-keyed (IdHash, perfect), so no
+    /// real caller ever passes a value below 64 here -- TrieCore's
+    /// constructor asserts against it.
+    explicit PersistentSet(std::pmr::memory_resource* mem, std::uint8_t max_shift = 64)
+        : core_(mem, max_shift) {}
 
     std::size_t size() const noexcept { return core_.size(); }
     bool empty() const noexcept { return core_.empty(); }

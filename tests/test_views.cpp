@@ -516,7 +516,7 @@ TEST(for_each_view_is_type_filtered) {
 }
 
 // Order::computed_key() is declared in BOTH define_keys() and define_fields()
-// (tagged LookupType::Cache) at once (see tests/test_types.h), so a single
+// (tagged LookupType::Exact) at once (see tests/test_types.h), so a single
 // update() that changes what it returns must reconcile the key index AND
 // the cached-field index together -- find_by_field always takes the
 // cache-hit branch for a Cache-tagged field, so that's the only branch

@@ -69,9 +69,9 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Order::account>(), s.account, model::LookupType::Cache, "account");
-        v(model::field_tag<&Order::parent>(), s.parent, model::LookupType::Scan, "parent");
-        v(model::field_tag<&Order::account_scan>(), s.account_scan, model::LookupType::Scan,
+        v(model::field_tag<&Order::account>(), s.account, model::RefLookupType::Exact, "account");
+        v(model::field_tag<&Order::parent>(), s.parent, model::RefLookupType::Scan, "parent");
+        v(model::field_tag<&Order::account_scan>(), s.account_scan, model::RefLookupType::Scan,
           "account_scan");
     }
 
@@ -82,8 +82,8 @@ public:
 
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.field<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
-        v.field<&Order::computed_key>(s.computed_key(), model::LookupType::Cache, "computed_key");
+        v.field<&Order::qty>(s.qty, model::LookupType::Exact, "qty");
+        v.field<&Order::computed_key>(s.computed_key(), model::LookupType::Exact, "computed_key");
         v.field<&Order::qty_scan>(s.qty_scan, model::LookupType::Scan, "qty_scan");
     }
 };

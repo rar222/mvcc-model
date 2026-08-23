@@ -6,26 +6,29 @@
 // The declaration contract (each define_X below): a field left out of
 // define_fields()/define_references() is invisible to find_by_field/find_referrers
 // (find_by_key on an undeclared field is similarly invisible to define_keys()) --
-// empty, nothing walked. Each field/reference carries a single LookupType tag
-// (Cache or Scan) attached at its one declaration site -- a field can be tagged
-// exactly one way, never both. See model.h's Object<Derived> class comment for
-// the full contract.
+// empty, nothing walked. Each field/reference carries a single lookup-type tag
+// attached at its one declaration site -- a field can be tagged exactly one way,
+// never both. See model.h's Object<Derived> class comment for the full contract.
 //   define_references()     optional: list every reference field ONCE, tagged by its own
-//                           address and a model::LookupType (Cache or Scan) -- Cache backs
-//                           find_referrers's "who points at this?" lookup with an INDEXED
-//                           O(log n + matches) reverse index (one entry per object,
-//                           maintained every commit); Scan leaves it on the always-
-//                           available O(#objects) scan fallback (zero write-side cost).
-//                           Declare Cache only for what's queried often.
+//                           address and a model::RefLookupType (Exact or Scan) -- Exact
+//                           backs find_referrers's "who points at this?" lookup with an
+//                           INDEXED O(log n + matches) reverse index (one entry per
+//                           object, maintained every commit); Scan leaves it on the
+//                           always-available O(#objects) scan fallback (zero write-side
+//                           cost). Declare Exact only for what's queried often.
 //   define_keys()           optional: zero or more fields (or computed methods) for fast
 //                           UNIQUE lookup (find_by_key; a create/update that would duplicate
-//                           another live object's value is rejected, CommitStatus::Invalid)
+//                           another live object's value is rejected, CommitStatus::Invalid),
+//                           each optionally tagged model::KeyLookupType (Exact/Coarse/
+//                           VeryCoarse -- see its own doc comment; Exact if omitted)
 //   define_fields()         optional: zero or more fields, each tagged model::LookupType::
-//                           Cache or model::LookupType::Scan, that make find_by_field
-//                           reachable -- Cache resolves via an INDEXED O(log n + matches)
-//                           lookup (one index entry per object, maintained every commit);
-//                           Scan resolves via an UNINDEXED O(#objects) scan (zero write-side
-//                           cost). Declare Cache only for what's queried often.
+//                           Exact/Coarse/VeryCoarse or model::LookupType::Scan, that make
+//                           find_by_field reachable -- the non-Scan tags resolve via an
+//                           INDEXED lookup (one index entry per object, maintained every
+//                           commit; Coarse/VeryCoarse trade index depth for a larger
+//                           collision-chain scan, see LookupType's own doc comment); Scan
+//                           resolves via an UNINDEXED O(#objects) scan (zero write-side
+//                           cost). Declare an index only for what's queried often.
 //
 // (type() also exists, for diagnostic messages, but Object<Derived> derives it
 // from typeid() automatically -- there's nothing to override.)
@@ -131,7 +134,7 @@ public:
     }
 
     /// account is the classic hot reverse lookup ("every Order for this
-    /// Account") -- worth the index, so it's tagged LookupType::Cache and
+    /// Account") -- worth the index, so it's tagged RefLookupType::Exact and
     /// find_referrers<&Order::account> resolves via Root::by_cached_
     /// reference. parent and account_scan are deliberately tagged Scan:
     /// queried rarely enough that find_referrers's O(#orders) scan fallback
@@ -143,13 +146,13 @@ public:
     /// ref. All three are still declared in define_references() regardless
     /// of tag -- that's what makes account CASCADE and parent/account_scan
     /// NULL correctly on their target's delete (see Ref<>/Opt<> nullability
-    /// above); the LookupType only adds (or withholds) the fast reverse
+    /// above); the RefLookupType only adds (or withholds) the fast reverse
     /// lookup on top of that.
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Order::account>(), s.account, model::LookupType::Cache, "account");
-        v(model::field_tag<&Order::parent>(), s.parent, model::LookupType::Scan, "parent");
-        v(model::field_tag<&Order::account_scan>(), s.account_scan, model::LookupType::Scan,
+        v(model::field_tag<&Order::account>(), s.account, model::RefLookupType::Exact, "account");
+        v(model::field_tag<&Order::parent>(), s.parent, model::RefLookupType::Scan, "parent");
+        v(model::field_tag<&Order::account_scan>(), s.account_scan, model::RefLookupType::Scan,
           "account_scan");
     }
 
@@ -161,7 +164,7 @@ public:
     /// qty is deliberately non-unique (many orders share a quantity), so it
     /// goes in the MULTI-match family, not define_keys():
     /// s.find_by_field<&Order::qty>(5) -> every order with qty == 5.
-    /// Tagged Cache, so that resolves via the index; qty_scan is a scan-
+    /// Tagged Exact, so that resolves via the index; qty_scan is a scan-
     /// only twin kept equal to qty (see its own field comment) so find_by_
     /// field/find_referrers's scan-fallback branch can be exercised on data
     /// shaped exactly like qty's cache-hit case. computed_key is ALSO
@@ -171,8 +174,8 @@ public:
     /// lookup paths agree.
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.field<&Order::qty>(s.qty, model::LookupType::Cache, "qty");
-        v.field<&Order::computed_key>(s.computed_key(), model::LookupType::Cache, "computed_key");
+        v.field<&Order::qty>(s.qty, model::LookupType::Exact, "qty");
+        v.field<&Order::computed_key>(s.computed_key(), model::LookupType::Exact, "computed_key");
         v.field<&Order::qty_scan>(s.qty_scan, model::LookupType::Scan, "qty_scan");
     }
 };

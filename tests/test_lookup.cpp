@@ -665,7 +665,7 @@ TEST(range_by_field_visits_the_same_matches_as_for_each_by_field) {
     // Field naming a nullary const method (computed_key), not a data member
     // -- exercises FieldRange::matches' other branch
     // (std::is_member_object_pointer_v == false), reached here via the
-    // cache-hit path since computed_key is tagged LookupType::Cache.
+    // cache-hit path since computed_key is tagged LookupType::Exact.
     int computed_hits = 0;
     for (const Order& o : s.range_by_field<&Order::computed_key>("ord:O1")) {
         CHECK(o.id == o1.id());
@@ -1142,7 +1142,7 @@ public:
     std::int64_t code = 0;
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.field<&Unnamed::code>(s.code, model::LookupType::Cache);  // no name argument
+        v.field<&Unnamed::code>(s.code, model::LookupType::Exact);  // no name argument
     }
 };
 }  // namespace
@@ -1170,9 +1170,9 @@ TEST(lookup_diagnostics_falls_back_to_an_address_for_an_unnamed_field) {
 // (LookupFieldReader::field(), feeding find_by_field) -- a genuinely different
 // code path in register_field_lookup's callers, and one with a real unnamed
 // field sitting in test_types.h already: Order::account is named ("account")
-// and tagged LookupType::Cache in define_references(), but Order::parent is
+// and tagged RefLookupType::Exact in define_references(), but Order::parent is
 // also declared in define_references() (so cascade/null still work) and
-// deliberately tagged LookupType::Scan instead -- see its own comment -- so
+// deliberately tagged RefLookupType::Scan instead -- see its own comment -- so
 // it never reaches CachedRefReader and has no registered name. Both fields
 // live on the SAME type, which is exactly the disambiguation case
 // FieldStat::field exists for.
@@ -1190,5 +1190,75 @@ TEST(lookup_diagnostics_shows_names_for_reference_fields_too) {
     CHECK(report.find("Order::account") != std::string::npos);   // named
     CHECK(report.find("Order::parent") == std::string::npos);    // not named
     CHECK(report.find("Order @") != std::string::npos);          // falls back to an address instead
+}
+
+namespace {
+// Dedicated type for exercising KeyLookupType::Coarse/LookupType::Coarse end
+// to end -- deliberately NOT Order::computed_key, which is a demo/benchmark
+// fixture with its own separate redundant-declaration cleanup pending (see
+// CLAUDE.md's project memory on that).
+class CoarseKeyed final : public model::Object<CoarseKeyed> {
+public:
+    std::string code;
+    std::int64_t bucket = 0;
+
+    template <class Self>
+    static void define_keys(Self& s, const model::FieldKeyReader& v) {
+        v.key<&CoarseKeyed::code>(s.code, model::KeyLookupType::Coarse, "code");
+    }
+
+    template <class Self>
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.field<&CoarseKeyed::bucket>(s.bucket, model::LookupType::Coarse, "bucket");
+    }
+};
+}  // namespace
+
+// KeyLookupType::Coarse/LookupType::Coarse deliberately route many distinct
+// values through the same collision chain (see their own doc comments) --
+// find_by_key/find_by_field must still resolve every one of them correctly.
+// Proves the read side (find_by_key_raw, cached_field_short_circuit_raw)
+// needs no awareness of routing precision: it's entirely internal to the
+// trie instance being queried, never threaded through the lookup call.
+TEST(coarse_routing_still_resolves_every_key_and_field_value_correctly) {
+    Model m;
+    // 2000 distinct code values through Coarse's 3-level/32,768-bucket
+    // routing (expected colliding pairs ~= 2000*1999/2/32768 =~ 61) --
+    // enough margin that at least one real chain forms reliably, not left
+    // to the coin-flip odds a smaller n would carry.
+    constexpr int n = 2000;
+    Transaction txn = m.begin();
+    for (int i = 0; i < n; ++i) {
+        auto o = std::make_unique<CoarseKeyed>();
+        o->code = "code" + std::to_string(i);
+        o->bucket = i % 10;
+        txn.create(std::move(o));
+    }
+    commit_ok(m, txn);
+
+    Snapshot s = m.snapshot();
+    for (int i = 0; i < n; ++i) {
+        const CoarseKeyed* found = s.find_by_key<&CoarseKeyed::code>("code" + std::to_string(i));
+        CHECK(found != nullptr);
+        if (found) CHECK_EQ(found->bucket, static_cast<std::int64_t>(i % 10));
+    }
+    CHECK(s.find_by_key<&CoarseKeyed::code>("nonexistent") == nullptr);
+
+    for (int b = 0; b < 10; ++b) {
+        const auto matches = s.find_by_field<&CoarseKeyed::bucket>(b);
+        CHECK_EQ(matches.size(), std::size_t{n / 10});
+        for (const CoarseKeyed* o : matches) CHECK_EQ(o->bucket, static_cast<std::int64_t>(b));
+    }
+
+    // Sanity: n=300 distinct code values through a deliberately shallow trie
+    // actually formed a real collision chain somewhere -- confirms the test
+    // exercises Coarse's trade-off, not a no-op.
+    const auto diag = m.slot_stats_diagnostics();
+    bool found_coarse_chain = false;
+    for (const auto& [key, stats] : diag.by_key_detail) {
+        (void)key;
+        if (stats.max_chain_len > 1) found_coarse_chain = true;
+    }
+    CHECK(found_coarse_chain);
 }
 

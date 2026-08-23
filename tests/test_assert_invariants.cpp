@@ -369,7 +369,7 @@ public:
     std::int64_t x = 0;
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.field<&DupCacheField::x>(s.x, model::LookupType::Cache, "x");
+        v.field<&DupCacheField::x>(s.x, model::LookupType::Exact, "x");
         v.field<&DupCacheField::x>(s.x, model::LookupType::Scan, "x_again");  // same field, twice
     }
 };
@@ -379,8 +379,8 @@ public:
     model::Ref<Account> a;
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&DupRefField::a>(), s.a, model::LookupType::Cache, "a");
-        v(model::field_tag<&DupRefField::a>(), s.a, model::LookupType::Scan, "a_again");  // twice
+        v(model::field_tag<&DupRefField::a>(), s.a, model::RefLookupType::Exact, "a");
+        v(model::field_tag<&DupRefField::a>(), s.a, model::RefLookupType::Scan, "a_again");  // twice
     }
 };
 }  // namespace

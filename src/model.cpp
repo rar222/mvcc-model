@@ -60,6 +60,32 @@ struct IdLess {
     }
 };
 
+/// TrieCore::max_shift_ for a given routing precision, in bits (5 per trie
+/// level -- see slice()'s own comment in persistent_map.h). 64 reproduces
+/// today's unconditional-to-hash-exhaustion behavior exactly (Exact, and
+/// Scan's own value here is never read -- see this function's callers, all
+/// of which skip Scan-tagged fields before reaching it). Coarse/VeryCoarse's
+/// levels are starting points to tune against slot_stats_diagnostics()'s
+/// chain-length fields, not fixed forever.
+std::uint8_t max_shift_for(LookupType t) noexcept {
+    switch (t) {
+        case LookupType::Coarse: return 15;      // 3 levels
+        case LookupType::VeryCoarse: return 10;  // 2 levels
+        case LookupType::Exact:
+        case LookupType::Scan: return 64;
+    }
+    return 64;
+}
+
+std::uint8_t max_shift_for(KeyLookupType t) noexcept {
+    switch (t) {
+        case KeyLookupType::Coarse: return 15;      // 3 levels
+        case KeyLookupType::VeryCoarse: return 10;  // 2 levels
+        case KeyLookupType::Exact: return 64;
+    }
+    return 64;
+}
+
 /// Shared plumbing behind BOTH the cached-field and cached-referrer _raw
 /// wrapper trios (find_*_raw / for_each_*_raw / all_of_*_raw): each pair
 /// differs only in WHICH short-circuiting primitive walks its underlying
@@ -126,7 +152,7 @@ bool Snapshot::cached_field_short_circuit_raw(const void* field, const std::stri
     // of value -> set of every Id currently holding it -- same two-level
     // shape as by_key/find_by_key_raw above, just multi-match per value.
     auto it = root_->by_cached_field.find(field);
-    if (it == root_->by_cached_field.end()) return true;  // never tagged LookupType::Cache: vacuous
+    if (it == root_->by_cached_field.end()) return true;  // never indexed (non-Scan): vacuous
     const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key);
     if (!bucket) return true;  // no live object currently holds this exact value: vacuous
     return bucket->for_each_short_circuit(f);
@@ -170,7 +196,7 @@ bool Snapshot::cached_referrer_short_circuit_raw(const void* field, Id target,
     // there -- same two-level shape as by_cached_field/cached_field_short_
     // circuit_raw above, just keyed by Id instead of a value string.
     auto it = root_->by_cached_reference.find(field);
-    if (it == root_->by_cached_reference.end()) return true;  // never tagged LookupType::Cache: vacuous
+    if (it == root_->by_cached_reference.end()) return true;  // never tagged RefLookupType::Exact: vacuous
     const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(target);
     if (!bucket) return true;  // nothing currently references this target: vacuous
     return bucket->for_each_short_circuit(f);
@@ -789,8 +815,9 @@ Model::collect_update_baseline_field_keys(const Transaction& txn) const {
         // reconcile_out_refs()'s comment for why (a handful of fields at
         // most).
         std::vector<std::pair<const void*, std::string>> old_keys;
-        baseline->each_field_key(
-            [&](const void* field, std::string key) { old_keys.emplace_back(field, std::move(key)); });
+        baseline->each_field_key([&](const void* field, std::string key, KeyLookupType) {
+            old_keys.emplace_back(field, std::move(key));
+        });
         out.emplace(slot, std::move(old_keys));
     }
     return out;
@@ -815,7 +842,7 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
     for (const auto& obj : txn.local_created_) {
         if (!obj) continue;  // cancelled locally (see remove_raw): nothing to claim
         std::optional<IntegrityError> err;
-        obj->each_field_key([&](const void* field, std::string key) {
+        obj->each_field_key([&](const void* field, std::string key, KeyLookupType) {
             if (err) return;  // keep the FIRST violation, same convention as validate()
             auto& plan = plans[field];
             const void* self = obj.get();
@@ -840,7 +867,7 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
         const std::vector<std::pair<const void*, std::string>>& obj_old_keys = old_keys_it->second;
 
         std::optional<IntegrityError> err;
-        clone->each_field_key([&](const void* field, std::string new_key) {
+        clone->each_field_key([&](const void* field, std::string new_key, KeyLookupType) {
             if (err) return;
             const auto oldit = std::find_if(obj_old_keys.begin(), obj_old_keys.end(),
                                             [&](const auto& p) { return p.first == field; });
@@ -983,11 +1010,11 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
 
 void Model::add_field_keys(const ObjectBase* o) {
     const Id id = o->id;
-    o->each_field_key([&](const void* field, std::string key) {
+    o->each_field_key([&](const void* field, std::string key, KeyLookupType type) {
         // logged_index_entry: pool-seeds by_key_[field] on first touch AND
         // captures its pre-attempt value once, for the rollback log -- see
         // its own doc comment in model.h.
-        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field);
+        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field, max_shift_for(type));
         sub = sub.set(key, id);  // key is unique per field by construction (see
                                  // define_keys' contract); a collision here is a
                                  // caller bug, not something this layer detects
@@ -995,8 +1022,8 @@ void Model::add_field_keys(const ObjectBase* o) {
 }
 
 void Model::drop_field_keys(const ObjectBase* o) {
-    o->each_field_key([&](const void* field, std::string key) {
-        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field);
+    o->each_field_key([&](const void* field, std::string key, KeyLookupType type) {
+        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field, max_shift_for(type));
         sub = sub.erase(key);
     });
 }
@@ -1016,14 +1043,14 @@ void Model::reconcile_field_keys(
     // see reconcile_out_refs()'s comment for why.
     std::vector<std::pair<const void*, std::string>> computed_old_keys;
     if (!old_keys_hint) {
-        before->each_field_key([&](const void* field, std::string key) {
+        before->each_field_key([&](const void* field, std::string key, KeyLookupType) {
             computed_old_keys.emplace_back(field, std::move(key));
         });
         old_keys_hint = &computed_old_keys;
     }
     const std::vector<std::pair<const void*, std::string>>& old_keys = *old_keys_hint;
 
-    after->each_field_key([&](const void* field, std::string new_key) {
+    after->each_field_key([&](const void* field, std::string new_key, KeyLookupType type) {
         const auto it = std::find_if(old_keys.begin(), old_keys.end(),
                                      [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
@@ -1033,7 +1060,7 @@ void Model::reconcile_field_keys(
         // per attempt (logged_index_entry), and restore it on rollback.
         // Without this, a vetoed/conflicted attempt leaves by_key_
         // permanently indexing values that never committed.
-        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field);
+        auto& sub = logged_index_entry(by_key_, dirty_by_key_, field, max_shift_for(type));
         // Only erase the OLD key if we still hold it. local_updated_ is an
         // unordered_map -- apply order across objects in one transaction is
         // arbitrary -- so a same-transaction swap (this object vacates K
@@ -1061,14 +1088,15 @@ void Model::reconcile_field_keys(
 void Model::add_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field([&](const void* field, std::string key, LookupType type) {
-        if (type != LookupType::Cache) return;  // Scan-tagged: no index to maintain
+        if (type == LookupType::Scan) return;  // no index to maintain
         // Two-level structure: by_cached_field_[field] is the OUTER map (key
         // string -> bucket); logged_index_entry pool-seeds it on first touch
         // and captures its pre-attempt state, once, for the rollback log.
         // bucket_insert then does the same pool-seeded-first-holder dance
         // one level down, for the INNER bucket (the set of every object
         // currently holding `key`).
-        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field);
+        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field,
+                                       max_shift_for(type));
         sub = pmap::bucket_insert(sub, key, id, &node_pool_);
     });
 }
@@ -1076,8 +1104,9 @@ void Model::add_cached_fields(const ObjectBase* o) {
 void Model::drop_cached_fields(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field([&](const void* field, std::string key, LookupType type) {
-        if (type != LookupType::Cache) return;
-        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field);
+        if (type == LookupType::Scan) return;
+        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field,
+                                       max_shift_for(type));
         sub = pmap::bucket_erase(sub, key, id);
     });
 }
@@ -1090,12 +1119,12 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
     // unordered_map -- see reconcile_out_refs()'s comment for why.
     std::vector<std::pair<const void*, std::string>> old_keys;
     before->each_field([&](const void* field, std::string key, LookupType type) {
-        if (type != LookupType::Cache) return;
+        if (type == LookupType::Scan) return;
         old_keys.emplace_back(field, std::move(key));
     });
 
     after->each_field([&](const void* field, std::string new_key, LookupType type) {
-        if (type != LookupType::Cache) return;
+        if (type == LookupType::Scan) return;
         const auto it = std::find_if(old_keys.begin(), old_keys.end(),
                                      [&](const auto& p) { return p.first == field; });
         if (it != old_keys.end() && it->second == new_key) return;  // unchanged
@@ -1106,7 +1135,8 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
         // bucket_insert steps below (old value's bucket shrinks/drops, new
         // value's bucket grows) -- each reassignment updates the map in
         // place, so there's no separate "cur" to install at the end.
-        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field);
+        auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field,
+                                       max_shift_for(type));
         // Remove this id from its OLD value's bucket, unless that value was
         // never actually indexed (e.g. this field just started returning a
         // cacheable value) -- bucket_erase is already a no-op in that case.
@@ -1118,7 +1148,7 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
 }
 
 // The cached-reference (reverse multimap) index -- the read-side counterpart
-// of referrers_, opt-in per Ref<>/Opt<> field tagged LookupType::Cache in
+// of referrers_, opt-in per Ref<>/Opt<> field tagged RefLookupType::Exact in
 // define_references(). Same persistent-bucket discipline as the cached-field
 // trio above (never a flat vector; every mutation rollback-logged), keyed by
 // the TARGET's Id bytes instead of a field's value, storing the REFERRER's Id
@@ -1202,11 +1232,31 @@ std::size_t Model::debug_changelog_size() const {
 }
 
 namespace {
-void accumulate(pmap::SlotStats& into, const pmap::SlotStats& ss) {
+// Structural fields only (node/leaf/capacity/size) -- NOT chain shape. Used
+// to fold an INNER bucket's cost into an outer field's totals: every inner
+// bucket in this codebase is Id-keyed via the perfect IdHash, so its chain
+// shape is always trivial (every leaf length 1, structurally -- not just
+// coincidentally, see hash_is_perfect_v) regardless of the outer field's own
+// LookupType. Merging that constant in would dilute chain_slot_count/
+// max_chain_len/min_chain_len with a value that carries no information about
+// whether the outer (possibly Coarse/VeryCoarse) routing has grown chains --
+// the actual question these three fields exist to answer.
+void accumulate_structure_only(pmap::SlotStats& into, const pmap::SlotStats& ss) {
     into.node_count += ss.node_count;
     into.leaf_count += ss.leaf_count;
     into.total_capacity += ss.total_capacity;
     into.total_size += ss.total_size;
+}
+
+// Full merge, chain shape included -- for combining several SAME-shape
+// measurements (multiple by_type_ entries, or multiple by_key_ fields'
+// own top-level chain stats), never for folding a nested bucket into its
+// parent (see accumulate_structure_only for that).
+void accumulate(pmap::SlotStats& into, const pmap::SlotStats& ss) {
+    accumulate_structure_only(into, ss);
+    into.chain_slot_count += ss.chain_slot_count;
+    into.max_chain_len = std::max(into.max_chain_len, ss.max_chain_len);
+    if (ss.chain_slot_count) into.min_chain_len = std::min(into.min_chain_len, ss.min_chain_len);
 }
 }  // namespace
 
@@ -1259,7 +1309,7 @@ Model::Diagnostics::SlotStats Model::slot_stats_diagnostics() const {
         accumulate(s.by_key, ss);
         const auto key = owning_type_key(field, [field](const ObjectBase& obj) {
             bool hit = false;
-            obj.each_field_key([&](const void* f, const std::string&) { hit |= (f == field); });
+            obj.each_field_key([&](const void* f, const std::string&, KeyLookupType) { hit |= (f == field); });
             return hit;
         });
         s.by_key_detail.emplace(key, ss);
@@ -1268,7 +1318,7 @@ Model::Diagnostics::SlotStats Model::slot_stats_diagnostics() const {
         pmap::SlotStats ss = m.slot_stats();
         m.for_each([&](const std::string& value, const pmap::PersistentSet<Id, IdHash>& bucket) {
             (void)value;
-            accumulate(ss, bucket.slot_stats());
+            accumulate_structure_only(ss, bucket.slot_stats());
         });
         accumulate(s.by_cached_field, ss);
         const auto key = owning_type_key(field, [field](const ObjectBase& obj) {
@@ -1282,7 +1332,7 @@ Model::Diagnostics::SlotStats Model::slot_stats_diagnostics() const {
         pmap::SlotStats ss = m.slot_stats();
         m.for_each([&](Id target, const pmap::PersistentSet<Id, IdHash>& bucket) {
             (void)target;
-            accumulate(ss, bucket.slot_stats());
+            accumulate_structure_only(ss, bucket.slot_stats());
         });
         accumulate(s.by_cached_reference, ss);
         const auto key = owning_type_key(field, [field](const ObjectBase& obj) {
@@ -2743,11 +2793,11 @@ void Model::add_out_refs_no_log(const ObjectBase* o) {
 // runs, every key in the batch is already known unique.
 void Model::add_field_keys_no_log(const ObjectBase* o) {
     const Id id = o->id;
-    o->each_field_key([&](const void* field, std::string key) {
+    o->each_field_key([&](const void* field, std::string key, KeyLookupType type) {
         // seed_index_entry: see add_field_keys's identical seeding for why
         // (no rollback capture needed on this bulk-load path, but still
         // needs to seed the pool on first touch).
-        auto& sub = seed_index_entry(by_key_, field);
+        auto& sub = seed_index_entry(by_key_, field, max_shift_for(type));
         sub = sub.set(key, id);
     });
 }
@@ -2759,11 +2809,11 @@ void Model::add_field_keys_no_log(const ObjectBase* o) {
 void Model::add_cached_fields_no_log(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field([&](const void* field, std::string key, LookupType type) {
-        if (type != LookupType::Cache) return;
+        if (type == LookupType::Scan) return;
         // seed_index_entry + pool-seeded bucket: see add_cached_fields's
         // identical seeding (no rollback capture needed on this bulk-load
         // path, but still needs to seed the pool on first touch).
-        auto& sub = seed_index_entry(by_cached_field_, field);
+        auto& sub = seed_index_entry(by_cached_field_, field, max_shift_for(type));
         sub = pmap::bucket_insert(sub, key, id, &node_pool_);
     });
 }
@@ -2828,7 +2878,7 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
         }
 
         std::optional<IntegrityError> key_err;
-        obj->each_field_key([&](const void* field, std::string key) {
+        obj->each_field_key([&](const void* field, std::string key, KeyLookupType) {
             if (key_err) return;
             auto& claims = field_key_claims[field];
             const void* self = obj.get();

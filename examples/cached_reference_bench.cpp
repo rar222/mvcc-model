@@ -7,7 +7,7 @@
 //     find_referrers) falls back to an O(#items) linear scan: nothing
 //     indexes it.
 //   CachedItem::bucket -- listed in define_references(), tagged
-//     LookupType::Cache instead. find_referrers answers the same question
+//     RefLookupType::Exact instead. find_referrers answers the same question
 //     in O(log n + #matches) instead, resolving via its cache-hit branch,
 //     backed by Root::by_cached_reference -- see DESIGN.md's "Lookup
 //     families" section.
@@ -65,7 +65,7 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(field_tag<&UncachedItem::bucket>(), s.bucket, LookupType::Scan, "bucket");
+        v(field_tag<&UncachedItem::bucket>(), s.bucket, RefLookupType::Scan, "bucket");
     }
 };
 
@@ -77,7 +77,7 @@ public:
     // The one word UncachedItem doesn't have.
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(field_tag<&CachedItem::bucket>(), s.bucket, LookupType::Cache, "bucket");
+        v(field_tag<&CachedItem::bucket>(), s.bucket, RefLookupType::Exact, "bucket");
     }
 };
 
@@ -430,7 +430,7 @@ int main() {
 
     std::printf(
         "\nThis is the whole tradeoff in one run: index only the reverse lookups you actually\n"
-        "run often (tag the field LookupType::Cache in define_references()) -- and leave the\n"
+        "run often (tag the field RefLookupType::Exact in define_references()) -- and leave the\n"
         "rest on the always-correct, zero-write-cost, zero-standing-memory scan (LookupType::Scan).\n");
     return 0;
 }

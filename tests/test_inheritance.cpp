@@ -112,7 +112,7 @@ public:
 
     /// Scan-only twin of asset_description() (see Order::qty_scan in
     /// test_types.h for the same pattern) -- tagged LookupType::Scan
-    /// below, while asset_description() is tagged LookupType::Cache, so
+    /// below, while asset_description() is tagged LookupType::Exact, so
     /// find_by_field on this one always takes the scan-fallback branch even
     /// though asset_description itself always takes the cache-hit branch.
     std::string asset_description_scan() const { return description; }
@@ -128,7 +128,7 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Asset::owner>(), s.owner, model::LookupType::Cache, "owner");
+        v(model::field_tag<&Asset::owner>(), s.owner, model::RefLookupType::Exact, "owner");
     }
 
     template <class Self>
@@ -148,18 +148,18 @@ public:
     /// legal even though the field itself lives in Labeled, since
     /// asset_description_scan() (not the raw field) is what's named here.
     ///
-    /// Indexed multi-match: same underlying value, tagged LookupType::Cache
+    /// Indexed multi-match: same underlying value, tagged LookupType::Exact
     /// instead, backed by Root::by_cached_field -- O(log n + matches) via
     /// find_by_field's cache-hit branch on &Asset::asset_description.
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
         v.field<&Asset::asset_description_scan>(s.asset_description_scan(), model::LookupType::Scan,
                                                 "description_scan");
-        v.field<&Asset::asset_description>(s.asset_description(), model::LookupType::Cache, "description");
+        v.field<&Asset::asset_description>(s.asset_description(), model::LookupType::Exact, "description");
         // The raw inherited field, under its OWN tag -- same &Labeled::
         // label split as define_keys() above. A tag can be declared exactly
-        // once now (Cache or Scan, never both -- see Object<Derived>::
-        // validate_field_declarations), so this is tagged Cache: that's the
+        // once now (a single LookupType, never two -- see Object<Derived>::
+        // validate_field_declarations), so this is tagged Exact: that's the
         // one that's genuinely queryable across types afterward --
         // Root::by_cached_field is a field-tag-keyed shared index,
         // type-agnostic at the storage layer (it just holds Ids).
@@ -167,7 +167,7 @@ public:
         // across types (member_class_t<Field> forces one concrete type),
         // but Snapshot::find_by_cached_field_raw can: see finding_by_the_
         // inherited_description_field_finds_both_types_in_one_call below.
-        v.field<&Labeled::description>(s.description, model::LookupType::Cache, "base description");
+        v.field<&Labeled::description>(s.description, model::LookupType::Exact, "base description");
         // A SECOND shared-across-types tag, same description VALUE as the
         // asset_description() entry above, but under &Keys::example_key --
         // a tag with no inheritance relationship to Asset (or to Labeled)
@@ -175,7 +175,7 @@ public:
         // holding the same string, under three different tags: proof the
         // sharing is about the TAG (an arbitrary NTTP identity), not about
         // where the field happens to live or where the value came from.
-        v.field<&Keys::example_key>(s.asset_description(), model::LookupType::Cache, "asset description");
+        v.field<&Keys::example_key>(s.asset_description(), model::LookupType::Exact, "asset description");
     }
 };
 
@@ -201,7 +201,7 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Gizmo::linked>(), s.linked, model::LookupType::Scan, "linked");
+        v(model::field_tag<&Gizmo::linked>(), s.linked, model::RefLookupType::Scan, "linked");
     }
 
     template <class Self>
@@ -224,22 +224,22 @@ public:
     // (&Gizmo::gizmo_description_scan), because &Labeled::description
     // would fail to compile through find_by_field's member_class_t
     // downcast. Plus the SAME raw &Labeled::description entry Asset also
-    // registers, tagged Cache for the same reason Asset's is -- see Asset's
+    // registers, tagged Exact for the same reason Asset's is -- see Asset's
     // own comments on why that one is genuinely queryable across types
     // while a per-type scan tag isn't.
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
         v.field<&Gizmo::gizmo_description_scan>(s.gizmo_description_scan(), model::LookupType::Scan,
                                                 "description_scan");
-        v.field<&Gizmo::gizmo_description>(s.gizmo_description(), model::LookupType::Cache, "description");
-        v.field<&Labeled::description>(s.description, model::LookupType::Cache, "base description");
+        v.field<&Gizmo::gizmo_description>(s.gizmo_description(), model::LookupType::Exact, "description");
+        v.field<&Labeled::description>(s.description, model::LookupType::Exact, "base description");
         // Same &Keys::example_key tag Asset registers above -- see Keys'
         // own doc comment and Asset::define_fields' comment on it. Gizmo
         // shares no base with Keys (or, for that matter, with Asset beyond
         // Timestamped/Labeled/Object<Derived>), which is the point: this
         // tag's sharing comes from nothing but both types naming the same
         // &Keys::example_key.
-        v.field<&Keys::example_key>(s.gizmo_description(), model::LookupType::Cache, "gizmo description");
+        v.field<&Keys::example_key>(s.gizmo_description(), model::LookupType::Exact, "gizmo description");
     }
 };
 
@@ -511,7 +511,7 @@ TEST(model_type_with_diamond_base_nulls_on_nullable_ref) {
 }
 
 // find_referrers's cache-hit branch (Asset::owner is tagged
-// LookupType::Cache) on a diamond-derived type's own field -- same downcast
+// LookupType::Exact) on a diamond-derived type's own field -- same downcast
 // concern as find_by_key, satisfied the same way (owner lives on Asset
 // itself).
 TEST(model_type_with_diamond_base_supports_cached_referrer_lookup) {
@@ -687,7 +687,7 @@ TEST(finding_by_the_inherited_description_field_finds_both_types_in_one_call) {
     CHECK_EQ(other.front()->id, g2.id());
 
     CHECK(s.find_by_cached_field_raw(model::field_tag<&Labeled::description>(), "NOPE").empty());
-    // A field never tagged LookupType::Cache at all: empty, not an error.
+    // A field never tagged LookupType::Exact at all: empty, not an error.
     CHECK(s.find_by_cached_field_raw(model::field_tag<&Asset::value>(), "0").empty());
 }
 
@@ -698,7 +698,7 @@ TEST(finding_by_the_inherited_description_field_finds_both_types_in_one_call) {
 // to Asset, Gizmo, Labeled, or ObjectBase at all -- see Keys' own doc
 // comment. &Keys::example_key's only job is to be a distinct, stable
 // pointer-to-member VALUE that both types' define_fields() happen to name,
-// tagged LookupType::Cache. That's sufficient: field_tag<Field> is an identity function of
+// tagged LookupType::Exact. That's sufficient: field_tag<Field> is an identity function of
 // Field alone, and FieldKeyReader::key<Field>(v, name) stores whatever `v`
 // the CALLER supplies under it, so Asset and Gizmo can feed it their own,
 // completely independent description values and still land in the same

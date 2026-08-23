@@ -526,8 +526,8 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Hub::left>(), s.left, model::LookupType::Scan, "left");
-        v(model::field_tag<&Hub::right>(), s.right, model::LookupType::Scan, "right");
+        v(model::field_tag<&Hub::left>(), s.left, model::RefLookupType::Scan, "left");
+        v(model::field_tag<&Hub::right>(), s.right, model::RefLookupType::Scan, "right");
     }
 };
 }  // namespace

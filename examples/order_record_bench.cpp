@@ -4,8 +4,8 @@
 // Order (include/example/types.h) touches:
 //   by_type_               -- every object, unconditionally (see basic_record_bench.cpp)
 //   by_key_                -- computed_key (define_keys())
-//   by_cached_field_       -- qty, computed_key (define_fields(), LookupType::Cache)
-//   by_cached_reference_   -- account (define_references(), LookupType::Cache)
+//   by_cached_field_       -- qty, computed_key (define_fields(), LookupType::Exact)
+//   by_cached_reference_   -- account (define_references(), RefLookupType::Exact)
 //   referrers_             -- account (non-nullable), parent (nullable)
 // Same shape as large_txn_bench.cpp's bench_bulk_create, pulled into its own
 // binary with basic_record_bench.cpp's build/commit phase split and argv

@@ -408,7 +408,7 @@ void seed_orders(Model& m, const std::vector<Ref<Account>>& accounts, int n_orde
 // backed by by_key_'s persistent map -- O(log n), same as the
 // kSmallIndexedRead lookups above, not truly flat) and define_fields()
 // tagged LookupType::Scan (find_by_field's scan-fallback branch,
-// O(#accounts) linear scan -- name isn't tagged LookupType::Cache, so
+// O(#accounts) linear scan -- name isn't tagged LookupType::Exact, so
 // find_by_field always falls back here) -- see tests/test_types.h. Same field, same data, same query: any
 // timing difference is attributable entirely to the index, not to anything
 // else. Uses kSmallIndexedRead for the same reason the cache-hit-vs-scan
@@ -472,7 +472,7 @@ TEST(find_by_key_stays_near_flat_while_find_by_field_scan_fallback_grows_with_po
                      key_us.back(), 3.0);
 }
 
-// Same comparison, one level up: Order::qty is tagged LookupType::Cache
+// Same comparison, one level up: Order::qty is tagged LookupType::Exact
 // (find_by_field resolves it in O(log n + matches)); its scan-only twin
 // qty_scan (see seed_orders' own comment) is tagged LookupType::Scan, so
 // find_by_field on it always takes the O(#orders) scan fallback -- same
@@ -523,7 +523,7 @@ TEST(find_by_field_stays_near_flat_via_cache_while_its_scan_only_twin_grows) {
                      cached_us.back(), 3.0);
 }
 
-// The reverse-lookup counterpart: Order::account is tagged LookupType::Cache
+// The reverse-lookup counterpart: Order::account is tagged RefLookupType::Exact
 // in define_references(), so find_referrers resolves it in
 // O(log n + matches); its scan-only twin account_scan (see seed_orders' own
 // comment) is tagged LookupType::Scan, so find_referrers on it
@@ -1240,8 +1240,8 @@ public:
 
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
-        v.field<&StrKeyed::unique_key>(s.unique_key, model::LookupType::Cache, "unique_key");
-        v.field<&StrKeyed::dup_key>(s.dup_key, model::LookupType::Cache, "dup_key");
+        v.field<&StrKeyed::unique_key>(s.unique_key, model::LookupType::Exact, "unique_key");
+        v.field<&StrKeyed::dup_key>(s.dup_key, model::LookupType::Exact, "dup_key");
         v.field<&StrKeyed::unique_key_scan>(s.unique_key_scan, model::LookupType::Scan, "unique_key_scan");
         v.field<&StrKeyed::dup_key_scan>(s.dup_key_scan, model::LookupType::Scan, "dup_key_scan");
     }
@@ -1528,7 +1528,7 @@ public:
     model::Ref<Account> bucket;
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&MemUncached::bucket>(), s.bucket, model::LookupType::Scan, "bucket");
+        v(model::field_tag<&MemUncached::bucket>(), s.bucket, model::RefLookupType::Scan, "bucket");
     }
 };
 class MemCached final : public model::Object<MemCached> {
@@ -1536,7 +1536,7 @@ public:
     model::Ref<Account> bucket;
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&MemCached::bucket>(), s.bucket, model::LookupType::Cache, "bucket");
+        v(model::field_tag<&MemCached::bucket>(), s.bucket, model::RefLookupType::Exact, "bucket");
     }
 };
 

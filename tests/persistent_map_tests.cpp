@@ -1082,6 +1082,104 @@ TEST(slot_stats_reports_leaf_root_as_zero_nodes_one_leaf) {
     CHECK_EQ(ss.total_size, 0u);
 }
 
+// A leaf-root can itself be a collision chain (chain_set at set_entry's
+// root_is_leaf_ branch, since 1 % 3 == 4 % 3 under ClashHash) -- leaf_count
+// must walk it, not report one leaf for the whole chain.
+TEST(slot_stats_leaf_root_chain_counts_every_chained_entry) {
+    PersistentMap<std::uint64_t, int, ClashHash> m;
+    m = m.set(std::uint64_t{1}, 10);
+    m = m.set(std::uint64_t{4}, 40);
+    CHECK_EQ(m.size(), 2u);
+    SlotStats ss = m.slot_stats();
+    CHECK_EQ(ss.node_count, 0u);
+    CHECK_EQ(ss.leaf_count, 2u);
+    CHECK_EQ(ss.chain_slot_count, 1u);
+    CHECK_EQ(ss.max_chain_len, 2u);
+    CHECK_EQ(ss.min_chain_len, 2u);
+}
+
+// Same as above, one level down: key 3 (hash 0) pushes the leaf-root into a
+// Node, then key 5 (hash 2, same as key 2) chains onto key 2's leaf slot
+// inside that Node -- leaf_count must still see 3 real entries, not 2 slots.
+TEST(slot_stats_node_level_leaf_chain_counts_every_chained_entry) {
+    PersistentMap<std::uint64_t, int, ClashHash> m;
+    m = m.set(std::uint64_t{2}, 20);
+    m = m.set(std::uint64_t{3}, 30);
+    m = m.set(std::uint64_t{5}, 50);
+    CHECK_EQ(m.size(), 3u);
+    SlotStats ss = m.slot_stats();
+    CHECK_EQ(ss.node_count, 1u);
+    CHECK_EQ(ss.leaf_count, 3u);
+    // Two chain heads: key 3 alone (length 1), and the key-2/key-5 chain
+    // (length 2).
+    CHECK_EQ(ss.chain_slot_count, 2u);
+    CHECK_EQ(ss.max_chain_len, 2u);
+    CHECK_EQ(ss.min_chain_len, 1u);
+}
+
+// A real (non-forced) coarsening: max_shift=15 (3 levels) routes 2000
+// distinct, genuinely-StringHash-hashed keys through far fewer trie levels
+// than the default max_shift=64, at the cost of collision chains --
+// exercises set_in's shift-vs-max_shift_ comparison directly, unlike
+// ClashHash (which collides by construction at any depth and so never
+// touches that comparison the way a real, well-distributed hash does).
+TEST(coarser_max_shift_reduces_node_count_and_still_resolves_every_key) {
+    constexpr int n = 2000;
+    PersistentMap<std::string, int, StringHash> exact(nullptr, 64);
+    PersistentMap<std::string, int, StringHash> coarse(nullptr, 15);
+    for (int i = 0; i < n; ++i) {
+        const std::string key = "key" + std::to_string(i);
+        exact = exact.set(key, i);
+        coarse = coarse.set(key, i);
+    }
+    CHECK_EQ(exact.size(), std::size_t{n});
+    CHECK_EQ(coarse.size(), std::size_t{n});
+    for (int i = 0; i < n; ++i) {
+        const std::string key = "key" + std::to_string(i);
+        const int* ev = exact.get(key);
+        const int* cv = coarse.get(key);
+        CHECK(ev && *ev == i);
+        CHECK(cv && *cv == i);
+    }
+
+    const SlotStats es = exact.slot_stats();
+    const SlotStats cs = coarse.slot_stats();
+    CHECK_EQ(cs.leaf_count, std::size_t{n});
+    CHECK(cs.node_count < es.node_count);  // fewer levels needed to route 3-bit-shallower
+    CHECK(cs.max_chain_len > 1u);          // real collisions, deliberately provoked
+}
+
+// TrieCore's constructor asserts against coarsening a perfect-hash trie --
+// IdHash-family hashes (PerfectU64Hash here) declare is_perfect, so distinct
+// keys never collide and a max_shift below 64 has nothing to trade away.
+TEST(constructing_a_coarsened_perfect_hash_set_asserts) {
+    CHECK(dies_of_assert([&] {
+        PersistentSet<std::uint64_t, PerfectU64Hash> s(nullptr, 15);
+        (void)s;
+    }));
+}
+
+// Erasing one entry from a deliberately-coarsened chain must leave every
+// other entry in that same chain still reachable, with size() tracking
+// correctly -- proves erase_in needs no max_shift_ awareness of its own (it
+// just walks whatever shape set_in already built) by test, not just by
+// inspection.
+TEST(erase_from_a_coarsened_chain_leaves_siblings_reachable_and_size_correct) {
+    constexpr int n = 200;
+    PersistentMap<std::string, int, StringHash> m(nullptr, 10);  // 2 levels: aggressive coarsening
+    for (int i = 0; i < n; ++i) m = m.set("k" + std::to_string(i), i);
+    CHECK_EQ(m.size(), std::size_t{n});
+    CHECK(m.slot_stats().max_chain_len > 1u);  // confirms real chains formed
+
+    m = m.erase("k0");
+    CHECK_EQ(m.size(), std::size_t{n - 1});
+    CHECK(m.get("k0") == nullptr);
+    for (int i = 1; i < n; ++i) {
+        const int* v = m.get("k" + std::to_string(i));
+        CHECK(v && *v == i);
+    }
+}
+
 // chain_set's kPerfectHash branch trusts its caller's promise (Hash::
 // is_perfect == true) unconditionally -- no per-entry key comparison, unlike
 // erase_in, which only ever calls chain_erase() after leaf_get() has already

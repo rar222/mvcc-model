@@ -18,6 +18,24 @@
 
 using namespace model;
 
+namespace {
+// Dedicated type for stress-testing KeyLookupType::Coarse's first-touch
+// seed_index_entry() path under real concurrent try_commit() contention --
+// several writer threads racing to construct the SAME field's PersistentMap
+// for the first time (the exact moment max_shift_ gets baked in) is the one
+// scenario a single-threaded test can't exercise. Kept separate from Order
+// (which test_types.h keeps deliberately field-for-field identical to
+// include/example/types.h's copy) rather than adding a field there.
+class CoarseThing final : public model::Object<CoarseThing> {
+public:
+    std::string code;
+
+    template <class Self>
+    static void define_keys(Self& s, const model::FieldKeyReader& v) {
+        v.key<&CoarseThing::code>(s.code, model::KeyLookupType::Coarse, "code");
+    }
+};
+}  // namespace
 
 // The project's primary concurrency invariant test (see CLAUDE.md):
 // many writer threads racing try_commit() on overlapping state, plus
@@ -66,21 +84,37 @@ TEST(
         }
     };
 
+    std::atomic<int> next_coarse_id{0};
+    std::atomic<std::uint64_t> coarse_created{0};
+
     auto writer = [&](unsigned seed) {
         std::mt19937 rng(seed);
         while (!stop.load(std::memory_order_relaxed)) {
             Transaction txn = m.begin();
             const int roll = rng() % 100;
-            if (roll < 50) {
+            if (roll < 45) {
                 auto o = std::make_unique<Order>();
                 o->code = "W" + std::to_string(next_id.fetch_add(1));
                 o->account = accounts[rng() % accounts.size()];
                 txn.create(std::move(o));
-            } else if (roll < 80) {
+            } else if (roll < 75) {
                 if (Order* o = txn.update(seed_orders[rng() % seed_orders.size()]))
                     o->qty = static_cast<std::int64_t>(rng() % 50);
-            } else {
+            } else if (roll < 90) {
                 txn.remove(seed_orders[rng() % seed_orders.size()]);
+            } else {
+                // All 3 writer threads racing to touch CoarseThing's Coarse-
+                // tagged by_key_ entry for the first time -- exactly the
+                // seed_index_entry() first-touch race this field exists to
+                // stress. try_commit()'s conflict check already serializes
+                // the ACTUAL index mutation (commit_mu_), so this is really
+                // testing that racing to be first through that gate is safe,
+                // not that concurrent mutation of the index itself is.
+                auto c = std::make_unique<CoarseThing>();
+                c->code = "C" + std::to_string(next_coarse_id.fetch_add(1));
+                txn.create(std::move(c));
+                if (m.try_commit(txn).status == CommitStatus::Committed) coarse_created.fetch_add(1);
+                continue;
             }
             m.try_commit(txn);  // conflicts are expected and fine; just don't corrupt anything
         }
@@ -123,10 +157,21 @@ TEST(
     CHECK(snaps.load() > 0);
     CHECK(resolved.load() > 0);
     CHECK(accessor_calls.load() > 0);
+    CHECK(coarse_created.load() > 0);
 
     Snapshot final_s = m.snapshot();
     final_s.for_each<Order>(
         [&](const Order& o) { CHECK(final_s.resolve(o.account).id == o.account.id()); });
+
+    // Every CoarseThing this run committed must still resolve correctly --
+    // no corruption of by_key_[CoarseThing::code] survived the concurrent
+    // first-touch race.
+    std::uint64_t coarse_seen = 0;
+    final_s.for_each<CoarseThing>([&](const CoarseThing& c) {
+        CHECK(final_s.find_by_key<&CoarseThing::code>(c.code) == &c);
+        ++coarse_seen;
+    });
+    CHECK_EQ(coarse_seen, coarse_created.load());
 }
 
 // The intersection the individual hook tests above never cover: every hook

@@ -49,6 +49,20 @@ bool dies_of_assert(const std::function<void()>& fn) {
     // row -- the per-call deadline has to stay small enough that even a
     // total wipeout (every attempt legitimately hangs) finishes well inside
     // model_tests' own default 300s ctest TIMEOUT, not brush up against it.
+    //
+    // WARNING: KNOWN TO BE UNRELIABLE under ASan specifically, when run as
+    // part of a large parallel `ctest` batch (not in isolation). ASan's own
+    // fork()/signal-handling overhead can push a genuine sub-millisecond
+    // assert-abort past this 3s deadline under enough concurrent system
+    // load, producing a false "didn't die of an assert" failure -- observed
+    // on creating_a_type_with_a_field_declared_twice_in_define_fields_asserts
+    // (3.04s, right at the deadline, in a full `ctest --preset asan` run;
+    // 0.05s and passing when rerun alone). To tell a real regression apart:
+    // rerun just the failing test in isolation (`ctest -R <name>`) -- the
+    // known flake clears immediately; a real regression (fn() genuinely not
+    // asserting) fails the same way every time, isolated or not. Any caller
+    // of dies_of_assert()/completes_cleanly() below can in principle hit this
+    // same deadline-under-load flake, not just the one observed so far.
     using namespace std::chrono;
     const auto deadline = steady_clock::now() + seconds(3);
     int status = 0;

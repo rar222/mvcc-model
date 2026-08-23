@@ -400,9 +400,9 @@ TEST(diagnostics_reports_object_population_storage_and_indexes) {
 
     // Account::name (define_keys), Order::computed_key (define_keys).
     CHECK_EQ(d.key_indexed_fields, std::size_t{2});
-    // Order::qty, Order::computed_key (define_fields, LookupType::Cache).
+    // Order::qty, Order::computed_key (define_fields, LookupType::Exact).
     CHECK_EQ(d.cached_value_indexed_fields, std::size_t{2});
-    // Order::account (define_references, LookupType::Cache) -- parent is deliberately Scan-tagged.
+    // Order::account (define_references, RefLookupType::Exact) -- parent is deliberately Scan-tagged.
     CHECK_EQ(d.cached_reference_indexed_fields, std::size_t{1});
 
     // referrers_ tracks every define_references() field regardless of caching:

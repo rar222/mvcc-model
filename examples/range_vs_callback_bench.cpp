@@ -52,7 +52,7 @@ public:
 
 // Exercises range_by_field / for_each_by_field / all_of_by_field's cache-hit
 // branch: category is a low-cardinality VALUE field, indexed via
-// define_fields() tagged LookupType::Cache.
+// define_fields() tagged LookupType::Exact.
 class Widget final : public Object<Widget> {
 public:
     std::int64_t category = 0;
@@ -60,13 +60,13 @@ public:
 
     template <class Self>
     static void define_fields(Self& s, const LookupFieldReader& v) {
-        v.field<&Widget::category>(s.category, LookupType::Cache, "category");
+        v.field<&Widget::category>(s.category, LookupType::Exact, "category");
     }
 };
 
 // Exercises range_referrers / for_each_referrers / all_of_referrers's
 // cache-hit branch: bucket is a Ref<Bucket>, indexed via define_references()
-// tagged LookupType::Cache.
+// tagged RefLookupType::Exact.
 class Gadget final : public Object<Gadget> {
 public:
     Ref<Bucket> bucket;
@@ -74,7 +74,7 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(field_tag<&Gadget::bucket>(), s.bucket, LookupType::Cache, "bucket");
+        v(field_tag<&Gadget::bucket>(), s.bucket, RefLookupType::Exact, "bucket");
     }
 };
 

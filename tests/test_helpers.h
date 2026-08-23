@@ -97,10 +97,10 @@ Ref<Gadget> make_gadget(Model& m, const std::string& label, std::int64_t serial)
 
 /// Self-referential, with a CACHED nullable reference. Order::parent (the
 /// shared demo type's analogous field) is deliberately tagged
-/// LookupType::Scan to demonstrate the "index only what's worth it"
+/// RefLookupType::Scan to demonstrate the "index only what's worth it"
 /// tradeoff -- so testing the cascade-NULL maintenance path of
 /// Model::reconcile_cached_references needs a field that actually IS
-/// LookupType::Cache and nullable. Node exists purely for that.
+/// RefLookupType::Exact and nullable. Node exists purely for that.
 class Node final : public model::Object<Node> {
 public:
     std::string label;
@@ -119,7 +119,7 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Node::parent>(), s.parent, model::LookupType::Cache, "parent");
+        v(model::field_tag<&Node::parent>(), s.parent, model::RefLookupType::Exact, "parent");
     }
 };
 
@@ -165,7 +165,7 @@ std::string state_of(Model& m);
 /// cascade-delete path) and related (Opt<Record>, nullable, self-referential:
 /// the cascade-null path) -- so every write there exercises reconcile_
 /// referrer_edges across two DIFFERENT edges at once, not just one. owner is
-/// tagged LookupType::Cache, so the same run stress-tests Root::by_cached_
+/// tagged RefLookupType::Exact, so the same run stress-tests Root::by_cached_
 /// reference concurrently for the first time -- every prior cached-
 /// reference test was single-threaded.
 class Record final : public model::Object<Record> {
@@ -198,9 +198,9 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Record::owner>(), s.owner, model::LookupType::Cache, "owner");
-        v(model::field_tag<&Record::related>(), s.related, model::LookupType::Scan, "related");
-        v(model::field_tag<&Record::owner_scan>(), s.owner_scan, model::LookupType::Scan,
+        v(model::field_tag<&Record::owner>(), s.owner, model::RefLookupType::Exact, "owner");
+        v(model::field_tag<&Record::related>(), s.related, model::RefLookupType::Scan, "related");
+        v(model::field_tag<&Record::owner_scan>(), s.owner_scan, model::RefLookupType::Scan,
           "owner_scan");
     }
 };
@@ -243,6 +243,6 @@ public:
 
     template <class Self, class V>
     static void define_references(Self& s, V&& v) {
-        v(model::field_tag<&Link::next>(), s.next, model::LookupType::Scan, "next");
+        v(model::field_tag<&Link::next>(), s.next, model::RefLookupType::Scan, "next");
     }
 };

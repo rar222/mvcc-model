@@ -92,7 +92,7 @@ int main() {
 
     assert(s.find_by_key<&Order::computed_key>("ord:O1") == o2);
     assert(s.view_by_key<&Order::computed_key>("ord:O1"));
-    // Order::qty/computed_key are tagged LookupType::Cache in define_fields()
+    // Order::qty/computed_key are tagged LookupType::Exact in define_fields()
     // -- exercises find_by_field's cache-hit branch.
     assert(s.find_by_field<&Order::qty>(5).size() == 1);
     assert(s.find_by_field<&Order::computed_key>("ord:O1").size() == 1);
