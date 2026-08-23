@@ -718,6 +718,13 @@ std::string to_field_key(const V& v) {
 struct FieldKeyReader {
     const FieldKeyFn& fn;
 
+    /// Non-null: each_field_key_for's single-field mode -- key<Field>()
+    /// skips every field except this one, and skips it BEFORE computing
+    /// to_field_key(v), not just before calling fn. nullptr (the default)
+    /// reproduces each_field_key's existing full-walk behavior exactly, so
+    /// every call site that predates this member is unaffected.
+    const void* target = nullptr;
+
     /// No KeyLookupType given: full precision, same as every call site
     /// before KeyLookupType existed. Delegates to the explicit overload
     /// below rather than duplicating its body.
@@ -735,8 +742,10 @@ struct FieldKeyReader {
         // and can't make this mistake; tie the write side down the same way.
         static_assert(std::is_same_v<V, member_value_t<decltype(Field)>>,
                       "key<Field>(v): v's type must match Field's own declared value type");
-        fn(field_tag<Field>(), to_field_key(v), type);
+        const void* tag = field_tag<Field>();
         detail::register_field_name_once<Field>(name);
+        if (target && target != tag) return;
+        fn(tag, to_field_key(v), type);
     }
 };
 
@@ -761,6 +770,11 @@ using LookupFieldFn = std::function<void(const void* field, std::string key, Loo
 /// same way FieldKeyReader::key()'s is.
 struct LookupFieldReader {
     const LookupFieldFn& fn;
+
+    /// Same single-field filter as FieldKeyReader::target -- see its
+    /// comment.
+    const void* target = nullptr;
+
     template <auto Field, class V>
     void field(const V& v, LookupType type, const char* name = nullptr) const {
         // See FieldKeyReader::key's identical static_assert: V is otherwise
@@ -768,8 +782,10 @@ struct LookupFieldReader {
         // silently populate the wrong field's index.
         static_assert(std::is_same_v<V, member_value_t<decltype(Field)>>,
                       "field<Field>(v): v's type must match Field's own declared value type");
-        fn(field_tag<Field>(), to_field_key(v), type);
+        const void* tag = field_tag<Field>();
         detail::register_field_name_once<Field>(name);
+        if (target && target != tag) return;
+        fn(tag, to_field_key(v), type);
     }
 };
 
@@ -918,6 +934,27 @@ public:
     /// invisible to the lookup -- the declaration is the visibility gate.
     /// See Object<> for the contract and the cost model.
     virtual void each_field(const LookupFieldFn&) const {}
+
+    /// Single-field twin of each_field_key: invokes `fn` for `target` alone
+    /// (a field_tag<Field>() from define_keys()), never for any other
+    /// declared key field. Backs by_key_'s dedup'd comparison (resolving a
+    /// leaf's stored Id back to just the one field being compared) without
+    /// paying to re-derive every key field on the type -- see
+    /// FieldKeyReader's `target` member for how the skip is implemented (it
+    /// skips computing to_field_key() for a non-matching field, not just
+    /// skips using the result).
+    virtual void each_field_key_for(const void* target, const FieldKeyFn& fn) const {
+        (void)target;
+        (void)fn;
+    }
+
+    /// Single-field twin of each_field: invokes `fn` for `target` alone (a
+    /// field_tag<Field>() from define_fields()). Backs by_cached_field_'s
+    /// dedup'd comparison the same way each_field_key_for backs by_key_'s.
+    virtual void each_field_for(const void* target, const LookupFieldFn& fn) const {
+        (void)target;
+        (void)fn;
+    }
 };
 
 /// CRTP base. Derive from it and declare your reference fields ONCE, in
@@ -1192,6 +1229,18 @@ public:
         }
     }
 
+    void each_field_key_for(const void* target, const FieldKeyFn& fn) const override {
+        if constexpr (detail::has_define_keys<Derived>::value)
+            Derived::define_keys(static_cast<const Derived&>(*this), FieldKeyReader{fn, target});
+    }
+
+    void each_field_for(const void* target, const LookupFieldFn& fn) const override {
+        if constexpr (detail::has_define_fields<Derived>::value) {
+            validate_field_declarations();
+            Derived::define_fields(static_cast<const Derived&>(*this), LookupFieldReader{fn, target});
+        }
+    }
+
 private:
     // Both validation passes run ONCE per Derived type (function-local
     // static, thread-safe init -- the same "compute once per type" tool
@@ -1293,6 +1342,36 @@ inline const ObjectBase* slot_lookup(const std::vector<std::shared_ptr<const Chu
     return ch.obj[i];
 }
 
+/// KeyOf for by_key's dedup'd storage: Entry = Id alone, no stored string --
+/// the comparison key is derived by resolving `id` back to its object and
+/// reading the one define_keys() field this map indexes, via
+/// ObjectBase::each_field_key_for. `resolve` does that (bound to whichever
+/// spine -- Root::spine on the read side, Model::spine_ on the write side --
+/// is live at the call site); this type itself stays spine-agnostic, same as
+/// every other KeyOf in this project.
+struct DedupIdKeyOf {
+    template <class Resolve>
+    std::string operator()(const Id& id, const Resolve& resolve) const {
+        return resolve(id);
+    }
+};
+
+/// KeyOf for by_cached_field's dedup'd outer map: Entry = PersistentSet<Id,
+/// IdHash> (the bucket of every Id currently holding this field value), no
+/// stored string. Every member of one bucket shares the identical field
+/// value by find_by_field's own exact-match invariant, so resolving ANY one
+/// member recovers the bucket's comparison key -- peek() avoids walking the
+/// whole bucket to get it.
+struct DedupBucketKeyOf {
+    template <class Resolve>
+    std::string operator()(const pmap::PersistentSet<Id, IdHash>& bucket,
+                           const Resolve& resolve) const {
+        const Id* any = bucket.peek();
+        assert(any && "an indexed bucket is never empty -- bucket_erase drops it once empty");
+        return resolve(*any);
+    }
+};
+
 /// One published, immutable version of the whole model -- everything a
 /// Snapshot can see, in one struct. try_commit() builds a fresh Root per
 /// commit and swaps it in atomically (Model::root_); nothing in a published
@@ -1325,7 +1404,8 @@ struct Root {
     /// way by_type needs TypeTag. Empty for types that declare none. This is
     /// the unique lookup-by-value index (later write wins); there is no
     /// separate mandatory "primary key" index.
-    std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_key;
+    std::unordered_map<const void*, pmap::DedupMap<std::string, Id, pmap::StringHash, DedupIdKeyOf>>
+        by_key;
 
     /// One persistent MULTIMAP per define_fields()-declared field NOT tagged
     /// LookupType::Scan: canonical value string -> a persistent set of
@@ -1336,8 +1416,8 @@ struct Root {
     /// O(n) per op -- the exact size-proportional cost this design exists to
     /// avoid.
     std::unordered_map<const void*,
-                       pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
-                                          pmap::StringHash>>
+                       pmap::DedupMap<std::string, pmap::PersistentSet<Id, IdHash>,
+                                     pmap::StringHash, DedupBucketKeyOf>>
         by_cached_field;
 
     /// One persistent MULTIMAP per define_references()-declared Ref<>/Opt<>
@@ -3784,6 +3864,19 @@ private:
     void drop_out_refs(const ObjectBase* o);
     void reconcile_out_refs(const ObjectBase* before, const ObjectBase* after);
 
+    // by_key_/by_cached_field_ are dedup'd (see pmap::DedupMap): a leaf holds
+    // an Id (or a Set of them), never the field's string value. These two
+    // recover that value on demand by resolving `id` through peek_raw and
+    // reading just the ONE field `field` names (via each_field_key_for/
+    // each_field_for's single-field filter, not a whole-object walk) --
+    // every add/drop/reconcile call below binds one of these into a lambda
+    // and threads it through DedupMap::set/get/erase as `resolve`. Callable
+    // only where `id` is already resolvable: every add_*/drop_*/reconcile_*
+    // call site installs (or hasn't yet removed) the object from spine_
+    // before touching these indexes -- see add_field_keys's own doc comment.
+    std::string resolve_field_key_string(const void* field, Id id) const;
+    std::string resolve_cached_field_value(const void* field, Id id) const;
+
     // Same trio for the unique key index (by_key_)...
     void add_field_keys(const ObjectBase* o);
     void drop_field_keys(const ObjectBase* o);
@@ -4478,10 +4571,11 @@ private:
     // The writer's working copies of Root's three indexes -- same persistent
     // structures, so publishing them into a new Root is a cheap map copy.
     std::unordered_map<TypeTag, pmap::PersistentSet<Id, IdHash>> by_type_;
-    std::unordered_map<const void*, pmap::PersistentMap<std::string, Id, pmap::StringHash>> by_key_;
+    std::unordered_map<const void*, pmap::DedupMap<std::string, Id, pmap::StringHash, DedupIdKeyOf>>
+        by_key_;
     std::unordered_map<const void*,
-                       pmap::PersistentMap<std::string, pmap::PersistentSet<Id, IdHash>,
-                                          pmap::StringHash>>
+                       pmap::DedupMap<std::string, pmap::PersistentSet<Id, IdHash>,
+                                     pmap::StringHash, DedupBucketKeyOf>>
         by_cached_field_;
     std::unordered_map<const void*,
                        pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>>

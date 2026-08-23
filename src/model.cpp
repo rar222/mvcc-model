@@ -137,7 +137,22 @@ const ObjectBase* Snapshot::find_by_key_raw(const void* field, const std::string
     // because each field owns an independent keyspace (see field_tag's doc).
     auto it = root_->by_key.find(field);
     if (it == root_->by_key.end()) return nullptr;  // this field was never define_keys()'d
-    const Id* id = it->second.get(key);               // no match for this exact key value
+    // by_key's leaves are dedup'd (pmap::DedupMap): no stored string, just an
+    // Id -- resolve it back through THIS Root's own (immutable) spine to
+    // recover the comparison key. Every Id by_key ever indexes resolves in
+    // this Root by construction (invariant 1): reconcile always runs before
+    // publish, so there's no in-flight old/new duality here the way there
+    // briefly is mid-commit (see resolve_field_key_string's callers).
+    auto resolve = [&](Id r) -> std::string {
+        const ObjectBase* obj = slot_lookup(root_->spine, r);
+        assert(obj && "by_key never indexes an Id that doesn't resolve in this Root");
+        std::string out;
+        obj->each_field_key_for(field, [&](const void*, std::string k, KeyLookupType) {
+            out = std::move(k);
+        });
+        return out;
+    };
+    const Id* id = it->second.get(key, resolve);       // no match for this exact key value
     // find_raw() re-checks the generation, so even if the id this key mapped
     // to at commit time has since been recycled (in a LATER snapshot -- this
     // one is immutable), this snapshot still resolves it correctly or not at
@@ -153,7 +168,16 @@ bool Snapshot::cached_field_short_circuit_raw(const void* field, const std::stri
     // shape as by_key/find_by_key_raw above, just multi-match per value.
     auto it = root_->by_cached_field.find(field);
     if (it == root_->by_cached_field.end()) return true;  // never indexed (non-Scan): vacuous
-    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key);
+    // Same dedup'd-leaf resolve as find_by_key_raw above, just reading the
+    // matched field via each_field_for instead of each_field_key_for.
+    auto resolve = [&](Id r) -> std::string {
+        const ObjectBase* obj = slot_lookup(root_->spine, r);
+        assert(obj && "by_cached_field never indexes an Id that doesn't resolve in this Root");
+        std::string out;
+        obj->each_field_for(field, [&](const void*, std::string k, LookupType) { out = std::move(k); });
+        return out;
+    };
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key, resolve);
     if (!bucket) return true;  // no live object currently holds this exact value: vacuous
     return bucket->for_each_short_circuit(f);
 }
@@ -163,7 +187,14 @@ pmap::PersistentSet<Id, IdHash> Snapshot::cached_field_bucket_raw(const void* fi
     if (!root_) return {};
     auto it = root_->by_cached_field.find(field);
     if (it == root_->by_cached_field.end()) return {};
-    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key);
+    auto resolve = [&](Id r) -> std::string {
+        const ObjectBase* obj = slot_lookup(root_->spine, r);
+        assert(obj && "by_cached_field never indexes an Id that doesn't resolve in this Root");
+        std::string out;
+        obj->each_field_for(field, [&](const void*, std::string k, LookupType) { out = std::move(k); });
+        return out;
+    };
+    const pmap::PersistentSet<Id, IdHash>* bucket = it->second.get(key, resolve);
     return bucket ? *bucket : pmap::PersistentSet<Id, IdHash>{};
 }
 
@@ -893,10 +924,11 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
     for (const auto& [field, plan] : plans) {
         const auto fit = by_key_.find(field);
         if (fit == by_key_.end()) continue;  // this field has no committed entries at all
+        auto resolve = [this, field = field](Id r) { return resolve_field_key_string(field, r); };
         for (const auto& [key, owner] : plan.claims) {
             (void)owner;
             if (plan.vacated.count(key)) continue;
-            if (const Id* holder = fit->second.get(key))
+            if (const Id* holder = fit->second.get(key, resolve))
                 return IntegrityError{"key '" + key + "' is already in use by object " +
                                           std::to_string(holder->index) + ":" +
                                           std::to_string(holder->gen),
@@ -1008,6 +1040,27 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
 // it verbatim on rollback: a missed restore would leave by_key_ answering
 // find_by_key() with a value that never actually committed.
 
+// by_key_'s leaves are dedup'd (pmap::DedupMap<std::string, Id, ...>): no
+// stored string, just the Id -- every set/get/erase below resolves a
+// comparison key on demand via resolve_field_key_string, bound to `field`.
+std::string Model::resolve_field_key_string(const void* field, Id id) const {
+    const ObjectBase* obj = peek_raw(id);
+    assert(obj && "by_key_ never indexes an Id that doesn't resolve");
+    std::string out;
+    obj->each_field_key_for(field, [&](const void*, std::string k, KeyLookupType) {
+        out = std::move(k);
+    });
+    return out;
+}
+
+std::string Model::resolve_cached_field_value(const void* field, Id id) const {
+    const ObjectBase* obj = peek_raw(id);
+    assert(obj && "by_cached_field_ never indexes an Id that doesn't resolve");
+    std::string out;
+    obj->each_field_for(field, [&](const void*, std::string k, LookupType) { out = std::move(k); });
+    return out;
+}
+
 void Model::add_field_keys(const ObjectBase* o) {
     const Id id = o->id;
     o->each_field_key([&](const void* field, std::string key, KeyLookupType type) {
@@ -1015,16 +1068,18 @@ void Model::add_field_keys(const ObjectBase* o) {
         // captures its pre-attempt value once, for the rollback log -- see
         // its own doc comment in model.h.
         auto& sub = logged_index_entry(by_key_, dirty_by_key_, field, max_shift_for(type));
-        sub = sub.set(key, id);  // key is unique per field by construction (see
-                                 // define_keys' contract); a collision here is a
-                                 // caller bug, not something this layer detects
+        auto resolve = [this, field](Id r) { return resolve_field_key_string(field, r); };
+        sub = sub.set(key, id, resolve);  // key is unique per field by construction (see
+                                          // define_keys' contract); a collision here is a
+                                          // caller bug, not something this layer detects
     });
 }
 
 void Model::drop_field_keys(const ObjectBase* o) {
     o->each_field_key([&](const void* field, std::string key, KeyLookupType type) {
         auto& sub = logged_index_entry(by_key_, dirty_by_key_, field, max_shift_for(type));
-        sub = sub.erase(key);
+        auto resolve = [this, field](Id r) { return resolve_field_key_string(field, r); };
+        sub = sub.erase(key, resolve);
     });
 }
 
@@ -1071,10 +1126,24 @@ void Model::reconcile_field_keys(
         // unconditionally here would still wipe out that other object's
         // legitimate, already-applied claim.
         if (it != old_keys.end()) {
-            const Id* cur = sub.get(it->second);
-            if (cur && *cur == id) sub = sub.erase(it->second);
+            // `id` is already installed with its NEW value (apply_update
+            // installs before reconcile runs -- CLAUDE.md invariant 9), so a
+            // live resolve of `id` would answer with new_key, never the old
+            // value this ownership check needs. Special-case `id` to its
+            // already-known old value; every OTHER id a collision chain
+            // might touch here is a different, unaffected object (or an
+            // already-applied other participant in this same transaction),
+            // for which a live resolve is exactly right.
+            const std::string& old_value = it->second;
+            auto resolve_old = [this, field, id, &old_value](Id r) -> std::string {
+                if (r == id) return old_value;
+                return resolve_field_key_string(field, r);
+            };
+            const Id* cur = sub.get(old_value, resolve_old);
+            if (cur && *cur == id) sub = sub.erase(old_value, resolve_old);
         }
-        sub = sub.set(new_key, id);
+        auto resolve_live = [this, field](Id r) { return resolve_field_key_string(field, r); };
+        sub = sub.set(new_key, id, resolve_live);
     });
 }
 
@@ -1097,7 +1166,8 @@ void Model::add_cached_fields(const ObjectBase* o) {
         // currently holding `key`).
         auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field,
                                        max_shift_for(type));
-        sub = pmap::bucket_insert(sub, key, id, &node_pool_);
+        auto resolve = [this, field](Id r) { return resolve_cached_field_value(field, r); };
+        sub = pmap::bucket_insert(sub, key, id, &node_pool_, resolve);
     });
 }
 
@@ -1107,7 +1177,8 @@ void Model::drop_cached_fields(const ObjectBase* o) {
         if (type == LookupType::Scan) return;
         auto& sub = logged_index_entry(by_cached_field_, dirty_by_cached_field_, field,
                                        max_shift_for(type));
-        sub = pmap::bucket_erase(sub, key, id);
+        auto resolve = [this, field](Id r) { return resolve_cached_field_value(field, r); };
+        sub = pmap::bucket_erase(sub, key, id, resolve);
     });
 }
 
@@ -1140,10 +1211,24 @@ void Model::reconcile_cached_fields(const ObjectBase* before, const ObjectBase* 
         // Remove this id from its OLD value's bucket, unless that value was
         // never actually indexed (e.g. this field just started returning a
         // cacheable value) -- bucket_erase is already a no-op in that case.
-        if (it != old_keys.end()) sub = pmap::bucket_erase(sub, it->second, id);
+        // Same old-vs-new resolve hazard as reconcile_field_keys: `id` is
+        // already installed with its NEW value by the time this runs, so a
+        // live resolve of `id` (which bucket_erase's own bucket-lookup may
+        // do, if peek() happens to pick `id` as this bucket's representative
+        // member) would wrongly answer with the new value -- special-case
+        // `id` to its already-known old value instead.
+        if (it != old_keys.end()) {
+            const std::string& old_value = it->second;
+            auto resolve_old = [this, field, id, &old_value](Id r) -> std::string {
+                if (r == id) return old_value;
+                return resolve_cached_field_value(field, r);
+            };
+            sub = pmap::bucket_erase(sub, old_value, id, resolve_old);
+        }
         // Add this id to its NEW value's bucket, creating that bucket if
         // this is the first object ever to hold this particular value.
-        sub = pmap::bucket_insert(sub, new_key, id, &node_pool_);
+        auto resolve_live = [this, field](Id r) { return resolve_cached_field_value(field, r); };
+        sub = pmap::bucket_insert(sub, new_key, id, &node_pool_, resolve_live);
     });
 }
 
@@ -1316,8 +1401,11 @@ Model::Diagnostics::SlotStats Model::slot_stats_diagnostics() const {
     }
     for (const auto& [field, m] : by_cached_field_) {
         pmap::SlotStats ss = m.slot_stats();
-        m.for_each([&](const std::string& value, const pmap::PersistentSet<Id, IdHash>& bucket) {
-            (void)value;
+        // by_cached_field_'s outer map is dedup'd (pmap::DedupMap): no
+        // stored key, so for_each can only yield the bucket, not (value,
+        // bucket) -- unlike by_cached_reference_'s for_each just below,
+        // which is still a plain PersistentMap and keeps its key.
+        m.for_each([&](const pmap::PersistentSet<Id, IdHash>& bucket) {
             accumulate_structure_only(ss, bucket.slot_stats());
         });
         accumulate(s.by_cached_field, ss);
@@ -2798,7 +2886,8 @@ void Model::add_field_keys_no_log(const ObjectBase* o) {
         // (no rollback capture needed on this bulk-load path, but still
         // needs to seed the pool on first touch).
         auto& sub = seed_index_entry(by_key_, field, max_shift_for(type));
-        sub = sub.set(key, id);
+        auto resolve = [this, field](Id r) { return resolve_field_key_string(field, r); };
+        sub = sub.set(key, id, resolve);
     });
 }
 
@@ -2814,7 +2903,8 @@ void Model::add_cached_fields_no_log(const ObjectBase* o) {
         // identical seeding (no rollback capture needed on this bulk-load
         // path, but still needs to seed the pool on first touch).
         auto& sub = seed_index_entry(by_cached_field_, field, max_shift_for(type));
-        sub = pmap::bucket_insert(sub, key, id, &node_pool_);
+        auto resolve = [this, field](Id r) { return resolve_cached_field_value(field, r); };
+        sub = pmap::bucket_insert(sub, key, id, &node_pool_, resolve);
     });
 }
 

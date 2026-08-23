@@ -119,6 +119,37 @@ struct FakeId {
     friend bool operator!=(FakeId a, FakeId b) noexcept { return !(a == b); }
 };
 
+// Hashes FakeId for the test-local "spine" stand-in below -- not a Hash
+// passed to any TrieCore, just what lets a plain std::unordered_map use
+// FakeId as its own key.
+struct FakeIdHash {
+    std::size_t operator()(FakeId id) const noexcept {
+        return (static_cast<std::uint64_t>(id.index) << 32) | id.gen;
+    }
+};
+
+// KeyOf for a dedup'd map whose Entry is FakeId alone (mirrors model.h's
+// DedupIdKeyOf, whose Entry is the real model::Id): the comparison key is
+// derived by resolving the id, never stored inline. `resolve` here is a
+// test-local stand-in for what model.h's real resolvers do (Id -> object ->
+// field, via peek_raw/spine_) -- see FakeSpine below.
+struct FakeDedupKeyOf {
+    template <class Resolve>
+    std::string operator()(const FakeId& id, const Resolve& resolve) const {
+        return resolve(id);
+    }
+};
+
+// Collapses every string onto one of three hash values, same degenerate
+// purpose as ClashHash above but over std::string instead of std::uint64_t
+// (DedupMap's K here is std::string, matching by_key_'s real shape) -- forces
+// real collision chains so the differential churn test below exercises
+// chain_set/chain_erase's resolved comparisons, not just the leaf-root
+// single-entry path.
+struct ClashStringHash {
+    std::uint64_t operator()(const std::string& s) const noexcept { return StringHash{}(s) % 3; }
+};
+
 // Compile-time-only coverage of the trait-detection machinery itself
 // (detail::hash_is_perfect_v, persistent_map.h) -- a template option in its
 // own right, independent of any trie behavior it later gates.
@@ -396,6 +427,132 @@ TEST(string_keyed_map_with_struct_value_matches_unordered_map) {
         if (i % 300 == 0) check_equal("churn");
     }
     check_equal("final");
+}
+
+// DedupMap<std::string, FakeId, StringHash, FakeDedupKeyOf> mirrors by_key_'s
+// real shape (model.h: DedupMap<std::string, Id, StringHash, DedupIdKeyOf>)
+// -- Entry = FakeId alone, no stored string; every set()/get()/erase() below
+// resolves its comparison key through `spine`, a plain map standing in for
+// what Model::peek_raw/Root::spine resolve through in the real model. FakeId
+// values are always freshly generated (next_gen never repeats), so an id is
+// never ambiguous between two different keys -- ref/spine/dm can't disagree
+// about which string a given id currently means.
+TEST(dedup_map_random_churn_matches_unordered_map) {
+    std::mt19937 rng(4242);
+    std::unordered_map<FakeId, std::string, FakeIdHash> spine;
+    auto resolve = [&](FakeId id) -> std::string {
+        auto it = spine.find(id);
+        return it == spine.end() ? std::string{} : it->second;
+    };
+
+    DedupMap<std::string, FakeId, StringHash, FakeDedupKeyOf> dm;
+    std::unordered_map<std::string, FakeId> ref;
+    std::uint32_t next_gen = 1;
+
+    const int base = g_failures;
+    auto check_equal = [&](const char* where) {
+        if (dm.size() != ref.size()) {
+            std::printf("DEDUP SIZE MISMATCH at %s: dm=%zu ref=%zu\n", where, dm.size(), ref.size());
+            ++g_failures;
+        }
+        for (auto& [k, v] : ref) {
+            const FakeId* p = dm.get(k, resolve);
+            if (!p || !(*p == v)) {
+                std::printf("DEDUP GET MISMATCH at %s key=%s\n", where, k.c_str());
+                ++g_failures;
+                return;
+            }
+        }
+    };
+
+    for (int i = 0; i < 8000 && g_failures == base; i++) {
+        std::string k = "k" + std::to_string(rng() % 800);
+        if (rng() % 3) {
+            FakeId v{static_cast<std::uint32_t>(rng() % 1000), next_gen++};
+            spine[v] = k;
+            dm = dm.set(k, v, resolve);
+            ref[k] = v;
+        } else {
+            dm = dm.erase(k, resolve);
+            ref.erase(k);
+        }
+        if (i % 300 == 0) check_equal("churn");
+    }
+    check_equal("final");
+}
+
+// Same shape, but ClashStringHash forces every key into one of three
+// buckets -- a real collision chain on almost every insert, exercising
+// chain_set_links/chain_erase_links's resolved comparisons walking PAST the
+// chain head, not just leaf_get's single-entry replace path.
+TEST(dedup_map_forced_collisions_still_resolve_correct_key) {
+    std::mt19937 rng(99);
+    std::unordered_map<FakeId, std::string, FakeIdHash> spine;
+    auto resolve = [&](FakeId id) -> std::string {
+        auto it = spine.find(id);
+        return it == spine.end() ? std::string{} : it->second;
+    };
+
+    DedupMap<std::string, FakeId, ClashStringHash, FakeDedupKeyOf> dm;
+    std::unordered_map<std::string, FakeId> ref;
+    std::uint32_t next_gen = 1;
+
+    const int base = g_failures;
+    auto check_equal = [&](const char* where) {
+        if (dm.size() != ref.size()) {
+            std::printf("DEDUP CLASH SIZE MISMATCH at %s: dm=%zu ref=%zu\n", where, dm.size(),
+                        ref.size());
+            ++g_failures;
+        }
+        for (auto& [k, v] : ref) {
+            const FakeId* p = dm.get(k, resolve);
+            if (!p || !(*p == v)) {
+                std::printf("DEDUP CLASH GET MISMATCH at %s key=%s\n", where, k.c_str());
+                ++g_failures;
+                return;
+            }
+        }
+    };
+
+    for (int i = 0; i < 4000 && g_failures == base; i++) {
+        std::string k = "c" + std::to_string(rng() % 400);
+        if (rng() % 3) {
+            FakeId v{static_cast<std::uint32_t>(rng() % 1000), next_gen++};
+            spine[v] = k;
+            dm = dm.set(k, v, resolve);
+            ref[k] = v;
+        } else {
+            dm = dm.erase(k, resolve);
+            ref.erase(k);
+        }
+        if (i % 200 == 0) check_equal("churn");
+    }
+    check_equal("final");
+}
+
+// PersistentSet::peek(): nullptr iff empty; otherwise a genuine member
+// (cross-checked via contains()), stable across insert/erase -- the
+// primitive DedupBucketKeyOf (model.h) leans on to recover by_cached_field_'s
+// comparison value from any one member of a bucket.
+TEST(persistent_set_peek_returns_null_when_empty_or_a_genuine_member) {
+    PersistentSet<std::uint64_t, U64Hash> s;
+    CHECK(s.peek() == nullptr);
+
+    s = s.insert(42);
+    const std::uint64_t* p = s.peek();
+    CHECK(p != nullptr);
+    if (p) CHECK(s.contains(*p));
+
+    s = s.insert(7);
+    s = s.insert(1000);
+    p = s.peek();
+    CHECK(p != nullptr);
+    if (p) CHECK(s.contains(*p));
+
+    s = s.erase(7);
+    s = s.erase(1000);
+    s = s.erase(42);
+    CHECK(s.peek() == nullptr);
 }
 
 // Speed: set()/contains() must grow like O(log32 n) as the population

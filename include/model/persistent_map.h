@@ -96,20 +96,41 @@ struct SlotStats {
 namespace detail {
 
 /// Entry = std::pair<K,V> (PersistentMap's shape): the comparison key is the
-/// pair's first half.
+/// pair's first half. The Resolve parameter exists so every KeyOf
+/// implementation shares one call shape (see TrieCore's own comment on
+/// Resolve) -- this one has the key in hand already and ignores it.
 template <class K, class V>
 struct PairKeyOf {
-    const K& operator()(const std::pair<K, V>& e) const noexcept { return e.first; }
+    template <class Resolve>
+    const K& operator()(const std::pair<K, V>& e, const Resolve&) const noexcept {
+        return e.first;
+    }
 };
 
 /// Entry = K itself (PersistentSet's shape): the entry IS the comparison key,
 /// so "replacing" a matched entry with itself (see TrieCore::set_entry's
 /// collision-bucket step) is a correct, harmless no-op -- no special-casing
-/// needed anywhere in TrieCore for the value-less case.
+/// needed anywhere in TrieCore for the value-less case. Ignores Resolve, same
+/// reason as PairKeyOf above.
 template <class K>
 struct IdentityKeyOf {
-    const K& operator()(const K& e) const noexcept { return e; }
+    template <class Resolve>
+    const K& operator()(const K& e, const Resolve&) const noexcept {
+        return e;
+    }
 };
+
+/// The resolver every KeyOf that stores its own comparison key inline
+/// ignores. TrieCore's public entry points (set_entry/erase_key/get_entry)
+/// default to this so every existing caller -- by_type_, by_cached_reference_,
+/// the inner Set<Id,IdHash> of by_cached_field_ -- compiles and runs exactly
+/// as before, with zero source change and zero added TrieCore state: Resolve
+/// is a stack parameter threaded through by value at call time, never stored
+/// in a Leaf, Node, or TrieCore member (see model.h's DedupIdKeyOf/
+/// DedupBucketKeyOf for the one KeyOf family that actually reads it, to
+/// derive a comparison key by resolving a stored Id back to its object
+/// instead of storing the key redundantly alongside it).
+struct NoResolve {};
 
 /// Detects an opt-in `static constexpr bool is_perfect = true;` on a Hash
 /// functor -- the same optional-static-member detection idiom model.h's
@@ -596,7 +617,10 @@ class TrieCore {
 
     /// The hash a Leaf's entry WOULD have stored, recomputed from its key --
     /// see Leaf's own comment for why nothing caches this.
-    static std::uint64_t entry_hash(const Entry& e) noexcept { return hash_key(KeyOf{}(e)); }
+    template <class Resolve>
+    static std::uint64_t entry_hash(const Entry& e, const Resolve& resolve) noexcept {
+        return hash_key(KeyOf{}(e, resolve));
+    }
 
     static std::uint32_t slice(std::uint64_t hash, int shift) noexcept {
         return static_cast<std::uint32_t>((hash >> shift) & 0x1f);  // 5 bits
@@ -750,9 +774,10 @@ class TrieCore {
         return static_cast<const Leaf*>(s.get());
     }
 
-    static const Entry* leaf_get(const Leaf* lf, const K& key) {
+    template <class Resolve>
+    static const Entry* leaf_get(const Leaf* lf, const K& key, const Resolve& resolve) {
         for (const Leaf* l = lf; l; l = l->next.get())
-            if (KeyOf{}(l->entry) == key) return &l->entry;
+            if (KeyOf{}(l->entry, resolve) == key) return &l->entry;
         return nullptr;
     }
 
@@ -780,16 +805,18 @@ class TrieCore {
 
     // Tail-link half of chain_set: `entry` replaces the link whose key
     // matches, or lands in a fresh link at the end (reported via `added`).
+    template <class Resolve>
     static std::unique_ptr<const Leaf> chain_set_links(const Leaf* l, const K& key,
-                                                       const Entry& entry, bool& added) {
+                                                       const Entry& entry, bool& added,
+                                                       const Resolve& resolve) {
         if (!l) {
             added = true;
             return std::make_unique<Leaf>(entry, nullptr);
         }
-        if (KeyOf{}(l->entry) == key)
+        if (KeyOf{}(l->entry, resolve) == key)
             return std::make_unique<Leaf>(entry, chain_copy(l->next.get()));
-        return std::make_unique<Leaf>(l->entry,
-                                      chain_set_links(l->next.get(), key, entry, added));
+        return std::make_unique<Leaf>(
+            l->entry, chain_set_links(l->next.get(), key, entry, added, resolve));
     }
 
     // Returns `lf`'s chain, rebuilt, with `entry` replacing the link whose
@@ -808,9 +835,11 @@ class TrieCore {
         return RcHandle::adopt(alloc_leaf(std::move(e), std::move(n)));
     }
 
-    RcHandle chain_set(const Leaf* lf, const K& key, const Entry& entry, bool& added) const {
+    template <class Resolve>
+    RcHandle chain_set(const Leaf* lf, const K& key, const Entry& entry, bool& added,
+                       const Resolve& resolve) const {
         if constexpr (kPerfectHash) {
-            assert(lf && KeyOf{}(lf->entry) == key &&
+            assert(lf && KeyOf{}(lf->entry, resolve) == key &&
                   "Hash declared is_perfect but produced a real collision");
             added = false;
             return make_leaf(entry, NoChain{});
@@ -819,8 +848,10 @@ class TrieCore {
                 added = true;
                 return make_leaf(entry, nullptr);
             }
-            if (KeyOf{}(lf->entry) == key) return make_leaf(entry, chain_copy(lf->next.get()));
-            return make_leaf(lf->entry, chain_set_links(lf->next.get(), key, entry, added));
+            if (KeyOf{}(lf->entry, resolve) == key)
+                return make_leaf(entry, chain_copy(lf->next.get()));
+            return make_leaf(lf->entry,
+                             chain_set_links(lf->next.get(), key, entry, added, resolve));
         }
     }
 
@@ -828,10 +859,12 @@ class TrieCore {
     // leaf_get): `key` IS present in `l`'s chain -- which is what lets this
     // rebuild unconditionally instead of needing a "key absent, share
     // untouched" path that unique ownership couldn't express anyway.
-    static std::unique_ptr<const Leaf> chain_erase_links(const Leaf* l, const K& key) {
+    template <class Resolve>
+    static std::unique_ptr<const Leaf> chain_erase_links(const Leaf* l, const K& key,
+                                                          const Resolve& resolve) {
         assert(l && "caller verified the key is present in this chain");
-        if (KeyOf{}(l->entry) == key) return chain_copy(l->next.get());
-        return std::make_unique<Leaf>(l->entry, chain_erase_links(l->next.get(), key));
+        if (KeyOf{}(l->entry, resolve) == key) return chain_copy(l->next.get());
+        return std::make_unique<Leaf>(l->entry, chain_erase_links(l->next.get(), key, resolve));
     }
 
     // Returns `lf`'s chain, rebuilt without `key`'s link. Same presence
@@ -841,19 +874,20 @@ class TrieCore {
     // Under a perfect Hash, `lf` (found via the same hash slice as `key`)
     // IS the entry for `key` -- same reasoning as chain_set -- so erasing
     // it always empties the slot; there is no tail that could survive.
-    RcHandle chain_erase(const Leaf* lf, const K& key) const {
+    template <class Resolve>
+    RcHandle chain_erase(const Leaf* lf, const K& key, const Resolve& resolve) const {
         assert(lf && "caller verified the key is present in this chain");
         if constexpr (kPerfectHash) {
-            assert(KeyOf{}(lf->entry) == key &&
+            assert(KeyOf{}(lf->entry, resolve) == key &&
                   "Hash declared is_perfect but produced a real collision");
             return nullptr;
         } else {
-            if (KeyOf{}(lf->entry) == key) {
+            if (KeyOf{}(lf->entry, resolve) == key) {
                 const Leaf* t = lf->next.get();
                 if (!t) return nullptr;  // the chain held only this key
                 return make_leaf(t->entry, chain_copy(t->next.get()));
             }
-            return make_leaf(lf->entry, chain_erase_links(lf->next.get(), key));
+            return make_leaf(lf->entry, chain_erase_links(lf->next.get(), key, resolve));
         }
     }
 
@@ -916,8 +950,9 @@ class TrieCore {
     // parent was cloned would see the clone's extra reference and wrongly
     // report "shared" for a child that was still private one statement
     // earlier.
+    template <class Resolve>
     RcHandle set_in(const RcHandle& owner, bool parent_private, std::uint64_t hash, int shift,
-                    const K& key, const Entry& entry, bool& added) const {
+                    const K& key, const Entry& entry, bool& added, const Resolve& resolve) const {
         const Node* n = as_node(owner);
         const std::uint32_t idx = slice(hash, shift);
         const std::uint32_t b = bit(idx);
@@ -957,7 +992,8 @@ class TrieCore {
             // the child's parent_private -- see this function's doc
             // comment on why an isolated child use_count() check is not
             // enough on its own.
-            auto new_child = set_in(n->slots[pos], can_mutate, hash, shift + 5, key, entry, added);
+            auto new_child =
+                set_in(n->slots[pos], can_mutate, hash, shift + 5, key, entry, added, resolve);
             if (can_mutate) {
                 const_cast<Node*>(n)->slots[pos] = std::move(new_child);
                 return owner;
@@ -971,11 +1007,11 @@ class TrieCore {
         // own entry (see Leaf's comment); this recompute happens at most
         // once per level of an O(log32 n) insert, never on a read path.
         const Leaf* lf = as_leaf(n->slots[pos]);
-        const std::uint64_t lf_hash = entry_hash(lf->entry);
+        const std::uint64_t lf_hash = entry_hash(lf->entry, resolve);
         if (lf_hash == hash) {
             // Same hash: replace-or-append within the chain (true collision or
             // same key).
-            auto new_slot = chain_set(lf, key, entry, added);
+            auto new_slot = chain_set(lf, key, entry, added, resolve);
             if (can_mutate) {
                 const_cast<Node*>(n)->slots[pos] = std::move(new_slot);
                 return owner;
@@ -1015,7 +1051,8 @@ class TrieCore {
         // matter whether the current level itself is shared, so it starts a
         // brand new private lineage regardless.
         RcHandle sub_owner = RcHandle::adopt(sub);
-        auto sub2 = set_in(sub_owner, /*parent_private=*/true, hash, shift + 5, key, entry, added);
+        auto sub2 = set_in(sub_owner, /*parent_private=*/true, hash, shift + 5, key, entry, added,
+                           resolve);
         if (can_mutate) {
             Node* mut = const_cast<Node*>(n);
             mut->slots[pos] = std::move(sub2);
@@ -1051,8 +1088,9 @@ class TrieCore {
     // node on its path -- same O(log32 n) cost as set() -- this only removes
     // the cost for the no-op case, which used to pay that same price for
     // nothing: see persistent_map_tests.cpp's erase_absent_key_* tests.)
+    template <class Resolve>
     RcHandle erase_in(const RcHandle& owner, std::uint64_t hash, int shift, const K& key,
-                      bool& removed) const {
+                      bool& removed, const Resolve& resolve) const {
         const Node* n = as_node(owner);
         if (!n) return owner;  // empty subtree: nothing to erase
         const std::uint32_t idx = slice(hash, shift);
@@ -1062,7 +1100,7 @@ class TrieCore {
         const std::uint32_t pos = popcount_below(n->bitmap, idx);
 
         if (!(n->is_leaf & b)) {
-            auto sub = erase_in(n->slots[pos], hash, shift + 5, key, removed);
+            auto sub = erase_in(n->slots[pos], hash, shift + 5, key, removed, resolve);
             if (sub.get() == n->slots[pos].get()) return owner;  // unchanged below: unchanged here too
             Node* nn = clone_node(n);
             const Node* subnode = as_node(sub);
@@ -1079,10 +1117,10 @@ class TrieCore {
 
         // Leaf slot.
         const Leaf* lf = as_leaf(n->slots[pos]);
-        if (!leaf_get(lf, key)) return owner;  // key absent: unchanged
+        if (!leaf_get(lf, key, resolve)) return owner;  // key absent: unchanged
 
         removed = true;
-        auto nl = chain_erase(lf, key);
+        auto nl = chain_erase(lf, key, resolve);
         Node* nn = clone_node(n);
         if (nl) {
             nn->slots[pos] = std::move(nl);
@@ -1095,8 +1133,9 @@ class TrieCore {
         return RcHandle::adopt(nn);
     }
 
-    static const Entry* get_in(const Node* n, std::uint64_t hash, int shift,
-                               const K& key) {
+    template <class Resolve>
+    static const Entry* get_in(const Node* n, std::uint64_t hash, int shift, const K& key,
+                               const Resolve& resolve) {
         while (n) {
             const std::uint32_t idx = slice(hash, shift);
             const std::uint32_t b = bit(idx);
@@ -1107,7 +1146,7 @@ class TrieCore {
                 shift += 5;
                 continue;
             }
-            return leaf_get(as_leaf(n->slots[pos]), key);
+            return leaf_get(as_leaf(n->slots[pos]), key, resolve);
         }
         return nullptr;
     }
@@ -1188,7 +1227,8 @@ public:
     /// the UNMODIFIED set_in() (different hash) -- the exact push-down
     /// set_in already performs for an interior leaf slot (see its "Slot
     /// holds a leaf... different hash" branch), just rooted at shift 0.
-    TrieCore set_entry(const K& key, const Entry& entry) const {
+    template <class Resolve = NoResolve>
+    TrieCore set_entry(const K& key, const Entry& entry, const Resolve& resolve = Resolve{}) const {
         bool added = false;
         const std::uint64_t hash = hash_key(key);
 
@@ -1199,9 +1239,9 @@ public:
 
         if (root_is_leaf_) {
             const Leaf* lf = as_leaf(root_);
-            const std::uint64_t lf_hash = entry_hash(lf->entry);
+            const std::uint64_t lf_hash = entry_hash(lf->entry, resolve);
             if (lf_hash == hash) {
-                auto new_leaf = chain_set(lf, key, entry, added);
+                auto new_leaf = chain_set(lf, key, entry, added, resolve);
                 return TrieCore(std::move(new_leaf), size_ + (added ? 1 : 0), mem_,
                                 /*leaf_root=*/true, max_shift_);
             }
@@ -1211,7 +1251,7 @@ public:
             node->is_leaf = bit(exist_idx);
             node->slots = grow_insert(nullptr, 0, 0, RcHandle(root_));  // reuse the existing Leaf, no clone
             RcHandle node_owner = RcHandle::adopt(node);
-            auto r = set_in(node_owner, /*parent_private=*/true, hash, 0, key, entry, added);
+            auto r = set_in(node_owner, /*parent_private=*/true, hash, 0, key, entry, added, resolve);
             return TrieCore(std::move(r), size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false, max_shift_);
         }
 
@@ -1219,7 +1259,7 @@ public:
         // actual RcHandle (by reference, no copy) to check use_count() --
         // see its own doc comment. parent_private=true: there is no
         // ancestor above the root to be shared with.
-        auto r = set_in(root_, /*parent_private=*/true, hash, 0, key, entry, added);
+        auto r = set_in(root_, /*parent_private=*/true, hash, 0, key, entry, added, resolve);
         return TrieCore(r, size_ + (added ? 1 : 0), mem_, /*leaf_root=*/false, max_shift_);
     }
 
@@ -1233,26 +1273,28 @@ public:
     /// policy of never path-collapsing on erase (see erase_in's own
     /// comment); a leaf-root only ever arises via set_entry's 0->1
     /// transition.
-    TrieCore erase_key(const K& key) const {
+    template <class Resolve = NoResolve>
+    TrieCore erase_key(const K& key, const Resolve& resolve = Resolve{}) const {
         bool removed = false;
         const std::uint64_t hash = hash_key(key);
 
         if (root_is_leaf_) {
             const Leaf* lf = as_leaf(root_);
-            if (!leaf_get(lf, key)) return *this;  // absent: no-op, zero allocation
+            if (!leaf_get(lf, key, resolve)) return *this;  // absent: no-op, zero allocation
             removed = true;
-            auto nl = chain_erase(lf, key);
+            auto nl = chain_erase(lf, key, resolve);
             if (nl) return TrieCore(std::move(nl), size_ - 1, mem_, /*leaf_root=*/true, max_shift_);
             return TrieCore(nullptr, 0, mem_, /*leaf_root=*/false, max_shift_);
         }
 
-        auto r = erase_in(root_, hash, 0, key, removed);
+        auto r = erase_in(root_, hash, 0, key, removed, resolve);
         return TrieCore(std::move(r), size_ - (removed ? 1 : 0), mem_, /*leaf_root=*/false, max_shift_);
     }
 
-    const Entry* get_entry(const K& key) const {
-        if (root_is_leaf_) return leaf_get(as_leaf(root_), key);
-        return get_in(as_node(root_), hash_key(key), 0, key);
+    template <class Resolve = NoResolve>
+    const Entry* get_entry(const K& key, const Resolve& resolve = Resolve{}) const {
+        if (root_is_leaf_) return leaf_get(as_leaf(root_), key, resolve);
+        return get_in(as_node(root_), hash_key(key), 0, key, resolve);
     }
 
     template <class F>
@@ -1608,6 +1650,20 @@ public:
 
     bool contains(const K& key) const { return core_.get_entry(key) != nullptr; }
 
+    /// Some member of the set, or nullptr iff empty -- which member is
+    /// unspecified (trie layout order, same as begin()/for_each). Exists for
+    /// callers that need any one representative element rather than every
+    /// element (see model.h's DedupBucketKeyOf: every Id in one
+    /// by_cached_field_ bucket resolves to the identical field value, by
+    /// find_by_field's own exact-match invariant, so any one suffices to
+    /// recover it). O(depth) via the existing external iterator -- begin()
+    /// is already a zero-allocation walk to the first entry (a fixed-size
+    /// Frame stack, see TrieCore::iterator) -- not a new traversal.
+    const K* peek() const {
+        auto it = core_.begin();
+        return it == core_.end() ? nullptr : &*it;
+    }
+
     /// Visits every key once. Same "trie layout order, not insertion or
     /// sorted order" caveat as PersistentMap::for_each above -- see its
     /// comment.
@@ -1639,6 +1695,73 @@ public:
     SlotStats slot_stats() const { return core_.slot_stats(); }
 };
 
+/// Like PersistentMap, but the comparison key is NOT stored in the leaf --
+/// Entry = V alone, and KeyOf derives the comparison key from V (plus a
+/// caller-supplied Resolve) instead of extracting it from a stored pair.
+/// PersistentMap can't express this: its Core alias hardcodes
+/// Entry = std::pair<K,V>. Used where the key is redundant with something
+/// already resolvable through V (model.h's by_key_/by_cached_field_: V is an
+/// Id, or a Set of them, and the field value they'd otherwise duplicate is
+/// recoverable by resolving that Id back to its object). set()/get()/erase()
+/// take Resolve explicitly, with no default -- a DedupMap only ever exists
+/// where dedup applies, so an unresolved call is a compile error, not a
+/// silent wrong answer.
+template <class K, class V, class Hash, class KeyOf>
+class DedupMap {
+    using Core = detail::TrieCore<K, V, Hash, KeyOf>;
+    Core core_;
+    explicit DedupMap(Core c) : core_(std::move(c)) {}
+
+public:
+    DedupMap() = default;
+
+    /// Same pooling contract as PersistentMap's identical constructor -- see
+    /// its own comment.
+    explicit DedupMap(std::pmr::memory_resource* mem, std::uint8_t max_shift = 64)
+        : core_(mem, max_shift) {}
+
+    std::size_t size() const noexcept { return core_.size(); }
+    bool empty() const noexcept { return core_.empty(); }
+
+    /// Same mutate-in-place aliasing hazard as PersistentMap::set -- see its
+    /// doc comment.
+    template <class Resolve>
+    DedupMap set(const K& key, const V& val, const Resolve& resolve) const {
+        return DedupMap(core_.set_entry(key, val, resolve));
+    }
+    template <class Resolve>
+    DedupMap erase(const K& key, const Resolve& resolve) const {
+        return DedupMap(core_.erase_key(key, resolve));
+    }
+    template <class Resolve>
+    const V* get(const K& key, const Resolve& resolve) const {
+        return core_.get_entry(key, resolve);
+    }
+
+    /// Visits every V once. Unlike PersistentMap::for_each, there is no
+    /// stored K to hand back alongside it -- the whole point of this type is
+    /// that K isn't stored. Same trie-layout-order caveat as PersistentMap::
+    /// for_each.
+    template <class F>
+    void for_each(F&& f) const {
+        core_.each_entry([&](const V& v) { f(v); });
+    }
+
+    /// Short-circuiting form of for_each -- see PersistentMap::
+    /// for_each_short_circuit for the contract.
+    template <class F>
+    bool for_each_short_circuit(F&& f) const {
+        return core_.each_entry_short_circuit([&](const V& v) { return f(v); });
+    }
+
+    using iterator = typename Core::iterator;
+    using const_iterator = iterator;
+    iterator begin() const { return core_.begin(); }
+    iterator end() const { return core_.end(); }
+
+    SlotStats slot_stats() const { return core_.slot_stats(); }
+};
+
 /// Add `v` to the persistent-SET bucket at `key` of a PersistentMap<K,
 /// PersistentSet<V, VHash>, Hash> multimap -- the shared two-level shape
 /// behind model.h's Root::by_cached_field and Root::by_cached_reference
@@ -1667,6 +1790,27 @@ PersistentMap<K, PersistentSet<V, VHash>, Hash> bucket_erase(
     if (!bucket) return m;
     PersistentSet<V, VHash> nb = bucket->erase(v);
     return nb.empty() ? m.erase(key) : m.set(key, nb);
+}
+
+/// bucket_insert/bucket_erase for a DedupMap-backed multimap (by_cached_field_'s
+/// shape once dedup'd) -- same contract as the PersistentMap-typed overloads
+/// above, just threading `resolve` through the outer map's get/set/erase.
+template <class K, class Hash, class V, class VHash, class KeyOf, class Resolve>
+DedupMap<K, PersistentSet<V, VHash>, Hash, KeyOf> bucket_insert(
+    const DedupMap<K, PersistentSet<V, VHash>, Hash, KeyOf>& m, const K& key, const V& v,
+    std::pmr::memory_resource* mem, const Resolve& resolve) {
+    const PersistentSet<V, VHash>* bucket = m.get(key, resolve);
+    return m.set(key, (bucket ? *bucket : PersistentSet<V, VHash>(mem)).insert(v), resolve);
+}
+
+template <class K, class Hash, class V, class VHash, class KeyOf, class Resolve>
+DedupMap<K, PersistentSet<V, VHash>, Hash, KeyOf> bucket_erase(
+    const DedupMap<K, PersistentSet<V, VHash>, Hash, KeyOf>& m, const K& key, const V& v,
+    const Resolve& resolve) {
+    const PersistentSet<V, VHash>* bucket = m.get(key, resolve);
+    if (!bucket) return m;
+    PersistentSet<V, VHash> nb = bucket->erase(v);
+    return nb.empty() ? m.erase(key, resolve) : m.set(key, nb, resolve);
 }
 
 }  // namespace model::pmap

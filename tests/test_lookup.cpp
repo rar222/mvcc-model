@@ -1262,3 +1262,114 @@ TEST(coarse_routing_still_resolves_every_key_and_field_value_correctly) {
     CHECK(found_coarse_chain);
 }
 
+// by_key_/by_cached_field_ leaves store an Id (or a Set of them), never a
+// stored string -- a comparison derives its key by resolving that Id back to
+// the live object. reconcile_field_keys/reconcile_cached_fields specifically
+// query the trie for an object's OLD value AFTER that object's NEW value is
+// already installed (apply_update installs before reconcile runs, CLAUDE.md
+// invariant 9) -- a naive "always resolve live" comparator would answer with
+// the NEW value there and wrongly conclude the old entry isn't this object's
+// to reclaim, leaking a stale index entry. Forces real collision chains
+// (same Coarse routing as the test above) around a batch of reassignments to
+// prove that reconciliation resolves correctly even when the old and new
+// keys share a chain with unrelated, untouched objects.
+TEST(coarse_routing_reconciles_reassigned_keys_correctly_under_forced_collisions) {
+    Model m;
+    constexpr int n = 2000;
+    Transaction txn = m.begin();
+    std::vector<Ref<CoarseKeyed>> local;
+    for (int i = 0; i < n; ++i) {
+        auto o = std::make_unique<CoarseKeyed>();
+        o->code = "code" + std::to_string(i);
+        o->bucket = i % 10;
+        local.push_back(txn.create(std::move(o)));
+    }
+    const CommitResult res = commit_ok(m, txn);
+    std::vector<Ref<CoarseKeyed>> created;
+    for (auto& r : local) created.push_back(res.to_real(r));
+
+    // Reassign every 7th object to a NEW, still-colliding code value, in one
+    // transaction -- reconcile_field_keys runs for each, against a by_key_
+    // that already has 2000 entries sharing Coarse's 32,768 buckets.
+    std::vector<Id> reassigned_ids;
+    std::vector<std::string> new_codes;
+    Transaction txn2 = m.begin();
+    for (int i = 0; i < n; i += 7) {
+        CoarseKeyed* clone = txn2.update(created[static_cast<std::size_t>(i)]);
+        CHECK(clone != nullptr);
+        if (!clone) continue;
+        std::string new_code = "reassigned" + std::to_string(i);
+        clone->code = new_code;
+        reassigned_ids.push_back(created[static_cast<std::size_t>(i)].id());
+        new_codes.push_back(new_code);
+    }
+    commit_ok(m, txn2);
+
+    Snapshot after = m.snapshot();
+    for (std::size_t k = 0; k < reassigned_ids.size(); ++k) {
+        const int i = static_cast<int>(k) * 7;
+        // Old code vacated.
+        CHECK(after.find_by_key<&CoarseKeyed::code>("code" + std::to_string(i)) == nullptr);
+        // New code resolves to the SAME object.
+        const CoarseKeyed* found = after.find_by_key<&CoarseKeyed::code>(new_codes[k]);
+        CHECK(found != nullptr);
+        if (found) CHECK(found->id == reassigned_ids[k]);
+    }
+    // Every untouched object (not a multiple of 7) is still findable under
+    // its original code -- proves reconciling its collision-chain neighbors
+    // didn't corrupt it.
+    for (int i = 0; i < n; ++i) {
+        if (i % 7 == 0) continue;
+        const CoarseKeyed* found = after.find_by_key<&CoarseKeyed::code>("code" + std::to_string(i));
+        CHECK(found != nullptr);
+        if (found) CHECK_EQ(found->bucket, static_cast<std::int64_t>(i % 10));
+    }
+}
+
+// each_field_key_for/each_field_for (ObjectBase) are the single-field
+// primitives by_key_/by_cached_field_'s resolvers use to avoid re-deriving
+// every declared key/cached field just to compare one. CoarseKeyed declares
+// exactly one of each (`code` via define_keys(), `bucket` via
+// define_fields()), so cross-querying with the OTHER field's tag is a clean
+// way to prove the filter actually excludes a non-matching field rather than
+// just ignoring the result.
+TEST(each_field_key_for_and_each_field_for_target_exactly_one_field) {
+    CoarseKeyed o;
+    o.code = "code42";
+    o.bucket = 7;
+
+    int hits = 0;
+    std::string seen;
+    o.each_field_key_for(model::field_tag<&CoarseKeyed::code>(),
+                         [&](const void*, std::string k, KeyLookupType) {
+                             ++hits;
+                             seen = std::move(k);
+                         });
+    CHECK_EQ(hits, 1);
+    CHECK_EQ(seen, std::string("code42"));
+
+    // Fields tag on the keys reader: CoarseKeyed's only define_keys() entry
+    // is `code`, so this must invoke the callback zero times.
+    hits = 0;
+    o.each_field_key_for(model::field_tag<&CoarseKeyed::bucket>(),
+                         [&](const void*, std::string, KeyLookupType) { ++hits; });
+    CHECK_EQ(hits, 0);
+
+    hits = 0;
+    std::string seen_field;
+    o.each_field_for(model::field_tag<&CoarseKeyed::bucket>(),
+                     [&](const void*, std::string k, LookupType) {
+                         ++hits;
+                         seen_field = std::move(k);
+                     });
+    CHECK_EQ(hits, 1);
+    CHECK_EQ(seen_field, std::string("7"));
+
+    // Keys tag on the fields reader: CoarseKeyed's only define_fields()
+    // entry is `bucket`, so this must invoke the callback zero times.
+    hits = 0;
+    o.each_field_for(model::field_tag<&CoarseKeyed::code>(),
+                     [&](const void*, std::string, LookupType) { ++hits; });
+    CHECK_EQ(hits, 0);
+}
+

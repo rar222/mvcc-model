@@ -7,6 +7,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -81,11 +82,30 @@ TEST(
                 ++resolved;
                 (void)s.resolve(o.parent);
             });
+            // by_key_/by_cached_field_ leaves are dedup'd (pmap::DedupMap):
+            // every lookup here resolves a stored Id back through THIS
+            // snapshot's own (immutable) spine to recover a comparison key
+            // (find_by_key_raw/cached_field_short_circuit_raw, model.cpp),
+            // concurrently with writer threads publishing new Roots and
+            // reconciling the SAME indexes (the `roll < 75` qty update
+            // below, and CoarseThing's create/update branch) -- proves that
+            // resolve path is race-free under real concurrent commit
+            // pressure, not just against a single writer.
+            if (const Order* found = s.find_by_key<&Order::computed_key>("ord:W0")) {
+                (void)found->qty;
+            }
+            for (const Order* o : s.find_by_field<&Order::qty>(0)) (void)o->code;
+            (void)s.find_by_key<&CoarseThing::code>("C0");
         }
     };
 
     std::atomic<int> next_coarse_id{0};
     std::atomic<std::uint64_t> coarse_created{0};
+    // Guards `live_coarse` below (a plain std::vector, not lock-free) -- the
+    // reassignment branch needs SOME already-committed CoarseThing to update,
+    // which create-only writing can never provide.
+    std::mutex live_coarse_mu;
+    std::vector<Ref<CoarseThing>> live_coarse;
 
     auto writer = [&](unsigned seed) {
         std::mt19937 rng(seed);
@@ -102,7 +122,7 @@ TEST(
                     o->qty = static_cast<std::int64_t>(rng() % 50);
             } else if (roll < 90) {
                 txn.remove(seed_orders[rng() % seed_orders.size()]);
-            } else {
+            } else if (roll < 96) {
                 // All 3 writer threads racing to touch CoarseThing's Coarse-
                 // tagged by_key_ entry for the first time -- exactly the
                 // seed_index_entry() first-touch race this field exists to
@@ -112,9 +132,36 @@ TEST(
                 // not that concurrent mutation of the index itself is.
                 auto c = std::make_unique<CoarseThing>();
                 c->code = "C" + std::to_string(next_coarse_id.fetch_add(1));
-                txn.create(std::move(c));
-                if (m.try_commit(txn).status == CommitStatus::Committed) coarse_created.fetch_add(1);
+                const Ref<CoarseThing> local = txn.create(std::move(c));
+                const CommitResult res = m.try_commit(txn);
+                if (res.status == CommitStatus::Committed) {
+                    coarse_created.fetch_add(1);
+                    std::lock_guard<std::mutex> lk(live_coarse_mu);
+                    live_coarse.push_back(res.to_real(local));
+                }
                 continue;
+            } else {
+                // Reassign an existing CoarseThing's Coarse-tagged code --
+                // reconcile_field_keys's old-vs-new resolve path (see
+                // resolve_field_key_string's callers, model.cpp), under real
+                // concurrent commit_mu_ contention rather than the single-
+                // threaded coverage in test_lookup.cpp's
+                // coarse_routing_reconciles_reassigned_keys_correctly_under_forced_collisions.
+                Ref<CoarseThing> target;
+                bool have_target = false;
+                {
+                    std::lock_guard<std::mutex> lk(live_coarse_mu);
+                    if (!live_coarse.empty()) {
+                        target = live_coarse[rng() % live_coarse.size()];
+                        have_target = true;
+                    }
+                }
+                if (have_target) {
+                    if (CoarseThing* c = txn.update(target))
+                        c->code = "C" + std::to_string(next_coarse_id.fetch_add(1));
+                } else {
+                    continue;  // nothing committed yet to reassign: retry
+                }
             }
             m.try_commit(txn);  // conflicts are expected and fine; just don't corrupt anything
         }
