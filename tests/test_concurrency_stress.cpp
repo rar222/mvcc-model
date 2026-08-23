@@ -40,14 +40,24 @@ public:
     // coarse_field_bucket_merge_* tests (test_lookup.cpp) can't exercise.
     std::string tag;
 
+    // Narrow-int key/field, populated alongside code/tag in the same
+    // create/reassign branches below -- stresses by_key_narrow_'s/
+    // by_cached_field_narrow_'s own first-touch seed_index_entry() race and
+    // reconcile path under real concurrent try_commit() contention, the
+    // narrow-int counterpart of what code/tag already stress for Coarse.
+    std::int64_t narrow_id = 0;
+    std::int64_t narrow_tag = 0;
+
     template <class Self>
     static void define_keys(Self& s, const model::FieldKeyReader& v) {
         v.key<&CoarseThing::code>(s.code, model::KeyLookupType::Coarse, "code");
+        v.key<&CoarseThing::narrow_id>(s.narrow_id, model::KeyLookupType::Exact, "narrow_id");
     }
 
     template <class Self>
     static void define_fields(Self& s, const model::LookupFieldReader& v) {
         v.field<&CoarseThing::tag>(s.tag, model::LookupType::Coarse, "tag");
+        v.field<&CoarseThing::narrow_tag>(s.narrow_tag, model::LookupType::Exact, "narrow_tag");
     }
 };
 }  // namespace
@@ -115,6 +125,10 @@ TEST(
             // sharing a coarse prefix -- see cached_field_short_circuit_raw),
             // racing the writer's CoarseThing create/reassign branches above.
             for (const CoarseThing* c : s.find_by_field<&CoarseThing::tag>("T0")) (void)c->code;
+            // Narrow-int read paths (find_by_key_narrow_raw, cached_field_
+            // short_circuit_narrow_raw), racing the same writer traffic.
+            (void)s.find_by_key<&CoarseThing::narrow_id>(0);
+            for (const CoarseThing* c : s.find_by_field<&CoarseThing::narrow_tag>(0)) (void)c->code;
         }
     };
 
@@ -153,6 +167,8 @@ TEST(
                 const int cid = next_coarse_id.fetch_add(1);
                 c->code = "C" + std::to_string(cid);
                 c->tag = "T" + std::to_string(cid);
+                c->narrow_id = cid;
+                c->narrow_tag = cid;
                 const Ref<CoarseThing> local = txn.create(std::move(c));
                 const CommitResult res = m.try_commit(txn);
                 if (res.status == CommitStatus::Committed) {
@@ -185,6 +201,10 @@ TEST(
                         // the same concurrent contention as code's by_key_
                         // reassignment above.
                         c->tag = "T" + std::to_string(cid);
+                        // by_key_narrow_'s/by_cached_field_narrow_'s own
+                        // reconcile branch, same contention.
+                        c->narrow_id = cid;
+                        c->narrow_tag = cid;
                     }
                 } else {
                     continue;  // nothing committed yet to reassign: retry
@@ -243,6 +263,7 @@ TEST(
     std::uint64_t coarse_seen = 0;
     final_s.for_each<CoarseThing>([&](const CoarseThing& c) {
         CHECK(final_s.find_by_key<&CoarseThing::code>(c.code) == &c);
+        CHECK(final_s.find_by_key<&CoarseThing::narrow_id>(c.narrow_id) == &c);
         ++coarse_seen;
     });
     CHECK_EQ(coarse_seen, coarse_created.load());

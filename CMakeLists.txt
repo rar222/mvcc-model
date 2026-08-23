@@ -143,6 +143,14 @@ add_executable(key_lookup_type_tuning_demo examples/key_lookup_type_tuning_demo.
 target_link_libraries(key_lookup_type_tuning_demo PRIVATE model)
 target_precompile_headers(key_lookup_type_tuning_demo REUSE_FROM model)
 
+# Measures the CPU/structural case for native narrow-int keys/fields
+# (force_string=true vs the default narrow routing, same field, same data)
+# -- see the file's own top comment for why this is a CPU claim, not a
+# memory one.
+add_executable(narrow_key_tuning_demo examples/narrow_key_tuning_demo.cpp)
+target_link_libraries(narrow_key_tuning_demo PRIVATE model)
+target_precompile_headers(narrow_key_tuning_demo REUSE_FROM model)
+
 # range_by_cached_field/range_cached_referrers (range-based for) vs.
 # for_each_by_cached_field/for_each_cached_referrers (callback, never stops
 # early) vs. all_of_by_cached_field/all_of_cached_referrers stopping after
@@ -273,6 +281,7 @@ add_executable(model_tests
     tests/test_events.cpp
     tests/test_cascade.cpp
     tests/test_lookup.cpp
+    tests/test_narrow_keys.cpp
     tests/test_views.cpp
     tests/test_transactions.cpp
     tests/test_hooks.cpp

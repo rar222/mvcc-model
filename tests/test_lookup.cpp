@@ -1226,6 +1226,251 @@ public:
 };
 }  // namespace
 
+namespace {
+enum class Flavor : std::int32_t { Vanilla = 0, Chocolate = 1, Strawberry = 2 };
+
+// Padding-free (sizeof == 2, matches the sum of its members exactly) --
+// narrow-key-eligible. See is_narrow_key_eligible_v's own comment for why a
+// padded struct would NOT be.
+struct Pair16 {
+    std::int8_t a = 0;
+    std::int8_t b = 0;
+
+    // Required by scan_field_short_circuit<Field>'s own comparison
+    // (o.*Field == value) -- that scan-fallback code path gets INSTANTIATED
+    // for any Field usable with find_by_field, regardless of whether the
+    // narrow-routed runtime path ever actually takes it.
+    friend bool operator==(const Pair16& x, const Pair16& y) { return x.a == y.a && x.b == y.b; }
+};
+
+// Dedicated type for exercising native narrow-int keys/fields end to end:
+// LookupType::Exact/KeyLookupType::Exact on an integral type (the common
+// case), a struct, and an enum -- plus force_string's opt-out and Coarse's
+// exclusion, both of which must fall back to the ordinary string path.
+class NarrowKeyed final : public model::Object<NarrowKeyed> {
+public:
+    std::int64_t narrow_key = 0;
+    std::int64_t narrow_field = 0;
+    Pair16 struct_field;
+    Flavor enum_field = Flavor::Vanilla;
+    std::int64_t forced_string_field = 0;
+    std::int64_t coarse_field = 0;
+
+    template <class Self>
+    static void define_keys(Self& s, const model::FieldKeyReader& v) {
+        v.key<&NarrowKeyed::narrow_key>(s.narrow_key, model::KeyLookupType::Exact, "narrow_key");
+    }
+
+    template <class Self>
+    static void define_fields(Self& s, const model::LookupFieldReader& v) {
+        v.field<&NarrowKeyed::narrow_field>(s.narrow_field, model::LookupType::Exact, "narrow_field");
+        v.field<&NarrowKeyed::struct_field>(s.struct_field, model::LookupType::Exact, "struct_field");
+        v.field<&NarrowKeyed::enum_field>(s.enum_field, model::LookupType::Exact, "enum_field");
+        v.field<&NarrowKeyed::forced_string_field>(s.forced_string_field, model::LookupType::Exact,
+                                                    "forced_string_field", /*force_string=*/true);
+        v.field<&NarrowKeyed::coarse_field>(s.coarse_field, model::LookupType::Coarse, "coarse_field");
+    }
+};
+}  // namespace
+
+// The default path: an eligible int64_t key/field routes through
+// by_key_narrow/by_cached_field_narrow automatically, and every read entry
+// point (find_by_key/find_by_field/for_each_by_field/all_of_by_field/
+// range_by_field/range_view_by_field) resolves it correctly -- including a
+// negative value (pack_narrow_key's zero-extend/bit-reinterpret path) and a
+// value sharing low bits with another (0 and (1i64<<40), both zero in their
+// low 32 bits -- Exact routing uses the full 64 bits, so this must not
+// collide).
+TEST(narrow_key_and_field_resolve_via_every_read_entry_point) {
+    Model m;
+    Transaction txn = m.begin();
+    std::vector<Ref<NarrowKeyed>> local;
+    const std::vector<std::int64_t> values = {0, -1, -12345, 42, (std::int64_t{1} << 40)};
+    for (std::int64_t v : values) {
+        auto o = std::make_unique<NarrowKeyed>();
+        o->narrow_key = v;
+        o->narrow_field = v;
+        local.push_back(txn.create(std::move(o)));
+    }
+    const CommitResult res = commit_ok(m, txn);
+    std::vector<Ref<NarrowKeyed>> created;
+    for (auto& r : local) created.push_back(res.to_real(r));
+
+    Snapshot s = m.snapshot();
+    CHECK(s.key_is_narrow(model::field_tag<&NarrowKeyed::narrow_key>()));
+    CHECK(s.cached_field_is_narrow(model::field_tag<&NarrowKeyed::narrow_field>()));
+
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const Id want = created[i].id();
+        const NarrowKeyed* by_key = s.find_by_key<&NarrowKeyed::narrow_key>(values[i]);
+        CHECK(by_key != nullptr);
+        if (by_key) CHECK(by_key->id == want);
+
+        const auto by_field = s.find_by_field<&NarrowKeyed::narrow_field>(values[i]);
+        CHECK_EQ(by_field.size(), std::size_t{1});
+        if (by_field.size() == 1) CHECK(by_field.front()->id == want);
+
+        int hits = 0;
+        s.for_each_by_field<&NarrowKeyed::narrow_field>(values[i],
+                                                        [&](const NarrowKeyed& o) {
+                                                            CHECK(o.id == want);
+                                                            ++hits;
+                                                        });
+        CHECK_EQ(hits, 1);
+        CHECK(s.all_of_by_field<&NarrowKeyed::narrow_field>(
+            values[i], [&](const NarrowKeyed& o) { return o.id == want; }));
+
+        int range_count = 0;
+        for (const NarrowKeyed& o : s.range_by_field<&NarrowKeyed::narrow_field>(values[i])) {
+            CHECK(o.id == want);
+            ++range_count;
+        }
+        CHECK_EQ(range_count, 1);
+
+        int view_count = 0;
+        for (const View<NarrowKeyed>& v : s.range_view_by_field<&NarrowKeyed::narrow_field>(values[i])) {
+            CHECK((*v).id == want);
+            ++view_count;
+        }
+        CHECK_EQ(view_count, 1);
+    }
+
+    CHECK(s.find_by_key<&NarrowKeyed::narrow_key>(999999) == nullptr);
+    CHECK(s.find_by_field<&NarrowKeyed::narrow_field>(999999).empty());
+}
+
+// A struct field and an enum field, both narrow-eligible but not
+// std::is_arithmetic_v -- proves the to_field_key() non-arithmetic branch
+// (only ever reachable via force_string/Coarse, never the default path) AND
+// the default narrow-storage path both work for these types, not just
+// plain integers.
+TEST(narrow_struct_and_enum_fields_resolve_correctly) {
+    Model m;
+    Transaction txn = m.begin();
+    auto o1 = std::make_unique<NarrowKeyed>();
+    o1->narrow_key = 1;
+    o1->struct_field = Pair16{5, 10};
+    o1->enum_field = Flavor::Chocolate;
+    const Ref<NarrowKeyed> r1 = txn.create(std::move(o1));
+    auto o2 = std::make_unique<NarrowKeyed>();
+    o2->narrow_key = 2;
+    o2->struct_field = Pair16{5, 11};  // shares `a` with o1, differs in `b`
+    o2->enum_field = Flavor::Strawberry;
+    const Ref<NarrowKeyed> r2 = txn.create(std::move(o2));
+    const CommitResult res = commit_ok(m, txn);
+    const Ref<NarrowKeyed> real1 = res.to_real(r1), real2 = res.to_real(r2);
+
+    Snapshot s = m.snapshot();
+    const auto by_struct1 = s.find_by_field<&NarrowKeyed::struct_field>(Pair16{5, 10});
+    CHECK_EQ(by_struct1.size(), std::size_t{1});
+    if (by_struct1.size() == 1) CHECK(by_struct1.front()->id == real1.id());
+
+    const auto by_struct2 = s.find_by_field<&NarrowKeyed::struct_field>(Pair16{5, 11});
+    CHECK_EQ(by_struct2.size(), std::size_t{1});
+    if (by_struct2.size() == 1) CHECK(by_struct2.front()->id == real2.id());
+
+    const auto by_enum1 = s.find_by_field<&NarrowKeyed::enum_field>(Flavor::Chocolate);
+    CHECK_EQ(by_enum1.size(), std::size_t{1});
+    if (by_enum1.size() == 1) CHECK(by_enum1.front()->id == real1.id());
+
+    const auto by_enum2 = s.find_by_field<&NarrowKeyed::enum_field>(Flavor::Strawberry);
+    CHECK_EQ(by_enum2.size(), std::size_t{1});
+    if (by_enum2.size() == 1) CHECK(by_enum2.front()->id == real2.id());
+}
+
+// force_string=true opts an otherwise-eligible field out of narrow storage;
+// LookupType::Coarse excludes one regardless of force_string (decision 3 --
+// a perfect hash can't pair with a coarsened max_shift_). Both must route
+// through the ordinary string path, verified directly via cached_field_is_
+// narrow rather than slot_stats_diagnostics() (which folds narrow stats
+// into the same by_cached_field accumulation and so can't tell the two
+// apart -- see key_is_narrow's own comment).
+TEST(force_string_and_coarse_both_stay_on_the_string_path) {
+    Model m;
+    Transaction txn = m.begin();
+    auto o = std::make_unique<NarrowKeyed>();
+    o->narrow_key = 1;
+    o->forced_string_field = 5;
+    o->coarse_field = 7;
+    const Ref<NarrowKeyed> local = txn.create(std::move(o));
+    const CommitResult res = commit_ok(m, txn);
+    const Ref<NarrowKeyed> real = res.to_real(local);
+
+    Snapshot s = m.snapshot();
+    CHECK(!s.cached_field_is_narrow(model::field_tag<&NarrowKeyed::forced_string_field>()));
+    CHECK(!s.cached_field_is_narrow(model::field_tag<&NarrowKeyed::coarse_field>()));
+    CHECK(s.cached_field_is_declared(model::field_tag<&NarrowKeyed::forced_string_field>()));
+    CHECK(s.cached_field_is_declared(model::field_tag<&NarrowKeyed::coarse_field>()));
+
+    // Both still resolve correctly through the (now confirmed) string path.
+    const auto by_forced = s.find_by_field<&NarrowKeyed::forced_string_field>(5);
+    CHECK_EQ(by_forced.size(), std::size_t{1});
+    if (by_forced.size() == 1) CHECK(by_forced.front()->id == real.id());
+
+    const auto by_coarse = s.find_by_field<&NarrowKeyed::coarse_field>(7);
+    CHECK_EQ(by_coarse.size(), std::size_t{1});
+    if (by_coarse.size() == 1) CHECK(by_coarse.front()->id == real.id());
+}
+
+// Update reassignment and removal correctly move/drop entries in
+// by_key_narrow/by_cached_field_narrow without disturbing unrelated
+// entries -- mirrors field_index_tracks_a_reassigned_indexed_field/
+// field_index_is_cleaned_up_on_removal's own pattern (Gadget::serial), here
+// for the narrow-specific maps explicitly.
+TEST(narrow_key_and_field_track_reassignment_and_removal) {
+    Model m;
+    Transaction txn = m.begin();
+    auto a = std::make_unique<NarrowKeyed>();
+    a->narrow_key = 100;
+    a->narrow_field = 100;
+    const Ref<NarrowKeyed> ra = txn.create(std::move(a));
+    auto b = std::make_unique<NarrowKeyed>();
+    b->narrow_key = 200;
+    b->narrow_field = 200;
+    const Ref<NarrowKeyed> rb = txn.create(std::move(b));
+    const CommitResult res1 = commit_ok(m, txn);
+    const Ref<NarrowKeyed> real_a = res1.to_real(ra), real_b = res1.to_real(rb);
+
+    update_field(m, real_a, [](NarrowKeyed* p) {
+        p->narrow_key = 101;
+        p->narrow_field = 101;
+    });
+
+    Snapshot s1 = m.snapshot();
+    CHECK(s1.find_by_key<&NarrowKeyed::narrow_key>(100) == nullptr);
+    CHECK_EQ(s1.find_by_key<&NarrowKeyed::narrow_key>(101)->id, real_a.id());
+    CHECK(s1.find_by_field<&NarrowKeyed::narrow_field>(100).empty());
+    CHECK_EQ(s1.find_by_field<&NarrowKeyed::narrow_field>(101).size(), std::size_t{1});
+    // b, untouched, is still findable and correct.
+    CHECK_EQ(s1.find_by_key<&NarrowKeyed::narrow_key>(200)->id, real_b.id());
+    CHECK_EQ(s1.find_by_field<&NarrowKeyed::narrow_field>(200).size(), std::size_t{1});
+
+    remove_and_commit(m, real_a);
+    Snapshot s2 = m.snapshot();
+    CHECK(s2.find_by_key<&NarrowKeyed::narrow_key>(101) == nullptr);
+    CHECK(s2.find_by_field<&NarrowKeyed::narrow_field>(101).empty());
+    // b is still unaffected by a's removal.
+    CHECK_EQ(s2.find_by_key<&NarrowKeyed::narrow_key>(200)->id, real_b.id());
+    CHECK_EQ(s2.find_by_field<&NarrowKeyed::narrow_field>(200).size(), std::size_t{1});
+}
+
+// The type-erased public _raw entry points never see a narrow-stored field
+// -- decision 5's deliberate limitation, proven here rather than just
+// documented.
+TEST(narrow_stored_fields_are_invisible_to_the_type_erased_raw_entry_points) {
+    Model m;
+    Transaction txn = m.begin();
+    auto o = std::make_unique<NarrowKeyed>();
+    o->narrow_key = 42;
+    o->narrow_field = 42;
+    txn.create(std::move(o));
+    commit_ok(m, txn);
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find_by_key_raw(model::field_tag<&NarrowKeyed::narrow_key>(), "42") == nullptr);
+    CHECK(s.find_by_cached_field_raw(model::field_tag<&NarrowKeyed::narrow_field>(), "42").empty());
+}
+
 // KeyLookupType::Coarse/LookupType::Coarse deliberately route many distinct
 // values through the same collision chain (see their own doc comments) --
 // find_by_key/find_by_field must still resolve every one of them correctly.
@@ -1499,36 +1744,44 @@ TEST(each_field_key_for_and_each_field_for_target_exactly_one_field) {
 
     int hits = 0;
     std::string seen;
-    o.each_field_key_for(model::field_tag<&CoarseKeyed::code>(),
-                         [&](const void*, std::string k, KeyLookupType) {
-                             ++hits;
-                             seen = std::move(k);
-                         });
+    o.each_field_key_for(
+        model::field_tag<&CoarseKeyed::code>(),
+        [&](const void*, std::string k, KeyLookupType) {
+            ++hits;
+            seen = std::move(k);
+        },
+        [](const void*, std::uint64_t, KeyLookupType) {});
     CHECK_EQ(hits, 1);
     CHECK_EQ(seen, std::string("code42"));
 
     // Fields tag on the keys reader: CoarseKeyed's only define_keys() entry
     // is `code`, so this must invoke the callback zero times.
     hits = 0;
-    o.each_field_key_for(model::field_tag<&CoarseKeyed::bucket>(),
-                         [&](const void*, std::string, KeyLookupType) { ++hits; });
+    o.each_field_key_for(
+        model::field_tag<&CoarseKeyed::bucket>(),
+        [&](const void*, std::string, KeyLookupType) { ++hits; },
+        [](const void*, std::uint64_t, KeyLookupType) {});
     CHECK_EQ(hits, 0);
 
     hits = 0;
     std::string seen_field;
-    o.each_field_for(model::field_tag<&CoarseKeyed::bucket>(),
-                     [&](const void*, std::string k, LookupType) {
-                         ++hits;
-                         seen_field = std::move(k);
-                     });
+    o.each_field_for(
+        model::field_tag<&CoarseKeyed::bucket>(),
+        [&](const void*, std::string k, LookupType) {
+            ++hits;
+            seen_field = std::move(k);
+        },
+        [](const void*, std::uint64_t, LookupType) {});
     CHECK_EQ(hits, 1);
     CHECK_EQ(seen_field, std::string("7"));
 
     // Keys tag on the fields reader: CoarseKeyed's only define_fields()
     // entry is `bucket`, so this must invoke the callback zero times.
     hits = 0;
-    o.each_field_for(model::field_tag<&CoarseKeyed::code>(),
-                     [&](const void*, std::string, LookupType) { ++hits; });
+    o.each_field_for(
+        model::field_tag<&CoarseKeyed::code>(),
+        [&](const void*, std::string, LookupType) { ++hits; },
+        [](const void*, std::uint64_t, LookupType) {});
     CHECK_EQ(hits, 0);
 }
 

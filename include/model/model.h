@@ -40,6 +40,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <iterator>
@@ -697,25 +698,109 @@ struct CachedRefReader {
 /// gets its own shape, distinct from the multi-match side's one.
 using FieldKeyFn = std::function<void(const void* field, std::string key, KeyLookupType type)>;
 
+/// Narrow-int twin of FieldKeyFn: invoked instead of FieldKeyFn for an
+/// Exact-tagged, narrow-key-eligible field not declared force_string (see
+/// FieldKeyReader::key()) -- backs Root::by_key_narrow. `key` here is
+/// pack_narrow_key(v), not to_field_key(v); never both for the same field.
+using FieldKeyIntFn = std::function<void(const void* field, std::uint64_t key, KeyLookupType type)>;
+
+/// An object's own define_keys() field values, as of some baseline moment
+/// (see collect_update_baseline_field_keys()'s own doc comment) -- bundles
+/// BOTH storage families in one pass over each_field_key(), since a single
+/// object may have some fields routed through by_key_ (strings) and others
+/// through by_key_narrow_ (packed uint64_t) simultaneously, one map per
+/// field never both. Threaded, as a whole, through
+/// validate_field_key_uniqueness()/apply_update()/reconcile_all_indexes()/
+/// reconcile_field_keys() -- every one of those needs both halves together,
+/// never just one.
+struct FieldKeyBaseline {
+    std::vector<std::pair<const void*, std::string>> strings;
+    std::vector<std::pair<const void*, std::uint64_t>> narrow;
+};
+
+/// Whether V's own value can be packed directly into a uint64_t trie key
+/// (Root::by_key_narrow/by_cached_field_narrow) instead of going through
+/// to_field_key()'s std::string form -- see pack_narrow_key's own comment.
+/// Every clause is carried explicitly, not just is_integral_v, as
+/// defense-in-depth/documentation, even though is_integral_v alone already
+/// implies the other three on any real platform:
+///   sizeof(V) <= 8                        -- fits in one uint64_t
+///   has_unique_object_representations_v   -- no padding bits, no two bit
+///                                             patterns for the same value
+///                                             (rules out float/double: IEEE-754's
+///                                             +0.0/-0.0 and multiple NaN encodings
+///                                             fail this trait, for exactly the
+///                                             reason it would be unsafe here --
+///                                             two objects a user considers equal
+///                                             could otherwise land under different
+///                                             keys)
+///   !is_pointer_v                         -- a stored raw pointer's bit pattern
+///                                             is a meaningless "value" for lookup
+///                                             purposes, even though it would
+///                                             otherwise pass every clause above
+template <class V>
+constexpr bool is_narrow_key_eligible_v =
+    sizeof(V) <= 8 && std::has_unique_object_representations_v<V> && !std::is_pointer_v<V>;
+
+/// Packs v's own bytes into a uint64_t, zero-extended -- the trie key
+/// Root::by_key_narrow/by_cached_field_narrow compare directly, with no
+/// resolver and no chain walk (IdentityHash64 is provably perfect over this
+/// domain, since is_narrow_key_eligible_v already guarantees an injective
+/// value<->bit-pattern mapping within sizeof(V) bytes). Zero-initializing
+/// `key` before the memcpy is load-bearing, not defensive: without it, the
+/// untouched upper bytes (when sizeof(V) < 8) are indeterminate stack
+/// content, silently reintroducing the exact padding-garbage hazard
+/// has_unique_object_representations_v exists to rule out, one level up --
+/// two objects with the identical logical value could otherwise pack to
+/// different keys depending on what happened to be sitting in memory.
+template <class V>
+std::uint64_t pack_narrow_key(const V& v) noexcept {
+    static_assert(is_narrow_key_eligible_v<V>);
+    std::uint64_t key = 0;
+    std::memcpy(&key, &v, sizeof(V));
+    return key;
+}
+
 /// Canonical string form of a define_keys()-indexed field's value: a
-/// std::string as-is, or an arithmetic type via std::to_string. Shared by
-/// FieldKeyReader::key() (writing the index) and Snapshot::find_by_key()
-/// (reading it) so the two can never drift apart on what a value maps to --
-/// which is also what makes find_by_key type safe: it takes the field's own
-/// value type, not a bare std::string, so a caller can't pass a key of the
-/// wrong shape for that field in the first place. Same reason
-/// collect_update_baseline_field_keys() stores baseline values in this form
-/// rather than the field's native type: it lets old-vs-new be a plain ==
-/// regardless of the field's declared type, and lets that baseline live in
-/// the same string-keyed shape as by_key_ itself.
+/// std::string as-is, an arithmetic type via std::to_string, or -- for a
+/// narrow-eligible but non-arithmetic type (a struct or enum) -- the decimal
+/// form of its own packed narrow key. That last branch exists purely as a
+/// fallback (force_string=true, or a Coarse-tagged declaration -- see
+/// FieldKeyReader::key()/LookupFieldReader::field()): the DEFAULT path for
+/// such a type never calls to_field_key at all, going straight through
+/// pack_narrow_key to Root::by_key_narrow/by_cached_field_narrow instead.
+/// Reusing pack_narrow_key here (rather than a separate byte-encoding
+/// scheme) means a struct/enum field gets a working string fallback for
+/// free, with no new machinery -- the previous version of this function
+/// simply rejected non-arithmetic types outright (static_assert failure),
+/// which is why they were never usable as define_keys()/define_fields()
+/// fields before this. Order matters: this branch is checked strictly AFTER
+/// is_arithmetic_v, never in place of it -- for a signed integer,
+/// pack_narrow_key's raw bit copy reinterpreted as unsigned and printed
+/// gives a completely different string than std::to_string(v)'s normal
+/// signed decimal form (e.g. -5 packed and reinterpreted as uint64_t prints
+/// as a huge number, not "-5"). Shared by FieldKeyReader::key() (writing the
+/// index) and Snapshot::find_by_key() (reading it) so the two can never
+/// drift apart on what a value maps to -- which is also what makes
+/// find_by_key type safe: it takes the field's own value type, not a bare
+/// std::string, so a caller can't pass a key of the wrong shape for that
+/// field in the first place. Same reason collect_update_baseline_field_keys()
+/// stores baseline values in this form rather than the field's native type:
+/// it lets old-vs-new be a plain == regardless of the field's declared type,
+/// and lets that baseline live in the same string-keyed shape as by_key_
+/// itself.
 template <class V>
 std::string to_field_key(const V& v) {
     if constexpr (std::is_same_v<V, std::string>) {
         return v;
     } else if constexpr (std::is_arithmetic_v<V>) {
         return std::to_string(v);
+    } else if constexpr (is_narrow_key_eligible_v<V>) {
+        return std::to_string(pack_narrow_key(v));
     } else {
-        static_assert(!sizeof(V), "define_keys() field must be std::string or an arithmetic type");
+        static_assert(!sizeof(V),
+                      "define_keys() field must be std::string, an arithmetic type, or a "
+                      "narrow-key-eligible type (see is_narrow_key_eligible_v)");
     }
 }
 
@@ -738,12 +823,14 @@ std::string to_field_key(const V& v) {
 /// LookupFieldReader::field() below registers it the identical way.
 struct FieldKeyReader {
     const FieldKeyFn& fn;
+    const FieldKeyIntFn& fn_int;
 
     /// Non-null: each_field_key_for's single-field mode -- key<Field>()
     /// skips every field except this one, and skips it BEFORE computing
-    /// to_field_key(v), not just before calling fn. nullptr (the default)
-    /// reproduces each_field_key's existing full-walk behavior exactly, so
-    /// every call site that predates this member is unaffected.
+    /// to_field_key(v)/pack_narrow_key(v), not just before calling fn/fn_int.
+    /// nullptr (the default) reproduces each_field_key's existing full-walk
+    /// behavior exactly, so every call site that predates this member is
+    /// unaffected.
     const void* target = nullptr;
 
     /// No KeyLookupType given: full precision, same as every call site
@@ -754,8 +841,18 @@ struct FieldKeyReader {
         key<Field>(v, KeyLookupType::Exact, name);
     }
 
+    /// force_string: opt out of narrow-int storage for this one declaration
+    /// even though V otherwise qualifies (is_narrow_key_eligible_v<V>) --
+    /// e.g. because this field's real values don't vary in their low bits
+    /// (see is_narrow_key_eligible_v's own comment on why that's a routing-
+    /// quality, not a correctness, concern). Ignored (never even inspected)
+    /// for a V that doesn't qualify in the first place -- there is nothing
+    /// to opt out of. Narrow-int storage never applies to Coarse -- see
+    /// KeyLookupType::Coarse's own doc comment for why -- so a Coarse-tagged
+    /// field always takes the to_field_key() branch below regardless of
+    /// force_string.
     template <auto Field, class V>
-    void key(const V& v, KeyLookupType type, const char* name = nullptr) const {
+    void key(const V& v, KeyLookupType type, const char* name = nullptr, bool force_string = false) const {
         // V is otherwise deduced purely from the call-site argument, independent
         // of Field -- a copy-pasted field swap (v.key<&Gadget::label>(s.otherField))
         // would silently populate Field's index with the wrong field's values.
@@ -766,6 +863,12 @@ struct FieldKeyReader {
         const void* tag = field_tag<Field>();
         detail::register_field_name_once<Field>(name);
         if (target && target != tag) return;
+        if constexpr (is_narrow_key_eligible_v<V>) {
+            if (!force_string && type == KeyLookupType::Exact) {
+                fn_int(tag, pack_narrow_key(v), type);
+                return;
+            }
+        }
         fn(tag, to_field_key(v), type);
     }
 };
@@ -779,6 +882,11 @@ struct FieldKeyReader {
 /// enough for both.
 using LookupFieldFn = std::function<void(const void* field, std::string key, LookupType type)>;
 
+/// Narrow-int twin of LookupFieldFn -- see FieldKeyIntFn's own comment,
+/// same shape one level up (backs Root::by_cached_field_narrow instead of
+/// by_key_narrow).
+using LookupFieldIntFn = std::function<void(const void* field, std::uint64_t key, LookupType type)>;
+
 /// Visitor for define_fields(): `v.field<&Order::qty>(s.qty, LookupType::Exact,
 /// "qty")`. `type` is required (no default): every field gets exactly one
 /// LookupType, chosen at the one
@@ -791,13 +899,18 @@ using LookupFieldFn = std::function<void(const void* field, std::string key, Loo
 /// same way FieldKeyReader::key()'s is.
 struct LookupFieldReader {
     const LookupFieldFn& fn;
+    const LookupFieldIntFn& fn_int;
 
     /// Same single-field filter as FieldKeyReader::target -- see its
     /// comment.
     const void* target = nullptr;
 
+    /// force_string -- same opt-out as FieldKeyReader::key(), see its own
+    /// comment. Narrow-int storage never applies to Coarse/Scan, only
+    /// Exact -- a Coarse or Scan field always takes the to_field_key()
+    /// branch below regardless of force_string.
     template <auto Field, class V>
-    void field(const V& v, LookupType type, const char* name = nullptr) const {
+    void field(const V& v, LookupType type, const char* name = nullptr, bool force_string = false) const {
         // See FieldKeyReader::key's identical static_assert: V is otherwise
         // deduced independent of Field, so a swapped-field call site would
         // silently populate the wrong field's index.
@@ -806,6 +919,12 @@ struct LookupFieldReader {
         const void* tag = field_tag<Field>();
         detail::register_field_name_once<Field>(name);
         if (target && target != tag) return;
+        if constexpr (is_narrow_key_eligible_v<V>) {
+            if (!force_string && type == LookupType::Exact) {
+                fn_int(tag, pack_narrow_key(v), type);
+                return;
+            }
+        }
         fn(tag, to_field_key(v), type);
     }
 };
@@ -943,7 +1062,9 @@ public:
     /// reports nothing. Unlike a stable identity key, these are explicitly
     /// NOT assumed stable: the model diffs old vs. new value at apply time and
     /// keeps the index in sync.
-    virtual void each_field_key(const FieldKeyFn&) const {}
+    /// fn_int is invoked instead of fn for an Exact-tagged, narrow-key-
+    /// eligible field not declared force_string -- see FieldKeyReader::key().
+    virtual void each_field_key(const FieldKeyFn&, const FieldKeyIntFn&) const {}
 
     /// Every field declared in define_fields(), each carrying its own
     /// LookupType -- the single source for BOTH halves of find_by_field's
@@ -953,28 +1074,35 @@ public:
     /// check (Snapshot::declares_scan_field) keeps only LookupType::Scan.
     /// A field declared in neither define_fields() nor here at all is
     /// invisible to the lookup -- the declaration is the visibility gate.
-    /// See Object<> for the contract and the cost model.
-    virtual void each_field(const LookupFieldFn&) const {}
+    /// fn_int is invoked instead of fn the same way each_field_key's is --
+    /// see LookupFieldReader::field(). See Object<> for the contract and the
+    /// cost model.
+    virtual void each_field(const LookupFieldFn&, const LookupFieldIntFn&) const {}
 
-    /// Single-field twin of each_field_key: invokes `fn` for `target` alone
-    /// (a field_tag<Field>() from define_keys()), never for any other
-    /// declared key field. Backs by_key_'s dedup'd comparison (resolving a
-    /// leaf's stored Id back to just the one field being compared) without
-    /// paying to re-derive every key field on the type -- see
-    /// FieldKeyReader's `target` member for how the skip is implemented (it
-    /// skips computing to_field_key() for a non-matching field, not just
-    /// skips using the result).
-    virtual void each_field_key_for(const void* target, const FieldKeyFn& fn) const {
+    /// Single-field twin of each_field_key: invokes `fn`/`fn_int` for
+    /// `target` alone (a field_tag<Field>() from define_keys()), never for
+    /// any other declared key field. Backs by_key_'s/by_key_narrow_'s
+    /// comparison (resolving a leaf's stored Id back to just the one field
+    /// being compared) without paying to re-derive every key field on the
+    /// type -- see FieldKeyReader's `target` member for how the skip is
+    /// implemented (it skips computing to_field_key()/pack_narrow_key() for
+    /// a non-matching field, not just skips using the result).
+    virtual void each_field_key_for(const void* target, const FieldKeyFn& fn,
+                                    const FieldKeyIntFn& fn_int) const {
         (void)target;
         (void)fn;
+        (void)fn_int;
     }
 
-    /// Single-field twin of each_field: invokes `fn` for `target` alone (a
-    /// field_tag<Field>() from define_fields()). Backs by_cached_field_'s
-    /// dedup'd comparison the same way each_field_key_for backs by_key_'s.
-    virtual void each_field_for(const void* target, const LookupFieldFn& fn) const {
+    /// Single-field twin of each_field: invokes `fn`/`fn_int` for `target`
+    /// alone (a field_tag<Field>() from define_fields()). Backs
+    /// by_cached_field_'s/by_cached_field_narrow_'s comparison the same way
+    /// each_field_key_for backs by_key_'s/by_key_narrow_'s.
+    virtual void each_field_for(const void* target, const LookupFieldFn& fn,
+                                const LookupFieldIntFn& fn_int) const {
         (void)target;
         (void)fn;
+        (void)fn_int;
     }
 };
 
@@ -1238,27 +1366,30 @@ public:
         }
     }
 
-    void each_field_key(const FieldKeyFn& fn) const override {
+    void each_field_key(const FieldKeyFn& fn, const FieldKeyIntFn& fn_int) const override {
         if constexpr (detail::has_define_keys<Derived>::value)
-            Derived::define_keys(static_cast<const Derived&>(*this), FieldKeyReader{fn});
+            Derived::define_keys(static_cast<const Derived&>(*this), FieldKeyReader{fn, fn_int});
     }
 
-    void each_field(const LookupFieldFn& fn) const override {
+    void each_field(const LookupFieldFn& fn, const LookupFieldIntFn& fn_int) const override {
         if constexpr (detail::has_define_fields<Derived>::value) {
             validate_field_declarations();
-            Derived::define_fields(static_cast<const Derived&>(*this), LookupFieldReader{fn});
+            Derived::define_fields(static_cast<const Derived&>(*this), LookupFieldReader{fn, fn_int});
         }
     }
 
-    void each_field_key_for(const void* target, const FieldKeyFn& fn) const override {
+    void each_field_key_for(const void* target, const FieldKeyFn& fn,
+                            const FieldKeyIntFn& fn_int) const override {
         if constexpr (detail::has_define_keys<Derived>::value)
-            Derived::define_keys(static_cast<const Derived&>(*this), FieldKeyReader{fn, target});
+            Derived::define_keys(static_cast<const Derived&>(*this), FieldKeyReader{fn, fn_int, target});
     }
 
-    void each_field_for(const void* target, const LookupFieldFn& fn) const override {
+    void each_field_for(const void* target, const LookupFieldFn& fn,
+                        const LookupFieldIntFn& fn_int) const override {
         if constexpr (detail::has_define_fields<Derived>::value) {
             validate_field_declarations();
-            Derived::define_fields(static_cast<const Derived&>(*this), LookupFieldReader{fn, target});
+            Derived::define_fields(static_cast<const Derived&>(*this),
+                                   LookupFieldReader{fn, fn_int, target});
         }
     }
 
@@ -1287,7 +1418,12 @@ private:
                     assert(seen.insert(field).second &&
                            "define_fields(): a field must be declared exactly once (Cache or Scan)");
                 };
-                Derived::define_fields(static_cast<const Derived&>(*this), LookupFieldReader{check});
+                LookupFieldIntFn check_int = [&](const void* field, std::uint64_t, LookupType) {
+                    assert(seen.insert(field).second &&
+                           "define_fields(): a field must be declared exactly once (Cache or Scan)");
+                };
+                Derived::define_fields(static_cast<const Derived&>(*this),
+                                       LookupFieldReader{check, check_int});
                 return true;
             }();
             (void)ok;
@@ -1428,6 +1564,19 @@ struct Root {
     std::unordered_map<const void*, pmap::DedupMap<std::string, Id, pmap::StringHash, DedupIdKeyOf>>
         by_key;
 
+    /// The narrow-int counterpart of by_key, for every Exact-tagged,
+    /// narrow-key-eligible field not declared force_string (see
+    /// is_narrow_key_eligible_v/FieldKeyReader::key()). A plain
+    /// PersistentMap, not a DedupMap -- the key IS stored (no resolver),
+    /// preserving the property that's this mechanism's whole point: the
+    /// value never leaves the leaf, so a lookup is a direct uint64_t
+    /// compare, never a resolve-and-compare. Always max_shift=64 (Exact
+    /// only -- IdentityHash64 is provably perfect over this domain, and a
+    /// perfect hash can never pair with a coarsened max_shift_, see
+    /// TrieCore's own assert), so there is no chain to walk either.
+    std::unordered_map<const void*, pmap::PersistentMap<std::uint64_t, Id, pmap::IdentityHash64>>
+        by_key_narrow;
+
     /// One persistent MULTIMAP per define_fields()-declared field NOT tagged
     /// LookupType::Scan: canonical value string -> a persistent set of
     /// every Id whose field currently holds that value. Unlike by_key,
@@ -1457,6 +1606,20 @@ struct Root {
                        pmap::PersistentMap<std::uint64_t, pmap::PersistentSet<Id, IdHash>,
                                           pmap::IdentityHash64>>
         by_cached_field_merged;
+
+    /// The narrow-int counterpart of by_cached_field, for every Exact-tagged,
+    /// narrow-key-eligible field not declared force_string -- see
+    /// by_key_narrow's own comment, same reasoning one level up (a plain
+    /// PersistentMap, key stored, always max_shift=64). Deliberately
+    /// separate from by_cached_field_merged above: narrow-int storage never
+    /// applies to Coarse (a perfect hash can't pair with a coarsened
+    /// max_shift_), so there is no bucket-merge concern here at all -- a
+    /// narrow-eligible field declared Coarse stays on by_cached_field
+    /// (string-keyed, merged) entirely, unaffected by this map's existence.
+    std::unordered_map<const void*,
+                       pmap::PersistentMap<std::uint64_t, pmap::PersistentSet<Id, IdHash>,
+                                          pmap::IdentityHash64>>
+        by_cached_field_narrow;
 
     /// One persistent MULTIMAP per define_references()-declared Ref<>/Opt<>
     /// field tagged RefLookupType::Exact: TARGET's Id -> a persistent set of
@@ -1621,6 +1784,20 @@ public:
     template <auto Field>
     const member_class_t<decltype(Field)>* find_by_key(
         const member_value_t<decltype(Field)>& value) const {
+        using V = member_value_t<decltype(Field)>;
+        // A field is routed through EXACTLY ONE of by_key/by_key_narrow for
+        // its whole lifetime (decided once, at declaration -- see
+        // FieldKeyReader::key()), never both, so trying the narrow map first
+        // and falling back to the string one is correct regardless of
+        // whether THIS field actually went narrow: the "wrong" one is
+        // always an empty, cheap miss, not a wrong answer. The is_narrow_
+        // key_eligible_v gate is required, not optional, for compilation
+        // alone -- pack_narrow_key<V> doesn't exist for a non-eligible V
+        // (e.g. std::string) at all.
+        if constexpr (is_narrow_key_eligible_v<V>) {
+            if (const ObjectBase* o = find_by_key_narrow_raw(field_tag<Field>(), pack_narrow_key(value)))
+                return cast<member_class_t<decltype(Field)>>(o);
+        }
         return cast<member_class_t<decltype(Field)>>(
             find_by_key_raw(field_tag<Field>(), to_field_key(value)));
     }
@@ -1929,8 +2106,80 @@ public:
     /// within `field`'s own keyspace (see field_tag), never global, so the
     /// field must be supplied to disambiguate. Used where the field isn't
     /// known at compile time; find_by_key<Field>(value) is the typed,
-    /// preferred entry point that calls this.
+    /// preferred entry point that calls this. A narrow-int-routed field
+    /// (see find_by_key_narrow_raw) is invisible here: this takes a bare
+    /// std::string, with no compile-time V to pack a query value from.
     const ObjectBase* find_by_key_raw(const void* field, const std::string& key) const;
+
+    /// Narrow-int counterpart of find_by_key_raw, backing find_by_key<Field>
+    /// for a narrow-key-eligible Field -- NOT part of the type-erased public
+    /// `_raw` family (find_by_key_raw/find_by_cached_field_raw/
+    /// for_each_by_cached_field_raw/all_of_by_cached_field_raw): those take a
+    /// bare std::string with no compile-time V to pack a query value from,
+    /// so they only ever check the string-keyed maps -- a narrow-stored
+    /// field is invisible to them by design (see LookupType::Coarse's own
+    /// doc comment's "opt-out" discussion). This one is called ONLY by
+    /// find_by_key<Field>, which has a real V to pack. Returns nullptr both
+    /// when `field` was never routed through by_key_narrow at all (an
+    /// ordinary miss for a string/Coarse/force_string field, always -- see
+    /// find_by_key<Field>'s own fallback to find_by_key_raw right after this
+    /// call) and when it was, but `key` isn't present.
+    const ObjectBase* find_by_key_narrow_raw(const void* field, std::uint64_t key) const;
+
+    /// Whether `field` specifically lives in the narrow-int key index
+    /// (by_key_narrow) rather than the string one (by_key) -- find_by_key
+    /// itself doesn't need this (it tries the narrow map first and falls
+    /// back, correct either way -- see its own comment), but it's a direct,
+    /// intention-revealing way for a caller (chiefly tests) to confirm a
+    /// field's actual routing without depending on internal byte counts.
+    /// Diagnostics::SlotStats folds by_key_narrow's stats into the same
+    /// by_key/by_key_detail accumulation as by_key itself (same precedent as
+    /// by_cached_field_merged/by_cached_field_narrow below), so it alone
+    /// can't distinguish the two -- this can.
+    bool key_is_narrow(const void* field) const {
+        return root_ && root_->by_key_narrow.find(field) != root_->by_key_narrow.end();
+    }
+
+    /// Whether `field` has an indexed (Exact/Coarse) entry in
+    /// define_fields() at all -- i.e. whether find_by_field/for_each_by_field/
+    /// all_of_by_field/range_by_field should take the cache-hit branch or
+    /// fall back to the scan. A field's presence as a key in
+    /// Root::by_cached_field already IS this fact (see Root::by_cached_field's
+    /// own doc comment: one entry is added the first time a non-Scan-tagged
+    /// define_fields() entry runs for it, never removed), so this is just
+    /// naming that check in one place --
+    /// same reason declares_scan_field/scan_field_is_declared exist as named
+    /// helpers instead of an inline map lookup repeated at every call site.
+    bool cached_field_is_declared(const void* field) const {
+        return root_ && (root_->by_cached_field.find(field) != root_->by_cached_field.end() ||
+                         root_->by_cached_field_merged.find(field) != root_->by_cached_field_merged.end() ||
+                         root_->by_cached_field_narrow.find(field) != root_->by_cached_field_narrow.end());
+    }
+
+    /// Whether `field` specifically lives in the bucket-merged index
+    /// (LookupType::Coarse) rather than the exact one
+    /// (Exact/Cache) -- both are already known to be cache-indexed by the
+    /// time this is asked (see cached_field_is_declared), so this only
+    /// needs to distinguish which of the two. Used by range_by_field/
+    /// range_view_by_field to pick FieldRange/FieldViewRange's filtered_
+    /// flag: a merged bucket may hold Ids belonging to several different
+    /// real values, so the range must verify each one natively (o.*Field ==
+    /// value) rather than trusting bucket membership outright.
+    bool cached_field_is_merged(const void* field) const {
+        return root_ && root_->by_cached_field_merged.find(field) != root_->by_cached_field_merged.end();
+    }
+
+    /// Whether `field` specifically lives in the narrow-int index
+    /// (LookupType::Exact, narrow-key-eligible V, not force_string) rather
+    /// than either string-keyed family. Used by for_each_by_field/
+    /// all_of_by_field/range_by_field/range_view_by_field to route to the
+    /// narrow-specific raw helpers -- a narrow bucket is always exact (no
+    /// merge ambiguity, unlike cached_field_is_merged's case: narrow-int
+    /// storage never applies to Coarse, see LookupType::Coarse's own doc
+    /// comment), so callers that check this never also need filtered_ true.
+    bool cached_field_is_narrow(const void* field) const {
+        return root_ && root_->by_cached_field_narrow.find(field) != root_->by_cached_field_narrow.end();
+    }
 
     /// Untyped counterpart of the CACHE-HIT half of find_by_field -- same
     /// "field disambiguates the keyspace" reasoning as find_by_key_raw, but
@@ -1950,7 +2199,8 @@ public:
     /// fallback: unlike the typed find_by_field<Field>, there is no single
     /// ClassT here to walk by_type with (that's the whole reason this exists
     /// -- several types share one field tag), so a field never declared
-    /// cached is simply empty.
+    /// cached is simply empty. Same narrow-int blind spot as find_by_key_raw
+    /// -- a narrow-routed field is invisible here too, for the same reason.
     std::vector<const ObjectBase*> find_by_cached_field_raw(const void* field, const std::string& key) const;
 
     /// Untyped counterpart of the cache-hit half of for_each_by_field -- same
@@ -1959,7 +2209,8 @@ public:
     /// for_each_* in this file: NEVER stops early, `f` is called for every
     /// match. Use this over find_by_cached_field_raw when you don't need a
     /// materialized vector; use all_of_by_cached_field_raw instead when you
-    /// DO want to stop early.
+    /// DO want to stop early. Same narrow-int blind spot as
+    /// find_by_cached_field_raw -- see its own comment.
     void for_each_by_cached_field_raw(const void* field, const std::string& key,
                                       const std::function<void(const ObjectBase&)>& f) const;
 
@@ -1968,7 +2219,8 @@ public:
     /// this returns false. Vacuously true if the field was never declared
     /// indexed (non-Scan) in define_fields() or nothing currently holds
     /// `key`, same as every other lookup family's empty-is-not-an-error
-    /// contract.
+    /// contract. Same narrow-int blind spot as find_by_cached_field_raw --
+    /// see its own comment.
     bool all_of_by_cached_field_raw(const void* field, const std::string& key,
                                     const std::function<bool(const ObjectBase&)>& pred) const;
 
@@ -2453,9 +2705,14 @@ private:
     template <auto Field>
     static bool declares_scan_field(const ObjectBase& o) {
         bool declared = false;
-        o.each_field([&](const void* field, std::string, LookupType type) {
-            if (field == field_tag<Field>() && type == LookupType::Scan) declared = true;
-        });
+        // A Scan-tagged field is always string-routed (narrow-int only ever
+        // applies to Exact) -- fn_int can never fire for one, so a no-op is
+        // correct, not a shortcut.
+        o.each_field(
+            [&](const void* field, std::string, LookupType type) {
+                if (field == field_tag<Field>() && type == LookupType::Scan) declared = true;
+            },
+            [](const void*, std::uint64_t, LookupType) {});
         return declared;
     }
 
@@ -2480,33 +2737,6 @@ private:
         return declared;
     }
 
-    /// Whether `field` has an indexed (Exact/Coarse) entry in
-    /// define_fields() at all -- i.e. whether find_by_field/for_each_by_field/
-    /// all_of_by_field/range_by_field should take the cache-hit branch or
-    /// fall back to the scan. A field's presence as a key in
-    /// Root::by_cached_field already IS this fact (see Root::by_cached_field's
-    /// own doc comment: one entry is added the first time a non-Scan-tagged
-    /// define_fields() entry runs for it, never removed), so this is just
-    /// naming that check in one place --
-    /// same reason declares_scan_field/scan_field_is_declared exist as named
-    /// helpers instead of an inline map lookup repeated at every call site.
-    bool cached_field_is_declared(const void* field) const {
-        return root_ && (root_->by_cached_field.find(field) != root_->by_cached_field.end() ||
-                         root_->by_cached_field_merged.find(field) != root_->by_cached_field_merged.end());
-    }
-
-    /// Whether `field` specifically lives in the bucket-merged index
-    /// (LookupType::Coarse) rather than the exact one
-    /// (Exact/Cache) -- both are already known to be cache-indexed by the
-    /// time this is asked (see cached_field_is_declared), so this only
-    /// needs to distinguish which of the two. Used by range_by_field/
-    /// range_view_by_field to pick FieldRange/FieldViewRange's filtered_
-    /// flag: a merged bucket may hold Ids belonging to several different
-    /// real values, so the range must verify each one natively (o.*Field ==
-    /// value) rather than trusting bucket membership outright.
-    bool cached_field_is_merged(const void* field) const {
-        return root_ && root_->by_cached_field_merged.find(field) != root_->by_cached_field_merged.end();
-    }
 
     /// Same role as cached_field_is_declared, for the referrer family:
     /// whether `field` has a RefLookupType::Exact entry in define_references(),
@@ -2560,6 +2790,20 @@ private:
     /// begin()/end() pair, not a single walk-then-return.
     pmap::PersistentSet<Id, IdHash> cached_field_bucket_raw(const void* field,
                                                             const std::string& key) const;
+
+    /// Narrow-int counterparts of cached_field_short_circuit_raw/
+    /// cached_field_bucket_raw, for a field routed through
+    /// by_cached_field_narrow (see cached_field_is_narrow) -- called ONLY by
+    /// for_each_by_field/all_of_by_field/range_by_field/range_view_by_field
+    /// for a narrow-key-eligible Field, never by the type-erased public
+    /// `_raw` family (see find_by_key_narrow_raw's own comment for why: no
+    /// compile-time V there to pack a query value from). A narrow bucket is
+    /// always exact -- no per-candidate resolve-and-verify needed, unlike
+    /// the merged-field branch inside cached_field_short_circuit_raw.
+    bool cached_field_short_circuit_narrow_raw(const void* field, std::uint64_t key,
+                                               const std::function<bool(Id)>& f) const;
+    pmap::PersistentSet<Id, IdHash> cached_field_bucket_narrow_raw(const void* field,
+                                                                   std::uint64_t key) const;
 
     /// Shared, short-circuiting scan implementation behind the SCAN-FALLBACK
     /// half of both for_each_referrers<Field> and all_of_referrers<Field> --
@@ -3853,25 +4097,40 @@ private:
     ///                                      key() hand out; an opaque
     ///                                      address, compared, never
     ///                                      dereferenced.
-    ///       S = std::string                that field's value, in
-    ///                                      to_field_key()'s canonical
-    ///                                      string form, AS OF THE BASELINE
-    ///                                      (before this transaction's own
-    ///                                      edit) -- what by_key_ indexed
-    ///                                      this object under prior to the
-    ///                                      update. Canonical string, not
-    ///                                      the field's native type, for
-    ///                                      two reasons: it lets one
-    ///                                      vector hold define_keys()
-    ///                                      fields of different types
-    ///                                      (std::string, int, ...) with
-    ///                                      no variant, and it lets
+    ///     V = FieldKeyBaseline              that object's baseline
+    ///                                      define_keys() fields, split into
+    ///                                      FieldKeyBaseline::strings (F =
+    ///                                      const void* field_tag<Field>(),
+    ///                                      S = std::string, to_field_key()'s
+    ///                                      canonical form -- what by_key_
+    ///                                      indexed this object under prior
+    ///                                      to the update) and
+    ///                                      FieldKeyBaseline::narrow (F
+    ///                                      likewise, uint64_t =
+    ///                                      pack_narrow_key()'s form -- what
+    ///                                      by_key_narrow_ indexed it under)
+    ///                                      -- ONE PAIR PER DECLARED FIELD in
+    ///                                      whichever half it belongs to, a
+    ///                                      linear-scan vector rather than a
+    ///                                      nested map for both, because a
+    ///                                      type has a handful of
+    ///                                      define_keys() fields at most
+    ///                                      (same tradeoff as
+    ///                                      reconcile_out_refs()'s own
+    ///                                      old_targets vector). The string
+    ///                                      form lets one vector hold
+    ///                                      string-typed define_keys() fields
+    ///                                      of different declared types with
+    ///                                      no variant, and lets
     ///                                      validate_field_key_uniqueness()
-    ///                                      tell old from new with a
-    ///                                      plain == against the new
-    ///                                      key's own to_field_key() form.
-    std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>
-    collect_update_baseline_field_keys(const Transaction& txn) const;
+    ///                                      tell old from new with a plain ==
+    ///                                      against the new key's own
+    ///                                      to_field_key() form; narrow
+    ///                                      fields get the identical
+    ///                                      treatment one level down, ==
+    ///                                      against pack_narrow_key()'s form.
+    std::unordered_map<std::uint32_t, FieldKeyBaseline> collect_update_baseline_field_keys(
+        const Transaction& txn) const;
 
     /// Read-only, whole-transaction pass over every define_keys() field this
     /// transaction's creates/updates touch, run once at the very start of
@@ -3902,9 +4161,7 @@ private:
     /// baseline's each_field_key() -- that traversal belongs entirely to the
     /// collection step, so this function is pure validation, nothing more.
     std::optional<IntegrityError> validate_field_key_uniqueness(
-        const Transaction& txn,
-        const std::unordered_map<std::uint32_t, std::vector<std::pair<const void*, std::string>>>&
-            old_keys) const;
+        const Transaction& txn, const std::unordered_map<std::uint32_t, FieldKeyBaseline>& old_keys) const;
 
     // ---- index maintenance (ALL require commit_mu_ already held) -----------
 
@@ -3940,9 +4197,8 @@ private:
     /// branch in remove_raw, which reconciles a survivor's fields against a
     /// baseline validate_field_key_uniqueness never saw) passes nullptr and
     /// gets the original behavior, deriving old_keys from `before` itself.
-    void reconcile_field_keys(
-        const ObjectBase* before, const ObjectBase* after,
-        const std::vector<std::pair<const void*, std::string>>* old_keys_hint = nullptr);
+    void reconcile_field_keys(const ObjectBase* before, const ObjectBase* after,
+                              const FieldKeyBaseline* old_keys_hint = nullptr);
 
     // ...and for the multimap index (by_cached_field_).
     void add_cached_fields(const ObjectBase* o);
@@ -4002,9 +4258,8 @@ private:
     /// cascade-null branch alike. `old_field_keys_hint` forwards straight
     /// through to reconcile_field_keys() -- see its own doc comment; every
     /// caller except apply_update() passes nullptr.
-    void reconcile_all_indexes(
-        const ObjectBase* before, const ObjectBase* after,
-        const std::vector<std::pair<const void*, std::string>>* old_field_keys_hint = nullptr) {
+    void reconcile_all_indexes(const ObjectBase* before, const ObjectBase* after,
+                               const FieldKeyBaseline* old_field_keys_hint = nullptr) {
         reconcile_out_refs(before, after);
         reconcile_field_keys(before, after, old_field_keys_hint);
         reconcile_cached_fields(before, after);
@@ -4250,10 +4505,10 @@ private:
     /// doesn't walk baseline->each_field_key() a second time. nullptr for
     /// any caller (there are none today besides apply_transaction_contents's
     /// own update loop) that hasn't already computed it.
-    std::optional<IntegrityError> apply_update(
-        std::unique_ptr<ObjectBase> clone, const std::unordered_map<std::uint32_t, Id>& remap,
-        const std::vector<std::pair<const void*, std::string>>* old_field_keys_hint = nullptr,
-        bool keep_undo = true);
+    std::optional<IntegrityError> apply_update(std::unique_ptr<ObjectBase> clone,
+                                               const std::unordered_map<std::uint32_t, Id>& remap,
+                                               const FieldKeyBaseline* old_field_keys_hint = nullptr,
+                                               bool keep_undo = true);
     /// Cascade BFS, called from try_commit()'s apply phase. `work` is EVERY
     /// remove() intent this transaction resolves (deferred local removes AND
     /// real remove_intents_), taken BY VALUE and used directly as the BFS's
@@ -4625,6 +4880,8 @@ private:
     std::unordered_map<TypeTag, pmap::PersistentSet<Id, IdHash>> by_type_;
     std::unordered_map<const void*, pmap::DedupMap<std::string, Id, pmap::StringHash, DedupIdKeyOf>>
         by_key_;
+    std::unordered_map<const void*, pmap::PersistentMap<std::uint64_t, Id, pmap::IdentityHash64>>
+        by_key_narrow_;
     std::unordered_map<const void*,
                        pmap::DedupMap<std::string, pmap::PersistentSet<Id, IdHash>,
                                      pmap::StringHash, DedupBucketKeyOf>>
@@ -4633,6 +4890,10 @@ private:
                        pmap::PersistentMap<std::uint64_t, pmap::PersistentSet<Id, IdHash>,
                                           pmap::IdentityHash64>>
         by_cached_field_merged_;
+    std::unordered_map<const void*,
+                       pmap::PersistentMap<std::uint64_t, pmap::PersistentSet<Id, IdHash>,
+                                          pmap::IdentityHash64>>
+        by_cached_field_narrow_;
     std::unordered_map<const void*,
                        pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>>
         by_cached_reference_;
@@ -4824,6 +5085,22 @@ bool Snapshot::scan_field_short_circuit(const member_value_t<decltype(Field)>& v
 template <auto Field, class F>
 void Snapshot::for_each_by_field(const member_value_t<decltype(Field)>& value, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
+    using V = member_value_t<decltype(Field)>;
+    // Narrow-routed fields never appear in by_cached_field/by_cached_field_merged
+    // (mutually exclusive routing, decided once at declaration) -- checked
+    // first, via cached_field_is_narrow, so an eligible-but-string-routed
+    // field (force_string or Coarse) falls straight through unaffected.
+    if constexpr (is_narrow_key_eligible_v<V>) {
+        if (cached_field_is_narrow(field_tag<Field>())) {
+            register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+            cached_field_short_circuit_narrow_raw(
+                field_tag<Field>(), pack_narrow_key(value), [&](Id id) {
+                    if (const ClassT* p = cast<ClassT>(find_raw(id))) f(*p);
+                    return true;  // for_each_by_field never stops early
+                });
+            return;
+        }
+    }
     if (cached_field_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
         cached_field_short_circuit_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
@@ -4842,6 +5119,17 @@ void Snapshot::for_each_by_field(const member_value_t<decltype(Field)>& value, F
 template <auto Field, class Pred>
 bool Snapshot::all_of_by_field(const member_value_t<decltype(Field)>& value, Pred&& pred) const {
     using ClassT = member_class_t<decltype(Field)>;
+    using V = member_value_t<decltype(Field)>;
+    if constexpr (is_narrow_key_eligible_v<V>) {
+        if (cached_field_is_narrow(field_tag<Field>())) {
+            register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+            return cached_field_short_circuit_narrow_raw(
+                field_tag<Field>(), pack_narrow_key(value), [&](Id id) {
+                    const ClassT* p = cast<ClassT>(find_raw(id));
+                    return !p || pred(*p);
+                });
+        }
+    }
     if (cached_field_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
         return cached_field_short_circuit_raw(field_tag<Field>(), to_field_key(value), [&](Id id) {
@@ -4866,6 +5154,18 @@ template <auto Field>
 Snapshot::FieldRange<Field> Snapshot::range_by_field(
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
+    using V = member_value_t<decltype(Field)>;
+    if constexpr (is_narrow_key_eligible_v<V>) {
+        if (cached_field_is_narrow(field_tag<Field>())) {
+            register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+            // Always exact, never filtered -- see cached_field_is_narrow's
+            // own comment for why a narrow bucket can never need native
+            // verification the way a merged one does.
+            return FieldRange<Field>(
+                this, cached_field_bucket_narrow_raw(field_tag<Field>(), pack_narrow_key(value)), value,
+                /*filtered=*/false);
+        }
+    }
     if (cached_field_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
         // A merged (Coarse) field's bucket may hold Ids from
@@ -5741,6 +6041,17 @@ template <auto Field>
 Snapshot::FieldViewRange<Field> Snapshot::range_view_by_field(
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
+    using V = member_value_t<decltype(Field)>;
+    if constexpr (is_narrow_key_eligible_v<V>) {
+        if (cached_field_is_narrow(field_tag<Field>())) {
+            register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
+            // See range_by_field's own comment on why a narrow field is
+            // always exact, never filtered.
+            return FieldViewRange<Field>(
+                this, cached_field_bucket_narrow_raw(field_tag<Field>(), pack_narrow_key(value)), value,
+                /*filtered=*/false);
+        }
+    }
     if (cached_field_is_declared(field_tag<Field>())) {
         register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/true);
         // See range_by_field's own comment on why a merged field needs
