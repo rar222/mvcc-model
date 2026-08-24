@@ -1,0 +1,695 @@
+<!doctype html><html><head><!-- frame-runtime --><base href="/_f/1787529462-b0a3/"><script>window.__FRAME_PREAMBLE={"capabilities":{"artifact":"artifact.oqIe8shs.js","assets":"assets.BkxVItX2.js","comments":"comments.GLuHR3zP.js","db":"db.CRhVHzSt.js","downloads":"downloads.C3GSvEDP.js","embed":"embed.CZsbekoQ.js","mcp":"mcp.D3B2EyQu.js","permissions":"permissions.BNySkLV5.js","room":"room.DE7EMui-.js","sample":"sample.C7z_6W62.js","self":"artifact.oqIe8shs.js","user":"user.BpKav-Rf.js"},"transforms":"_transforms.h3_8GSUa.js","comments":"_comments.BOgkE6qU.js","translate":"_translate.5HCW4BJh.js"}</script><script>(function(){"use strict";var Y=["light","dark","system"],X=/^[A-Za-z0-9_-]{1,64}$/,D=/^[a-zA-Z_:][a-zA-Z0-9_:.-]{0,127}$/,G=new Set(["class","hidden","value","checked"]);function V(e){const t=e.toLowerCase();return t.startsWith("data-")||t.startsWith("aria-")||G.has(t)}var be="http://www.w3.org/1999/xhtml",Z="http://www.w3.org/2000/svg",J=new Set(["script","style","iframe","noscript","noframes","noembed","xmp","plaintext","template","title","textarea","object","embed"]),Q=new Set(["script","style"]);function ee(e){const t=e.localName.toLowerCase();return e.namespaceURI==="http://www.w3.org/1999/xhtml"?!J.has(t):e.namespaceURI===Z?!Q.has(t):!1}var te=new Set(["html","head","body","frameset"]);function re(e){return e.namespaceURI==="http://www.w3.org/1999/xhtml"&&te.has(e.localName)}function ne(e){if(e===null||typeof e!="object")return!1;const t=e;if(typeof t.target!="string"||!X.test(t.target)||t.text!==void 0&&typeof t.text!="string")return!1;if(t.attrsSet!==void 0){if(t.attrsSet===null||typeof t.attrsSet!="object")return!1;for(const[n,s]of Object.entries(t.attrsSet))if(!D.test(n)||typeof s!="string")return!1}if(t.attrsRemoved!==void 0){if(!Array.isArray(t.attrsRemoved))return!1;for(const n of t.attrsRemoved)if(typeof n!="string"||!D.test(n))return!1}return!0}function se(e,t){if(e===null||typeof e!="object")return!1;const{seq:n,elements:s}=e;if(typeof n!="number"||!Number.isSafeInteger(n)||!Array.isArray(s)||s.length===0||s.length>64)return!1;for(let o=0;o<s.length;o++)if(!t(s[o]))return!1;return!0}function ae(e){return e===null||typeof e!="object"?!1:se(e.__frame_patch,ne)}function oe(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_init;return t!==null&&typeof t=="object"}function ie(e){return e!==null&&typeof e=="object"&&e.__frame_size_poke===!0}function le(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_theme;if(t===null||typeof t!="object")return!1;const n=t.theme;return typeof n=="string"&&Y.includes(n)}var O="__frame_scroll",ce=150,ue=310,fe=160,pe=3e4;function de(){let e=0,t=!1,n=!1,s=!1,o=0,l=null;const c=i=>{try{sessionStorage.setItem(O,JSON.stringify({y:i}))}catch{}},f=()=>{if(clearTimeout(e),l===null)return;const i=l;l=null,c(i)},S=()=>{if(t){t=!1;return}n=!0,l=scrollY,clearTimeout(e),e=setTimeout(f,ce)};try{addEventListener("scroll",S,{passive:!0}),addEventListener("pagehide",f)}catch{}const v=()=>{let i;try{i=sessionStorage.getItem(O)}catch{return null}if(i===null)return null;let d;try{d=JSON.parse(i)}catch{d=null}const u=d?.y;if(!(typeof u=="number"&&Number.isFinite(u)&&u>=0)){try{sessionStorage.removeItem(O)}catch{}return null}return u};let b=!1;const m=i=>{try{const d=scrollY;scrollTo({top:i,left:0,behavior:"instant"}),o=i,s=!0,clearTimeout(e),l=null,c(i);const u=scrollY;u!==d&&(t=!0),u!==i&&!b&&(b=!0,addEventListener("load",()=>{try{if(scrollY===u){const h=v();m(h!==null?h:o)}}catch{}},{once:!0}))}catch{}},y=()=>{try{return!!location.hash}catch{return!0}};let g=!1;const E=()=>{try{if(g||innerWidth>ue||innerHeight>fe)return;g=!0;const i=Date.now(),d=()=>{try{removeEventListener("resize",d)}catch{}if(Date.now()-i>pe||n||y())return;const u=v();m(u!==null?u:o)};addEventListener("resize",d)}catch{}};let r=!1,p=!1;return{restore(){if(r||(r=!0,y()))return;const i=v();i!==null&&(m(i),E())},promoted(){if(p||(p=!0,y()))return;const i=v();i!==null?(m(i),E()):s&&m(o)}}}var Ee="modulepreload",Ae=function(e){return"/"+e},Re={},me=function(t,n,s){let o=Promise.resolve();function l(c){const f=new Event("vite:preloadError",{cancelable:!0});if(f.payload=c,window.dispatchEvent(f),!f.defaultPrevented)throw c}return o.then(c=>{for(const f of c||[])f.status==="rejected"&&l(f.reason);return t().catch(l)})};(function(){const e=Object.defineProperty,t=globalThis,n=["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","RTCIceCandidate","RTCSessionDescription","RTCRtpSender","RTCRtpReceiver"];let s=0;for(let o=0;o<n.length;o++){const l=n[o];try{e(t,l,{value:void 0,writable:!1,configurable:!1})}catch{try{delete t[l]}catch{}try{e(t,l,{value:void 0,writable:!1,configurable:!0})}catch{}}typeof t[l]=="function"&&s++}if(s&&window!==top)try{parent.postMessage({__frame_rtc_lockdown_failed:s},"*")}catch{}})();var he=1e4,_e=Object.freeze([...window.__FRAME_PREAMBLE?.origins??["https://claude.ai","https://preview.claude.ai"]]);function F(e){for(const t of _e)if(t.endsWith(":*"))try{const n=new URL(e);if(`${n.protocol}//${n.hostname}:*`===t)return!0}catch{}else if(e===t)return!0;return!1}var M=Object.freeze({...window.__FRAME_PREAMBLE?.capabilities}),j=window.__FRAME_PREAMBLE?.transforms,N=window.__FRAME_PREAMBLE?.comments,I=window.__FRAME_PREAMBLE?.translate,L=/^[\w.-]+\.js$/;function T(e){return me(()=>import("/_runtime/"+e),void 0)}function z(e,t){return{contract:e.contract,changes:new Set(e.changes??[]),flags:new Set(e.flags??[]),capabilities:e.capabilities??{},capBudgets:e.capBudgets??{},transforms:new Map,shellOrigin:t,mount:W,pipe:()=>({wrap:(n,s)=>(...o)=>{try{return s(...o)}catch(l){return Promise.reject(l)}}})}}var P=null,w=null;function q(e,t,n){try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!1,enumerable:!0})}catch{try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!0,enumerable:!0})}catch{}}}var B=!1;function ve(e,t){const n=[];for(const s of e.elements){const o=document.querySelector(`[data-id="${s.target}"]`);if(!o){parent.postMessage({__frame_patch_miss:{seq:e.seq}},t);return}if([...Object.keys(s.attrsSet??{}),...s.attrsRemoved??[]].some(l=>!V(l))){parent.postMessage({__frame_patch_miss:{seq:e.seq}},t);return}if(s.text!==void 0&&(!ee(o)||re(o))){parent.postMessage({__frame_patch_miss:{seq:e.seq}},t);return}for(const[l,c]of Object.entries(s.attrsSet??{}))if(!$(o,l)){try{o.setAttribute(l,c)}catch{}H(o,l,c)}for(const l of s.attrsRemoved??[])$(o,l)||(o.removeAttribute(l),H(o,l,null));typeof s.text=="string"&&(o.textContent=s.text),n.push(s.target)}try{document.dispatchEvent(new CustomEvent("claude:edit",{detail:{seq:e.seq,targets:n}}))}catch{}}function H(e,t,n){if(!(e instanceof HTMLInputElement))return;const s=t.toLowerCase();s==="checked"?e.checked=n!==null:s==="value"&&e.type!=="file"&&(e.value=n??"")}function $(e,t){const n=t.toLowerCase(),s=e;return n==="data-id"||(n==="value"||n==="checked")&&(s.__artifactSecret===!0||/^(password|hidden|file)$/.test(s.type??"")||/(^|\s)(cc-|one-time-code|current-password|new-password)/i.test(`${e.getAttribute("autocomplete")??""} ${s.autocomplete??""}`))}function K(e){const t=document.documentElement;e==="light"||e==="dark"?(t.dataset.theme=e,t.style.colorScheme=e,B=!0):B&&(delete t.dataset.theme,t.style.colorScheme="",B=!1)}var R=new Map;function ye(){let e;const t={u:new Promise(n=>{e=n}),r:n=>{t.done=!0,e(n)},done:!1,nulled:!1};return t}var ge=Object.freeze(Object.assign(Object.create(null),{call:Function.prototype.call,apply:Function.prototype.apply,bind:Function.prototype.bind})),W=(e,t)=>{const n=R.get(e);if(!n||n.done){n?.nulled&&w&&parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:e}},w);return}const s=typeof t=="function"?Object.setPrototypeOf(t,ge):Object.assign(Object.create(null),t);typeof s.then=="function"&&delete s.then,n.r(Object.freeze(s))},U=Object.getOwnPropertyDescriptor(window,"claude");if(window!==top&&!(U&&U.writable===!1)){const e=j&&L.test(j)?T(j).catch(()=>{}):Promise.resolve(void 0),t=r=>{if(r.type==="auxclick"&&r.button!==1)return;const p=r.target,i=p&&p.closest?p.closest("a[href],area[href]"):null;if(!i)return;const d=i.getAttribute("href");if(!d)return;let u,h;try{u=new URL(d,document.baseURI),h=new URL(document.baseURI).origin}catch{return}if((u.protocol==="http:"||u.protocol==="https:")&&u.origin!==h){r.preventDefault();const _=(i.getAttribute("target")??"").toLowerCase(),C=r.type==="auxclick"||r.metaKey||r.ctrlKey||r.shiftKey||r.altKey||!["","_self","_top","_parent"].includes(_);parent.postMessage({__frame_nav:!0,url:u.href,newTab:C},"*")}};addEventListener("click",t,!0),addEventListener("auxclick",t,!0);const n={},s=r=>{r.isTrusted&&(n.pointer=!0)},o=r=>{r.isTrusted&&(n.click=!0)};addEventListener("pointermove",s,{capture:!0,passive:!0}),addEventListener("click",o,{capture:!0,passive:!0}),e.then(r=>{r?.wireNav&&(r.wireNav(),removeEventListener("click",t,!0),removeEventListener("auxclick",t,!0),removeEventListener("pointermove",s,!0),removeEventListener("click",o,!0),r.wireEngagement?.(n))});let l=null;try{l=de()}catch{}const c=U?.value??{};q(window,"claude",c);for(const r of Object.keys(M)){if(c[r]!==void 0){q(c,r,c[r]);continue}R.set(r,ye())}if(c.use===void 0){const r=p=>{if(typeof p!="string"||!Object.hasOwn(M,p))return Promise.resolve(null);const i=R.get(p);return i?i.u:Promise.resolve(c[p]??null)};try{Object.defineProperty(c,"use",{value:r,writable:!0,configurable:!0,enumerable:!1})}catch{}}let f=null,S=null,v=0;const b=r=>{r.source!==parent||!F(r.origin)||oe(r.data)&&(f=r.data.__frame_init,w=r.origin,removeEventListener("message",b),clearTimeout(v),S?.())};addEventListener("message",b),parent.postMessage({__frame_connect:!0},"*");const m=new Promise(r=>{S=r,v=setTimeout(()=>{removeEventListener("message",b),r()},he)}),y=document.readyState==="loading"?new Promise(r=>document.addEventListener("DOMContentLoaded",()=>r(),{once:!0})):Promise.resolve();y.then(()=>{try{l?.restore()}catch{}});const g={cb:null},E=r=>{if(!(r.source!==parent||!F(r.origin))&&ie(r.data)){try{l?.promoted()}catch{}g.cb?.()}};addEventListener("message",E),m.then(async()=>{if(!f||!w){for(const a of R.values())a.nulled=!0,a.r(null);return}K(f.theme);const r=w;let p=!1,i=!1;addEventListener("message",a=>{if(a.source!==parent||a.origin!==r)return;le(a.data)&&K(a.data.__frame_theme.theme),ae(a.data)&&ve(a.data.__frame_patch,r);const k=a.data?.__fc_mode;k&&typeof k=="object"&&!p&&N&&L.test(N)&&(p=!0,T(N).then(x=>x.install?.(r,k.on===!0)).catch(()=>{}));const A=a.data?.__ft_cmd;A&&typeof A=="object"&&!i&&I&&L.test(I)&&(i=!0,T(I).then(x=>x.install?.(r,A)).catch(()=>{}))});const d=Object.keys(f.capabilities??{}).filter(a=>Object.hasOwn(M,a)).map(a=>[a,M[a]]).filter(a=>typeof a[1]=="string"&&L.test(a[1])),u=await Promise.allSettled(d.map(([,a])=>T(a))),h=await e,_=w;if(h?.buildBoot||parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:"_transforms"}},_),h?.buildBoot)try{P=h.buildBoot(f,h.TRANSFORMS??{},{shellOrigin:_,mount:W},a=>parent.postMessage({__frame_cap_telemetry:a},_))}catch{parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:"_transforms"}},_),P=z(f,_)}else P=z(f,_);const C=a=>parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:a}},_),we=P;u.forEach((a,k)=>{const A=d[k][0];if(a.status!=="fulfilled"){C(A);return}try{a.value?.install?.(we)}catch{C(A)}});for(const a of R.values())a.done||(a.nulled=!0,a.r(null));await y,parent.postMessage({__frame_ready:!0},w),e.then(a=>a?.installSizeReporter?.(_,g))})}})();</script><!-- /frame-runtime --><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>Update Anatomy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --surface-2: #eef0f4;
+    --surface-3: #e4e7ee;
+    --border: #d7dbe3;
+    --border-strong: #b9bfcc;
+    --text: #1b2029;
+    --text-dim: #5c6472;
+    --text-faint: #8991a1;
+    --accent-new: #2458d6;
+    --accent-new-bg: rgba(36,88,214,0.08);
+    --accent-new-line: rgba(36,88,214,0.35);
+    --accent-old: #a35c07;
+    --accent-old-bg: rgba(163,92,7,0.09);
+    --accent-old-line: rgba(163,92,7,0.35);
+    --shadow: 0 1px 2px rgba(20,24,32,0.04), 0 8px 24px -12px rgba(20,24,32,0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #10141b;
+      --surface: #171c26;
+      --surface-2: #1d2330;
+      --surface-3: #242b3a;
+      --border: #2c3444;
+      --border-strong: #3a4356;
+      --text: #e8eaf0;
+      --text-dim: #a2aabb;
+      --text-faint: #6b7386;
+      --accent-new: #6f97ff;
+      --accent-new-bg: rgba(111,151,255,0.13);
+      --accent-new-line: rgba(111,151,255,0.4);
+      --accent-old: #e3a656;
+      --accent-old-bg: rgba(227,166,86,0.12);
+      --accent-old-line: rgba(227,166,86,0.4);
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #10141b;
+    --surface: #171c26;
+    --surface-2: #1d2330;
+    --surface-3: #242b3a;
+    --border: #2c3444;
+    --border-strong: #3a4356;
+    --text: #e8eaf0;
+    --text-dim: #a2aabb;
+    --text-faint: #6b7386;
+    --accent-new: #6f97ff;
+    --accent-new-bg: rgba(111,151,255,0.13);
+    --accent-new-line: rgba(111,151,255,0.4);
+    --accent-old: #e3a656;
+    --accent-old-bg: rgba(227,166,86,0.12);
+    --accent-old-line: rgba(227,166,86,0.4);
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Source Sans 3", ui-sans-serif, system-ui, sans-serif;
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 64px 24px 96px;
+  }
+  header.hero {
+    margin-bottom: 56px;
+  }
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  .eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-new); }
+  h1 {
+    font-family: "Archivo", ui-sans-serif, sans-serif;
+    font-weight: 800;
+    font-size: clamp(2.1rem, 4.4vw, 3rem);
+    line-height: 1.05;
+    letter-spacing: -0.01em;
+    margin: 0 0 18px;
+    text-wrap: balance;
+  }
+  .lede {
+    font-size: 1.15rem;
+    color: var(--text-dim);
+    max-width: 62ch;
+    margin: 0;
+  }
+  .scenario {
+    margin-top: 28px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .scenario div {
+    background: var(--surface);
+    padding: 12px 14px;
+  }
+  .scenario .k {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-faint);
+    margin-bottom: 4px;
+  }
+  .scenario .v {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 14px;
+    color: var(--text);
+  }
+
+  section { margin-top: 64px; }
+  section:first-of-type { margin-top: 0; }
+
+  .step-label {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12.5px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--accent-new);
+    margin-bottom: 8px;
+  }
+  h2 {
+    font-family: "Archivo", sans-serif;
+    font-weight: 700;
+    font-size: 1.55rem;
+    letter-spacing: -0.005em;
+    margin: 0 0 14px;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: "Archivo", sans-serif;
+    font-weight: 700;
+    font-size: 1.05rem;
+    margin: 28px 0 10px;
+  }
+  p { margin: 0 0 14px; max-width: 68ch; }
+  p:last-child { margin-bottom: 0; }
+  ul { margin: 0 0 14px; padding-left: 1.3em; max-width: 66ch; }
+  li { margin-bottom: 6px; }
+
+  code, .mono {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.88em;
+  }
+  code {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05em 0.4em;
+    color: var(--text);
+  }
+
+  figure {
+    margin: 24px 0 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px 20px 14px;
+    box-shadow: var(--shadow);
+  }
+  figure svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  figcaption {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 0.92rem;
+    color: var(--text-dim);
+  }
+  figcaption .mono { color: var(--text-faint); }
+
+  .diagram-wrap { overflow-x: auto; }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin: 10px 0 4px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .sw-new { background: var(--accent-new-bg); border: 1.5px solid var(--accent-new); }
+  .sw-old { background: var(--accent-old-bg); border: 1.5px solid var(--accent-old); }
+  .sw-shared { background: var(--surface-3); border: 1.5px solid var(--border-strong); }
+
+  .callout {
+    margin: 20px 0;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    padding: 18px 20px;
+  }
+  .callout.new { border-left: 3px solid var(--accent-new); }
+  .callout.old { border-left: 3px solid var(--accent-old); }
+  .callout h4 {
+    font-family: "Archivo", sans-serif;
+    font-size: 0.95rem;
+    margin: 0 0 8px;
+  }
+  .callout p { margin: 0; font-size: 0.95rem; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 18px 0;
+    font-size: 0.94rem;
+  }
+  thead th {
+    text-align: left;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    font-weight: 500;
+    padding: 0 12px 10px;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  tbody td {
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.what { font-family: "Archivo", sans-serif; font-weight: 700; font-size: 0.92rem; white-space: nowrap; }
+  .pill {
+    display: inline-block;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.03em;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 999px;
+    margin-bottom: 4px;
+  }
+  .pill.copied { background: var(--accent-new-bg); color: var(--accent-new); border: 1px solid var(--accent-new-line); }
+  .pill.shared { background: var(--surface-3); color: var(--text-dim); border: 1px solid var(--border-strong); }
+
+  .idcard {
+    display: flex;
+    gap: 0;
+    margin: 22px 0;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .idcard > div { flex: 1; padding: 18px 20px; }
+  .idcard > div + div { border-left: 1px solid var(--border); }
+  .idcard .tag {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 8px;
+  }
+  .idcard .same .tag { color: var(--text-dim); }
+  .idcard .changed .tag { color: var(--accent-new); }
+  .idcard .val {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 1.3rem;
+    font-weight: 600;
+  }
+  .idcard .sub { color: var(--text-dim); font-size: 0.86rem; margin-top: 6px; }
+
+  footer.notes {
+    margin-top: 72px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--text-faint);
+    font-size: 0.86rem;
+  }
+  footer.notes code { font-size: 0.86em; }
+
+  @media (max-width: 640px) {
+    .scenario { grid-template-columns: repeat(2, 1fr); }
+    .idcard { flex-direction: column; }
+    .idcard > div + div { border-left: none; border-top: 1px solid var(--border); }
+  }
+</style>
+
+<div class="page">
+
+  <header class="hero">
+    <div class="eyebrow"><span class="dot"></span>mvcc-model &mdash; write path walkthrough</div>
+    <h1>What one update does to the spine</h1>
+    <p class="lede">
+      One record, one field write, one commit. This traces it structure by structure &mdash;
+      what gets cloned, what stays a shared pointer, and why the object's <code>Id</code>
+      comes out the other side completely unchanged even though its value did not.
+    </p>
+    <div class="scenario">
+      <div><div class="k">Type</div><div class="v">Account</div></div>
+      <div><div class="k">Id</div><div class="v">{ index: 42, gen: 1 }</div></div>
+      <div><div class="k">Slot</div><div class="v">chunk 0, i=42</div></div>
+      <div><div class="k">Write</div><div class="v">balance 100 &rarr; 150</div></div>
+    </div>
+  </header>
+
+  <section id="s0">
+    <div class="step-label">Starting point</div>
+    <h2>A model with one record</h2>
+    <p>
+      The model has exactly one chunk allocated &mdash; slot 42 falls inside chunk&nbsp;0
+      (<code>kChunkSize</code> = 4096 slots), so that's the only chunk that exists at all. It holds one live
+      slot; the other 4095 are empty. <code>Model::spine_</code> (the writer's working copy) and the
+      published <code>Root</code>'s <code>spine</code> point at the <em>literal same</em> <code>Chunk</code>
+      object &mdash; nothing has diverged yet, so there is nothing to copy.
+    </p>
+    <div class="legend">
+      <span><i class="sw-shared"></i>shared_ptr, untouched by any commit in flight</span>
+    </div>
+    <figure>
+      <div class="diagram-wrap">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Model's working spine and the published Root both point at the same Chunk object; slot 42 inside it holds the current Account object at generation 1.">
+        <defs>
+          <marker id="a0" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g font-family="IBM Plex Mono, monospace" font-size="12.5">
+          <!-- Model box -->
+          <rect x="20" y="20" width="220" height="52" rx="8" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+          <text x="36" y="41" fill="currentColor">Model (writer-private)</text>
+          <text x="36" y="58" fill="currentColor" fill-opacity="0.6">spine_[0]</text>
+
+          <!-- Root box -->
+          <rect x="620" y="20" width="220" height="52" rx="8" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+          <text x="636" y="41" fill="currentColor">Root v1 (published)</text>
+          <text x="636" y="58" fill="currentColor" fill-opacity="0.6">spine[0]</text>
+
+          <!-- arrows down to chunk -->
+          <line x1="130" y1="72" x2="330" y2="128" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#a0)"/>
+          <line x1="730" y1="72" x2="530" y2="128" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#a0)"/>
+          <text x="175" y="98" fill="currentColor" fill-opacity="0.55" font-size="11">same shared_ptr&lt;Chunk&gt;</text>
+          <text x="600" y="98" fill="currentColor" fill-opacity="0.55" font-size="11" text-anchor="end">same shared_ptr&lt;Chunk&gt;</text>
+
+          <!-- Chunk box -->
+          <rect x="230" y="130" width="400" height="90" rx="10" class="sw-shared" style="fill:var(--surface-3);stroke:var(--border-strong)"/>
+          <text x="430" y="152" text-anchor="middle" fill="currentColor" font-weight="600">Chunk 0</text>
+          <text x="430" y="168" text-anchor="middle" fill="currentColor" fill-opacity="0.55" font-size="11">obj[4096] / gen[4096]</text>
+
+          <!-- cells -->
+          <g font-size="11">
+            <rect x="250" y="182" width="26" height="26" rx="3" fill="none" stroke="currentColor" stroke-opacity="0.35"/>
+            <rect x="280" y="182" width="26" height="26" rx="3" fill="none" stroke="currentColor" stroke-opacity="0.35"/>
+            <text x="323" y="199" fill="currentColor" fill-opacity="0.5">&hellip;</text>
+            <rect x="355" y="178" width="40" height="34" rx="4" fill="var(--accent-old-bg)" stroke="var(--accent-old)" stroke-width="1.5"/>
+            <text x="375" y="197" text-anchor="middle" fill="var(--accent-old)" font-weight="600">42</text>
+            <text x="375" y="222" text-anchor="middle" fill="var(--accent-old)" font-size="10">gen 1</text>
+            <text x="425" y="199" fill="currentColor" fill-opacity="0.5">&hellip;</text>
+            <rect x="465" y="182" width="26" height="26" rx="3" fill="none" stroke="currentColor" stroke-opacity="0.35"/>
+            <rect x="495" y="182" width="26" height="26" rx="3" fill="none" stroke="currentColor" stroke-opacity="0.35"/>
+            <text x="540" y="199" fill="currentColor" fill-opacity="0.5">4095 empty slots</text>
+          </g>
+
+          <!-- arrow to object -->
+          <line x1="375" y1="212" x2="375" y2="255" stroke="var(--accent-old)" marker-end="url(#a0)"/>
+          <rect x="270" y="257" width="210" height="40" rx="8" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/>
+          <text x="375" y="273" text-anchor="middle" fill="var(--accent-old)" font-weight="600">Account{ id: 42,1 }</text>
+          <text x="375" y="289" text-anchor="middle" fill="var(--accent-old)" font-size="11">balance: 100</text>
+        </g>
+      </svg>
+      </div>
+      <figcaption>
+        One <code>Chunk</code>, one shared_ptr, no divergence: the writer's working spine and the
+        currently-published <code>Root</code> are looking at the exact same object in memory.
+      </figcaption>
+    </figure>
+  </section>
+
+  <section id="s1">
+    <div class="step-label">Step 1</div>
+    <h2>Begin a transaction, call update()</h2>
+    <p>
+      <code>Model::begin()</code> takes a <code>Snapshot</code> of the current <code>Root</code>
+      (v1) as the transaction's base &mdash; a pointer copy, no lock. <code>txn.update&lt;Account&gt;(id)</code>
+      then hands back a mutable pointer to a fresh <strong>clone</strong> of that object. The clone lives
+      entirely outside the spine: not linked into any <code>Chunk</code>, not visible to any
+      <code>Snapshot</code>, not touched by <code>commit_mu_</code> at all. Its <code>Id</code> is copied
+      verbatim from the original &mdash; <code>{42, 1}</code> &mdash; because it names the same object; only
+      its field values are free to change, and can change any number of times, in any order, before commit.
+    </p>
+    <figure>
+      <div class="diagram-wrap">
+      <svg viewBox="0 0 860 220" role="img" aria-label="The published Chunk is untouched. A transaction-private clone of the object exists off to the side, not linked into any chunk, with the same Id but an edited balance.">
+        <defs>
+          <marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g font-family="IBM Plex Mono, monospace" font-size="12.5">
+          <rect x="20" y="20" width="230" height="72" rx="10" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/>
+          <text x="36" y="42" fill="var(--accent-old)" font-weight="600">Root v1 &middot; Chunk 0</text>
+          <text x="36" y="60" fill="var(--accent-old)" font-size="11">slot 42: Account{100}</text>
+          <text x="36" y="76" fill="var(--accent-old)" font-size="11">gen 1 &middot; unchanged</text>
+
+          <line x1="250" y1="56" x2="330" y2="56" stroke="currentColor" stroke-opacity="0.5" marker-end="url(#a1)" stroke-dasharray="3 3"/>
+          <text x="290" y="46" text-anchor="middle" fill="currentColor" fill-opacity="0.6" font-size="10.5">base()</text>
+
+          <rect x="330" y="16" width="150" height="80" rx="10" fill="none" stroke="currentColor" stroke-opacity="0.45" stroke-dasharray="4 3"/>
+          <text x="405" y="42" text-anchor="middle" fill="currentColor">Snapshot</text>
+          <text x="405" y="60" text-anchor="middle" fill="currentColor" fill-opacity="0.6" font-size="11">base of Transaction</text>
+          <text x="405" y="76" text-anchor="middle" fill="currentColor" fill-opacity="0.6" font-size="11">(version 1)</text>
+
+          <line x1="480" y1="56" x2="560" y2="56" stroke="currentColor" stroke-opacity="0.5" marker-end="url(#a1)"/>
+          <text x="520" y="46" text-anchor="middle" fill="currentColor" fill-opacity="0.6" font-size="10.5">clone()</text>
+
+          <rect x="560" y="120" width="260" height="80" rx="10" fill="var(--accent-new-bg)" stroke="var(--accent-new)" stroke-dasharray="5 3"/>
+          <text x="580" y="144" fill="var(--accent-new)" font-weight="600">clone (transaction-private)</text>
+          <text x="580" y="164" fill="var(--accent-new)" font-size="11">Id { 42, 1 } &mdash; unchanged</text>
+          <text x="580" y="182" fill="var(--accent-new)" font-size="11">balance: 100 &rarr; 150 (written here)</text>
+
+          <line x1="690" y1="96" x2="690" y2="118" stroke="var(--accent-new)" stroke-dasharray="4 3" marker-end="url(#a1)"/>
+
+          <text x="30" y="200" fill="currentColor" fill-opacity="0.55" font-size="11.5">not linked into any Chunk &middot; invisible to every reader &middot; free to edit repeatedly</text>
+        </g>
+      </svg>
+      </div>
+      <figcaption>
+        Building the write is entirely lock-free: nothing under <code>commit_mu_</code> (spine, indexes,
+        <code>referrers_</code>) is touched yet.
+      </figcaption>
+    </figure>
+  </section>
+
+  <section id="s2">
+    <div class="step-label">Step 2 &middot; inside try_commit(), under commit_mu_</div>
+    <h2>Apply: clone the chunk, not the model</h2>
+    <p>
+      Once <code>try_commit()</code> takes <code>commit_mu_</code> and confirms nothing else touched id
+      42 since this transaction's base, <code>apply_update()</code> installs the clone. The old object is
+      <strong>retired</strong> &mdash; marked invisible starting at the next version, not freed &mdash; and
+      <code>set_slot(42, new_ptr, gen=1)</code> writes the new pointer in. That call starts with
+      <code>cow(chunk 0)</code>: first touch of a chunk in this attempt clones the <em>whole</em> chunk, all
+      4096 slots, in one memcpy. <code>Model::spine_[0]</code> is repointed at that clone; the original
+      <code>Chunk 0</code> is left completely alone &mdash; still exactly what <code>Root v1</code> points at.
+    </p>
+    <div class="legend">
+      <span><i class="sw-old"></i>original chunk &mdash; still what Root v1 sees</span>
+      <span><i class="sw-new"></i>cloned chunk &mdash; spine_[0]'s new target</span>
+    </div>
+    <figure>
+      <div class="diagram-wrap">
+      <svg viewBox="0 0 860 340" role="img" aria-label="cow() clones chunk 0 in full. spine_ now points at the clone, where slot 42 holds the new object pointer at the same generation 1; the original chunk, still pointed to by Root v1, is untouched.">
+        <defs>
+          <marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g font-family="IBM Plex Mono, monospace" font-size="12">
+          <!-- old chunk -->
+          <rect x="20" y="20" width="360" height="110" rx="10" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/>
+          <text x="36" y="42" fill="var(--accent-old)" font-weight="600">Chunk 0 (original)</text>
+          <text x="36" y="58" fill="var(--accent-old)" font-size="10.5">still referenced by Root v1.spine[0]</text>
+          <rect x="150" y="72" width="40" height="34" rx="4" fill="var(--surface)" stroke="var(--accent-old)" stroke-width="1.5"/>
+          <text x="170" y="91" text-anchor="middle" fill="var(--accent-old)" font-weight="600">42</text>
+          <text x="170" y="116" text-anchor="middle" fill="var(--accent-old)" font-size="10">gen 1 &middot; old ptr</text>
+          <text x="230" y="93" fill="var(--accent-old)" fill-opacity="0.7" font-size="11">4095 other slots, untouched</text>
+
+          <!-- arrow cow -->
+          <line x1="380" y1="75" x2="460" y2="75" stroke="currentColor" marker-end="url(#a2)"/>
+          <text x="420" y="63" text-anchor="middle" fill="currentColor" font-size="11">cow()</text>
+          <text x="420" y="98" text-anchor="middle" fill="currentColor" fill-opacity="0.6" font-size="10">memcpy, 4096 slots</text>
+
+          <!-- new chunk -->
+          <rect x="460" y="20" width="380" height="110" rx="10" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <text x="476" y="42" fill="var(--accent-new)" font-weight="600">Chunk 0' (clone, this attempt)</text>
+          <text x="476" y="58" fill="var(--accent-new)" font-size="10.5">Model::spine_[0] now points here</text>
+          <rect x="590" y="72" width="40" height="34" rx="4" fill="var(--surface)" stroke="var(--accent-new)" stroke-width="1.5"/>
+          <text x="610" y="91" text-anchor="middle" fill="var(--accent-new)" font-weight="600">42</text>
+          <text x="610" y="116" text-anchor="middle" fill="var(--accent-new)" font-size="10">gen 1 &middot; new ptr</text>
+          <text x="670" y="93" fill="var(--accent-new)" fill-opacity="0.7" font-size="11">4095 slots: byte-identical copies</text>
+
+          <!-- objects below -->
+          <line x1="170" y1="106" x2="170" y2="170" stroke="var(--accent-old)" marker-end="url(#a2)"/>
+          <rect x="60" y="172" width="220" height="52" rx="8" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/>
+          <text x="170" y="193" text-anchor="middle" fill="var(--accent-old)" font-weight="600">Account{100} (baseline)</text>
+          <text x="170" y="211" text-anchor="middle" fill="var(--accent-old)" font-size="10.5">retired: invisible from v2 on</text>
+
+          <line x1="610" y1="106" x2="610" y2="170" stroke="var(--accent-new)" marker-end="url(#a2)"/>
+          <rect x="500" y="172" width="220" height="52" rx="8" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <text x="610" y="193" text-anchor="middle" fill="var(--accent-new)" font-weight="600">Account{150} (clone)</text>
+          <text x="610" y="211" text-anchor="middle" fill="var(--accent-new)" font-size="10.5">installed at slot 42</text>
+
+          <text x="20" y="270" fill="currentColor" fill-opacity="0.6" font-size="11.5">gen written by set_slot() is id.gen, unchanged &mdash; this is a value swap at a fixed slot, not a new identity.</text>
+          <text x="20" y="292" fill="currentColor" fill-opacity="0.6" font-size="11.5">Neither chunk is visible to any reader yet: Model::root_ still points at Root v1.</text>
+        </g>
+      </svg>
+      </div>
+      <figcaption>
+        <span class="mono">dirty_</span> tracks "already cloned this attempt": a second write to slot 43 in
+        the same commit would land in <code>Chunk 0'</code> directly, no second memcpy.
+      </figcaption>
+    </figure>
+  </section>
+
+  <section id="s3">
+    <div class="step-label">Step 3</div>
+    <h2>Publish: a new Root, mostly borrowed</h2>
+    <p>
+      <code>publish_now()</code> bumps <code>version_</code> to 2 and builds a fresh <code>Root</code>.
+      <code>r-&gt;spine = spine_</code> copies the <em>vector</em> &mdash; one <code>shared_ptr</code> handle
+      per chunk, O(chunks touched), never O(objects). For this model, that's a single pointer: slot 0 now
+      names <code>Chunk 0'</code>. <code>Model::root_</code> is swapped to <code>r</code> atomically; every
+      <code>Snapshot</code> taken from this point on sees version 2. <code>Root v1</code> is not modified,
+      not decremented, not touched &mdash; it simply keeps existing, held alive by whatever still references
+      version 1: a live <code>Snapshot</code>, or another transaction's still-open <code>base()</code>.
+    </p>
+    <figure>
+      <div class="diagram-wrap">
+      <svg viewBox="0 0 860 380" role="img" aria-label="Root v1 and Root v2 exist side by side. Root v1's spine still points at the original chunk and resolves id 42 to balance 100. Root v2's spine points at the cloned chunk and resolves the identical id to balance 150.">
+        <defs>
+          <marker id="a3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g font-family="IBM Plex Mono, monospace" font-size="12">
+
+          <!-- S_old -->
+          <rect x="20" y="16" width="150" height="46" rx="8" fill="none" stroke="currentColor" stroke-opacity="0.5" stroke-dasharray="4 3"/>
+          <text x="95" y="35" text-anchor="middle" fill="currentColor">Snapshot S_old</text>
+          <text x="95" y="52" text-anchor="middle" fill="currentColor" fill-opacity="0.6" font-size="10.5">holds version 1</text>
+          <line x1="95" y1="62" x2="95" y2="88" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#a3)"/>
+
+          <!-- Root v1 col -->
+          <rect x="20" y="90" width="330" height="270" rx="12" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/>
+          <text x="40" y="116" fill="var(--accent-old)" font-weight="700" font-size="14">Root v1</text>
+          <text x="40" y="134" fill="var(--accent-old)" font-size="10.5">spine[0] &rarr; Chunk 0 (original)</text>
+
+          <rect x="60" y="150" width="60" height="46" rx="5" fill="var(--surface)" stroke="var(--accent-old)" stroke-width="1.5"/>
+          <text x="90" y="170" text-anchor="middle" fill="var(--accent-old)" font-weight="600">42</text>
+          <text x="90" y="186" text-anchor="middle" fill="var(--accent-old)" font-size="9.5">gen 1</text>
+
+          <line x1="90" y1="196" x2="90" y2="222" stroke="var(--accent-old)" marker-end="url(#a3)"/>
+          <rect x="40" y="224" width="270" height="52" rx="8" fill="var(--surface)" stroke="var(--accent-old)"/>
+          <text x="175" y="245" text-anchor="middle" fill="var(--accent-old)" font-weight="600">Account{ id: 42,1 }</text>
+          <text x="175" y="263" text-anchor="middle" fill="var(--accent-old)" font-size="11">balance: 100</text>
+
+          <text x="40" y="300" fill="var(--accent-old)" font-size="10.5">still alive: retained by S_old,</text>
+          <text x="40" y="316" fill="var(--accent-old)" font-size="10.5">not freed until it drops</text>
+
+          <!-- Root v2 col -->
+          <rect x="510" y="90" width="330" height="270" rx="12" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <text x="530" y="116" fill="var(--accent-new)" font-weight="700" font-size="14">Root v2</text>
+          <text x="530" y="134" fill="var(--accent-new)" font-size="10.5">spine[0] &rarr; Chunk 0' (clone)</text>
+
+          <rect x="550" y="150" width="60" height="46" rx="5" fill="var(--surface)" stroke="var(--accent-new)" stroke-width="1.5"/>
+          <text x="580" y="170" text-anchor="middle" fill="var(--accent-new)" font-weight="600">42</text>
+          <text x="580" y="186" text-anchor="middle" fill="var(--accent-new)" font-size="9.5">gen 1</text>
+
+          <line x1="580" y1="196" x2="580" y2="222" stroke="var(--accent-new)" marker-end="url(#a3)"/>
+          <rect x="530" y="224" width="270" height="52" rx="8" fill="var(--surface)" stroke="var(--accent-new)"/>
+          <text x="665" y="245" text-anchor="middle" fill="var(--accent-new)" font-weight="600">Account{ id: 42,1 }</text>
+          <text x="665" y="263" text-anchor="middle" fill="var(--accent-new)" font-size="11">balance: 150</text>
+
+          <text x="530" y="300" fill="var(--accent-new)" font-size="10.5">this is now Model::root_ &mdash;</text>
+          <text x="530" y="316" fill="var(--accent-new)" font-size="10.5">every new Snapshot resolves here</text>
+
+          <!-- S_new -->
+          <rect x="670" y="16" width="150" height="46" rx="8" fill="none" stroke="currentColor" stroke-opacity="0.5" stroke-dasharray="4 3"/>
+          <text x="745" y="35" text-anchor="middle" fill="currentColor">Snapshot S_new</text>
+          <text x="745" y="52" text-anchor="middle" fill="currentColor" fill-opacity="0.6" font-size="10.5">holds version 2</text>
+          <line x1="745" y1="62" x2="745" y2="88" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#a3)"/>
+
+          <!-- shared chunk note -->
+          <line x1="350" y1="140" x2="510" y2="140" stroke="currentColor" stroke-opacity="0.35" stroke-dasharray="3 3"/>
+          <text x="430" y="130" text-anchor="middle" fill="currentColor" fill-opacity="0.55" font-size="10.5">same Id{42,1}</text>
+          <text x="430" y="345" text-anchor="middle" fill="currentColor" fill-opacity="0.5" font-size="10.5">a second, untouched chunk would sit here as ONE shared_ptr, identical in both spines</text>
+        </g>
+      </svg>
+      </div>
+      <figcaption>
+        The same 64 bits &mdash; <code>Id{42, 1}</code> &mdash; resolves to two different objects depending
+        only on which <code>Root</code> you resolve it against. That's the entire mechanism of snapshot
+        isolation: no locking on read, because a reader's world never moves under it.
+      </figcaption>
+    </figure>
+  </section>
+
+  <section id="s4">
+    <div class="step-label">Bottom line</div>
+    <h2>The Id never moved</h2>
+    <div class="idcard">
+      <div class="same">
+        <div class="tag">index</div>
+        <div class="val">42 &rarr; 42</div>
+        <div class="sub">same slot in the spine, before and after</div>
+      </div>
+      <div class="same">
+        <div class="tag">gen</div>
+        <div class="val">1 &rarr; 1</div>
+        <div class="sub"><code>set_slot()</code> is called with the clone's own <code>id.gen</code>, unmodified &mdash; an update never bumps it</div>
+      </div>
+      <div class="changed">
+        <div class="tag">value</div>
+        <div class="val">100 &rarr; 150</div>
+        <div class="sub">the only thing that actually changed</div>
+      </div>
+    </div>
+    <p>
+      Generation only moves on <strong>slot reuse</strong>, never on an update. If this record were removed
+      instead, and something later allocated slot 42 for a new object, <code>alloc_slot()</code> would read
+      the slot's current generation (1) and mint <code>{42, 2}</code>. A stale <code>Id{42, 1}</code> held by
+      an old reference would then fail <code>slot_lookup</code>'s generation check forever, rather than
+      silently resolving to the new occupant &mdash; that's invariant&nbsp;5, and it's the entire reason
+      <code>Id</code> carries a generation at all instead of just an index.
+    </p>
+  </section>
+
+  <section id="s5">
+    <div class="step-label">Summary</div>
+    <h2>What copied, what stayed shared</h2>
+    <table>
+      <thead>
+        <tr><th>Structure</th><th></th><th>Detail</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="what">The object</td>
+          <td><span class="pill copied">copied</span></td>
+          <td>Cloned by <code>Transaction::update()</code> the moment it's requested. The published baseline is never mutated (invariant 3); the clone is written freely until commit, then installed.</td>
+        </tr>
+        <tr>
+          <td class="what">Chunk 0</td>
+          <td><span class="pill copied">copied</span></td>
+          <td>One memcpy of all 4096 slots, on first touch of that chunk in this commit attempt (<code>cow()</code>). A second write to a different slot in the same chunk, same commit, reuses this clone &mdash; no second copy.</td>
+        </tr>
+        <tr>
+          <td class="what">Every other chunk</td>
+          <td><span class="pill shared">shared</span></td>
+          <td>Untouched <code>shared_ptr&lt;Chunk&gt;</code> entries carry over into the new <code>Root</code> unchanged &mdash; not read, not copied. At 1M objects that's roughly 250 chunks sharing structure while one changes.</td>
+        </tr>
+        <tr>
+          <td class="what">The spine vector</td>
+          <td><span class="pill copied">copied</span></td>
+          <td>Root's <code>spine</code> is a fresh <code>std::vector</code> of handles &mdash; cheap, proportional to chunk count (model size &divide; 4096), not to how many objects changed.</td>
+        </tr>
+        <tr>
+          <td class="what">Index maps (by_type, by_key, &hellip;)</td>
+          <td><span class="pill shared">shared</span></td>
+          <td>This update touched no <code>define_keys()</code>/<code>define_fields()</code> field, so every index handle in the new <code>Root</code> is byte-identical to the old one. A field that <em>is</em> indexed would instead copy only the path from that persistent map's root to the changed leaf &mdash; same structural-sharing idea, one level down from the spine.</td>
+        </tr>
+        <tr>
+          <td class="what">The Root struct</td>
+          <td><span class="pill copied">copied</span></td>
+          <td>One small heap allocation per commit (<code>make_shared&lt;Root&gt;()</code>) &mdash; a handful of handles, cheap regardless of model size.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer class="notes">
+    Grounded in <code>include/model/model.h</code> (<code>Id</code>, <code>Chunk</code>, <code>Root</code>) and
+    <code>src/model.cpp</code> (<code>Model::cow</code>, <code>Model::set_slot</code>,
+    <code>Model::apply_update</code>, <code>Model::publish_now</code>). Invariants referenced: 3 (published
+    state is immutable), 4 (nothing frees while a reader can still see it), 5 (Id carries a generation).
+  </footer>
+
+</div>
+
+</body></html>
