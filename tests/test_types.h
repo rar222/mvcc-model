@@ -22,10 +22,9 @@ public:
 
     /// Diagnostic only -- see include/example/types.h's Account::to_string()
     /// doc comment for why `id` comes first and refs (none here) would print
-    /// as raw index:gen.
+    /// as raw Id::to_string().
     std::string to_string() const {
-        return "Account{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) +
-               ", name=" + name + ", balance=" + std::to_string(balance) + "}";
+        return "Account{id=" + id.to_string() + ", name=" + name + ", balance=" + std::to_string(balance) + "}";
     }
 
     template <class Self>
@@ -57,14 +56,11 @@ public:
 
     /// Diagnostic only -- see include/example/types.h's Order::to_string()
     /// doc comment for why `id` comes first and account/parent print as raw
-    /// index:gen instead of being resolved.
+    /// Id::to_string() instead of being resolved.
     std::string to_string() const {
-        auto ref_str = [](model::Id ref_id) {
-            return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
-        };
-        return "Order{id=" + ref_str(id) + ", code=" + code + ", qty=" + std::to_string(qty) +
-               ", account=" + ref_str(account.id()) +
-               ", parent=" + (parent ? ref_str(parent.id()) : "null") + "}";
+        return "Order{id=" + id.to_string() + ", code=" + code + ", qty=" + std::to_string(qty) +
+               ", account=" + account.id().to_string() +
+               ", parent=" + (parent ? parent.id().to_string() : "null") + "}";
     }
 
     template <class Self, class V>

@@ -966,8 +966,8 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
                 const void* self = obj.get();
                 auto [it, inserted] = plan.claims.try_emplace(std::move(key), self);
                 if (!inserted && it->second != self)
-                    err = IntegrityError{"duplicate key '" + it->first +
-                                         "' claimed by more than one object within the same transaction",
+                    err = IntegrityError{"duplicate key '" + it->first + "' also claimed by a " +
+                                         obj->type() + " object within the same transaction",
                                          Id{}};
             },
             [&](const void* field, std::uint64_t key, KeyLookupType) {
@@ -977,7 +977,8 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
                 auto [it, inserted] = plan.claims.try_emplace(key, self);
                 if (!inserted && it->second != self)
                     err = IntegrityError{"duplicate key '" + std::to_string(it->first) +
-                                         "' claimed by more than one object within the same transaction",
+                                         "' also claimed by a " + obj->type() +
+                                         " object within the same transaction",
                                          Id{}};
             });
         if (err) return err;
@@ -1008,8 +1009,8 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
                 const void* self = clone.get();
                 auto [it, inserted] = plan.claims.try_emplace(std::move(new_key), self);
                 if (!inserted && it->second != self)
-                    err = IntegrityError{"duplicate key '" + it->first +
-                                         "' claimed by more than one object within the same transaction",
+                    err = IntegrityError{"duplicate key '" + it->first + "' also claimed by a " +
+                                         clone->type() + " object within the same transaction",
                                          Id{}};
             },
             [&](const void* field, std::uint64_t new_key, KeyLookupType) {
@@ -1024,7 +1025,8 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
                 auto [it, inserted] = plan.claims.try_emplace(new_key, self);
                 if (!inserted && it->second != self)
                     err = IntegrityError{"duplicate key '" + std::to_string(it->first) +
-                                         "' claimed by more than one object within the same transaction",
+                                         "' also claimed by a " + clone->type() +
+                                         " object within the same transaction",
                                          Id{}};
             });
         if (err) return err;
@@ -1043,9 +1045,12 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
             (void)owner;
             if (plan.vacated.count(key)) continue;
             if (const Id* holder = fit->second.get(key, resolve))
-                return IntegrityError{"key '" + key + "' is already in use by object " +
-                                          std::to_string(holder->index) + ":" +
-                                          std::to_string(holder->gen),
+                // bad_target intentionally left Id{} -- unlike a dangling Ref, this
+                // holder is a live, currently-committed object; setting bad_target to
+                // it would make try_commit()'s base-lookup reclassify this as a
+                // Conflict instead of Invalid (see bad_target's own doc comment).
+                return IntegrityError{"key '" + key + "' is already in use by " + peek_raw(*holder)->type() +
+                                          " object " + holder->to_string(),
                                       Id{}};
         }
     }
@@ -1056,9 +1061,9 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
             (void)owner;
             if (plan.vacated.count(key)) continue;
             if (const Id* holder = fit->second.get(key))
-                return IntegrityError{"key '" + std::to_string(key) + "' is already in use by object " +
-                                          std::to_string(holder->index) + ":" +
-                                          std::to_string(holder->gen),
+                // bad_target intentionally left Id{} -- see the string-key loop above.
+                return IntegrityError{"key '" + std::to_string(key) + "' is already in use by " +
+                                          peek_raw(*holder)->type() + " object " + holder->to_string(),
                                       Id{}};
         }
     }
@@ -3281,8 +3286,8 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
                 const void* self = obj.get();
                 auto [it, inserted] = claims.try_emplace(std::move(key), self);
                 if (!inserted && it->second != self)
-                    key_err = IntegrityError{"duplicate key '" + it->first +
-                                                 "' claimed by more than one object within the same bulk load",
+                    key_err = IntegrityError{"duplicate key '" + it->first + "' also claimed by a " +
+                                                 obj->type() + " object within the same bulk load",
                                              Id{}};
             },
             [&](const void* field, std::uint64_t key, KeyLookupType) {
@@ -3292,7 +3297,8 @@ CommitResult Model::commit_bulk_without_undo(BulkTransaction& txn) {
                 auto [it, inserted] = claims.try_emplace(key, self);
                 if (!inserted && it->second != self)
                     key_err = IntegrityError{"duplicate key '" + std::to_string(it->first) +
-                                                 "' claimed by more than one object within the same bulk load",
+                                                 "' also claimed by a " + obj->type() +
+                                                 " object within the same bulk load",
                                              Id{}};
             });
         if (key_err) {

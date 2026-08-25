@@ -38,6 +38,31 @@ TEST(id_to_uint64_and_from_uint64_round_trip) {
     CHECK_EQ(asym.to_uint64(), (std::uint64_t{2} << 32) | std::uint64_t{1});
 }
 
+// to_string()/from_string() round-trip, use lowercase hex with no
+// zero-padding, and from_string() rejects malformed input rather than
+// partially parsing it.
+TEST(id_to_string_and_from_string_round_trip) {
+    const Id example{0x2a, 1};
+    CHECK_EQ(example.to_string(), std::string{"2a::1"});
+    CHECK(Id::from_string("2a::1") == example);
+
+    const Id zero{};
+    CHECK_EQ(zero.to_string(), std::string{"0::0"});
+    CHECK(Id::from_string(zero.to_string()) == zero);
+
+    const Id hi{0xFFFF'FFFFu, 0xFFFF'FFFFu};
+    CHECK_EQ(hi.to_string(), std::string{"ffffffff::ffffffff"});
+    CHECK(Id::from_string(hi.to_string()) == hi);
+
+    CHECK(!Id::from_string("2a1").has_value());       // missing "::"
+    CHECK(!Id::from_string("::1").has_value());       // empty index
+    CHECK(!Id::from_string("2a::").has_value());      // empty gen
+    CHECK(!Id::from_string("2a::1::2").has_value());  // trailing junk after gen
+    CHECK(!Id::from_string("2a::1x").has_value());    // trailing junk after gen
+    CHECK(!Id::from_string("g::1").has_value());      // non-hex digit
+    CHECK(!Id::from_string("100000000::1").has_value());  // overflows uint32_t
+}
+
 // Basic roundtrip: create+commit, then find both by Ref/Id and by a
 // define_keys()-declared field, and confirm a typed lookup distinguishes
 // two types even when one's key string looks like the other's.

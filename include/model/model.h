@@ -38,6 +38,7 @@
 #include <any>
 #include <atomic>
 #include <cassert>
+#include <charconv>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -149,6 +150,42 @@ struct Id {
     /// from its packed form.
     static Id from_uint64(std::uint64_t v) noexcept {
         return Id{static_cast<std::uint32_t>(v), static_cast<std::uint32_t>(v >> 32)};
+    }
+
+    /// Formats as "index::gen", each field lowercase hex with no
+    /// zero-padding -- e.g. {42, 1} -> "2a::1". A compact, grep-able form
+    /// for logging and diagnostics. Inverse of from_string().
+    std::string to_string() const {
+        char buf[2 * 8 + 2];  // two uint32_t in hex (<=8 digits each) plus "::"
+        char* end = std::to_chars(buf, buf + 8, index, 16).ptr;
+        *end++ = ':';
+        *end++ = ':';
+        end = std::to_chars(end, buf + sizeof(buf), gen, 16).ptr;
+        return std::string(buf, end);
+    }
+
+    /// Inverse of to_string() -- parses "index::gen" hex. Returns nullopt
+    /// for anything that doesn't round-trip: missing "::", an empty field,
+    /// trailing junk, or a value that overflows uint32_t.
+    static std::optional<Id> from_string(std::string_view s) {
+        const auto sep = s.find("::");
+        if (sep == std::string_view::npos) return std::nullopt;
+        const std::string_view index_part = s.substr(0, sep);
+        const std::string_view gen_part = s.substr(sep + 2);
+        if (index_part.empty() || gen_part.empty()) return std::nullopt;
+
+        Id id;
+        const auto index_result =
+            std::from_chars(index_part.data(), index_part.data() + index_part.size(), id.index, 16);
+        if (index_result.ec != std::errc{} || index_result.ptr != index_part.data() + index_part.size()) {
+            return std::nullopt;
+        }
+        const auto gen_result =
+            std::from_chars(gen_part.data(), gen_part.data() + gen_part.size(), id.gen, 16);
+        if (gen_result.ec != std::errc{} || gen_result.ptr != gen_part.data() + gen_part.size()) {
+            return std::nullopt;
+        }
+        return id;
     }
 };
 

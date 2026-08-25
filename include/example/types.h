@@ -68,14 +68,13 @@ public:
     std::int64_t balance = 0;
 
     /// Diagnostic only -- e.g. for a subscriber printing a changeset. `id`
-    /// (own index:gen) always comes first, so every type's to_string() is
-    /// grep-able by id the same way. Refs are printed as raw index:gen, not
-    /// resolved: a Ref<T>/Opt<T> has no snapshot pointer to resolve through
-    /// (see Ref<T>'s doc comment), and to_string() has no Snapshot parameter
-    /// to resolve one with anyway.
+    /// (own Id::to_string()) always comes first, so every type's to_string()
+    /// is grep-able by id the same way. Refs are printed as raw
+    /// Id::to_string(), not resolved: a Ref<T>/Opt<T> has no snapshot
+    /// pointer to resolve through (see Ref<T>'s doc comment), and
+    /// to_string() has no Snapshot parameter to resolve one with anyway.
     std::string to_string() const {
-        return "Account{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) +
-               ", name=" + name + ", balance=" + std::to_string(balance) + "}";
+        return "Account{id=" + id.to_string() + ", name=" + name + ", balance=" + std::to_string(balance) + "}";
     }
 
     template <class Self>
@@ -122,15 +121,12 @@ public:
     std::string computed_key() const { return "ord:" + code; }
 
     /// Diagnostic only -- see Account::to_string()'s doc comment for why
-    /// `id` comes first and refs print as raw index:gen instead of being
-    /// resolved.
+    /// `id` comes first and refs print as raw Id::to_string() instead of
+    /// being resolved.
     std::string to_string() const {
-        auto ref_str = [](model::Id ref_id) {
-            return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
-        };
-        return "Order{id=" + ref_str(id) + ", code=" + code + ", qty=" + std::to_string(qty) +
-               ", account=" + ref_str(account.id()) +
-               ", parent=" + (parent ? ref_str(parent.id()) : "null") + "}";
+        return "Order{id=" + id.to_string() + ", code=" + code + ", qty=" + std::to_string(qty) +
+               ", account=" + account.id().to_string() +
+               ", parent=" + (parent ? parent.id().to_string() : "null") + "}";
     }
 
     /// account is the classic hot reverse lookup ("every Order for this

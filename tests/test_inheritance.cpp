@@ -118,12 +118,9 @@ public:
     std::string asset_description_scan() const { return description; }
 
     std::string to_string() const {
-        auto ref_str = [](model::Id ref_id) {
-            return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
-        };
-        return "Asset{id=" + ref_str(id) + ", label=" + label + ", created_at=" + std::to_string(created_at) +
+        return "Asset{id=" + id.to_string() + ", label=" + label + ", created_at=" + std::to_string(created_at) +
                ", schema_version=" + std::to_string(schema_version) + ", value=" + std::to_string(value) +
-               ", owner=" + ref_str(owner.id()) + "}";
+               ", owner=" + owner.id().to_string() + "}";
     }
 
     template <class Self, class V>
@@ -192,11 +189,8 @@ public:
     std::string gizmo_description_scan() const { return description; }  // see Asset::asset_description_scan()
 
     std::string to_string() const {
-        const model::Id linked_id = linked.id();
-        return "Gizmo{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
-               ", linked=" + (linked ? std::to_string(linked_id.index) + ":" + std::to_string(linked_id.gen)
-                                     : "null") +
-               "}";
+        return "Gizmo{id=" + id.to_string() + ", label=" + label +
+               ", linked=" + (linked ? linked.id().to_string() : "null") + "}";
     }
 
     template <class Self, class V>

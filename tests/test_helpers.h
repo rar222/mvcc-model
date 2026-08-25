@@ -52,9 +52,7 @@ public:
 
     /// Diagnostic only -- see example::Account::to_string()'s doc comment
     /// for why `id` comes first.
-    std::string to_string() const {
-        return "Widget{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", key=" + key + "}";
-    }
+    std::string to_string() const { return "Widget{id=" + id.to_string() + ", key=" + key + "}"; }
 
     // no outgoing references, so no define_references() to declare
     template <class Self>
@@ -79,8 +77,7 @@ public:
     /// Diagnostic only -- see example::Account::to_string()'s doc comment
     /// for why `id` comes first.
     std::string to_string() const {
-        return "Gadget{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
-               ", serial=" + std::to_string(serial) + "}";
+        return "Gadget{id=" + id.to_string() + ", label=" + label + ", serial=" + std::to_string(serial) + "}";
     }
 
     // no outgoing references, so no define_references() to declare
@@ -107,14 +104,11 @@ public:
     model::Opt<Node> parent;
 
     /// Diagnostic only -- see example::Account::to_string()'s doc comment
-    /// for why `id` comes first and parent prints as raw index:gen instead
-    /// of being resolved.
+    /// for why `id` comes first and parent prints as raw Id::to_string()
+    /// instead of being resolved.
     std::string to_string() const {
-        const model::Id parent_id = parent.id();
-        return "Node{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
-               ", parent=" +
-               (parent ? std::to_string(parent_id.index) + ":" + std::to_string(parent_id.gen) : "null") +
-               "}";
+        return "Node{id=" + id.to_string() + ", label=" + label +
+               ", parent=" + (parent ? parent.id().to_string() : "null") + "}";
     }
 
     template <class Self, class V>
@@ -185,15 +179,12 @@ public:
     model::Opt<Account> owner_scan;
 
     /// Diagnostic only -- see example::Account::to_string()'s doc comment
-    /// for why `id` comes first and owner/related print as raw index:gen
-    /// instead of being resolved.
+    /// for why `id` comes first and owner/related print as raw
+    /// Id::to_string() instead of being resolved.
     std::string to_string() const {
-        auto ref_str = [](model::Id ref_id) {
-            return std::to_string(ref_id.index) + ":" + std::to_string(ref_id.gen);
-        };
-        return "Record{id=" + ref_str(id) + ", label=" + label + ", value=" + std::to_string(value) +
-               ", flag=" + (flag ? "true" : "false") + ", owner=" + ref_str(owner.id()) +
-               ", related=" + (related ? ref_str(related.id()) : "null") + "}";
+        return "Record{id=" + id.to_string() + ", label=" + label + ", value=" + std::to_string(value) +
+               ", flag=" + (flag ? "true" : "false") + ", owner=" + owner.id().to_string() +
+               ", related=" + (related ? related.id().to_string() : "null") + "}";
     }
 
     template <class Self, class V>
@@ -233,12 +224,10 @@ public:
     model::Ref<Link> next;
 
     /// Diagnostic only -- see example::Account::to_string()'s doc comment
-    /// for why `id` comes first and next prints as raw index:gen instead of
-    /// being resolved.
+    /// for why `id` comes first and next prints as raw Id::to_string()
+    /// instead of being resolved.
     std::string to_string() const {
-        const model::Id next_id = next.id();
-        return "Link{id=" + std::to_string(id.index) + ":" + std::to_string(id.gen) + ", label=" + label +
-               ", next=" + std::to_string(next_id.index) + ":" + std::to_string(next_id.gen) + "}";
+        return "Link{id=" + id.to_string() + ", label=" + label + ", next=" + next.id().to_string() + "}";
     }
 
     template <class Self, class V>
