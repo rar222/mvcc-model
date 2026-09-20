@@ -56,6 +56,12 @@ them clean — see `CLAUDE.md`.
 //    The field TYPE decides what a delete does to you:
 //      Ref<T>  non-nullable -- deleting the target CASCADES and kills this object
 //      Opt<T>  nullable     -- deleting the target NULLS this field; the object lives
+class Account final : public model::Object<Account> {
+public:
+    std::string name;
+    // Every declaration below is opt-in; a type that needs none declares none.
+};
+
 class Order final : public model::Object<Order> {
 public:
     std::string code;
@@ -107,11 +113,9 @@ if (res.status == model::CommitStatus::Conflict) {
     // txn.create() hold local ids: res.to_real(ref) yields the committed one.
 }
 
-// 3. Reader threads: take an O(1) snapshot, resolve refs through it.
+// 3. Reader threads: take an O(1) snapshot and look things up through it.
 model::Snapshot s = m.snapshot();                     // O(1)
 const Order* x = s.find_by_key<&Order::computed_key>("ord:O1");
-const Account& owner = s.resolve(x->account);         // Ref<Account> -> const Account&
-const Order*   dad   = s.resolve(x->parent);          // Opt<Order>   -> const Order*
 
 s.for_each<Order>([&](const Order& o) { /* type-filtered iteration */ });
 
@@ -123,10 +127,34 @@ std::vector<const Order*> q5 = s.find_by_field<&Order::qty>(5);
 std::vector<const Order*> mine = s.find_referrers<&Order::account>(res.to_real(acct));
 
 // 3b. Views: a typed traversal handle scoped to a Snapshot, not a Transaction.
-auto v = *s.view_by_key<&Order::computed_key>("ord:O1");
-v->qty;
-model::View<Account> owner2 = v[&Order::account];
-if (auto d = v[&Order::parent]) (*d)[&Order::account]->name;
+// Two ways in: look one up, or pair an object you already read with the
+// snapshot it came from.
+if (x) {
+    model::View<Order> xv = s.view(*x);                     // the object is in hand, so this is a
+    xv[&Order::account]->name;                              // View: nothing to check, here or on a
+}                                                           // Ref<> hop off it
+auto v = s.view_by_key<&Order::computed_key>("ord:O1");     // a lookup can miss: OptView<Order>
+
+// An empty view propagates through every later hop, so ONE check at the end
+// covers all three ways this chain can come up empty -- no such key, a null
+// parent, or an account a cascade took.
+if (auto d = v[&Order::parent][&Order::account]) d->name;   // d is an OptView<Account>
+
+// Narrow to a View only to HOLD a non-nullable handle: view() asserts it is
+// non-empty, and from there a Ref<> hop stays a View with no check to make.
+if (v) {
+    v->qty;                                                 // -> reaches the Order, not the view
+    model::View<Account> owner2 = v.view()[&Order::account];
+}
+
+// 3c. The same hops without a view: resolve against a Snapshot by hand. You
+// name the snapshot at every hop, which is also what makes resolving an object
+// read from one snapshot against a different one compile. Views exist so that
+// mistake is not expressible.
+if (x) {
+    const Account& owner = s.resolve(x->account);     // Ref<Account> -> const Account&
+    const Order*   dad   = s.resolve(x->parent);      // Opt<Order>   -> const Order*
+}
 
 // 4. Subscribers: coalescing change events, bounded queue depth.
 auto sub = m.subscribe(/*queue_depth=*/8);
@@ -190,10 +218,10 @@ SNAPSHOTS.md            how the spine and HAMT indexes COW and get reclaimed, wi
 ## Status
 
 Working, tested, clean under ASan/UBSan/TSan. On the read side: snapshot isolation, typed
-`Ref<T>`/`Opt<T>`, cascade delete, `View<T>`, generation-exhaustion handling, a persistent
-HAMT secondary index, a background reaper thread, lock-free-ish snapshot acquisition. On the
-write side: `Transaction`-scoped local writes, `try_commit()` with conflict detection
-re-validated against latest state, and commit-time cascade resolution.
+`Ref<T>`/`Opt<T>`, cascade delete, `View<T>`/`OptView<T>`, generation-exhaustion handling, a
+persistent HAMT secondary index, a background reaper thread, lock-free-ish snapshot
+acquisition. On the write side: `Transaction`-scoped local writes, `try_commit()` with
+conflict detection re-validated against latest state, and commit-time cascade resolution.
 
 Reclamation is asynchronous — use `wait_for_reclamation()` as a barrier where you need
 determinism (tests, shutdown).

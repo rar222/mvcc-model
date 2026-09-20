@@ -90,6 +90,12 @@ A reference is still just an `Id` underneath; it resolves through a `Snapshot`, 
 The alternative — a "fat" ref carrying a pointer to its snapshot root — means every stored
 ref pins a snapshot alive, stalling reclamation.
 
+That nullability survives traversal. Following a `Ref<T>` through a `View` yields another
+`View`, which has no empty state; following an `Opt<T>` yields an `OptView`, which does, and
+every later hop off it stays an `OptView` instead of resolving. So a chain of hops carries
+its own answer to "can this come up empty?" in its type, and needs one check at the end
+rather than one per `Opt<T>` along the way.
+
 ### Lookup families: unique, and cost-transparent multi-match
 
 `define_keys()` is the baseline index: one persistent map per declared field (`by_key`, or

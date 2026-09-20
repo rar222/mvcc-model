@@ -73,7 +73,9 @@ tests/                  test_*.cpp on a dependency-free harness, tests/test_harn
    silently resolve to whatever object landed in that slot next.
 6. **A `View<T>` must not outlive its `Snapshot`, and must never be stored.** It holds the
    snapshot by pointer. Stack only: build it, traverse, drop it. A `View` in a member or a
-   container is a fat ref and will pin a version forever.
+   container is a fat ref and will pin a version forever. `OptView<T>` — what a nullable
+   hop yields — is the same two pointers under the same rule, one of them allowed to be
+   null. Neither may grow a third member; `tests/test_views.cpp` static_asserts both sizes.
 7. **`commit_mu_`-protected state (`referrers_`, `by_type_`, `by_key_`, `spine_`,
    `free_slots_`, `next_slot_`, `changelog_`, ...) is touched ONLY from inside
    `try_commit()`, by whichever thread currently holds `commit_mu_`.** It is writer-private
@@ -147,6 +149,16 @@ tests/                  test_*.cpp on a dependency-free harness, tests/test_harn
   every traversal hop would then copy a `shared_ptr` -- two atomic RMWs on the hottest path
   in the system. A stored view is also a fat ref: it pins its version and stalls the
   reaper. `View` is scoped, 16 bytes, by pointer. **Do not "fix" this.**
+- **"Why not let a `Ref<T>` hop return `OptView<T>` too, so every hop has one type?"**
+  Because the hop's result type is what tells a caller whether a check is owed. A `Ref<T>`
+  hop can't fail, so it yields `View<T>`, which has no empty state and no `operator bool`
+  to test; only an `Opt<T>` hop introduces one. Collapsing the two would hand every
+  non-nullable traversal a check it can never fail and silence the compiler on the one
+  that matters. The reverse — `OptView` short-circuiting on empty instead of forwarding —
+  is required everywhere it reads through the object: a hop reads the next field out of
+  it, and `for_each_referrers`/`find_referrers` read `o_->id` to build the target `Ref`.
+  Both dereference null without the guard. Anything else added to `OptView` that touches
+  the object needs the same guard.
 - **"Why not let a slow subscriber's queue grow?"** Every queued event pins a snapshot,
   and every pinned snapshot pins the objects retired since. An unbounded queue is a
   memory leak with a slow fuse. Overflow coalesces; see `Subscription::collapse`.

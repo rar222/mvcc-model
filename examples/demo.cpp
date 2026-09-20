@@ -65,17 +65,19 @@ void reader_thread(Model& m, int tid) {
             assert(!acct->name.empty());
             ++resolved;
 
-            // Opt<Order> -> optional<View<Order>>. Empty if a cascade took the
+            // Opt<Order> -> OptView<Order>. Empty if a cascade took the
             // parent and nulled the field rather than killing this order.
             if (auto parent = ord[&Order::parent]) {
-                assert(!(*parent)->code.empty());
+                assert(!parent->code.empty());
                 ++resolved;
             } else {
                 ++nulls;
             }
 
-            if (auto parent = ord[&Order::parent]) {
-                assert(!(*parent)[&Order::account]->name.empty());
+            // An empty hop propagates instead of resolving, so the whole
+            // chain needs one check rather than one per Opt<> in it.
+            if (auto owner = ord[&Order::parent][&Order::account]) {
+                assert(!owner->name.empty());
             }
 
             assert(s.find_by_key<&Order::computed_key>(ord->computed_key()) == &*ord);

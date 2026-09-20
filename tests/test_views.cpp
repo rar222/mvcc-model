@@ -10,6 +10,8 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "model/model.h"
@@ -29,21 +31,115 @@ TEST(view_traverses_refs_without_plumbing_the_snapshot) {
 
     Snapshot s = m.snapshot();
     auto c = s.view_by_key<&Order::computed_key>("ord:C");
-    CHECK(c.has_value());
+    CHECK(c);
 
-    CHECK_EQ((*c)->qty, 9);
-    CHECK_EQ((*c)[&Order::account]->name, std::string("A1"));
-    CHECK_EQ((*c)[&Order::account]->balance, 77);
+    CHECK_EQ(c->qty, 9);
+    CHECK_EQ(c[&Order::account]->name, std::string("A1"));
+    CHECK_EQ(c[&Order::account]->balance, 77);
 
-    auto parent = (*c)[&Order::parent];
-    CHECK(parent.has_value());
-    CHECK_EQ((*parent)->code, std::string("P"));
-    CHECK_EQ((*parent)[&Order::account]->name, std::string("A1"));
-    CHECK(!(*parent)[&Order::parent].has_value());
+    auto parent = c[&Order::parent];
+    CHECK(parent);
+    CHECK_EQ(parent->code, std::string("P"));
+    CHECK_EQ(parent[&Order::account]->name, std::string("A1"));
+    CHECK(!parent[&Order::parent]);
+}
+
+// An empty OptView propagates through every later hop instead of resolving
+// one, so a chain of any shape needs exactly one check, at its end. Both
+// hop overloads have to short-circuit: there is no object to read the next
+// field out of, so a hop that went ahead anyway would dereference null
+// before Snapshot::resolve() ever saw it.
+TEST(an_empty_hop_propagates_through_the_rest_of_the_chain) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 77);
+    const Ref<Order> p = make_order(m, "P", a, {}, 3);
+    const Ref<Order> c = make_order(m, "C", a, p, 9);
+
+    Snapshot s = m.snapshot();
+    auto child = s.view(c);
+    CHECK(child);
+
+    // P has no parent, so this hop is empty -- and every hop after it stays
+    // empty, whether it follows a Ref<> or an Opt<>.
+    CHECK(!child[&Order::parent][&Order::parent]);
+    CHECK(!child[&Order::parent][&Order::parent][&Order::account]);
+    CHECK(!child[&Order::parent][&Order::parent][&Order::parent]);
+
+    // The same chain stopping one hop earlier still resolves.
+    CHECK_EQ(child[&Order::parent][&Order::account]->name, std::string("A1"));
+
+    // A chain rooted at an empty view is empty too, hop count regardless.
+    auto stale = s.view(Ref<Order>(Id{}));
+    CHECK(!stale);
+    CHECK(!stale[&Order::account]);
+    CHECK(!stale[&Order::parent][&Order::account]);
+
+    // An empty OptView still knows which snapshot it came from, so a chain
+    // never has to reconstruct that to carry on from where it stopped.
+    CHECK(&child[&Order::parent][&Order::parent].snapshot() == &s);
+}
+
+// The referrer API short-circuits on an empty view for the same reason the
+// hops do: it reads the object to build its target Ref, so an empty view has
+// nothing to read. Nothing can reference an object that isn't here, so the
+// answer is no referrers -- checked here against a population where orders
+// with a null parent DO exist, since those are what a forwarded null target
+// would wrongly collect on the scan path.
+TEST(an_empty_view_has_no_referrers) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 77);
+    const Ref<Order> p = make_order(m, "P", a, {}, 3);
+    make_order(m, "C", a, p, 9);
+    make_order(m, "D", a, {}, 4);  // parent left null, like P's own
+
+    Snapshot s = m.snapshot();
+    auto parent_of_p = s.view(p)[&Order::parent];
+    CHECK(!parent_of_p);
+
+    // Order::parent is tagged RefLookupType::Scan, so this is the scan path.
+    CHECK(parent_of_p.find_referrers<&Order::parent>().empty());
+    int seen = 0;
+    parent_of_p.for_each_referrers<&Order::parent>([&](View<Order>) { ++seen; });
+    CHECK_EQ(seen, 0);
+
+    // ...and the same call on the non-empty view still finds C.
+    CHECK_EQ(s.view(p).find_referrers<&Order::parent>().size(), std::size_t{1});
+}
+
+// A hop's nullability is carried by its result TYPE: a Ref<> hop yields a
+// View, which has no empty state at all, and only an Opt<> hop introduces
+// one. The static_asserts are the test -- if a Ref<> hop ever started
+// returning OptView, every caller would silently gain a check it doesn't
+// need and the compiler would stop objecting to one it can't satisfy.
+TEST(a_ref_hop_yields_a_non_nullable_view_and_an_opt_hop_a_nullable_one) {
+    static_assert(std::is_same_v<decltype(std::declval<View<Order>>()[&Order::account]),
+                                 View<Account>>);
+    static_assert(std::is_same_v<decltype(std::declval<View<Order>>()[&Order::parent]),
+                                 OptView<Order>>);
+    static_assert(std::is_same_v<decltype(std::declval<OptView<Order>>()[&Order::account]),
+                                 OptView<Account>>);
+    static_assert(!std::is_constructible_v<bool, View<Account>>);
+    static_assert(std::is_constructible_v<bool, OptView<Account>>);
+
+    // A View converts to an OptView, never the reverse -- widening a
+    // guarantee is free, narrowing one has to go through view()'s assert.
+    static_assert(std::is_convertible_v<View<Account>, OptView<Account>>);
+    static_assert(!std::is_convertible_v<OptView<Account>, View<Account>>);
+
+    // Neither one may grow past the two pointers View's class comment
+    // promises -- a fat view pins its version and stalls the reaper.
+    static_assert(sizeof(View<Order>) == 2 * sizeof(void*));
+    static_assert(sizeof(OptView<Order>) == 2 * sizeof(void*));
+
+    Model m;
+    const Ref<Account> a = make_account(m, "A1", 77);
+    const Ref<Order> o = make_order(m, "O1", a, {}, 5);
+    Snapshot s = m.snapshot();
+    CHECK_EQ(s.view(o).view()[&Order::account]->balance, std::int64_t{77});
 }
 
 // Snapshot::view()/view_by_key() on a since-deleted handle return an
-// empty optional rather than a dangling View.
+// empty OptView rather than a dangling View.
 TEST(view_of_a_stale_handle_is_empty) {
     Model m;
     const Ref<Account> a = make_account(m, "A1");
@@ -51,8 +147,8 @@ TEST(view_of_a_stale_handle_is_empty) {
     remove_and_commit(m, o);
 
     Snapshot s = m.snapshot();
-    CHECK(!s.view(o).has_value());
-    CHECK(!s.view_by_key<&Order::computed_key>("ord:O1").has_value());
+    CHECK(!s.view(o));
+    CHECK(!s.view_by_key<&Order::computed_key>("ord:O1"));
 }
 
 // find_by_field returns EVERY match (unlike find_by_key's single winner),
@@ -481,17 +577,17 @@ TEST(a_view_always_traverses_its_own_snapshot) {
     Snapshot v2 = m.snapshot();
 
     auto c1 = v1.view_by_key<&Order::computed_key>("ord:C");
-    CHECK(c1.has_value());
-    auto par1 = (*c1)[&Order::parent];
-    CHECK(par1.has_value());
-    CHECK_EQ((*par1)->code, std::string("P"));
+    CHECK(c1);
+    auto par1 = c1[&Order::parent];
+    CHECK(par1);
+    CHECK_EQ(par1->code, std::string("P"));
 
     auto c2 = v2.view_by_key<&Order::computed_key>("ord:C");
-    CHECK(c2.has_value());
-    CHECK(!(*c2)[&Order::parent].has_value());
+    CHECK(c2);
+    CHECK(!c2[&Order::parent]);
 
-    CHECK(&(*c1).snapshot() != &(*c2).snapshot());
-    CHECK_EQ((*c1)[&Order::account]->name, (*c2)[&Order::account]->name);
+    CHECK(&c1.snapshot() != &c2.snapshot());
+    CHECK_EQ(c1[&Order::account]->name, c2[&Order::account]->name);
     (void)c;
 }
 
@@ -634,10 +730,14 @@ TEST(view_operator_star_dereferences_to_the_same_object_as_operator_arrow) {
     const Ref<Order> o = make_order(m, "O1", a, {}, 5);
     Snapshot s = m.snapshot();
 
-    std::optional<View<Order>> v = s.view(o);
-    CHECK(v.has_value());
-    const Order& via_star = **v;
-    CHECK_EQ(&via_star, v->operator->());
+    OptView<Order> v = s.view(o);
+    CHECK(v);
+    const Order& via_star = *v;
+    CHECK_EQ(&via_star, v.operator->());
     CHECK_EQ(via_star.qty, std::int64_t{5});
+
+    // ...and View<T>'s own pair, reached through OptView::view().
+    View<Order> w = v.view();
+    CHECK_EQ(&*w, w.operator->());
 }
 

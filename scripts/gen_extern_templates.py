@@ -135,7 +135,7 @@ in this repo" for when this check is required, not just suggested):
     # implementation" per CLAUDE.md), not a line generated per-T here.
     #
     # NONE of the above should be a Snapshot::/Transaction::/Model::/
-    # BulkTransaction::/CommitResult::/View:: entry point this script
+    # BulkTransaction::/CommitResult::/View::/OptView:: entry point this script
     # targets. If one shows up here -- most often a `*Range<...>` class
     # member, since it's easy to add the function and forget the class --
     # that's proof it (or its underlying class template) needs a
@@ -385,7 +385,7 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
         for fname in t.key_fields:
             arg = f'const {t.member_types[fname]}&'
             out.append(f'extern template const {T}* Snapshot::find_by_key<&{T}::{fname}>({arg}) const;')
-            out.append(f'extern template std::optional<View<{T}>> Snapshot::view_by_key<&{T}::{fname}>({arg}) const;')
+            out.append(f'extern template OptView<{T}> Snapshot::view_by_key<&{T}::{fname}>({arg}) const;')
         # find_by_field/view_by_field/range_by_field are the single merged
         # entry point for a field declared via define_fields(), tagged
         # LookupType::Cache or LookupType::Scan (cache-first, scan fallback
@@ -424,7 +424,7 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
             out.append(f'extern template class Snapshot::ReferrerRange<&{T}::{fname}>;')
             out.append(f'extern template class Snapshot::ReferrerViewRange<&{T}::{fname}>;')
         out.append(f'extern template View<{T}> Snapshot::view<{T}>(const {T}&) const noexcept;')
-        out.append(f'extern template std::optional<View<{T}>> Snapshot::view<{T}>(Ref<{T}>) const;')
+        out.append(f'extern template OptView<{T}> Snapshot::view<{T}>(Ref<{T}>) const;')
         out.append(f'extern template Snapshot::CachedBucketRange<{T}> Snapshot::range<{T}>() const;')
         out.append(f'extern template Snapshot::CachedBucketViewRange<{T}> Snapshot::range_view<{T}>() const;')
         # One instantiation each covers every use of CachedBucketRange<T>/
@@ -473,10 +473,27 @@ def render_entries(types: List[TypeInfo], ns: str) -> str:
             if kind == 'Ref':
                 out.append(f'extern template View<{Y}> View<{T}>::operator[]<{Y}>(Ref<{Y}> {T}::*) const noexcept;')
             else:
-                out.append(f'extern template std::optional<View<{Y}>> View<{T}>::operator[]<{Y}>(Opt<{Y}> {T}::*) const noexcept;')
+                out.append(f'extern template OptView<{Y}> View<{T}>::operator[]<{Y}>(Opt<{Y}> {T}::*) const noexcept;')
         for fname, kind, target in t.ref_fields:
             Y = Q(target)
             out.append(f'extern template std::vector<View<{T}>> View<{Y}>::find_referrers<&{T}::{fname}>() const;')
+        out.append('')
+
+        # -- OptView -- same per-field entry points as View above, for the
+        # nullable half of the same traversal: a chain that has passed
+        # through one Opt<> field stays an OptView for every hop after it,
+        # so both overloads are reachable from OptView<T> and not just from
+        # View<T>, and so is the referrer API those hops end at.
+        out.append('// -- OptView --')
+        for fname, kind, target in t.ref_fields:
+            Y = Q(target)
+            if kind == 'Ref':
+                out.append(f'extern template OptView<{Y}> OptView<{T}>::operator[]<{Y}>(Ref<{Y}> {T}::*) const noexcept;')
+            else:
+                out.append(f'extern template OptView<{Y}> OptView<{T}>::operator[]<{Y}>(Opt<{Y}> {T}::*) const noexcept;')
+        for fname, kind, target in t.ref_fields:
+            Y = Q(target)
+            out.append(f'extern template std::vector<View<{T}>> OptView<{Y}>::find_referrers<&{T}::{fname}>() const;')
         out.append('')
 
     return '\n'.join(out).rstrip('\n')

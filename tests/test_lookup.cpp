@@ -207,7 +207,7 @@ TEST(find_referrers_answers_who_points_at_me) {
 
     auto va1 = s.view(a1);
     int seen = 0;
-    va1->for_each_referrers<&Order::account>([&](View<Order> v) {
+    va1.for_each_referrers<&Order::account>([&](View<Order> v) {
         CHECK(v->account == a1);
         ++seen;
     });
@@ -215,6 +215,60 @@ TEST(find_referrers_answers_who_points_at_me) {
 
     const auto view_children = s.view(*s.find(p)).find_referrers<&Order::parent>();
     CHECK_EQ(view_children.size(), std::size_t{2});
+}
+
+// A null target has no referrers, whichever entry point asks and whichever
+// RefLookupType the field carries. The write side never indexes a null Opt<>
+// (Model::add_out_refs skips it), so the indexed path answers "none" for
+// free; the scan path compares `(o.*Field).id() == target.id()`, where Id{}
+// equals every null field, and without its own guard would answer "every
+// object whose field is null" instead. Order::account is tagged Exact and
+// Order::parent Scan, so both paths are covered here -- the point of the
+// test is that the two AGREE, since a lookup tag is a cost knob and must
+// never change an answer.
+TEST(a_null_target_has_no_referrers_on_the_scan_path_just_as_on_the_indexed_one) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> p = make_order(m, "P", a);        // parent null
+    make_order(m, "C", a, p);                          // parent = P
+    make_order(m, "D", a);                             // parent null
+
+    Snapshot s = m.snapshot();
+    // Two orders DO have a null parent, which is what a missing guard would
+    // wrongly collect -- without them the test would pass either way.
+    CHECK_EQ(s.find_by_predicate<Order>([](const Order& o) { return !o.parent; }).size(),
+             std::size_t{2});
+
+    const Ref<Order> null_order;
+    const Ref<Account> null_account;
+
+    // find_referrers, and the view-returning form built on it.
+    CHECK(s.find_referrers<&Order::parent>(null_order).empty());
+    CHECK(s.find_referrers<&Order::account>(null_account).empty());
+    CHECK(s.view_referrers<&Order::parent>(null_order).empty());
+
+    // for_each_referrers visits nobody.
+    int seen = 0;
+    s.for_each_referrers<&Order::parent>(null_order, [&](const Order&) { ++seen; });
+    CHECK_EQ(seen, 0);
+
+    // all_of_referrers over nothing is vacuously true, even for a predicate
+    // that would reject every object it was handed.
+    CHECK(s.all_of_referrers<&Order::parent>(null_order, [](const Order&) { return false; }));
+    CHECK(s.all_of_referrers<&Order::account>(null_account, [](const Order&) { return false; }));
+
+    // ...and the range forms, which filter in their own iterator rather than
+    // through referrer_short_circuit, so they need their own guard.
+    int ranged = 0;
+    for (const Order& o : s.range_referrers<&Order::parent>(null_order)) { (void)o; ++ranged; }
+    CHECK_EQ(ranged, 0);
+    int ranged_views = 0;
+    for (View<Order> v : s.range_view_referrers<&Order::parent>(null_order)) { (void)v; ++ranged_views; }
+    CHECK_EQ(ranged_views, 0);
+
+    // The same calls with a real target still find what they should, so the
+    // guard hasn't simply disabled the scan path.
+    CHECK_EQ(s.find_referrers<&Order::parent>(p).size(), std::size_t{1});
 }
 
 // all_of_referrers/all_of_view_referrers are built on the same
@@ -946,7 +1000,7 @@ TEST(lookup_stats_counts_calls_made_through_the_view_returning_referrer_api_too)
 
     auto va = s.view(a);
     int seen = 0;
-    va->for_each_referrers<&Order::account_scan>([&](View<Order>) { ++seen; });
+    va.for_each_referrers<&Order::account_scan>([&](View<Order>) { ++seen; });
     CHECK_EQ(seen, 2);
     CHECK_EQ(m.lookup_stats<&Order::account_scan>().uncached_calls, std::uint64_t{1});
 

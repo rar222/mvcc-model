@@ -1683,6 +1683,9 @@ enum class CommitStatus;
 template <class T>
 class View;
 
+template <class T>
+class OptView;
+
 // ---------------------------------------------------------------------------
 // Field lookup stats -- index-hit vs. scan-fallback call counts, for the life of a Model
 // ---------------------------------------------------------------------------
@@ -1839,9 +1842,10 @@ public:
             find_by_key_raw(field_tag<Field>(), to_field_key(value)));
     }
 
-    /// View-returning form of find_by_key.
+    /// View-returning form of find_by_key. Empty if there's no such key, and
+    /// traversable while empty -- see OptView.
     template <auto Field>
-    std::optional<View<member_class_t<decltype(Field)>>> view_by_key(
+    OptView<member_class_t<decltype(Field)>> view_by_key(
         const member_value_t<decltype(Field)>& value) const;
 
     /// Multi-match lookup: every object whose `Field` -- declared via
@@ -2106,7 +2110,10 @@ public:
     // A View<T> is an object bound to the snapshot it came from. Traversal
     // through a view always uses *that* snapshot, so you cannot accidentally
     // resolve a v40 object's reference against a v44 root -- a mistake the raw
-    // resolve() API happily compiles. See View below.
+    // resolve() API happily compiles. See View below. An entry point that can
+    // come up empty returns OptView<T> instead: the same binding, traversable
+    // while empty, so the caller checks once at the end of a chain rather than
+    // at every hop in it.
 
     /// Bind an object you already read from THIS snapshot. Unchecked --
     /// pairing an object from one snapshot with another compiles and is
@@ -2115,9 +2122,9 @@ public:
     template <class T>
     View<T> view(const T& obj) const noexcept;
 
-    /// Null if the handle is stale (deleted, or its slot recycled).
+    /// Empty if the handle is stale (deleted, or its slot recycled).
     template <class T>
-    std::optional<View<T>> view(Ref<T> r) const;
+    OptView<T> view(Ref<T> r) const;
 
     // ---- write side ---------------------------------------------------------
 
@@ -3556,6 +3563,7 @@ public:
     /// registration (readers' Snapshots AND every open Transaction::base()).
     /// The minimum key is the reclamation watermark. Not for production use.
     std::vector<std::pair<std::uint64_t, int>> debug_live_versions() const;
+
 
     // ---- diagnostics ---------------------------------------------------------
 
@@ -5329,6 +5337,11 @@ template <auto Field, class F>
 bool Snapshot::referrer_short_circuit(
     Ref<typename member_value_t<decltype(Field)>::target_type> target, F&& f) const {
     using ClassT = member_class_t<decltype(Field)>;
+    // A null target has no referrers, the same answer the indexed path gives:
+    // the write side never indexes a null Opt<> (Model::add_out_refs), so the
+    // id comparison below must not treat Id{} as a findable target either --
+    // it equals every null field, and would report all of them as referrers.
+    if (!target) return true;
     return all_of<ClassT>([&](const ClassT& o) {
         return (o.*Field).id() != target.id() || f(o);
     });
@@ -5387,6 +5400,9 @@ Snapshot::ReferrerRange<Field> Snapshot::range_referrers(
                                     target.id(), /*filtered=*/false);
     }
     register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    // A null target has no referrers -- see referrer_short_circuit. An empty
+    // bucket, not the type's, so the filtered comparison never runs at all.
+    if (!target) return ReferrerRange<Field>(this, {}, target.id(), /*filtered=*/true);
     return ReferrerRange<Field>(this, type_bucket_raw(type_tag<ClassT>()), target.id(), /*filtered=*/true);
 }
 
@@ -6049,11 +6065,15 @@ inline const ObjectBase* Snapshot::find_raw(Id id) const noexcept {
 
 /// An object and the snapshot it was read from, travelling together.
 ///
-///     auto ord = *s.view_by_key<&Order::computed_key>("ord:O1");
+///     View<Order> ord = s.view(someOrder);
 ///     ord->qty;                                  // fields, as usual
-///     const Account& a = *ord[&Order::account];  // Ref<>  -> View<Account>, never null
-///     if (auto dad = ord[&Order::parent])        // Opt<>  -> optional<View<Order>>
+///     const Account& a = *ord[&Order::account];  // Ref<> -> View<Account>, never null
+///     if (auto dad = ord[&Order::parent])        // Opt<> -> OptView<Order>
 ///         dad->code;
+///
+/// A Ref<> hop yields a View, which has no empty state and so needs no check;
+/// an Opt<> hop yields an OptView, which does. That's the whole difference,
+/// and it means the chain's own type says whether a check is owed.
 ///
 /// Traversal always uses the view's OWN snapshot, so mixing versions is not
 /// expressible. Compare the raw API, where `s2.resolve(orderFromS1->account)`
@@ -6091,11 +6111,9 @@ public:
     }
 
     /// Follow a nullable field. Empty if the target was cascaded away.
+    /// Defined below, once OptView is complete.
     template <class U>
-    std::optional<View<U>> operator[](Opt<U> T::* field) const noexcept {
-        if (const U* p = s_->resolve(o_->*field)) return View<U>(*s_, *p);
-        return std::nullopt;
-    }
+    OptView<U> operator[](Opt<U> T::* field) const noexcept;
 
     /// The snapshot this view reads through -- to drop back to the raw API
     /// (find_by_key, for_each, ...) mid-traversal without re-plumbing which
@@ -6121,6 +6139,106 @@ private:
     const T* o_;         ///< owned by the Model, alive as long as *s_ is
 };
 
+// ---------------------------------------------------------------------------
+// OptView -- a View that may be empty
+// ---------------------------------------------------------------------------
+
+/// What a nullable hop yields: a View<T> with an empty state.
+///
+/// Every hop off an OptView is another OptView, and an empty one propagates
+/// instead of resolving, so a chain needs exactly one check no matter where
+/// the Opt<> sat in it:
+///
+///     if (auto a = ord[&Order::parent][&Order::account]) a->name;
+///
+/// That short circuit is what makes the empty state safe to keep hopping
+/// from: there's no object to read the next field out of, so the hop yields
+/// another empty view rather than dereferencing null and calling
+/// Snapshot::resolve() with whatever it found.
+///
+/// An empty OptView still carries its snapshot, so snapshot() is valid either
+/// way and a chain never has to reconstruct which version it was reading.
+///
+/// SCOPED, NOT STORED, for exactly the reasons in View's class comment -- this
+/// is the same two pointers, one of which is allowed to be null.
+template <class T>
+class OptView {
+public:
+    /// Pairs a possibly-absent object with the snapshot it would have come
+    /// from -- unchecked and by REFERENCE, see View's own constructor.
+    OptView(const Snapshot& s, const T* obj) noexcept : s_(&s), o_(obj) {}
+    OptView(Snapshot&&, const T*) = delete;  // never bind to a temporary snapshot
+
+    /// A View is always a non-empty OptView. Not the reverse -- that one is
+    /// view(), and it asserts. Same asymmetry as Opt<T>'s own Ref<T> ctor.
+    OptView(View<T> v) noexcept : s_(&v.snapshot()), o_(&*v) {}
+
+    explicit operator bool() const noexcept { return o_ != nullptr; }
+
+    // UNCHECKED when empty, exactly like std::optional's -- test first.
+    const T& operator*() const noexcept { return *o_; }
+    const T* operator->() const noexcept { return o_; }
+
+    /// Follow a non-nullable field. Empty in, empty out -- the target is only
+    /// resolved when there's something to resolve it from.
+    template <class U>
+    OptView<U> operator[](Ref<U> T::* field) const noexcept {
+        // Nothing here to hop from; stay empty rather than resolve.
+        if (!o_) return OptView<U>(*s_, nullptr);
+        return OptView<U>(*s_, &s_->resolve(o_->*field));
+    }
+
+    /// Follow a nullable field. Empty if this view is, or if the target was
+    /// cascaded away.
+    template <class U>
+    OptView<U> operator[](Opt<U> T::* field) const noexcept {
+        // Same short circuit as the Ref<> overload above.
+        if (!o_) return OptView<U>(*s_, nullptr);
+        return OptView<U>(*s_, s_->resolve(o_->*field));
+    }
+
+    /// Back to the non-nullable View, to hand a checked view to something
+    /// that takes one. Asserts rather than returning a View that could be
+    /// empty -- View having no empty state is the point. The reverse
+    /// direction needs no call: a View converts to an OptView implicitly.
+    View<T> view() const noexcept {
+        assert(o_ && "OptView::view() on an empty view");
+        return View<T>(*s_, *o_);
+    }
+
+    /// The snapshot this view reads through -- valid even when empty. See
+    /// View::snapshot().
+    const Snapshot& snapshot() const noexcept { return *s_; }
+
+    /// "Who references this?" -- see View::for_each_referrers. Nothing can
+    /// reference an object that isn't here, so an empty view visits nobody.
+    template <auto Field, class F>
+    void for_each_referrers(F&& f) const {
+        // Same reason the hops short-circuit: there's no object here to read
+        // an id out of, and o_->id would dereference null to build the Ref.
+        if (!o_) return;
+        s_->for_each_view_referrers<Field>(Ref<T>(o_->id), std::forward<F>(f));
+    }
+
+    /// Same scan as for_each_referrers, collected into a vector of views.
+    template <auto Field>
+    std::vector<View<member_class_t<decltype(Field)>>> find_referrers() const {
+        // Same null dereference as for_each_referrers above.
+        if (!o_) return {};
+        return s_->view_referrers<Field>(Ref<T>(o_->id));
+    }
+
+private:
+    const Snapshot* s_;  ///< by POINTER, never by value -- see View's class comment
+    const T* o_;         ///< null when empty; otherwise owned by the Model, alive as long as *s_
+};
+
+template <class T>
+template <class U>
+OptView<U> View<T>::operator[](Opt<U> T::* field) const noexcept {
+    return OptView<U>(*s_, s_->resolve(o_->*field));
+}
+
 template <class T>
 View<T> Snapshot::view(const T& obj) const noexcept {
     // The one place a caller-supplied object gets paired with a caller-chosen
@@ -6136,11 +6254,10 @@ View<T> Snapshot::view(const T& obj) const noexcept {
 }
 
 template <auto Field>
-std::optional<View<member_class_t<decltype(Field)>>> Snapshot::view_by_key(
+OptView<member_class_t<decltype(Field)>> Snapshot::view_by_key(
     const member_value_t<decltype(Field)>& value) const {
     using ClassT = member_class_t<decltype(Field)>;
-    if (const ClassT* p = find_by_key<Field>(value)) return View<ClassT>(*this, *p);
-    return std::nullopt;
+    return OptView<ClassT>(*this, find_by_key<Field>(value));
 }
 
 template <auto Field, class F>
@@ -6214,9 +6331,8 @@ View<ClassT> Snapshot::CachedBucketViewRange<ClassT>::iterator::operator*() cons
 }
 
 template <class T>
-std::optional<View<T>> Snapshot::view(Ref<T> r) const {
-    if (const T* p = find(r)) return View<T>(*this, *p);
-    return std::nullopt;
+OptView<T> Snapshot::view(Ref<T> r) const {
+    return OptView<T>(*this, find(r));
 }
 
 template <class T, class Pred>
@@ -6289,6 +6405,8 @@ Snapshot::ReferrerViewRange<Field> Snapshot::range_view_referrers(
                                         target.id(), /*filtered=*/false);
     }
     register_field_lookup(typeid(ClassT), field_tag<Field>(), /*cached=*/false);
+    // A null target has no referrers -- see range_referrers' identical guard.
+    if (!target) return ReferrerViewRange<Field>(this, {}, target.id(), /*filtered=*/true);
     return ReferrerViewRange<Field>(this, type_bucket_raw(type_tag<ClassT>()), target.id(),
                                     /*filtered=*/true);
 }

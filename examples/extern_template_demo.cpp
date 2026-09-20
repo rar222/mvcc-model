@@ -168,9 +168,25 @@ int main() {
         assert(av.find_referrers<&Order::account>().size() == 1);
     }
     if (auto ov = s.view(ord)) {
-        View<Account> linked = (*ov)[&Order::account];
+        // View<Order>'s own hops: Ref<> stays a View, Opt<> becomes an OptView.
+        View<Order> ordv = ov.view();
+        View<Account> linked = ordv[&Order::account];
         assert(linked->name == "Widgets Inc");
-        assert(!(*ov)[&Order::parent]);
+        assert(!ordv[&Order::parent]);                              // never set
+        assert(ordv[&Order::account_scan]->name == "Widgets Inc");  // set above
+
+        // OptView<Order>'s hops: the same two overloads, reached once a chain
+        // has gone through an Opt<> field and stayed nullable.
+        assert(ov[&Order::account]->name == "Widgets Inc");
+        assert(ov[&Order::account_scan]->name == "Widgets Inc");
+        assert(!ov[&Order::parent][&Order::account]);  // empty hop, then no resolve
+        assert(!ov[&Order::parent][&Order::parent]);
+
+        // The referrer API a chain ends at, on both view types.
+        assert(ov[&Order::account].find_referrers<&Order::account>().size() == 1);
+        assert(ov[&Order::account].find_referrers<&Order::account_scan>().size() == 1);
+        assert(ov[&Order::parent].find_referrers<&Order::parent>().empty());
+        assert(ordv.find_referrers<&Order::parent>().empty());
     }
 
     // BulkTransaction: same Account/Order instantiations, separate entry

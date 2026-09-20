@@ -97,6 +97,30 @@ TEST(view_pairs_object_from_a_different_model_asserts) {
     CHECK_ASSERT_FAILURE((void)sb.view(*obj));
 }
 
+// OptView::view() narrows a may-be-empty view to a View, which has no empty
+// state to return on failure -- so it asserts rather than handing back a View
+// holding null. The checked path is `if (v) v.view()`; the unchecked one is to
+// stay on OptView, where emptiness propagates through every later hop instead.
+TEST(narrowing_an_empty_optview_to_a_view_asserts) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> o = make_order(m, "O1", a);
+    Snapshot s = m.snapshot();
+
+    // Empty because the Opt<> field was never set, not because of a stale id.
+    auto no_parent = s.view(o)[&Order::parent];
+    CHECK(!no_parent);
+    CHECK_ASSERT_FAILURE((void)no_parent.view());
+
+    // Empty because the key does not exist -- the other way in.
+    auto missing = s.view_by_key<&Order::computed_key>("ord:NOPE");
+    CHECK(!missing);
+    CHECK_ASSERT_FAILURE((void)missing.view());
+
+    // ...and a non-empty one narrows without complaint.
+    CHECK_EQ(s.view(o).view()->code, std::string("O1"));
+}
+
 // ---------------------------------------------------------------------------
 // PreTransactionsFn / run_pre_transaction() misuse: this API's whole
 // contract is "call run_pre_transaction() only from inside a running
@@ -283,6 +307,30 @@ TEST(commit_bulk_without_undo_asserts_if_a_snapshot_is_still_live) {
 // asan runs on an unmodified HEAD, so "15/15 solo reruns pass" does not hold everywhere.
 // Judge a suspected regression by comparing against a baseline build's failure rate, run
 // interleaved, not by whether one solo rerun passes.
+// WARNING: KNOWN TO BE UNRELIABLE
+// Measured failing 6 of 10 ASan runs on an idle machine (and intermittently
+// under the default preset), with the assert below firing:
+//   wait_for_reclamation(): called concurrently with (or after) ~Model()
+// Mechanism, and why that assert is RIGHT to fire: `ready` is incremented
+// BEFORE each thread calls wait_for_reclamation(), so all kWaiters can report
+// ready while some are still outside the call. m.reset() then flips
+// reaper_stop_ under a caller that has not registered yet -- a caller bug in
+// C++ generally, and the case ~Model()'s own comment calls "unfixable-from-in-
+// here". The 5ms sleep is the only thing usually covering that gap. Callers
+// that ARE registered are waited out correctly (reap_done_cv_ + reap_waiters_
+// == 0, see ~Model()), which is what this test means to check and does check
+// whenever it passes.
+// Making it deterministic needs every waiter parked INSIDE the call before the
+// reset, which a test cannot arrange from out here: a reap round finishes in
+// microseconds, so waiters pass through rather than overlap -- measured peaks
+// of 8, 3, 2, 5, 2 concurrently inside across five runs of 8 threads. It would
+// take a seam that holds the reaper mid-pass, which is production surface this
+// project has declined to add for a test.
+// To tell a real regression apart from this flake: a flake is always THIS
+// assert, from a thread that had not yet entered. A regression in the wait-out
+// path looks different -- a 3s timeout from completes_cleanly() (a registered
+// waiter parked forever), an ASan use-after-free on reap_done_cv_, or a crash
+// rather than a clean assert message.
 TEST(wait_for_reclamation_callers_in_flight_when_model_is_destroyed_complete_safely) {
     constexpr int kAttempts = 10;
     constexpr int kWaiters = 8;

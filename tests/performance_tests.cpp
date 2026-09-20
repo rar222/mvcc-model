@@ -755,6 +755,23 @@ double bench_concurrent_create_and_update_with_undo_cap(std::size_t max_undo_lis
 // at all -- so while one thread holds commit_mu_ applying, the other three
 // can be off cloning and mutating their own next transaction instead of
 // waiting idle, which the fully-sequential run can never do.
+//
+// WARNING: KNOWN TO BE UNRELIABLE
+// The speedup > 1.15 floor below has been observed to fail in a full parallel
+// `ctest` run while another build and another test binary were competing for
+// the same cores. Mechanism: the concurrent half needs 4 threads genuinely
+// running at once to overlap building with apply, so when the machine has
+// fewer free cores than that, the concurrent and sequential halves converge
+// and the ratio falls through the floor -- no code-level regression required.
+// The sequential half is single-threaded and is not slowed the same way, which
+// is what makes contention one-sided here. Confirmed environmental: the same
+// binary, with no rebuild, passed three times in a row immediately after. To
+// tell a real regression apart from this flake: rerun just this test in
+// isolation (`ctest -R four_threads_updating_private_objects_concurrently`) on
+// an otherwise idle machine -- the flake clears immediately and the printed
+// concurrent/sequential ms both return to their usual figures, while a real
+// regression fails consistently and shows concurrent_ms itself climbing toward
+// sequential_ms rather than both moving together.
 TEST(
     four_threads_updating_private_objects_concurrently_beats_running_the_same_transactions_sequentially) {
     const int kIters = scaled(300);
