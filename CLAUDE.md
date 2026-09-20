@@ -172,9 +172,12 @@ tests/                  test_*.cpp on a dependency-free harness, tests/test_harn
 - `try_commit()`'s apply step is fully serialized behind `commit_mu_`. Transaction building
   is fully parallel; applying is not. `examples/commit_bench.cpp` has a thread-count sweep
   that demonstrates this — expect sub-linear scaling, not linear.
-- The reverse index (`referrers_`) still scans linearly per target (`vector<RefEdge>` with
-  `find_if`). A hub object with many referrers makes each mutate of one of them O(referrer
-  count).
+- The reverse index (`referrers_`) is split by referring field. Within a field, a target's
+  referrers are a vector of ids, scanned linearly, until the target has
+  `ReferrerIndex::kHubPromoteAt` (64) of them through that field. Above that they are a flat
+  hash set and removing one is O(1). It converts back at `kHubDemoteAt` (16).
+  `Model::diagnostics()` reports how many (target, field) pairs are in the hash-set form as
+  `reverse_index_hub_targets`.
 - Cascade fan-out from a single `remove()` intent is still unbounded and invisible to the
   caller until `try_commit()` returns. A two-phase plan/inspect/apply API is the natural fix.
 
@@ -217,13 +220,17 @@ tests/                  test_*.cpp on a dependency-free harness, tests/test_harn
 
 ## Code and comments
 
-- Comments are a last resort: write one only when an experienced engineer would be
-  surprised or misled by the code alone — never as narration, history, or a note to
-  your future self (that belongs in the commit message, or nowhere).
-- Any comment you do write is timeless: present tense, states what's currently true,
-  no "now"/"previously". It reads like a spec, not a commit message.
-- Within a function: one focused line. A second only if the why genuinely can't fit
-  in one, never a third — needing more means the code needs restructuring.
+- Every `if`, loop or other block that changes the indent gets a comment of at most
+  one line, directly above it, saying what the block does. A one-line statement with
+  no nested block needs none. Applies to library code and tests alike.
+- Beyond those, comment only where an experienced engineer would be surprised or
+  misled by the code alone: the why, not the what. Never as narration, history, or a
+  note to your future self (that belongs in the commit message, or nowhere).
+- Any comment is timeless: present tense, states what's currently true, no
+  "now"/"previously". It reads like a spec, not a commit message.
+- A block comment is one line, never two. A why-comment within a function is one
+  focused line, a second only if the why genuinely can't fit in one, never a third —
+  needing more means the code needs restructuring.
 
 ## Prose
 

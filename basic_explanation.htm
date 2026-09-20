@@ -930,14 +930,327 @@
     </table>
   </section>
 
+  <section id="s8">
+    <div class="step-label">Beyond Root &middot; writer-private state</div>
+    <h2>The referrers index is a flat table, not a trie</h2>
+    <p>
+      Everything so far &mdash; the spine, the index tries &mdash; is <em>published</em> state: immutable,
+      structurally shared, cloned along the write's path. <code>Model::referrers_</code> is the one
+      structure that is neither. It is the reverse index, &ldquo;who points at this target?&rdquo;, that the
+      cascade delete in <code>remove_raw()</code> walks, and it is only ever touched by the thread holding
+      <code>commit_mu_</code> (invariant 7). No reader can see it; the published counterpart for readers is
+      <code>by_cached_reference</code>. Nothing shares it between versions, so it can be mutated in place,
+      and a table that mutates in place is exactly what a trie's path-copying would only slow down.
+    </p>
+    <p>
+      It is split by <em>referring field</em> (<code>Order::account</code>, <code>Order::account_scan</code>, and
+      so on). Each field has its own index from a target's <em>slot index</em> to the ids of the objects whose
+      field points at that slot. The key is the bare slot, not a full <code>Id</code>, because only a slot's
+      live generation can ever be the target of a live ref. Because the field is the outer key, an edge is
+      stored as just the referrer's <code>Id</code>, 8 bytes; the field, and whether it is nullable, are stored
+      once per field instead of on every edge.
+    </p>
+    <p>
+      Inside one field's index, a target's referrers have two storage forms, chosen by how many there are.
+    </p>
+    <div class="legend">
+      <span><i class="sw-shared"></i>the index itself</span>
+      <span><i class="sw-old"></i>small form &mdash; a vector of ids, scanned linearly</span>
+      <span><i class="sw-new"></i>hub form &mdash; a flat hash set of ids</span>
+    </div>
+    <figure>
+      <div class="diagram-wrap">
+      <!--
+        DIAGRAM 1: Model::referrers_ split by referring field. Hand-written SVG, no generator.
+        Source of truth: Model::ReferrerIndex and its FieldIndex in include/model/model.h.
+        Reads left to right: the referrers_ box lists one box per referring field; each field has its own
+        index, drawn as two panels: "small" (target slot to a vector of ids) and "hubs" (target slot to a
+        flat set of ids). A target slot is in exactly one panel of a given field.
+
+        Coordinates: viewBox "0 24 1000 384". Font IBM Plex Mono (as elsewhere on the page): 12 default,
+        11 for row text, 10.5 for notes, 9.5 for the caption. Escape & as &amp; and < as &lt; in text.
+        Colours are CSS variables only, so light and dark themes both work:
+          --accent-old / --accent-old-bg  small form (matches legend swatch sw-old)
+          --accent-new / --accent-new-bg  hub form (sw-new)
+          --surface, --surface-3, --border-strong  neutrals (sw-shared)
+        Columns:  referrers_ box x 20-250 | field boxes x 40-230 | arrows x 230-300 | a field's index x 300-980,
+                  holding the small panel x 316-636 and the hubs panel x 656-964.
+        Rows:     index for the first field y 84-252, its field box y 132-202 (centred on the arrow at y 167);
+                  index for the second field y 268-388, its field box y 293-363 (arrow at y 328).
+        To add a field: copy a field box and its index group, move both down by the index height plus 16,
+        and grow the referrers_ box and the viewBox height to match.
+        To add a target row to a small panel: copy a row (a rect of height 22 plus two texts), step y by 28,
+        and grow the panel and its index rect by 28.
+        The threshold in the hub panel's empty-state text (64) is ReferrerIndex::kHubPromoteAt.
+      -->
+      <svg viewBox="0 24 1000 384" role="img" aria-label="The referrers_ index split by referring field. The field Order::account, not nullable, has a small map where slot 9 holds one id and slot 17 holds three ids, and a hubs map where slot 42 holds a flat set of 70 ids. The field Order::account_scan, nullable, has a small map where slot 17 holds one id and no hubs.">
+        <defs><marker id="a6" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="currentColor"/></marker></defs>
+        <g font-family="IBM Plex Mono, monospace" font-size="12">
+          <!-- referrers_ container and its title lines -->
+          <rect x="20" y="40" width="230" height="350" rx="10" fill="var(--surface-3)" stroke="var(--border-strong)"/>
+          <text x="135" y="66" text-anchor="middle" fill="currentColor" font-weight="600">Model::referrers_</text>
+          <text x="135" y="84" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.75">referring field → index</text>
+          <text x="135" y="100" text-anchor="middle" fill="currentColor" font-size="10" fill-opacity="0.6">under commit_mu_ only</text>
+
+          <!-- first field box: name, nullability, note that the flag is stored once per field -->
+          <rect x="40" y="132" width="190" height="70" rx="8" fill="var(--surface)" stroke="var(--border-strong)"/>
+          <text x="135" y="154" text-anchor="middle" fill="currentColor" font-weight="600">&amp;Order::account</text>
+          <text x="135" y="172" text-anchor="middle" fill="currentColor" font-size="10.5">nullable: no</text>
+          <text x="135" y="189" text-anchor="middle" fill="currentColor" font-size="10" fill-opacity="0.6">stored once per field</text>
+
+          <!-- ellipsis: more fields exist -->
+          <text x="135" y="256" text-anchor="middle" fill="currentColor" font-size="16" fill-opacity="0.5">⋮</text>
+
+          <!-- second field box -->
+          <rect x="40" y="293" width="190" height="70" rx="8" fill="var(--surface)" stroke="var(--border-strong)"/>
+          <text x="135" y="315" text-anchor="middle" fill="currentColor" font-weight="600">&amp;Order::account_scan</text>
+          <text x="135" y="333" text-anchor="middle" fill="currentColor" font-size="10.5">nullable: yes</text>
+          <text x="135" y="380" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.55">one index per referring field</text>
+
+          <!-- arrows from each field box to its index -->
+          <line x1="230" y1="167" x2="300" y2="167" stroke="currentColor" stroke-opacity="0.6" marker-end="url(#a6)"/>
+          <line x1="230" y1="328" x2="300" y2="328" stroke="currentColor" stroke-opacity="0.6" marker-end="url(#a6)"/>
+
+          <!-- index for the first field: outer box and title -->
+          <rect x="300" y="84" width="680" height="168" rx="8" fill="var(--surface)" stroke="var(--border-strong)"/>
+          <text x="640" y="106" text-anchor="middle" fill="currentColor" font-weight="600">index for &amp;Order::account</text>
+
+          <!-- small panel: rows are slot then its id vector; row y = 150 + 28*row, height 22 -->
+          <rect x="316" y="118" width="320" height="120" rx="6" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/>
+          <text x="476" y="138" text-anchor="middle" fill="var(--accent-old)" font-weight="600">small: slot → vector&lt;Id&gt;</text>
+          <rect x="330" y="150" width="292" height="22" rx="5" fill="var(--surface)" stroke="var(--accent-old)"/>
+          <text x="342" y="165" text-anchor="start" fill="var(--accent-old)" font-size="11">slot 9</text>
+          <text x="430" y="165" text-anchor="start" fill="var(--accent-old)" font-size="11">[ Id 71 ]</text>
+          <rect x="330" y="178" width="292" height="22" rx="5" fill="var(--surface)" stroke="var(--accent-old)"/>
+          <text x="342" y="193" text-anchor="start" fill="var(--accent-old)" font-size="11">slot 17</text>
+          <text x="430" y="193" text-anchor="start" fill="var(--accent-old)" font-size="11">[ Id 71, Id 12, Id 44 ]</text>
+          <text x="476" y="224" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.7">remove = scan the vector: cheap for a few ids</text>
+
+          <!-- hubs panel: one row (slot, id count) and a strip of 12 table cells -->
+          <rect x="656" y="118" width="308" height="120" rx="6" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <text x="810" y="138" text-anchor="middle" fill="var(--accent-new)" font-weight="600">hubs: slot → FlatSet&lt;Id&gt;</text>
+          <rect x="670" y="150" width="280" height="22" rx="5" fill="var(--surface)" stroke="var(--accent-new)"/>
+          <text x="682" y="165" text-anchor="start" fill="var(--accent-new)" font-size="11">slot 42</text>
+          <text x="770" y="165" text-anchor="start" fill="var(--accent-new)" font-size="11">FlatSet, 70 ids</text>
+          <!-- table cells: x = 670 + 23*i for i = 0..11, y = 182; every third one (i % 3 == 2) is empty and dashed -->
+          <rect x="670" y="182" width="21" height="26" rx="3" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <rect x="693" y="182" width="21" height="26" rx="3" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <rect x="716" y="182" width="21" height="26" rx="3" fill="none" stroke="var(--accent-new)" stroke-dasharray="3 2"/>
+          <rect x="739" y="182" width="21" height="26" rx="3" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <rect x="762" y="182" width="21" height="26" rx="3" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <rect x="785" y="182" width="21" height="26" rx="3" fill="none" stroke="var(--accent-new)" stroke-dasharray="3 2"/>
+          <rect x="808" y="182" width="21" height="26" rx="3" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <rect x="831" y="182" width="21" height="26" rx="3" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <rect x="854" y="182" width="21" height="26" rx="3" fill="none" stroke="var(--accent-new)" stroke-dasharray="3 2"/>
+          <rect x="877" y="182" width="21" height="26" rx="3" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <rect x="900" y="182" width="21" height="26" rx="3" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <rect x="923" y="182" width="21" height="26" rx="3" fill="none" stroke="var(--accent-new)" stroke-dasharray="3 2"/>
+          <text x="810" y="224" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.7">remove = one hash lookup</text>
+
+          <!-- index for the second field: same layout, one small row and no hubs -->
+          <rect x="300" y="268" width="680" height="120" rx="8" fill="var(--surface)" stroke="var(--border-strong)"/>
+          <text x="640" y="290" text-anchor="middle" fill="currentColor" font-weight="600">index for &amp;Order::account_scan</text>
+          <rect x="316" y="302" width="320" height="74" rx="6" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/>
+          <text x="476" y="322" text-anchor="middle" fill="var(--accent-old)" font-weight="600">small: slot → vector&lt;Id&gt;</text>
+          <rect x="330" y="334" width="292" height="22" rx="5" fill="var(--surface)" stroke="var(--accent-old)"/>
+          <text x="342" y="349" text-anchor="start" fill="var(--accent-old)" font-size="11">slot 17</text>
+          <text x="430" y="349" text-anchor="start" fill="var(--accent-old)" font-size="11">[ Id 90 ]</text>
+          <rect x="656" y="302" width="308" height="74" rx="6" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <text x="810" y="322" text-anchor="middle" fill="var(--accent-new)" font-weight="600">hubs: slot → FlatSet&lt;Id&gt;</text>
+          <text x="810" y="349" text-anchor="middle" fill="var(--accent-new)" font-size="10.5">no target has 64 ids through this field</text>
+        </g>
+      </svg>
+      </div>
+      <figcaption>
+        Illustrative: slot 42 is the running <code>Account</code>, and the referrers are <code>Order</code>s.
+        Most targets have a few referrers through a field and stay in that field's small map. A <em>hub</em> is
+        a target with many referrers through one field &mdash; an account with thousands of orders &mdash; and
+        it moves to that field's hub map. A target is in exactly one of the two maps for a given field, and the
+        same account can be a hub through one field and small through another.
+      </figcaption>
+    </figure>
+
+    <h3>Why two forms</h3>
+    <p>
+      A vector is the smallest and fastest thing for a handful of ids. But removing one means finding it, and
+      finding it in a vector is a scan: for a hub, every order that is deleted or re-pointed costs the whole
+      referrer count. In hub form the same removal is one hash lookup. The two forms swap at fixed thresholds,
+      counted per target and per field, and the gap between them is deliberate: a target hovering near a single
+      threshold would otherwise convert on every add and remove, and each conversion costs time proportional to
+      its size. The form is chosen per target, not per field, because one field can hold both many small groups
+      and a few very large ones, and its cardinality is not known in advance.
+    </p>
+    <div class="legend">
+      <span><i class="sw-old"></i>small form</span>
+      <span><i class="sw-new"></i>hub form</span>
+      <span><i class="sw-shared"></i>either form, whichever it already has</span>
+    </div>
+    <figure>
+      <div class="diagram-wrap">
+      <!--
+        DIAGRAM 2: the two storage forms on an id-count axis for one target's referrers through one field.
+        Hand-written SVG, no generator. The thresholds come from ReferrerIndex::kHubPromoteAt (64) and
+        kHubDemoteAt (16) in include/model/model.h; if they change, move the tick labels and the band edges
+        and reword the promote and demote labels.
+        Coordinates: viewBox "0 0 1000 220". Same fonts and CSS-variable colours as diagram 1
+        (--accent-old(-bg) small form, --accent-new(-bg) hub form, --surface-3 the shaded band).
+        The axis is a broken scale, so positions are not proportional across the 16 mark; see the comment on
+        the axis line for the two scales.
+      -->
+      <svg viewBox="0 0 1000 220" role="img" aria-label="Id-count axis for one target's referrers through one field. The small form holds 0 to 63 ids, the hub form holds 17 or more. The target promotes to hub when an add reaches 64 ids and demotes to small when a remove leaves 16 or fewer, so between 17 and 63 it stays in whichever form it already has.">
+        <defs><marker id="a7" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="currentColor"/></marker></defs>
+        <g font-family="IBM Plex Mono, monospace" font-size="12">
+          <!-- axis title -->
+          <text x="500" y="18" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.6">ids for one target through one field</text>
+          <!-- axis line. Broken scale: 15 px per id from 0 to 16 (x = 60 + 15*n), then 6.67 px per id from 16 to 64 (x = 300 + (n - 16) * 6.67); the line ends at 940 where the ellipsis says more ids follow -->
+          <line x1="60" y1="118" x2="940" y2="118" stroke="currentColor" stroke-opacity="0.5"/>
+          <!-- ticks and labels at the three thresholds: 0 at x 60, 16 (kHubDemoteAt) at x 300, 64 (kHubPromoteAt) at x 620 -->
+          <line x1="60" y1="112" x2="60" y2="124" stroke="currentColor" stroke-opacity="0.6"/>
+          <text x="60" y="142" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.75">0</text>
+          <line x1="300" y1="112" x2="300" y2="124" stroke="currentColor" stroke-opacity="0.6"/>
+          <text x="300" y="142" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.75">16</text>
+          <line x1="620" y1="112" x2="620" y2="124" stroke="currentColor" stroke-opacity="0.6"/>
+          <text x="620" y="142" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.75">64</text>
+          <text x="940" y="142" text-anchor="middle" fill="currentColor" font-size="13" fill-opacity="0.6">…</text>
+          <!-- shaded band for 17 to 63 ids, where either form is possible: above the axis behind the small box, below it behind the hub box -->
+          <rect x="300" y="36" width="320" height="92" rx="0" fill="var(--surface-3)" stroke="none" fill-opacity="0.55"/>
+          <rect x="300" y="150" width="320" height="50" rx="0" fill="var(--surface-3)" stroke="none" fill-opacity="0.55"/>
+          <!-- dashed band edges at x 300 and x 620, above and below the axis -->
+          <line x1="300" y1="36" x2="300" y2="128" stroke="currentColor" stroke-opacity="0.5" stroke-dasharray="4 3"/>
+          <line x1="300" y1="150" x2="300" y2="200" stroke="currentColor" stroke-opacity="0.5" stroke-dasharray="4 3"/>
+          <line x1="620" y1="36" x2="620" y2="128" stroke="currentColor" stroke-opacity="0.5" stroke-dasharray="4 3"/>
+          <line x1="620" y1="150" x2="620" y2="200" stroke="currentColor" stroke-opacity="0.5" stroke-dasharray="4 3"/>
+          <!-- small form box: covers 0 to 63 ids, x 60 to 620 -->
+          <rect x="60" y="50" width="560" height="46" rx="8" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/>
+          <text x="340" y="72" text-anchor="middle" fill="var(--accent-old)" font-weight="600">small form (vector)</text>
+          <text x="340" y="88" text-anchor="middle" fill="var(--accent-old)" font-size="10.5">holds 0 to 63 ids</text>
+          <!-- hub form box: covers 17 ids onward, x 300 to 940 -->
+          <rect x="300" y="148" width="640" height="46" rx="8" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/>
+          <text x="620" y="170" text-anchor="middle" fill="var(--accent-new)" font-weight="600">hub form (a flat set)</text>
+          <text x="620" y="186" text-anchor="middle" fill="var(--accent-new)" font-size="10.5">holds 17 or more ids</text>
+          <!-- promote arrow, leaving the end of the small box; its label lines are at y 66 and 80 -->
+          <line x1="628" y1="73" x2="680" y2="73" stroke="var(--accent-new)" marker-end="url(#a7)"/>
+          <text x="688" y="66" text-anchor="start" fill="var(--accent-new)" font-size="10.5">promote(): the add</text>
+          <text x="688" y="80" text-anchor="start" fill="var(--accent-new)" font-size="10.5">that reaches 64</text>
+          <!-- demote arrow, leaving the start of the hub box; its label lines are right-aligned at x 232 -->
+          <line x1="292" y1="171" x2="240" y2="171" stroke="var(--accent-old)" marker-end="url(#a7)"/>
+          <text x="232" y="164" text-anchor="end" fill="var(--accent-old)" font-size="10.5">demote(): the remove</text>
+          <text x="232" y="178" text-anchor="end" fill="var(--accent-old)" font-size="10.5">that leaves 16 or fewer</text>
+          <!-- label for the shaded band -->
+          <text x="460" y="110" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.75">17 to 63: either form</text>
+        </g>
+      </svg>
+      </div>
+      <figcaption>
+        <code>ReferrerIndex::kHubPromoteAt</code> = 64 and <code>kHubDemoteAt</code> = 16. Between 17 and 63
+        ids a target keeps the form it has. <code>Model::diagnostics()</code> reports how many (target, field)
+        pairs are currently in hub form as <code>reverse_index_hub_targets</code>.
+      </figcaption>
+    </figure>
+
+    <h3>Inside a hub: <code>FlatSet</code></h3>
+    <p>
+      In hub form, a target's referrers through one field are a <code>fset::FlatSet&lt;Id&gt;</code>: open addressing with linear probing,
+      one contiguous array of cells and no allocation per key. A key's <em>home cell</em> is where its
+      scrambled hash points; a lookup starts there and steps forward, wrapping at the end, until it finds the
+      key or reaches an empty cell. That walk is the <em>probe run</em>. The table is a power of two in size
+      and never more than three-quarters full, so every run ends at an empty cell, and <code>Id{}</code> (the
+      null id) is what marks a cell empty.
+    </p>
+    <p>
+      Deletion is the interesting part. Simply blanking a cell would cut a probe run in two and hide the keys
+      behind the hole, and a marker for &ldquo;deleted&rdquo; would make runs grow longer forever. Instead
+      <code>erase()</code> does a <em>backward shift</em>: it scans forward from the hole and pulls back any key
+      whose home cell is not past the hole, stopping at the first empty cell. No tombstone is ever left behind.
+    </p>
+    <div class="legend">
+      <span><i class="sw-old"></i>the key erased, and the cell it leaves empty</span>
+      <span><i class="sw-new"></i>the key that moved</span>
+      <span><i class="sw-shared"></i>keys that did not move</span>
+    </div>
+    <figure>
+      <div class="diagram-wrap">
+      <svg viewBox="0 0 1000 430" role="img" aria-label="A flat hash table run of cells 3 to 10, before and after erasing Id 12 from cell 5. Id 33, whose home cell is 5, shifts back from cell 7 into cell 5. Ids 90 and 58 stay where they are, and cell 7 becomes empty again. No tombstone is left."><defs><marker id="a8" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="currentColor"/></marker></defs><g font-family="IBM Plex Mono, monospace" font-size="12"><text x="80" y="28" text-anchor="start" fill="var(--accent-old)" font-size="11">before — erase Id 12, sitting in cell 5</text><rect x="82" y="44" width="101" height="64" rx="6" fill="none" stroke="var(--border-strong)" stroke-dasharray="4 3"/><text x="132.5" y="58" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.55">cell 3</text><text x="132.5" y="82" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.5" font-style="italic">empty</text><rect x="187" y="44" width="101" height="64" rx="6" fill="var(--surface-3)" stroke="var(--border-strong)"/><text x="237.5" y="58" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.7">cell 4</text><text x="237.5" y="80" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Id 71</text><text x="237.5" y="98" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.8">home 4</text><rect x="292" y="44" width="101" height="64" rx="6" fill="var(--accent-old-bg)" stroke="var(--accent-old)"/><text x="342.5" y="58" text-anchor="middle" fill="var(--accent-old)" font-size="9.5" fill-opacity="0.7">cell 5</text><text x="342.5" y="80" text-anchor="middle" fill="var(--accent-old)" font-size="13" font-weight="600">Id 12</text><text x="342.5" y="98" text-anchor="middle" fill="var(--accent-old)" font-size="9.5" fill-opacity="0.8">home 4 · erased</text><rect x="397" y="44" width="101" height="64" rx="6" fill="var(--surface-3)" stroke="var(--border-strong)"/><text x="447.5" y="58" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.7">cell 6</text><text x="447.5" y="80" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Id 90</text><text x="447.5" y="98" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.8">home 6</text><rect x="502" y="44" width="101" height="64" rx="6" fill="var(--surface-3)" stroke="var(--border-strong)"/><text x="552.5" y="58" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.7">cell 7</text><text x="552.5" y="80" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Id 33</text><text x="552.5" y="98" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.8">home 5</text><rect x="607" y="44" width="101" height="64" rx="6" fill="var(--surface-3)" stroke="var(--border-strong)"/><text x="657.5" y="58" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.7">cell 8</text><text x="657.5" y="80" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Id 58</text><text x="657.5" y="98" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.8">home 8</text><rect x="712" y="44" width="101" height="64" rx="6" fill="none" stroke="var(--border-strong)" stroke-dasharray="4 3"/><text x="762.5" y="58" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.55">cell 9</text><text x="762.5" y="82" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.5" font-style="italic">empty</text><rect x="817" y="44" width="101" height="64" rx="6" fill="none" stroke="var(--border-strong)" stroke-dasharray="4 3"/><text x="867.5" y="58" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.55">cell 10</text><text x="867.5" y="82" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.5" font-style="italic">empty</text><text x="80" y="246" text-anchor="start" fill="var(--accent-new)" font-size="11">after — no tombstone left behind</text><rect x="82" y="262" width="101" height="64" rx="6" fill="none" stroke="var(--border-strong)" stroke-dasharray="4 3"/><text x="132.5" y="276" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.55">cell 3</text><text x="132.5" y="300" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.5" font-style="italic">empty</text><rect x="187" y="262" width="101" height="64" rx="6" fill="var(--surface-3)" stroke="var(--border-strong)"/><text x="237.5" y="276" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.7">cell 4</text><text x="237.5" y="298" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Id 71</text><text x="237.5" y="316" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.8">home 4</text><rect x="292" y="262" width="101" height="64" rx="6" fill="var(--accent-new-bg)" stroke="var(--accent-new)"/><text x="342.5" y="276" text-anchor="middle" fill="var(--accent-new)" font-size="9.5" fill-opacity="0.7">cell 5</text><text x="342.5" y="298" text-anchor="middle" fill="var(--accent-new)" font-size="13" font-weight="600">Id 33</text><text x="342.5" y="316" text-anchor="middle" fill="var(--accent-new)" font-size="9.5" fill-opacity="0.8">home 5 · moved</text><rect x="397" y="262" width="101" height="64" rx="6" fill="var(--surface-3)" stroke="var(--border-strong)"/><text x="447.5" y="276" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.7">cell 6</text><text x="447.5" y="298" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Id 90</text><text x="447.5" y="316" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.8">home 6</text><rect x="502" y="262" width="101" height="64" rx="6" fill="var(--accent-old-bg)" stroke="var(--accent-old)" stroke-dasharray="4 3"/><text x="552.5" y="276" text-anchor="middle" fill="var(--accent-old)" font-size="9.5" fill-opacity="0.7">cell 7</text><text x="552.5" y="300" text-anchor="middle" fill="var(--accent-old)" font-size="11" font-style="italic">empty again</text><rect x="607" y="262" width="101" height="64" rx="6" fill="var(--surface-3)" stroke="var(--border-strong)"/><text x="657.5" y="276" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.7">cell 8</text><text x="657.5" y="298" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Id 58</text><text x="657.5" y="316" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.8">home 8</text><rect x="712" y="262" width="101" height="64" rx="6" fill="none" stroke="var(--border-strong)" stroke-dasharray="4 3"/><text x="762.5" y="276" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.55">cell 9</text><text x="762.5" y="300" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.5" font-style="italic">empty</text><rect x="817" y="262" width="101" height="64" rx="6" fill="none" stroke="var(--border-strong)" stroke-dasharray="4 3"/><text x="867.5" y="276" text-anchor="middle" fill="currentColor" font-size="9.5" fill-opacity="0.55">cell 10</text><text x="867.5" y="300" text-anchor="middle" fill="currentColor" font-size="11" fill-opacity="0.5" font-style="italic">empty</text><line x1="542.5" y1="110" x2="352.5" y2="260" stroke="var(--accent-new)" marker-end="url(#a8)"/><text x="477.5" y="190" text-anchor="start" fill="var(--accent-new)" font-size="10.5">backward shift:</text><text x="477.5" y="205" text-anchor="start" fill="var(--accent-new)" font-size="10.5">Id 33 fills the hole</text><text x="80" y="352" text-anchor="start" fill="currentColor" font-size="10.5" fill-opacity="0.65">how the scan after the hole decides, cell by cell:</text><text x="447.5" y="372" text-anchor="middle" fill="currentColor" font-size="10.5" font-weight="600" fill-opacity="1">Id 90 stays:</text><text x="447.5" y="387" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.85">home 6 is past</text><text x="447.5" y="402" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.85">the hole</text><text x="552.5" y="372" text-anchor="middle" fill="currentColor" font-size="10.5" font-weight="600" fill-opacity="1">Id 33 moves:</text><text x="552.5" y="387" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.85">home 5 is not</text><text x="552.5" y="402" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.85">past the hole</text><text x="657.5" y="372" text-anchor="middle" fill="currentColor" font-size="10.5" font-weight="600" fill-opacity="1">Id 58 stays:</text><text x="657.5" y="387" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.85">home 8 is past</text><text x="657.5" y="402" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.85">hole (now 7)</text><text x="762.5" y="372" text-anchor="middle" fill="currentColor" font-size="10.5" font-weight="600" fill-opacity="1">empty cell:</text><text x="762.5" y="387" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.85">the scan</text><text x="762.5" y="402" text-anchor="middle" fill="currentColor" font-size="10.5" fill-opacity="0.85">stops</text></g></svg>
+      </div>
+      <figcaption>
+        Illustrative: cells 3 to 10 of a 16-cell table, with home cells chosen for the example (real ones come from
+        the scrambled hash). Erasing never returns table space on its own, so when a set falls below one eighth
+        full and has more than 64 cells, <code>remove()</code> calls <code>shrink_to_fit()</code>; a set that
+        drains to 16 ids converts back to a vector.
+      </figcaption>
+    </figure>
+
+    <h3>Two kinds of index</h3>
+    <table>
+      <thead>
+        <tr><th>&nbsp;</th><th>Index tries (<code>Root</code>)</th><th>Referrers (<code>referrers_</code>)</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="what">Who can see it</td>
+          <td>every reader, as part of a published <code>Root</code></td>
+          <td>nobody but the thread holding <code>commit_mu_</code></td>
+        </tr>
+        <tr>
+          <td class="what">A write</td>
+          <td>clone the <code>Node</code>s on one path; the old version stays valid</td>
+          <td>mutate in place; there is only ever one version</td>
+        </tr>
+        <tr>
+          <td class="what">Layout</td>
+          <td>refcounted, pool-allocated nodes shared between versions</td>
+          <td>per referring field, a map of vectors of ids and a map of flat sets for hubs</td>
+        </tr>
+        <tr>
+          <td class="what">Undoing a failed commit</td>
+          <td>drop the new <code>Root</code>; the old one was never touched</td>
+          <td>the undo log replays the inverse edge operations (<code>ReferrersAddEdge</code>, <code>ReferrersRemoveEdge</code>, <code>RestoreReferrersBucket</code>)</td>
+        </tr>
+        <tr>
+          <td class="what">Why it is safe</td>
+          <td>immutability (invariant 3)</td>
+          <td>the lock (invariant 7); a <code>FlatSet</code> must never become part of published state</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>What splitting by field buys</h3>
+    <p>
+      Measured on this repository, with 200,000 <code>Order</code>s spread over a varying number of
+      <code>Account</code>s. Memory is resident growth per order. The old layout kept one vector of 24-byte
+      <code>RefEdge</code> per target, so the per-field layout gains more the more referrers each target has,
+      and costs nothing measurable when every target has one.
+    </p>
+    <table>
+      <thead>
+        <tr><th>Referrers per target</th><th>One vector of <code>RefEdge</code> per target</th><th>Per-field index</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="what">200,000 (one account)</td><td>541 B per order</td><td>538 B per order</td></tr>
+        <tr><td class="what">100</td><td>567 B per order</td><td>556 B per order</td></tr>
+        <tr><td class="what">10</td><td>573 B per order</td><td>547 B per order</td></tr>
+        <tr><td class="what">1</td><td>652 B per order</td><td>654 B per order</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Removing every order of one hub in a single commit, in random order, took 6.1 s (100,000 orders) and
+      20 to 32 s (200,000) with a vector per target, and takes 2.5 s and 5.8 s with hub form. The per-removal cost
+      stays near 25 to 30 microseconds instead of growing with the hub. Removing the hub target itself did not
+      change: the cascade takes the hub's whole entry out in one step, so its referrers' own removals find
+      nothing to search.
+    </p>
+  </section>
+
   <footer class="notes">
     Grounded in <code>include/model/model.h</code> (<code>Id</code>, <code>Chunk</code>, <code>Root</code>) and
     <code>src/model.cpp</code> (<code>Model::cow</code>, <code>Model::set_slot</code>,
     <code>Model::apply_update</code>, <code>Model::publish_now</code>,
     <code>Model::reconcile_cached_fields</code>), plus <code>include/model/persistent_map.h</code>
-    (<code>pmap::TrieCore</code>, <code>bucket_insert</code>/<code>bucket_erase</code>). Invariants
+    (<code>pmap::TrieCore</code>, <code>bucket_insert</code>/<code>bucket_erase</code>), and
+    <code>include/model/flat_set.h</code> (<code>fset::FlatSet</code>) with
+    <code>Model::ReferrerIndex</code> in <code>model.h</code>/<code>model.cpp</code>. Invariants
     referenced: 3 (published state is immutable), 4 (nothing frees while a reader can still see it),
-    5 (Id carries a generation).
+    5 (Id carries a generation), 7 (commit_mu_-protected state is touched only under the lock).
   </footer>
 
 </div>

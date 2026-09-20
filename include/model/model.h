@@ -61,6 +61,7 @@
 #include <variant>
 #include <vector>
 
+#include "model/flat_set.h"
 #include "model/persistent_map.h"
 
 // std::atomic<std::shared_ptr<T>> -- the class-template specialization used below for
@@ -3612,8 +3613,10 @@ public:
             std::size_t key_indexed_fields = 0;               ///< by_key_.size()
             std::size_t cached_value_indexed_fields = 0;       ///< by_cached_field_.size()
             std::size_t cached_reference_indexed_fields = 0;   ///< by_cached_reference_.size()
-            std::size_t reverse_index_targets = 0;  ///< referrers_.size() -- slots with >=1 referrer
+            std::size_t reverse_index_targets = 0;  ///< slots with >=1 referrer, through any field
             std::size_t reverse_index_edges = 0;    ///< total referrer edges, summed across all targets
+            std::size_t reverse_index_hub_targets = 0;  ///< (target, referring field) pairs in hub form, i.e. that
+                                                        ///< reached ReferrerIndex::kHubPromoteAt referrers
 
             bool pre_transactions_hook_installed = false;  ///< see set_pre_transactions()
             bool pre_commit_hook_installed = false;        ///< see set_pre_commit()
@@ -4055,6 +4058,109 @@ private:
         bool nullable;
     };
 
+    /// The reverse index behind cascade delete: for each referring field, which
+    /// referrers point at each target. Writer-private, like everything under
+    /// commit_mu_ (invariant 7).
+    ///
+    /// The index is split by referring field (`Order::account`, ...), so an edge
+    /// is stored as just the referrer's `Id`; the field and its nullability are
+    /// stored once per field. Within one field, a target's referrers are held in
+    /// one of two forms, chosen by how many there are:
+    ///  - small: a vector of ids, searched linearly. Right for the typical
+    ///    target, which has few referrers.
+    ///  - hub: for a target with many referrers through this field. The ids are a
+    ///    hash set, so removing one is a lookup instead of a scan.
+    /// Promotion converts small to hub, on the add that reaches kHubPromoteAt
+    /// ids. Demotion converts back, on the remove that leaves kHubDemoteAt or
+    /// fewer. The gap between the two keeps a target that hovers near one of
+    /// them from converting on every operation. Ids keep insertion order in the
+    /// small form and are unordered in the hub form.
+    class ReferrerIndex {
+    public:
+        static constexpr std::size_t kHubPromoteAt = 64;
+        static constexpr std::size_t kHubDemoteAt = 16;
+        /// remove() shrinks a hub's set once it is under 1/8 full, but only if it has more cells
+        /// than this; erasing alone never returns a FlatSet's table space.
+        static constexpr std::size_t kHubShrinkFloor = 64;
+
+        using IdSet = fset::FlatSet<Id, IdHash>;
+
+        /// One target's referrers through one field, moved out of the index by take().
+        struct Taken {
+            const void* field;
+            std::variant<std::vector<Id>, IdSet> ids;
+        };
+
+        /// `nullable` matters only the first time `field` is seen; it is fixed per field.
+        void add(std::uint32_t target, Id from, const void* field, bool nullable);
+
+        /// Adds back an edge removed earlier, so `field` already has an index.
+        void re_add(std::uint32_t target, Id from, const void* field);
+
+        /// False if the edge is not in the index.
+        bool remove(std::uint32_t target, Id from, const void* field);
+
+        /// Every edge pointing at `target`, copied out, in field-creation order.
+        std::vector<RefEdge> edges_of(std::uint32_t target) const;
+
+        /// Calls `f(Id from)` for each referrer of `target` through a non-nullable field.
+        template <class F>
+        void for_each_required(std::uint32_t target, F&& f) const {
+            // Nullable fields are skipped: their referrers survive the target.
+            for (const FieldIndex& fi : fields_)
+                if (!fi.nullable) fi.for_each(target, f);
+        }
+
+        /// Moves every field's referrers of `target` out of the index.
+        std::vector<Taken> take(std::uint32_t target);
+
+        /// Puts back what take() moved out, in the form it had.
+        void restore(std::uint32_t target, Taken taken);
+
+        void clear() {
+            fields_.clear();
+            by_field_.clear();
+        }
+
+        std::size_t target_count() const;  ///< distinct targets with a referrer through any field
+        std::size_t edge_count() const;
+        std::size_t hub_count() const;  ///< (target, field) pairs in hub form
+
+    private:
+        /// The referrers of every target through one referring field.
+        struct FieldIndex {
+            const void* field;
+            bool nullable;
+            std::unordered_map<std::uint32_t, std::vector<Id>> small;
+            std::unordered_map<std::uint32_t, IdSet> hubs;
+            std::size_t edges;  ///< total ids across `small` and `hubs`
+
+            void add(std::uint32_t target, Id from);
+            bool remove(std::uint32_t target, Id from);
+
+            template <class F>
+            void for_each(std::uint32_t target, F&& f) const {
+                // Hub form: visits the target's set.
+                if (!hubs.empty()) {
+                    const auto h = hubs.find(target);
+                    if (h != hubs.end()) {
+                        h->second.for_each(f);
+                        return;
+                    }
+                }
+                // Small form: visits the target's vector.
+                const auto s = small.find(target);
+                if (s != small.end())
+                    for (const Id& id : s->second) f(id);
+            }
+        };
+
+        FieldIndex& field_index(const void* field, bool nullable);
+
+        std::vector<FieldIndex> fields_;  ///< in first-seen order, so cascade order is deterministic
+        std::unordered_map<const void*, std::size_t> by_field_;  ///< field -> position in fields_
+    };
+
     /// One committed transaction's resolved changeset, retained for
     /// try_commit()'s id-overlap conflict check. See prune_changelog: safe to
     /// discard once no open Transaction's base_version() (or reader Snapshot)
@@ -4278,10 +4384,10 @@ private:
     /// The value-indexed trio ONLY -- field_keys/cached_fields/
     /// cached_references -- for remove_raw()'s drop path. Deliberately does
     /// NOT include drop_out_refs(): that one runs EARLIER in remove_raw,
-    /// before the incoming-edge-bucket save and the by_type_ removal, and a
+    /// before the incoming-edge save and the by_type_ removal, and a
     /// self-referencing victim makes that ordering observable (its own
-    /// outgoing edge lives in referrers_[victim.index], which the bucket
-    /// save reads). Call drop_out_refs() separately, first, same as today.
+    /// outgoing edge is among the victim's incoming edges in referrers_,
+    /// which the save reads). Call drop_out_refs() separately, first, same as today.
     void drop_value_indexes(const ObjectBase* o) {
         drop_field_keys(o);
         drop_cached_fields(o);
@@ -4430,12 +4536,15 @@ private:
         const ObjectBase* prev_obj;
         std::uint32_t prev_gen;
     };
-    struct ReferrersPopBack {
+    struct ReferrersRemoveEdge {
         std::uint32_t key;
+        Id from;
+        const void* field;
     };
-    struct ReferrersPushEdge {
+    struct ReferrersAddEdge {
         std::uint32_t key;
-        RefEdge edge;
+        Id from;
+        const void* field;
     };
     struct PopChanges {};
     struct DeleteObject {
@@ -4445,14 +4554,16 @@ private:
     struct PopFreeSlot {};
     struct RestoreReferrersBucket {
         std::uint32_t key;
-        std::vector<RefEdge> saved;
+        std::unique_ptr<ReferrerIndex::Taken> saved;  ///< boxed so this alternative does not size every log entry
     };
     struct GenericRollback {
         std::function<void()> fn;
     };
     using TxnRollbackOp = std::variant<PushFreeSlot, DecExhaustedSlots, DecNextSlot, RestoreSlot,
-                                ReferrersPopBack, ReferrersPushEdge, PopChanges, DeleteObject,
+                                ReferrersRemoveEdge, ReferrersAddEdge, PopChanges, DeleteObject,
                                 PopRetired, PopFreeSlot, RestoreReferrersBucket, GenericRollback>;
+    // Every logged mutation pays for one entry, so growing an alternative grows the memory of a large transaction.
+    static_assert(sizeof(TxnRollbackOp) <= 40, "TxnRollbackOp grew: box the large alternative instead");
 
     template <class Op>
     void log(Op op) {
@@ -4472,19 +4583,13 @@ private:
         c2->obj[ii] = op.prev_obj;
         c2->gen[ii] = op.prev_gen;
     }
-    void apply_rollback_op(ReferrersPopBack op) {
-        auto it = referrers_.find(op.key);
-        if (it != referrers_.end()) {
-            it->second.pop_back();  // exact inverse of the push_back it undoes
-            if (it->second.empty()) referrers_.erase(it);
-        }
-    }
-    void apply_rollback_op(ReferrersPushEdge op) { referrers_[op.key].push_back(op.edge); }
+    void apply_rollback_op(ReferrersRemoveEdge op) { referrers_.remove(op.key, op.from, op.field); }
+    void apply_rollback_op(ReferrersAddEdge op) { referrers_.re_add(op.key, op.from, op.field); }
     void apply_rollback_op(PopChanges) { changes_.pop_back(); }
     void apply_rollback_op(DeleteObject op) { delete op.obj; }
     void apply_rollback_op(PopRetired) { retired_.pop_back(); }
     void apply_rollback_op(PopFreeSlot) { free_slots_.pop_back(); }
-    void apply_rollback_op(RestoreReferrersBucket op) { referrers_[op.key] = std::move(op.saved); }
+    void apply_rollback_op(RestoreReferrersBucket op) { referrers_.restore(op.key, std::move(*op.saved)); }
     void apply_rollback_op(GenericRollback op) { op.fn(); }
 
     /// Point a slot at an object (or null) with a new generation, through
@@ -4931,13 +5036,13 @@ private:
                        pmap::PersistentMap<Id, pmap::PersistentSet<Id, IdHash>, IdHash>>
         by_cached_reference_;
 
-    /// The reverse index driving cascade delete: target SLOT (bare index --
-    /// only the live generation of a slot can ever be referenced, so the
-    /// full Id would be redundant) -> every edge pointing at it. Writer-only
+    /// The reverse index driving cascade delete: per referring field, target SLOT
+    /// (bare index -- only the live generation of a slot can ever be referenced,
+    /// so the full Id would be redundant) -> the referrers pointing at it. Writer-only
     /// and mutable in place; the one structure that could never be handed to
     /// readers, and the reason cascade resolution must happen at commit time
-    /// (invariant 8). Linear scan per target; see CLAUDE.md scope notes.
-    std::unordered_map<std::uint32_t, std::vector<RefEdge>> referrers_;
+    /// (invariant 8).
+    ReferrerIndex referrers_;
 
     std::vector<std::uint32_t> free_slots_;  ///< recycled slots, LIFO -- reuse concentrates on
                                              ///< hot slots, keeping the spine dense

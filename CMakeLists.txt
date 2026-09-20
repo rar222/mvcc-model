@@ -331,6 +331,16 @@ target_include_directories(persistent_map_tests PRIVATE ${CMAKE_CURRENT_SOURCE_D
 mvcc_discover_tests(persistent_map_tests TIMEOUT 120)
 
 ########################
+# flat_set_tests
+#
+# The flat hash set is differential-tested against std::unordered_set.
+# Independent of libmodel, like persistent_map_tests.
+add_executable(flat_set_tests tests/flat_set_tests.cpp tests/test_harness.cpp)
+target_link_libraries(flat_set_tests PRIVATE model_flags)
+target_include_directories(flat_set_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+mvcc_discover_tests(flat_set_tests TIMEOUT 120)
+
+########################
 # stand_alone tests
 #
 # Added with "stand_alone" prefix for grouping

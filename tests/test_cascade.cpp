@@ -675,3 +675,466 @@ TEST(cascade_does_not_double_process_a_referrer_whose_nullable_and_non_nullable_
     CHECK_EQ(s.size(), std::size_t{0});
 }
 
+
+// ---------------------------------------------------------------------------
+// Targets with many referrers. One target's referrers through one field become a flat set
+// at 64 ids and a vector again at 16 (Model::ReferrerIndex); these tests use counts well
+// clear of both so they hold if the thresholds move a little. reverse_index_hub_targets,
+// which counts (target, referring field) pairs in hub form, is how they know the hub form
+// was really reached.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// `n` Orders created in one commit, every one with account = `a`.
+std::vector<Ref<Order>> create_orders_on(Model& m, const Ref<Account>& a, const std::string& prefix, int n) {
+    Transaction txn = m.begin();
+    std::vector<Ref<Order>> locals;
+    // Builds each order with a unique code and account = `a`.
+    for (int i = 0; i < n; ++i) {
+        auto o = std::make_unique<Order>();
+        o->code = prefix + std::to_string(i);
+        o->account = a;
+        locals.push_back(txn.create(std::move(o)));
+    }
+    const CommitResult res = commit_ok(m, txn);
+    std::vector<Ref<Order>> out;
+    for (const Ref<Order>& l : locals) out.push_back(res.to_real(l));
+    return out;
+}
+
+}  // namespace
+
+TEST(hub_of_optional_referrers_is_nulled_not_killed_and_leaves_the_ref_edges_intact) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Order> p = make_order(m, "P", a);
+
+    Transaction txn = m.begin();
+    std::vector<Ref<Order>> locals;
+    // Builds 200 children, each with account = a and parent = p.
+    for (int i = 0; i < 200; ++i) {
+        auto c = std::make_unique<Order>();
+        c->code = "C" + std::to_string(i);
+        c->account = a;
+        c->parent = p;
+        locals.push_back(txn.create(std::move(c)));
+    }
+    const CommitResult made = commit_ok(m, txn);
+    std::vector<Ref<Order>> kids;
+    for (const Ref<Order>& l : locals) kids.push_back(made.to_real(l));
+
+    Model::Diagnostics::Status d = m.diagnostics();
+    CHECK_EQ(d.reverse_index_hub_targets, std::size_t{2});  // p (parent edges) and a (account edges)
+    CHECK_EQ(d.reverse_index_edges, std::size_t{401});
+
+    CHECK_EQ(remove_and_commit(m, p), std::size_t{1});  // only p: every child's edge is an Opt<>
+
+    Snapshot s = m.snapshot();
+    // Every child survives with its parent nulled and its account intact.
+    for (const Ref<Order>& kid : kids) {
+        const Order* o = s.find(kid);
+        CHECK(o != nullptr);
+        // Checks the survivor's fields.
+        if (o) {
+            CHECK(!o->parent);
+            CHECK_EQ(o->account.id(), a.id());
+        }
+    }
+    d = m.diagnostics();
+    CHECK_EQ(d.reverse_index_edges, std::size_t{200});
+    CHECK_EQ(d.reverse_index_hub_targets, std::size_t{1});
+
+    CHECK_EQ(remove_and_commit(m, a), std::size_t{201});  // a and every child
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});
+}
+
+TEST(hub_drains_through_demotion_and_regrows_with_every_edge_still_cascading) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const std::vector<Ref<Order>> orders = create_orders_on(m, a, "D", 300);
+
+    Model::Diagnostics::Status d = m.diagnostics();
+    CHECK_EQ(d.reverse_index_hub_targets, std::size_t{1});
+    CHECK_EQ(d.reverse_index_edges, std::size_t{300});
+
+    // Removes 290 of the 300 orders in one commit.
+    {
+        Transaction txn = m.begin();
+        for (int i = 0; i < 290; ++i) txn.remove(orders[static_cast<std::size_t>(i)]);
+        commit_ok(m, txn);
+    }
+    d = m.diagnostics();
+    CHECK_EQ(d.reverse_index_hub_targets, std::size_t{0});  // 10 edges left: back to the small form
+    CHECK_EQ(d.reverse_index_edges, std::size_t{10});
+    CHECK_EQ(d.reverse_index_targets, std::size_t{1});
+
+    create_orders_on(m, a, "E", 100);
+    d = m.diagnostics();
+    CHECK_EQ(d.reverse_index_hub_targets, std::size_t{1});
+    CHECK_EQ(d.reverse_index_edges, std::size_t{110});
+
+    CHECK_EQ(remove_and_commit(m, a), std::size_t{111});  // a, the 10 survivors, the 100 regrown
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});
+}
+
+TEST(repointing_refs_away_from_a_hub_moves_their_edges_to_the_new_target) {
+    Model m;
+    const Ref<Account> a1 = make_account(m, "A1");
+    const Ref<Account> a2 = make_account(m, "A2");
+    const std::vector<Ref<Order>> orders = create_orders_on(m, a1, "R", 200);
+
+    // Repoints 150 of the 200 orders to a2 in one commit.
+    {
+        Transaction txn = m.begin();
+        for (int i = 0; i < 150; ++i) txn.update(orders[static_cast<std::size_t>(i)])->account = a2;
+        commit_ok(m, txn);
+    }
+    Model::Diagnostics::Status d = m.diagnostics();
+    CHECK_EQ(d.reverse_index_edges, std::size_t{200});
+    // a2 crossed the promotion threshold; a1 fell to 50, between demotion and promotion, so it stays a hub.
+    CHECK_EQ(d.reverse_index_hub_targets, std::size_t{2});
+
+    CHECK_EQ(remove_and_commit(m, a1), std::size_t{51});  // a1 and the 50 orders still on it
+    Snapshot s = m.snapshot();
+    // The 150 orders moved to a2 survive; the 50 left on a1 died with it.
+    for (int i = 0; i < 200; ++i) {
+        const Ref<Order>& o = orders[static_cast<std::size_t>(i)];
+        CHECK_EQ(s.find(o) != nullptr, i < 150);
+    }
+
+    CHECK_EQ(remove_and_commit(m, a2), std::size_t{151});
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});
+}
+
+// account is a Ref<> and account_scan an Opt<>, both into `a`: two hubs on one target,
+// one per field, of different nullability.
+TEST(hub_cascade_skips_the_nullable_edge_of_a_referrer_that_dies_anyway) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+
+    Transaction txn = m.begin();
+    // Builds 100 orders whose account and account_scan both point at a.
+    for (int i = 0; i < 100; ++i) {
+        auto o = std::make_unique<Order>();
+        o->code = "X" + std::to_string(i);
+        o->account = a;
+        o->account_scan = a;
+        txn.create(std::move(o));
+    }
+    commit_ok(m, txn);
+    CHECK_EQ(m.diagnostics().reverse_index_edges, std::size_t{200});
+    CHECK_EQ(m.diagnostics().reverse_index_hub_targets, std::size_t{2});  // (a, account) and (a, account_scan)
+
+    Transaction rm = m.begin();
+    rm.remove(a);
+    const CommitResult res = m.try_commit(rm);
+    CHECK(res.status == CommitStatus::Committed);
+    std::size_t deleted = 0, updated = 0;
+    // Counts the deleted and updated changes.
+    for (const Change& c : res.changes) {
+        if (c.kind == ChangeKind::Deleted) ++deleted;
+        if (c.kind == ChangeKind::Updated) ++updated;
+    }
+    CHECK_EQ(deleted, std::size_t{101});
+    CHECK_EQ(updated, std::size_t{0});  // no referrer is nulled on its way to deletion
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});
+}
+
+TEST(hub_cascade_nulls_only_the_optional_field_of_a_referrer_that_survives) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Account> b = make_account(m, "B1");
+
+    Transaction txn = m.begin();
+    std::vector<Ref<Order>> locals;
+    // Builds 100 orders on b whose account_scan points at a.
+    for (int i = 0; i < 100; ++i) {
+        auto o = std::make_unique<Order>();
+        o->code = "Y" + std::to_string(i);
+        o->account = b;
+        o->account_scan = a;
+        locals.push_back(txn.create(std::move(o)));
+    }
+    const CommitResult made = commit_ok(m, txn);
+    CHECK_EQ(m.diagnostics().reverse_index_hub_targets, std::size_t{2});  // a (account_scan) and b (account)
+
+    Transaction rm = m.begin();
+    rm.remove(a);
+    const CommitResult res = m.try_commit(rm);
+    CHECK(res.status == CommitStatus::Committed);
+    std::size_t deleted = 0, updated = 0;
+    // Counts the deleted and updated changes.
+    for (const Change& c : res.changes) {
+        if (c.kind == ChangeKind::Deleted) ++deleted;
+        if (c.kind == ChangeKind::Updated) ++updated;
+    }
+    CHECK_EQ(deleted, std::size_t{1});
+    CHECK_EQ(updated, std::size_t{100});
+
+    Snapshot s = m.snapshot();
+    // Each order survives with account_scan nulled and account still b.
+    for (const Ref<Order>& l : locals) {
+        const Order* o = s.find(made.to_real(l));
+        CHECK(o != nullptr);
+        // Checks the survivor's fields.
+        if (o) {
+            CHECK(!o->account_scan);
+            CHECK_EQ(o->account.id(), b.id());
+        }
+    }
+    CHECK_EQ(remove_and_commit(m, b), std::size_t{101});
+}
+
+// A veto unwinds the apply step through the rollback log. This one drains a
+// hub below the demotion threshold and refills it past the promotion
+// threshold first, so the unwind has to convert the bucket both ways.
+TEST(a_vetoed_commit_that_drains_and_refills_a_hub_restores_it_exactly) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const std::vector<Ref<Order>> orders = create_orders_on(m, a, "V", 200);
+
+    m.set_pre_commit([](Model&, const Transaction&, const std::vector<Change>&) { return false; });
+    // Removes 190 orders and creates 100 more in one commit that the hook vetoes.
+    {
+        Transaction txn = m.begin();
+        for (int i = 0; i < 190; ++i) txn.remove(orders[static_cast<std::size_t>(i)]);
+        // Creates 100 orders on a.
+        for (int i = 0; i < 100; ++i) {
+            auto o = std::make_unique<Order>();
+            o->code = "VN" + std::to_string(i);
+            o->account = a;
+            txn.create(std::move(o));
+        }
+        CHECK(m.try_commit(txn).status == CommitStatus::Vetoed);
+    }
+    m.set_pre_commit({});
+
+    const Model::Diagnostics::Status d = m.diagnostics();
+    CHECK_EQ(d.reverse_index_targets, std::size_t{1});
+    CHECK_EQ(d.reverse_index_edges, std::size_t{200});
+    CHECK_EQ(d.reverse_index_hub_targets, std::size_t{1});
+    CHECK_EQ(m.snapshot().size(), std::size_t{201});
+
+    CHECK_EQ(remove_and_commit(m, a), std::size_t{201});
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});
+}
+
+namespace {
+// Must match ReferrerIndex::kHubPromoteAt / kHubDemoteAt in model.h: the boundary tests
+// below are about these exact edge counts and are meant to fail if the constants move.
+constexpr int kPromoteAt = 64;
+constexpr int kDemoteAt = 16;
+
+std::size_t hub_targets(Model& m) { return m.diagnostics().reverse_index_hub_targets; }
+std::size_t edge_count(Model& m) { return m.diagnostics().reverse_index_edges; }
+}  // namespace
+
+TEST(a_bucket_becomes_a_hub_at_the_promotion_threshold_and_a_vector_again_at_the_demotion_threshold) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+
+    std::vector<Ref<Order>> orders = create_orders_on(m, a, "B", kPromoteAt - 1);
+    CHECK_EQ(hub_targets(m), std::size_t{0});
+    CHECK_EQ(edge_count(m), static_cast<std::size_t>(kPromoteAt - 1));
+
+    orders.push_back(create_orders_on(m, a, "P", 1)[0]);  // the kPromoteAt-th edge
+    CHECK_EQ(hub_targets(m), std::size_t{1});
+    CHECK_EQ(edge_count(m), static_cast<std::size_t>(kPromoteAt));
+
+    // Drain one order per commit. The bucket stays a hub all the way down to
+    // kDemoteAt + 1 edges (hysteresis: it is not a vector again just below kPromoteAt).
+    // Removes one order per commit while the bucket stays a hub.
+    while (static_cast<int>(orders.size()) > kDemoteAt + 1) {
+        remove_and_commit(m, orders.back());
+        orders.pop_back();
+        CHECK_EQ(hub_targets(m), std::size_t{1});
+        CHECK_EQ(edge_count(m), orders.size());
+    }
+    remove_and_commit(m, orders.back());  // the kDemoteAt-th edge
+    orders.pop_back();
+    CHECK_EQ(hub_targets(m), std::size_t{0});
+    CHECK_EQ(edge_count(m), static_cast<std::size_t>(kDemoteAt));
+
+    // Refill: still a vector one edge short of kPromoteAt, a hub again at kPromoteAt.
+    const std::vector<Ref<Order>> refill =
+        create_orders_on(m, a, "R", kPromoteAt - 1 - static_cast<int>(orders.size()));
+    orders.insert(orders.end(), refill.begin(), refill.end());
+    CHECK_EQ(hub_targets(m), std::size_t{0});
+    orders.push_back(create_orders_on(m, a, "S", 1)[0]);
+    CHECK_EQ(hub_targets(m), std::size_t{1});
+
+    // Every edge survived two conversions each way.
+    CHECK_EQ(remove_and_commit(m, a), static_cast<std::size_t>(kPromoteAt) + 1);
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});
+}
+
+// Each referring field keeps its own hub, so a target can be a hub through one field and not
+// another. Demoting both fields' hubs must leave the Ref<> referrers dying with the target and
+// the Opt<> ones surviving, nulled.
+TEST(demoting_hubs_on_two_fields_of_one_target_keeps_each_fields_nullability) {
+    Model m;
+    const Ref<Account> a = make_account(m, "A1");
+    const Ref<Account> b = make_account(m, "B1");
+
+    // 80 X orders: account = a (Ref), account_scan = a (Opt) -- one edge into a through each field.
+    // 70 Y orders: account = b, account_scan = a (Opt) -- one edge each into b and into a.
+    Transaction txn = m.begin();
+    std::vector<Ref<Order>> x_local, y_local;
+    // Builds the X orders.
+    for (int i = 0; i < 80; ++i) {
+        auto o = std::make_unique<Order>();
+        o->code = "X" + std::to_string(i);
+        o->account = a;
+        o->account_scan = a;
+        x_local.push_back(txn.create(std::move(o)));
+    }
+    // Builds the Y orders.
+    for (int i = 0; i < 70; ++i) {
+        auto o = std::make_unique<Order>();
+        o->code = "Y" + std::to_string(i);
+        o->account = b;
+        o->account_scan = a;
+        y_local.push_back(txn.create(std::move(o)));
+    }
+    const CommitResult made = commit_ok(m, txn);
+    std::vector<Ref<Order>> xs, ys;
+    for (const Ref<Order>& l : x_local) xs.push_back(made.to_real(l));
+    for (const Ref<Order>& l : y_local) ys.push_back(made.to_real(l));
+    // (a, account) 80, (a, account_scan) 150, (b, account) 70: all three at or above kPromoteAt.
+    CHECK_EQ(edge_count(m), std::size_t{300});
+    CHECK_EQ(hub_targets(m), std::size_t{3});
+
+    // Leaves 1 X and 14 Y: (a, account) 1, (a, account_scan) 15, (b, account) 14 -- all at or below kDemoteAt.
+    {
+        Transaction rm = m.begin();
+        for (int i = 1; i < 80; ++i) rm.remove(xs[static_cast<std::size_t>(i)]);
+        for (int i = 14; i < 70; ++i) rm.remove(ys[static_cast<std::size_t>(i)]);
+        commit_ok(m, rm);
+    }
+    CHECK_EQ(hub_targets(m), std::size_t{0});
+    CHECK_EQ(edge_count(m), std::size_t{1 + 15 + 14});
+
+    Transaction kill = m.begin();
+    kill.remove(a);
+    const CommitResult res = m.try_commit(kill);
+    CHECK(res.status == CommitStatus::Committed);
+    std::size_t deleted = 0, updated = 0;
+    // Counts the deleted and updated changes.
+    for (const Change& c : res.changes) {
+        if (c.kind == ChangeKind::Deleted) ++deleted;
+        if (c.kind == ChangeKind::Updated) ++updated;
+    }
+    CHECK_EQ(deleted, std::size_t{2});  // a and the one X (its Ref<> edge)
+    CHECK_EQ(updated, std::size_t{14});  // each remaining Y, with its Opt<> nulled
+
+    Snapshot s = m.snapshot();
+    CHECK(s.find(xs[0]) == nullptr);
+    // The 14 remaining Y orders survive with account_scan nulled.
+    for (int i = 0; i < 14; ++i) {
+        const Order* o = s.find(ys[static_cast<std::size_t>(i)]);
+        CHECK(o != nullptr);
+        if (o) CHECK(!o->account_scan);
+    }
+}
+
+// Random adds, removes and repoints across three targets, with the mix flipping between growing and
+// draining so each bucket keeps climbing past kPromoteAt and falling below kDemoteAt. The reference is
+// a plain count per target. After every commit the edge total must match it and each bucket must be in
+// the form the thresholds force (a hub at kPromoteAt or more, a vector at kDemoteAt or fewer, either
+// in between by hysteresis). At the end, deleting a target must kill exactly its referrers.
+TEST(random_churn_across_the_promotion_and_demotion_thresholds_keeps_every_edge) {
+    Model m;
+    std::vector<Ref<Account>> accounts;
+    for (int i = 0; i < 3; ++i) accounts.push_back(make_account(m, "A" + std::to_string(i)));
+
+    struct Live {
+        Ref<Order> ref;
+        std::size_t account;
+    };
+    std::vector<Live> live;
+    std::size_t counts[3] = {0, 0, 0};
+    std::mt19937 rng(20240607);
+    int next_code = 0;
+    std::size_t hubs_before = 0, hub_rises = 0, hub_falls = 0;
+    const int failures_before = g_failures;
+
+    // Each round applies a random batch of adds, removes and repoints, then checks the index.
+    for (int round = 0; round < 640; ++round) {
+        const unsigned add_pct = round % 160 < 60 ? 50u : 5u;  // 60 rounds growing, then 100 draining
+        Transaction txn = m.begin();
+        std::vector<std::pair<Ref<Order>, std::size_t>> created;  // local ref, account
+        std::vector<std::size_t> touched, removed;  // indices into `live`; one touch per order per commit
+        const int ops = 1 + static_cast<int>(rng() % 30);
+        // Picks each operation of the batch at random.
+        for (int op = 0; op < ops; ++op) {
+            const unsigned kind = rng() % 100;
+            // Creates an order on a random account.
+            if (live.empty() || kind < add_pct) {
+                auto o = std::make_unique<Order>();
+                o->code = "N" + std::to_string(next_code++);
+                const std::size_t acct = rng() % accounts.size();
+                o->account = accounts[acct];
+                created.emplace_back(txn.create(std::move(o)), acct);
+                continue;
+            }
+            const std::size_t idx = rng() % live.size();
+            if (std::find(touched.begin(), touched.end(), idx) != touched.end()) continue;
+            touched.push_back(idx);
+            // Removes the order.
+            if (kind < add_pct + (100 - add_pct) / 2) {
+                txn.remove(live[idx].ref);
+                removed.push_back(idx);
+            } else {
+                // Repoints the order to a random account.
+                const std::size_t to = rng() % accounts.size();
+                txn.update(live[idx].ref)->account = accounts[to];
+                --counts[live[idx].account];
+                ++counts[to];
+                live[idx].account = to;
+            }
+        }
+        const CommitResult res = commit_ok(m, txn);
+
+        // Adds the committed creates to the reference.
+        for (const auto& [local, acct] : created) {
+            live.push_back({res.to_real(local), acct});
+            ++counts[acct];
+        }
+        std::sort(removed.rbegin(), removed.rend());  // highest index first, so swap-with-back is safe
+        // Drops the committed removes from the reference.
+        for (std::size_t idx : removed) {
+            --counts[live[idx].account];
+            live[idx] = live.back();
+            live.pop_back();
+        }
+
+        const Model::Diagnostics::Status d = m.diagnostics();
+        std::size_t total = 0, hubs_min = 0, hubs_max = 0;
+        // Derives the edge total and the bounds on how many buckets may be hubs.
+        for (std::size_t c : counts) {
+            total += c;
+            if (c >= static_cast<std::size_t>(kPromoteAt)) ++hubs_min;
+            if (c > static_cast<std::size_t>(kDemoteAt)) ++hubs_max;
+        }
+        CHECK_EQ(d.reverse_index_edges, total);
+        CHECK(d.reverse_index_hub_targets >= hubs_min);
+        CHECK(d.reverse_index_hub_targets <= hubs_max);
+        // Stops at the first divergence so one bug does not print hundreds of failures.
+        if (g_failures != failures_before) {
+            std::printf("  (churn diverged at round %d)\n", round);
+            return;
+        }
+        if (d.reverse_index_hub_targets > hubs_before) ++hub_rises;
+        if (d.reverse_index_hub_targets < hubs_before) ++hub_falls;
+        hubs_before = d.reverse_index_hub_targets;
+    }
+
+    // The run must have actually converted buckets, in both directions, or it proves nothing.
+    CHECK(hub_rises >= 3);
+    CHECK(hub_falls >= 3);
+
+    for (std::size_t i = 0; i < accounts.size(); ++i)
+        CHECK_EQ(remove_and_commit(m, accounts[i]), 1 + counts[i]);
+    CHECK_EQ(m.snapshot().size(), std::size_t{0});
+}

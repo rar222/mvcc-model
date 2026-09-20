@@ -1070,12 +1070,163 @@ std::optional<Model::IntegrityError> Model::validate_field_key_uniqueness(
     return std::nullopt;
 }
 
+void Model::ReferrerIndex::FieldIndex::add(std::uint32_t target, Id from) {
+    // Hub form: adds to the target's set.
+    if (!hubs.empty()) {
+        const auto h = hubs.find(target);
+        if (h != hubs.end()) {
+            const bool inserted = h->second.insert(from);
+            assert(inserted && "an edge is added at most once");
+            if (inserted) ++edges;
+            return;
+        }
+    }
+    std::vector<Id>& ids = small[target];
+    ids.push_back(from);
+    ++edges;
+    // Promotes once the small form reaches the threshold.
+    if (ids.size() >= kHubPromoteAt) {
+        IdSet set;
+        set.reserve(ids.size());
+        for (const Id& id : ids) set.insert(id);
+        hubs.emplace(target, std::move(set));
+        small.erase(target);
+    }
+}
+
+bool Model::ReferrerIndex::FieldIndex::remove(std::uint32_t target, Id from) {
+    // Hub form: erases from the set, shrinking or demoting it when it has drained.
+    if (!hubs.empty()) {
+        const auto h = hubs.find(target);
+        if (h != hubs.end()) {
+            IdSet& set = h->second;
+            if (!set.erase(from)) return false;
+            --edges;
+            // Demotes once the set is down to the threshold, else returns table space if it is sparse.
+            if (set.size() <= kHubDemoteAt) {
+                std::vector<Id> ids;
+                ids.reserve(set.size());
+                set.for_each([&](const Id& id) { ids.push_back(id); });
+                hubs.erase(h);
+                if (!ids.empty()) small.emplace(target, std::move(ids));
+            } else if (set.cell_count() > kHubShrinkFloor && set.size() * 8 < set.cell_count()) {
+                set.shrink_to_fit();
+            }
+            return true;
+        }
+    }
+    const auto s = small.find(target);
+    if (s == small.end()) return false;
+    std::vector<Id>& ids = s->second;
+    const auto pos = std::find(ids.begin(), ids.end(), from);
+    if (pos == ids.end()) return false;
+    ids.erase(pos);
+    --edges;
+    if (ids.empty()) small.erase(s);
+    return true;
+}
+
+Model::ReferrerIndex::FieldIndex& Model::ReferrerIndex::field_index(const void* field, bool nullable) {
+    const auto it = by_field_.find(field);
+    // A known field: returns its index.
+    if (it != by_field_.end()) {
+        assert(fields_[it->second].nullable == nullable && "nullability is fixed per field");
+        return fields_[it->second];
+    }
+    by_field_.emplace(field, fields_.size());
+    fields_.push_back(FieldIndex{field, nullable, {}, {}, 0});
+    return fields_.back();
+}
+
+void Model::ReferrerIndex::add(std::uint32_t target, Id from, const void* field, bool nullable) {
+    field_index(field, nullable).add(target, from);
+}
+
+void Model::ReferrerIndex::re_add(std::uint32_t target, Id from, const void* field) {
+    fields_[by_field_.at(field)].add(target, from);
+}
+
+bool Model::ReferrerIndex::remove(std::uint32_t target, Id from, const void* field) {
+    const auto it = by_field_.find(field);
+    return it != by_field_.end() && fields_[it->second].remove(target, from);
+}
+
+std::vector<Model::RefEdge> Model::ReferrerIndex::edges_of(std::uint32_t target) const {
+    std::vector<RefEdge> out;
+    // Gathers the target's referrers from every field.
+    for (const FieldIndex& fi : fields_)
+        fi.for_each(target, [&](const Id& from) { out.push_back(RefEdge{from, fi.field, fi.nullable}); });
+    return out;
+}
+
+std::vector<Model::ReferrerIndex::Taken> Model::ReferrerIndex::take(std::uint32_t target) {
+    std::vector<Taken> out;
+    // Moves the target's ids out of each field that has any.
+    for (FieldIndex& fi : fields_) {
+        const auto h = fi.hubs.find(target);
+        const auto s = fi.small.find(target);
+        // Hub form.
+        if (h != fi.hubs.end()) {
+            fi.edges -= h->second.size();
+            out.push_back(Taken{fi.field, std::move(h->second)});
+            fi.hubs.erase(h);
+        // Small form.
+        } else if (s != fi.small.end()) {
+            fi.edges -= s->second.size();
+            out.push_back(Taken{fi.field, std::move(s->second)});
+            fi.small.erase(s);
+        }
+    }
+    return out;
+}
+
+void Model::ReferrerIndex::restore(std::uint32_t target, Taken taken) {
+    FieldIndex& fi = fields_[by_field_.at(taken.field)];
+    // Small form: puts the vector back.
+    if (auto* ids = std::get_if<std::vector<Id>>(&taken.ids)) {
+        fi.edges += ids->size();
+        fi.small[target] = std::move(*ids);
+        return;
+    }
+    IdSet& set = std::get<IdSet>(taken.ids);
+    fi.edges += set.size();
+    fi.hubs[target] = std::move(set);
+}
+
+std::size_t Model::ReferrerIndex::target_count() const {
+    std::unordered_set<std::uint32_t> targets;
+    // Collects every target that has referrers through any field.
+    for (const FieldIndex& fi : fields_) {
+        for (const auto& [target, ids] : fi.small) {
+            (void)ids;
+            targets.insert(target);
+        }
+        for (const auto& [target, set] : fi.hubs) {
+            (void)set;
+            targets.insert(target);
+        }
+    }
+    return targets.size();
+}
+
+std::size_t Model::ReferrerIndex::edge_count() const {
+    std::size_t n = 0;
+    for (const FieldIndex& fi : fields_) n += fi.edges;
+    return n;
+}
+
+std::size_t Model::ReferrerIndex::hub_count() const {
+    std::size_t n = 0;
+    for (const FieldIndex& fi : fields_) n += fi.hubs.size();
+    return n;
+}
+
 // referrers_ maintenance: the writer-private reverse index that drives
-// cascade delete (invariant 8). Keyed by TARGET slot index (bare, not a full
-// Id -- only the live generation of a slot can ever be the target of a
-// live Ref, so the generation would be redundant), each bucket is a
-// vector<RefEdge> naming every field, on every object, currently pointing at
-// that slot. add_out_refs/drop_out_refs add or remove an object's WHOLE
+// cascade delete (invariant 8). Split by referring field, then keyed by
+// TARGET slot index (bare, not a full Id -- only the live generation of a
+// slot can ever be the target of a live Ref, so the generation would be
+// redundant); each entry holds the ids of the objects whose field currently
+// points at that slot. add_out_refs/drop_out_refs add or remove an object's WHOLE
 // outgoing edge set at once (create/delete); reconcile_out_refs below
 // diffs an update's before/after instead, touching only the fields whose
 // target actually changed.
@@ -1088,8 +1239,8 @@ void Model::add_out_refs(const ObjectBase* o) {
         // edge so drop_out_refs/reconcile can later find and remove exactly
         // this (from, field) pair without disturbing some other field on the
         // same object that happens to point at the same target.
-        referrers_[target.index].push_back(RefEdge{from, field, nullable});
-        log(ReferrersPopBack{target.index});  // exact inverse of the push_back above
+        referrers_.add(target.index, from, field, nullable);
+        log(ReferrersRemoveEdge{target.index, from, field});
     });
 }
 
@@ -1097,21 +1248,9 @@ void Model::drop_out_refs(const ObjectBase* o) {
     const Id from = o->id;
     o->each_ref([&](const void* field, const char* /*name*/, Id target, bool /*nullable*/) {
         if (!target) return;
-        auto it = referrers_.find(target.index);
-        if (it == referrers_.end())
-            return;  // nothing indexed for this target (shouldn't happen if
-                     // add_out_refs was called for every create, but a
-                     // missing bucket is harmless to tolerate here)
-        auto& v = it->second;
-        // Find the specific edge this (from, field) pair added -- v may hold
-        // edges from many OTHER objects/fields pointing at the same target.
-        auto pos = std::find_if(v.begin(), v.end(), [&](const RefEdge& e) {
-            return e.from == from && e.field == field;
-        });
-        if (pos == v.end()) return;
-        const RefEdge edge = *pos;  // saved for the rollback op -- `pos` itself won't survive the erase
-        v.erase(pos);
-        log(ReferrersPushEdge{target.index, edge});
+        // Logs the removal so a rollback can add the edge back; an edge that was never indexed logs nothing.
+        if (referrers_.remove(target.index, from, field))
+            log(ReferrersAddEdge{target.index, from, field});
     });
 }
 
@@ -1131,34 +1270,25 @@ void Model::reconcile_out_refs(const ObjectBase* before, const ObjectBase* after
     // vector beats an unordered_map here: one heap allocation for the whole
     // vector instead of one hash-table node allocation per field.
     std::vector<std::pair<const void*, Id>> old_targets;
+    // Records every field's target as it was before the update.
     before->each_ref([&](const void* field, const char*, Id target, bool) {
         old_targets.emplace_back(field, target);
     });
 
+    // Moves the edge of each field whose target changed.
     after->each_ref([&](const void* field, const char*, Id new_target, bool nullable) {
         const auto it = std::find_if(old_targets.begin(), old_targets.end(),
                                      [&](const auto& p) { return p.first == field; });
         const Id old_target = (it != old_targets.end()) ? it->second : Id{};
         if (new_target == old_target) return;
 
-        if (old_target) {
-            auto rit = referrers_.find(old_target.index);
-            if (rit != referrers_.end()) {
-                auto& v = rit->second;
-                auto pos = std::find_if(v.begin(), v.end(), [&](const RefEdge& e) {
-                    return e.from == id && e.field == field;
-                });
-                if (pos != v.end()) {
-                    const RefEdge edge = *pos;
-                    v.erase(pos);
-                    if (v.empty()) referrers_.erase(rit);
-                    log(ReferrersPushEdge{old_target.index, edge});
-                }
-            }
-        }
+        // Removes the field's edge from the old target, logging it so a rollback can restore it.
+        if (old_target && referrers_.remove(old_target.index, id, field))
+            log(ReferrersAddEdge{old_target.index, id, field});
+        // Adds the field's edge to the new target, logging its inverse.
         if (new_target) {
-            referrers_[new_target.index].push_back(RefEdge{id, field, nullable});
-            log(ReferrersPopBack{new_target.index});  // exact inverse of the push_back above
+            referrers_.add(new_target.index, id, field, nullable);
+            log(ReferrersRemoveEdge{new_target.index, id, field});
         }
     });
 }
@@ -1777,11 +1907,9 @@ Model::Diagnostics::Status Model::diagnostics() const {
             by_cached_field_.size() + by_cached_field_merged_.size() + by_cached_field_narrow_.size();
         diag.cached_reference_indexed_fields = by_cached_reference_.size();
 
-        diag.reverse_index_targets = referrers_.size();
-        for (const auto& [slot, edges] : referrers_) {
-            (void)slot;
-            diag.reverse_index_edges += edges.size();
-        }
+        diag.reverse_index_targets = referrers_.target_count();
+        diag.reverse_index_edges = referrers_.edge_count();
+        diag.reverse_index_hub_targets = referrers_.hub_count();
 
         diag.pre_transactions_hook_installed = static_cast<bool>(pre_transactions_);
         diag.pre_commit_hook_installed = static_cast<bool>(pre_commit_);
@@ -2109,10 +2237,8 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
             const Id x = frontier.back();
             frontier.pop_back();
             if (!doomed.insert(x.index).second) continue;  // cycles terminate here too
-            auto it = referrers_.find(x.index);
-            if (it == referrers_.end()) continue;
-            for (const RefEdge& e : it->second)
-                if (!e.nullable) frontier.push_back(e.from);
+            // Queues every referrer that cannot survive its target.
+            referrers_.for_each_required(x.index, [&](const Id& from) { frontier.push_back(from); });
         }
     }
 
@@ -2125,9 +2251,7 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
         // Copy the referrer list: we are about to mutate it (both directly,
         // via the erase below, and indirectly, via reconcile_out_refs
         // inside the nullable branch) while iterating what it pointed to.
-        auto it = referrers_.find(x.index);
-        const std::vector<RefEdge> edges =
-            (it == referrers_.end()) ? std::vector<RefEdge>{} : it->second;
+        const std::vector<RefEdge> edges = referrers_.edges_of(x.index);
 
         // Every edge currently pointing AT x: for a NULLABLE field, clear
         // just that field (the referrer survives) -- unless the referrer is
@@ -2174,12 +2298,9 @@ std::vector<Id> Model::remove_raw(std::vector<Id> work, bool keep_undo) {
         // victim.index should have no remaining incoming edges (its referrers
         // were cascaded or nulled above), but if any survive, preserve them for
         // rollback. In practice this is empty; capture it to be exact.
-        auto rit = referrers_.find(x.index);
-        if (rit != referrers_.end()) {
-            std::vector<RefEdge> saved = std::move(rit->second);
-            referrers_.erase(rit);
-            log(RestoreReferrersBucket{x.index, std::move(saved)});
-        }
+        // Moves any remaining incoming edges out of the index, logging each field's so a rollback can restore it.
+        for (ReferrerIndex::Taken& t : referrers_.take(x.index))
+            log(RestoreReferrersBucket{x.index, std::make_unique<ReferrerIndex::Taken>(std::move(t))});
 
         const TypeTag tag = victim->tag();
         auto& sub = logged_index_entry(by_type_, dirty_by_type_, tag);
@@ -3155,7 +3276,7 @@ void Model::add_out_refs_no_log(const ObjectBase* o) {
     const Id from = o->id;
     o->each_ref([&](const void* field, const char*, Id target, bool nullable) {
         if (!target) return;
-        referrers_[target.index].push_back(RefEdge{from, field, nullable});
+        referrers_.add(target.index, from, field, nullable);
     });
 }
 

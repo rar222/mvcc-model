@@ -76,6 +76,27 @@ TEST(
     for (int i = 0; i < 10; ++i)
         seed_orders.push_back(make_order(m, "O" + std::to_string(i), accounts[i % 4]));
 
+    // 100 orders on accounts[0] put that account's Order::account referrers in hub form from the start.
+    // Writers remove and repoint orders from this pool and from the W orders they create, so hub
+    // removal, repointing and demotion run under real concurrent commits.
+    std::mutex live_orders_mu;
+    std::vector<Ref<Order>> live_orders;
+    std::atomic<std::uint64_t> hub_ops{0};
+    // Creates the 100 seed orders in one commit.
+    {
+        Transaction seed = m.begin();
+        std::vector<Ref<Order>> locals;
+        // Builds each order on accounts[0].
+        for (int i = 0; i < 100; ++i) {
+            auto o = std::make_unique<Order>();
+            o->code = "H" + std::to_string(i);
+            o->account = accounts[0];
+            locals.push_back(seed.create(std::move(o)));
+        }
+        const CommitResult res = commit_ok(m, seed);
+        for (const Ref<Order>& l : locals) live_orders.push_back(res.to_real(l));
+    }
+
     std::atomic<bool> stop{false};
     std::atomic<std::uint64_t> resolved{0};
     std::atomic<std::uint64_t> snaps{0};
@@ -149,12 +170,33 @@ TEST(
                 auto o = std::make_unique<Order>();
                 o->code = "W" + std::to_string(next_id.fetch_add(1));
                 o->account = accounts[rng() % accounts.size()];
-                txn.create(std::move(o));
+                const Ref<Order> local = txn.create(std::move(o));
+                const CommitResult res = m.try_commit(txn);
+                // Publishes the committed order so later rolls can remove or repoint it.
+                if (res.status == CommitStatus::Committed) {
+                    std::lock_guard<std::mutex> lk(live_orders_mu);
+                    live_orders.push_back(res.to_real(local));
+                }
+                continue;
             } else if (roll < 75) {
                 if (Order* o = txn.update(seed_orders[rng() % seed_orders.size()]))
                     o->qty = static_cast<std::int64_t>(rng() % 50);
-            } else if (roll < 90) {
+            } else if (roll < 83) {
                 txn.remove(seed_orders[rng() % seed_orders.size()]);
+            } else if (roll < 90) {
+                Ref<Order> victim;
+                // Picks a random order from the shared pool.
+                {
+                    std::lock_guard<std::mutex> lk(live_orders_mu);
+                    victim = live_orders[rng() % live_orders.size()];
+                }
+                // Removes the order half the time, else repoints it to a random account.
+                hub_ops.fetch_add(1);
+                if (rng() % 2 == 0) {
+                    txn.remove(victim);
+                } else if (Order* o = txn.update(victim)) {
+                    o->account = accounts[rng() % accounts.size()];
+                }
             } else if (roll < 96) {
                 // All 3 writer threads racing to touch CoarseThing's Coarse-
                 // tagged by_key_ entry for the first time -- exactly the
@@ -238,6 +280,11 @@ TEST(
     std::thread acc(accessor_hammer);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Extends the run, up to 10 s, until a CoarseThing was created and a hub-pool order was touched; a
+    // fixed window is too short under asan.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while ((coarse_created.load() == 0 || hub_ops.load() == 0) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     stop = true;
     w1.join();
     w2.join();
@@ -252,6 +299,7 @@ TEST(
     CHECK(resolved.load() > 0);
     CHECK(accessor_calls.load() > 0);
     CHECK(coarse_created.load() > 0);
+    CHECK(hub_ops.load() > 0);
 
     Snapshot final_s = m.snapshot();
     final_s.for_each<Order>(
@@ -267,6 +315,20 @@ TEST(
         ++coarse_seen;
     });
     CHECK_EQ(coarse_seen, coarse_created.load());
+
+    // The reverse index, hub form included, must still name every referrer the run left:
+    // deleting an account has to kill exactly the orders that reference it.
+    std::vector<std::size_t> per_account(accounts.size(), 0);
+    // Counts the surviving orders per account.
+    final_s.for_each<Order>([&](const Order& o) {
+        for (std::size_t i = 0; i < accounts.size(); ++i)
+            if (o.account.id() == accounts[i].id()) ++per_account[i];
+    });
+    for (std::size_t i = 0; i < accounts.size(); ++i)
+        CHECK_EQ(remove_and_commit(m, accounts[i]), 1 + per_account[i]);
+    std::size_t orders_left = 0;
+    m.snapshot().for_each<Order>([&](const Order&) { ++orders_left; });
+    CHECK_EQ(orders_left, std::size_t{0});
 }
 
 // The intersection the individual hook tests above never cover: every hook
