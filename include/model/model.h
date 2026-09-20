@@ -12,17 +12,16 @@
 //   - readers take an O(1) immutable snapshot; refs resolve within it
 //   - subscribers get a bounded, coalescing queue of change events
 //
-// See DESIGN.md for why it is built this way, and for how this differs from
-// its single-writer sibling project (snapshot-model). The load-bearing
-// decision carried over unchanged: there is no per-object refcount anywhere.
-// Chunks hold raw pointers so that copying one is a memcpy, and lifetime is
-// handled by a version watermark instead.
+// See DESIGN.md for why it is built this way. Two decisions are load-bearing.
+// First, there is no per-object refcount anywhere: chunks hold raw pointers
+// so that copying one is a memcpy, and lifetime is handled by a version
+// watermark instead.
 //
-// The load-bearing decision that's NEW here: cascade-delete resolution is
-// deferred to commit time. That one choice is what keeps the reverse index
-// (referrers_) a single, writer-owned structure -- never per-transaction,
-// never needing to be merged -- even though many threads can now build
-// transactions concurrently. See CLAUDE.md invariant 8.
+// Second, cascade-delete resolution is deferred to commit time. That one
+// choice keeps the reverse index (referrers_) a single, writer-owned
+// structure -- never per-transaction, never needing to be merged -- even
+// though many threads build transactions concurrently. See CLAUDE.md
+// invariant 8.
 //
 // Comment style used throughout this file:
 //   ///        doc comment for whatever declaration follows it
@@ -3509,10 +3508,8 @@ public:
     /// exactly the same quantity Diagnostics::Status::reap_backlog reports, just
     /// without diagnostics()'s cost of also copying spine/index sizes and
     /// the live-snapshot/subscriber sections. retired_ is commit_mu_-
-    /// protected (unlike the single-writer sibling, where it was safe to
-    /// read unsynchronized from the one writer thread that owned it -- here
-    /// any thread may call this while another holds commit_mu_, so the read
-    /// needs the same lock apply() does).
+    /// protected: any thread may call this while another holds commit_mu_,
+    /// so the read needs the same lock apply() does.
     std::size_t reap_backlog() const {
         std::lock_guard lk(commit_mu_);
         return reap_backlog_.load(std::memory_order_relaxed) + retired_.size();
@@ -4883,11 +4880,10 @@ private:
 
     // ---- commit-lock-protected state ----------------------------------------
     // Touched ONLY by whichever thread currently holds commit_mu_, only from
-    // inside try_commit(). This is exactly the old single-writer-thread state
-    // (referrers_, by_type_, ...), unchanged in shape -- it's now protected by
-    // an actual mutex instead of "single-threaded by convention," which is
-    // strictly safer, not a rewrite. See CLAUDE.md invariant 7 and the lock
-    // order rule (commit_mu_ -> ver_mu_ -> reap_mu_, never reversed).
+    // inside try_commit(). This is the writer-private state (referrers_,
+    // by_type_, ...), made safe for concurrent writer threads by the mutex.
+    // See CLAUDE.md invariant 7 and the lock order rule
+    // (commit_mu_ -> ver_mu_ -> reap_mu_, never reversed).
     mutable std::mutex commit_mu_;
     std::atomic<std::thread::id> commit_owner_{};  ///< thread currently holding commit_mu_, or the
                                                     ///< default id when unheld; set/cleared only by
@@ -5647,9 +5643,8 @@ public:
     /// Copy-on-write handle, scoped to this transaction: clones from base()
     /// (or returns the same clone again, if this id was already touched this
     /// transaction) and returns a mutable pointer, fully local until commit.
-    /// Unlike the single-writer design's update(), there is no deferred
-    /// reconciliation step to worry about -- write whatever you like, in any
-    /// order, any number of times; try_commit() sees only the final value.
+    /// Write whatever you like, in any order, any number of times;
+    /// try_commit() reconciles the indexes against the final value only.
     /// Null if the target doesn't exist as of this transaction's base(), or
     /// (if it's a local id) was removed earlier in this same transaction.
     template <class T>
@@ -5675,11 +5670,11 @@ public:
     /// the SAME clone, so writes accumulate.
     ObjectBase* update_raw(Id id);
 
-    /// Records an INTENT to delete -- unlike the single-writer design's
-    /// remove(), this does NOT resolve cascade fan-out now (that can only be
-    /// computed correctly against the single, up-to-date, authoritative
-    /// reverse index, which is exactly what try_commit()'s serialized apply
-    /// phase has and a Transaction's private overlay does not). The full
+    /// Records an INTENT to delete. This does NOT resolve cascade fan-out
+    /// now (that can only be computed correctly against the single,
+    /// up-to-date, authoritative reverse index, which is exactly what
+    /// try_commit()'s serialized apply phase has and a Transaction's private
+    /// overlay does not). The full
     /// resolved kill list -- including everything cascade-deleted -- is only
     /// available afterward, in CommitResult::changes.
     ///

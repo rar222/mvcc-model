@@ -9,12 +9,12 @@ version watermark, not a structure — is what makes freeing either of them safe
 
 | Structure | What it stores | COW granularity | File |
 |---|---|---|---|
-| **The spine** | every object, by `Id` | one `Chunk` (256 slots) | `include/model/model.h` (`Root::spine`, `Chunk`) |
-| **The HAMT tries** (`by_type`, `by_field`, `by_cached_field`, `by_cached_reference`) | every index over those objects | one trie node per 5-bit hash slice on the path to the touched entry | `include/model/persistent_map.h` |
+| **The spine** | every object, by `Id` | one `Chunk` (4,096 slots) | `include/model/model.h` (`Root::spine`, `Chunk`) |
+| **The HAMT tries** (`by_type`, `by_key`, `by_key_narrow`, `by_cached_field`, `by_cached_field_merged`, `by_cached_field_narrow`, `by_cached_reference`) | every index over those objects | one trie node per 5-bit hash slice on the path to the touched entry | `include/model/persistent_map.h` |
 
 Both follow the same rule: a commit clones only what's on the path from root to the thing it
-touched. Everything else is a `shared_ptr` copy pointing at the exact memory the previous
-`Root` pointed at.
+touched. Everything else is a handle copy pointing at the exact memory the previous `Root`
+pointed at.
 
 ---
 
@@ -24,33 +24,33 @@ An `Id` is `{index, generation}`. The spine turns `index` into an object with tw
 two indexed loads — no hashing, no probing:
 
 ```
-Id{ index = 0x0000_0301, gen = 7 }
+Id{ index = 0x0000_3001, gen = 7 }
                     |
-        index >> 8  |  index & 0xFF     (kChunkBits = 8, kChunkSize = 256)
+       index >> 12  |  index & 0xFFF    (kChunkBits = 12, kChunkSize = 4096)
        +------------+------------+
        v                         v
    chunk = 3                  slot = 1
        |
        v
  spine[3] --> Chunk
-              +-----------------------------------------+
-              | obj[0] obj[1] obj[2] obj[3] ... obj[255] |
-              | gen[0] gen[1] gen[2] gen[3] ... gen[255] |
-              +-----------------------------------------+
+              +-------------------------------------------+
+              | obj[0] obj[1] obj[2] obj[3] ... obj[4095] |
+              | gen[0] gen[1] gen[2] gen[3] ... gen[4095] |
+              +-------------------------------------------+
                         ^
                         `-- slot 1: obj[1] is this Id's object,
                             IF gen[1] == 7 (else: stale, return null)
 ```
 
-`Root::spine` (model.h:749) is `std::vector<shared_ptr<const Chunk>>` — a flat array of
-pointers to fixed-size, immutable chunks. `Chunk` itself holds RAW pointers (`const
-ObjectBase* obj[256]`), not `shared_ptr<const ObjectBase>` — a deliberate choice (see
-CLAUDE.md's "Why not shared_ptr in Chunk") so that cloning a chunk is one `memcpy`, not 256
-atomic refcount bumps. Object lifetime is handled entirely by the watermark in §3 instead.
+`Root::spine` is `std::vector<shared_ptr<const Chunk>>` — a flat array of pointers to
+fixed-size, immutable chunks. `Chunk` itself holds RAW pointers (`const ObjectBase*
+obj[kChunkSize]`), not `shared_ptr<const ObjectBase>` — a deliberate choice (see CLAUDE.md's
+"Why not shared_ptr in Chunk") so that cloning a chunk is one `memcpy`, not 4,096 atomic
+refcount bumps. Object lifetime is handled entirely by the watermark in §3 instead.
 
 ### COW on the spine
 
-A commit that touches ONE object clones ONE chunk (`Model::cow`, `src/model.cpp:395`) —
+A commit that touches ONE object clones ONE chunk (`Model::cow`) —
 every other chunk pointer is copied as-is into the new `Root`:
 
 ```
@@ -79,13 +79,15 @@ same commit mutate the clone in place.
 
 ## 2. The HAMT tries: path-copying a 32-ary trie
 
-Every secondary index (`by_type`, `by_field`, `by_cached_field`, `by_cached_reference`) is a
+Every secondary index (`by_type`, `by_key`, `by_key_narrow`, `by_cached_field`,
+`by_cached_field_merged`, `by_cached_field_narrow`, `by_cached_reference`) is built from
 `PersistentMap`/`PersistentSet` — a HAMT (hash array mapped trie): a trie keyed on 5-bit
-slices of the entry's 64-bit hash, 32-ary at every level (`TrieCore`,
-`include/model/persistent_map.h:83`). A real node holds a 32-bit bitmap (which of the 32
-possible children are present) plus two parallel, densely packed vectors (`children`,
-`leaves`) — no wasted slots for absent children, and a leaf holds one entry inline plus a
-collision-chain link (`Leaf::next`), almost always null.
+slices of the entry's 64-bit hash, 32-ary at every level (`TrieCore` in
+`include/model/persistent_map.h`). A node holds a 32-bit `bitmap` (which of the 32 possible
+children are present), an `is_leaf` bitmap (which of those are leaves rather than nodes) and
+one densely packed `slots` array with exactly one handle per present child — no wasted slots
+for absent children. A leaf holds one entry inline plus a collision-chain link (`Leaf::next`),
+almost always empty; under a perfect hash such as `IdHash` the link is a zero-sized `NoChain`.
 
 Simplified to 4-way branching below for the diagram — the real trie is 32-way, 5 hash bits
 consumed per level:
@@ -102,9 +104,9 @@ consumed per level:
 
 ### Setting one key
 
-`set_in()` (`persistent_map.h:229`) walks the trie from the root, one 5-bit slice at a time.
-At each level it clones ONLY the node on the path to the target slot (`clone_node`,
-`persistent_map.h:146`) and re-links it to the untouched, shared siblings:
+`set_in()` walks the trie from the root, one 5-bit slice at a time. At each level it clones
+ONLY the node on the path to the target slot (`clone_node`) and re-links it to the untouched,
+shared siblings:
 
 ```
    old root (v1)                          new root (v2) -- CLONED
@@ -124,9 +126,9 @@ Only the nodes on ONE root-to-leaf path are ever cloned — `O(log32 n)` nodes f
 entries, the same bound `DESIGN.md` cites for why deriving a new `Root` costs proportional
 to the CHANGE, never to the index's size. A true collision (two distinct keys sharing a full
 64-bit hash) pushes down into a fresh subtree, or — once hash bits run out — chains inside a
-`Leaf`; editing a chain deep-copies its surviving links (`chain_copy`/`chain_set`,
-`persistent_map.h:165-201`) rather than sharing them, because a shared tail link could
-otherwise be mutated out from under an old, published version.
+`Leaf`; editing a chain deep-copies its surviving links (`chain_copy`/`chain_set`) rather than
+sharing them, because a chain tail is exclusively owned by its head (`unique_ptr`) and two
+versions sharing one would be a use-after-free.
 
 ---
 
@@ -148,12 +150,11 @@ Model::live_   (version -> refcount)          Model::root_  (atomic: current pub
 ```
 
 Every `Snapshot` (and every `Transaction`'s `base()`, which is itself a `Snapshot`) holds a
-`Lease` (`src/model.cpp:65`) — an RAII handle that increments `live_[version]` in its
-constructor and decrements it in its destructor (`Model::release_version`,
-`src/model.cpp:829`). `Model::snapshot()` registers a version under `ver_mu_` in the SAME
-critical section that loads `root_`, and `publish_now()` does the same for the version it
-just published (`src/model.cpp:330-347`, `1345-1349`) — so a version is never observably
-"current" before it's already un-freeable.
+`Lease` (`Snapshot::Lease`) — an RAII handle whose destructor calls `Model::release_version`,
+decrementing `live_[version]`. `Model::snapshot()` registers a version under `ver_mu_` in the
+SAME critical section that loads `root_`, and `publish_now()` does the same for the version
+it just published — so a version is never observably "current" before it's already
+un-freeable.
 
 When a commit overwrites or removes something, the OLD copy is handed to the reaper tagged
 with the version it stops being visible from:
@@ -166,7 +167,7 @@ Model::retire(X)  --->  retired_.push_back({ version_ + 1  /* = 6 */, X })
              reap_queue_: [ (invisible_from = 6, X), ... ]
 ```
 
-The background reaper thread (`Model::reaper_loop`, `src/model.cpp:245`) wakes on new work or
+The background reaper thread (`Model::reaper_loop`) wakes on new work or
 a dropped `Lease`, reads the current watermark, and frees exactly what no live version can
 still see:
 
@@ -180,33 +181,36 @@ watermark (min_live) = 7   -->  7 >= 6  -->  no live version is old enough to ne
                                               -> delete X, drop it from reap_queue_
 ```
 
-This is the ONE mechanism underneath both structures in §1 and §2. A retired `Chunk`'s old
-version and an orphaned trie node are freed by two different low-level means — plain
-`shared_ptr` refcounting for trie nodes (the last `Root` pointing at one drops it
-automatically when that `Root` itself is destroyed) and the explicit `reap_queue_`/watermark
-walk above for the raw-pointer `ObjectBase`s a `Chunk` holds — but both are only safe because
-of the same guarantee: nothing disappears while `live_`'s minimum key is still old enough to
-need it.
+This is the ONE mechanism underneath both structures in §1 and §2. A retired `Chunk`
+and an orphaned trie node are freed by two different low-level means — reference counting
+(`shared_ptr` for chunks, the trie's own intrusive atomic `RcHandle` for nodes and leaves; the
+last `Root` pointing at one drops it automatically when that `Root` itself is destroyed) and
+the explicit `reap_queue_`/watermark walk above for the raw-pointer `ObjectBase`s a `Chunk`
+holds — but both are only safe because of the same guarantee: nothing disappears while
+`live_`'s minimum key is still old enough to need it.
 
 ---
 
 ## 4. One commit, end to end
 
 Putting §1–§3 together: a `try_commit()` that changes one `Order`'s `qty`, a field also
-tagged `LookupType::Cache` in `define_fields()`:
+tagged `LookupType::Exact` in `define_fields()` (an `int64` field, so its index lives in
+`by_cached_field_narrow_`; a string-valued field's lives in `by_cached_field_`):
 
 ```
  1. Model::cow(chunk_of(order.id))                      -- clone ONE Chunk               (S1)
        spine_[c] = make_shared<Chunk>(*spine_[c]);
        write the updated Order into the clone's slot
 
- 2. by_cached_field_[qty_tag].set(old_qty_key, ...)      -- path-copy the OLD-value
-    by_cached_field_[qty_tag].set(new_qty_key, ...)      -- and NEW-value trie buckets  (S2)
+ 2. by_cached_field_narrow_[qty_tag].set(old_qty_key, ...)  -- path-copy the OLD-value
+    by_cached_field_narrow_[qty_tag].set(new_qty_key, ...)  -- and NEW-value trie buckets  (S2)
        clone only the nodes on each root-to-leaf path
 
  3. publish_now():
        r->spine = spine_;                      -- O(#chunks) shared_ptr copies, one is new
-       r->by_cached_field = by_cached_field_;   -- O(#cached fields) shared_ptr copies
+       r->by_cached_field_narrow = by_cached_field_narrow_;
+                                               -- O(#cached fields) handle copies (as does
+                                                  every other index map on Root)
        root_.store(r);  live_[r->version]++;    -- new Root visible, already un-freeable
 
  4. whatever this commit orphaned (the pre-commit Chunk, any displaced trie node):

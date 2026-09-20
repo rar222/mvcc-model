@@ -1,10 +1,8 @@
 # Design
 
 Why the model is built the way it is. `CLAUDE.md` has the rules; this is the reasoning
-behind them. This project is a sibling of `snapshot-model` (single-writer); read that
-project's own DESIGN.md for the storage/reclamation/events narrative in full — it is
-reproduced here because this project no longer depends on that one, but nothing about it
-changed. The new material is the "Multi-writer optimistic concurrency" section.
+behind them. It covers storage, identity, lookups, multi-writer optimistic concurrency,
+referential integrity, reclamation and events.
 
 ## Requirements
 
@@ -42,28 +40,35 @@ refcounts out of the hot structure entirely:
   reader acquires a snapshot, not one per object.
 - Lifetime is therefore **version-based (epoch/RCU) reclamation**, not refcounting.
 
-Everything unusual in the codebase, including the multi-writer redesign below, is downstream
-of this decision. None of it changed by adding multiple writers — a `Transaction` still
-publishes through the exact same immutable, COW `Root`.
+Everything unusual in the codebase, including the multi-writer design below, is downstream
+of this decision. A `Transaction` publishes through the same immutable, COW `Root` that every
+reader sees.
 
 ## Structure
 
 ```
-Root { version, spine, by_type, by_field, by_cached_field, by_cached_reference }
-  spine             : vector<shared_ptr<const Chunk>>   ~n/256 entries; copied whole per commit
-  Chunk             : 256 x const ObjectBase*            COW; copied only when dirtied
-                       256 x uint32 generation
-  by_type           : unordered_map<TypeTag, PersistentMap<Id>>
+Root { version, spine, by_type, by_key, by_key_narrow,
+       by_cached_field, by_cached_field_merged, by_cached_field_narrow, by_cached_reference }
+  spine             : vector<shared_ptr<const Chunk>>   ~n/4096 entries; copied whole per commit
+  Chunk             : 4096 x const ObjectBase*           COW; copied only when dirtied
+                       4096 x uint32 generation
+  by_type           : unordered_map<TypeTag, PersistentSet<Id>>
                        internal, Id-keyed: what for_each<T>() scans
-  by_field          : unordered_map<field_tag, PersistentMap<Id>>
+  by_key            : unordered_map<field_tag, DedupMap<string, Id>>
                        unique lookup index, see define_keys()
-  by_cached_field   : unordered_map<field_tag, PersistentMap<PersistentMap<Id>>>
-                       multi-match index, see define_fields()'s LookupType::Cache fields
-  by_cached_reference : unordered_map<field_tag, PersistentMap<PersistentMap<Id>>>
-                       reverse-lookup index, see define_references()'s LookupType::Cache fields
+  by_key_narrow     : unordered_map<field_tag, PersistentMap<uint64, Id>>
+                       the same index for narrow (<= 8-byte) Exact key fields
+  by_cached_field   : unordered_map<field_tag, DedupMap<string, PersistentSet<Id>>>
+                       multi-match index, see define_fields()'s LookupType::Exact fields
+  by_cached_field_merged : unordered_map<field_tag, PersistentMap<uint64, PersistentSet<Id>>>
+                       the same index with coarse-prefix buckets, see LookupType::Coarse fields
+  by_cached_field_narrow : unordered_map<field_tag, PersistentMap<uint64, PersistentSet<Id>>>
+                       the same index for narrow Exact fields
+  by_cached_reference : unordered_map<field_tag, PersistentMap<Id, PersistentSet<Id>>>
+                       reverse-lookup index, see define_references()'s RefLookupType::Exact fields
 ```
 
-All published atomically as one immutable `Root`. A read is `spine[k >> 8]->obj[k & 0xff]`
+All published atomically as one immutable `Root`. A read is `spine[k >> kChunkBits]->obj[k & kChunkMask]`
 — an array index. No hashing, no trie walk, one cache miss.
 
 ### Identity
@@ -79,7 +84,7 @@ Nullability is a property of the field type — the visitor that nulls a field d
 cascade (`RefNuller`) has *no overload* that can clear a `Ref<T>`. A type's
 `define_references()` enumerates its reference fields once, and that single list drives
 `clone()`, the reverse index, cascade delete, nulling, **and** local-id remapping
-(`RefRemapper` — new in this project, see below).
+(`RefRemapper`, see below).
 
 A reference is still just an `Id` underneath; it resolves through a `Snapshot`, never itself.
 The alternative — a "fat" ref carrying a pointer to its snapshot root — means every stored
@@ -87,14 +92,16 @@ ref pins a snapshot alive, stalling reclamation.
 
 ### Lookup families: unique, and cost-transparent multi-match
 
-`define_keys()` is the baseline index: one `PersistentMap<Id>` per declared field, UNIQUE (a
-duplicate value silently overwrites the earlier one), O(log n) via `find_by_key`. Everything
+`define_keys()` is the baseline index: one persistent map per declared field (`by_key`, or
+`by_key_narrow` for narrow key types), UNIQUE (a create or update that duplicates another live
+object's value is rejected as `Invalid`), O(log n) via `find_by_key`. Everything
 past that is "give me every match," and is exposed through a single entry point per shape —
 `find_by_field` for a value field, `find_referrers` for "who points at this?" — that resolves
 via an index when one exists and transparently falls back to a scan when it doesn't, rather
 than requiring the caller to name which of two functions to call. Each field declared in
-`define_fields()`/`define_references()` carries a `LookupType` tag, `Cache` or `Scan` — exactly
-one, never both (enforced by an assert the first time each type's declarations run, see
+`define_fields()`/`define_references()` carries a lookup tag — `LookupType` (`Exact`, `Coarse` or `Scan`) for a field, `RefLookupType`
+(`Exact` or `Scan`) for a reference — exactly one, never both (enforced by an assert the first
+time each type's declarations run, see
 `Object<Derived>::validate_field_declarations`/`validate_ref_declarations`):
 
 - **`LookupType::Scan`.** No index at all — the declaration is purely a *visibility gate* (a
@@ -103,30 +110,32 @@ one, never both (enforced by an assert the first time each type's declarations r
   O(#objects) linear scan comparing the field's real typed value. Zero write-side cost:
   nothing is touched at commit time. Right choice for a field queried rarely enough that
   paying per-query beats paying per-commit.
-- **`LookupType::Cache`.** A real index: `PersistentMap<PersistentMap<Id>>`, outer key the
-  field's own value (or, for a reference field, the *target's* `Id`), inner map a persistent
-  *set* of every matching object's `Id`. `find_by_field`/`find_referrers` resolve via this
-  index whenever the field is tagged this way. The inner map is deliberately a `PersistentMap`
-  bucket, never a flat `vector<Id>` — a flat bucket would make every mutation of a
-  low-cardinality value (a status, a category, a popular hub object) O(#objects sharing that
-  value), which is exactly the size-proportional cost this whole design exists to avoid. A
-  `PersistentMap` bucket keeps every mutation O(log n) regardless of how many objects share
-  the key. Maintained by the same three-function shape as every other index in this design
-  (`add_*`/`drop_*`/`reconcile_*`, undo-logged like everything else `try_commit()` touches),
-  wired into all four apply-phase sites that can change membership: create, update
-  (reconcile), cascade-null (reconcile), and cascade-delete (drop).
+- **`LookupType::Exact`.** A real index: a persistent map from the field's own value to a
+  persistent *set* of every matching object's `Id`. `find_by_field` resolves via this index
+  whenever the field is tagged this way. The bucket is deliberately a persistent set, never a
+  flat `vector<Id>` — a flat bucket would make every mutation of a low-cardinality value (a
+  status, a category) O(#objects sharing that value), which is exactly the size-proportional
+  cost this whole design exists to avoid. A persistent-set bucket keeps every mutation
+  O(log n) regardless of how many objects share the key. Maintained by the same
+  three-function shape as every other index in this design (`add_*`/`drop_*`/`reconcile_*`,
+  undo-logged like everything else `try_commit()` touches), wired into all four apply-phase
+  sites that can change membership: create, update (reconcile), cascade-null (reconcile), and
+  cascade-delete (drop).
+- **`LookupType::Coarse`.** The same index with buckets merged by a hash prefix, trading read
+  cost for memory: a lookup verifies each candidate's real value. Worth it only under the
+  conditions in `LookupType::Coarse`'s doc comment.
 
-For a reference field, `LookupType::Cache` is the read-side counterpart of `referrers_`
+For a reference field, `RefLookupType::Exact` is the read-side counterpart of `referrers_`
 (below): same "who points at this?" question, but published and O(log n + matches) instead of
 writer-private and O(1)-but-never-exposed. It supplies no value of its own (the target and
 nullability are already known from `define_references()`'s own list), just which fields are
 worth the index. `find_referrers` already works on any `Ref<>`/`Opt<>` field the moment it's
-listed in `define_references()`, `LookupType::Cache` or `Scan` alike — the tag only decides
+listed in `define_references()`, `Exact` or `Scan` alike — the tag only decides
 whether that lookup resolves via the index or the scan fallback.
 
-The cost of a `LookupType::Cache` field or reference is real: roughly one index entry per
+The cost of an `Exact` (or `Coarse`) field or reference is real: roughly one index entry per
 object per declared field, upkept inside `commit_mu_` on every commit that touches it — the
-same tax `by_type` already pays per object, just per declared field on top. That is why `Cache`
+same tax `by_type` already pays per object, just per declared field on top. That is why an index
 is opt-in rather than automatic, and why the scan fallback exists at all: index only what gets
 queried often at scale — `Model::lookup_stats()`/`lookup_diagnostics()` report, per field,
 how many calls actually resolved via the index versus fell back to the scan, which is the
@@ -134,12 +143,10 @@ signal for that decision — and leave the rest on the always-correct, zero-upke
 
 ## Multi-writer optimistic concurrency
 
-The single-writer sibling project can treat its reverse index (`referrers_`), its secondary
-indices, and its free list as **plain mutable writer-private state** — safe because there is
-only ever one writer, and it is always looking at the latest version. That assumption is
-gone here. The question this project had to answer: how do you let many threads mutate the
-model concurrently without turning `referrers_` into a structure that many transactions have
-to merge into?
+The reverse index (`referrers_`), the secondary indices and the free list are **plain
+mutable writer-private state**. With many writer threads, the design question is how to let
+them all mutate the model without turning `referrers_` into a structure that many
+transactions have to merge into.
 
 **The answer is to not let transaction-building touch `referrers_` (or any other shared
 state) at all.** A `Transaction` is a pile of purely local data: a pinned base `Snapshot`,
@@ -162,10 +169,10 @@ serialized** behind one mutex, `commit_mu_`. Inside that critical section:
    in the same transaction) get rewritten to real ids via `RefRemapper`. Updates are
    installed and their referrer/field-key edges reconciled **immediately** — not deferred to
    a later pass, because the very next step needs to see them.
-3. **Resolve remove-intents.** This is exactly the single-writer sibling's `remove_raw()`
-   BFS, reused essentially unchanged, run once per intent — now against `referrers_` as it
-   stands *after* this transaction's own updates have already been reconciled into it, so a
-   same-transaction "repoint away from X, then delete X" behaves correctly.
+3. **Resolve remove-intents.** `remove_raw()` runs its BFS once per intent, against
+   `referrers_` as it stands *after* this transaction's own updates have already been
+   reconciled into it, so a same-transaction "repoint away from X, then delete X" behaves
+   correctly.
 4. Every `validate()` call in steps 2–3 checks against **the current state**, not the
    transaction's base — so a `Ref<>` this transaction just created or repointed is checked
    against whatever is *actually* alive right now, not a possibly-stale view. This is what
@@ -173,24 +180,23 @@ serialized** behind one mutex, `commit_mu_`. Inside that critical section:
    with no separate re-validation pass.
 5. On failure (an integrity violation — reported by value as `CommitStatus::Conflict` or
    `Invalid` with `CommitResult::error`; this project has no exceptions — or a `false` from
-   the pre-commit hook), everything applied in this attempt unwinds via an undo log — the
-   same rollback mechanism the single-writer project uses for a failed `commit()`, just
-   scoped to one `try_commit()` attempt instead of an open-ended session.
+   the pre-commit hook), everything applied in this attempt unwinds via an undo log scoped to
+   that one `try_commit()` attempt.
 6. On success: version bump, COW `Root` build, atomic publish, subscriber notify, append to
    `changelog_`, prune whatever the changelog no longer needs.
 
 **Local placeholder ids** are what let a transaction build "create an Account, then create an
 Order referencing it" before either has a real id: the top bit of `Id::index` marks a value
 that is only meaningful inside the transaction that minted it, and `RefRemapper` rewrites
-every such id to its real one during apply. This needed zero changes to `Ref<T>`/`Opt<T>`
-themselves — remapping is just another visitor over `define_references()`, the same
-mechanism that already drives cloning, cascading, and nulling.
+every such id to its real one during apply. `Ref<T>`/`Opt<T>` need no special support —
+remapping is just another visitor over `define_references()`, the same mechanism that drives
+cloning, cascading, and nulling.
 
-**The changelog's retention piggybacks on the reclamation watermark that already exists.** A
+**The changelog's retention piggybacks on the reclamation watermark.** A
 `Transaction`'s base is a real, pinned `Snapshot` — registered in `live_` exactly like a
 reader's. So the watermark can never advance past any open transaction's base version, which
 means any changelog entry at or below that watermark can never be needed by a conflict check
-again. No separate bookkeeping; the existing reclamation machinery already proves it safe.
+again. No separate bookkeeping; the reclamation machinery proves it safe.
 
 ### What this buys, and what it costs
 
@@ -218,8 +224,7 @@ again. No separate bookkeeping; the existing reclamation machinery already prove
 At target scale (100k–1M objects), `Root::spine`'s per-commit cost is negligible:
 `publish_now()` republishes the *whole* spine — `r->spine = spine_`, one `shared_ptr<const
 Chunk>` copy per chunk, `O(total_slots / kChunkSize)` — regardless of how many objects the
-commit actually touched. At 1M objects and `kChunkBits = 8` (256 slots/chunk, the value this
-project started with) that's under 4,000 chunks: cheap enough to not show up.
+commit actually touched. At 1M objects and `kChunkBits = 8` (256 slots/chunk) that's under 4,000 chunks: cheap enough to not show up.
 
 That cost does not stay flat as the model grows past target scale, and it becomes the
 dominant cost well before 100M objects. Measured (default preset, `Order` — the heaviest
@@ -271,40 +276,34 @@ stat` / cachegrind), not a throughput benchmark, to pin down.
 
 ## Referential integrity
 
-Unchanged in mechanism from the single-writer sibling, just re-homed: `Model::validate()`
-rejects any object whose non-nullable refs are null or point at something dead, and it is
-called from inside `try_commit()`'s apply phase against current state. The reverse index
-(`Id -> [(referrer, field, nullable)]`) is still plain mutable state — it just now requires
-`commit_mu_` instead of "only one thread exists" to be safe to touch, and it is still
-writer-private: it can never be handed to a reader (that's the whole reason `by_cached_
-reference` — see "Lookup families" above, populated from `define_references()`'s
-`LookupType::Cache`-tagged fields — exists as a *separate*, published structure for the
-fields worth exposing that way).
+`Model::validate()` rejects any object whose non-nullable refs are null or point at
+something dead, and it is called from inside `try_commit()`'s apply phase against current
+state. The reverse index (`Id -> [(referrer, field, nullable)]`) is plain mutable state,
+safe to touch only while holding `commit_mu_`. It is writer-private: it can never be handed
+to a reader (that's the whole reason `by_cached_reference` — see "Lookup families" above,
+populated from `define_references()`'s `RefLookupType::Exact`-tagged fields — exists as a
+*separate*, published structure for the fields worth exposing that way).
 
-**Cascade fan-out is still unbounded and invisible to the caller** — same open TODO as the
-single-writer sibling (a two-phase plan/apply for `remove()` would help both projects
-equally).
+**Cascade fan-out is unbounded and invisible to the caller** until `try_commit()` returns. A
+two-phase plan/apply for `remove()` would fix that.
 
 ## Reclamation, Events
 
-Identical to the single-writer sibling in every respect: version-watermark-based
-reclamation, a background reaper, bounded coalescing subscriber queues. None of this needed
-to change — a `Transaction`'s base `Snapshot` participates in the watermark exactly like a
-reader's, and publication still happens at one point (the end of `try_commit()`), just
-reached by many possible callers instead of one dedicated thread.
+Reclamation is version-watermark-based, driven by a background reaper. Subscriber queues are
+bounded and coalescing. A `Transaction`'s base `Snapshot` participates in the watermark
+exactly like a reader's, and publication happens at one point, the end of `try_commit()`,
+reached by any writer thread.
 
-## What was learned building it
+## Design notes
 
-- **Reconciliation timing is the whole game.** The single-writer design deferred referrer/
-  field-key reconciliation to the end of `commit()`, comparing a baseline captured at
-  `update()`-call time against the final clone. This project's `Transaction::update()`
-  clones once, eagerly, and the caller writes to it directly — so reconciliation has to run
-  immediately, right after the object is fully written, not before. Getting this ordering
-  wrong for the *nullable-referrer* case inside the cascade BFS (`remove_raw`'s
-  now-immediate `clone_for_cascade_null` + `null_ref()` + reconcile sequence) would silently
-  reconcile against an object that hadn't been nulled yet — a guaranteed no-op that leaves a
-  phantom entry in the reverse index. Same failure shape as a bug the single-writer project
-  hit and fixed once already; worth naming explicitly so it doesn't come back.
+- **Reconciliation timing is the whole game.** `Transaction::update()` clones once,
+  eagerly, and the caller writes to the clone directly — so referrer/field-key
+  reconciliation has to run at apply time, right after the object is fully written, never
+  before. The same rule governs the *nullable-referrer* case inside the cascade BFS
+  (`remove_raw`'s `clone_for_cascade_null` + `null_ref()` + reconcile sequence):
+  reconciling before the nulling lands would silently reconcile against an object that
+  hadn't been nulled yet — a guaranteed no-op that leaves a phantom entry in the reverse
+  index.
 - **Deferring cascade to commit time is the one idea that makes any of this tractable.**
   Every other piece of shared state in `try_commit()` — the spine, the indices, the reverse
   index — can be touched by exactly one transaction at a time because `commit_mu_` says so.

@@ -10,10 +10,10 @@ A snapshot-isolated object model in C++20, with **multi-writer optimistic concur
 readers taking **O(1) immutable snapshots**, writers building a **local `Transaction`** and
 racing `try_commit()`, and subscribers receiving **coalescing change events**.
 
-This is a sibling project to `../snapshot-model`, which is the single-writer version. Read
-sides are identical; the write side was redesigned from scratch. `DESIGN.md` has the
-reasoning, especially the "Multi-writer optimistic concurrency" section. This file has the
-rules.
+Readers (`Snapshot`, `View<T>`, `Ref<T>`/`Opt<T>` resolution, the secondary indexes) and
+writers (`Transaction`, `try_commit()`) are two halves of one design: multi-writer optimistic
+concurrency control over immutable, versioned state. `DESIGN.md` has the reasoning,
+especially the "Multi-writer optimistic concurrency" section. This file has the rules.
 
 Target scale, which is what justifies every unusual decision below:
 
@@ -36,8 +36,8 @@ cmake --preset tsan && cmake --build --preset tsan -j && ctest --preset tsan
 ```
 
 **A change to the model is not done until `ctest --preset asan` and `ctest --preset tsan`
-both pass.** TSan matters more here than in the single-writer sibling: it's the preset that
-actually exercises concurrent `try_commit()` calls racing each other. The default preset
+both pass.** TSan is the preset that actually exercises concurrent `try_commit()` calls
+racing each other. The default preset
 deliberately keeps `assert` enabled (no `-DNDEBUG`), because `Snapshot::resolve()`'s assert
 is the tripwire for the central invariant. Do not add `NDEBUG` to the default preset.
 
@@ -49,7 +49,7 @@ src/model.cpp           all of the implementation
 include/example/types.h example user types (Account, Order) -- NOT part of the model
 examples/demo.cpp       concurrent demo: 3 writer threads racing try_commit(), 2 readers, 1 slow subscriber
 examples/commit_bench.cpp   commit latency vs. size, and throughput vs. writer-thread count
-tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that way)
+tests/                  test_*.cpp on a dependency-free harness, tests/test_harness.h (no gtest/Catch2 -- keep it that way)
 ```
 
 ## The invariants. Do not break these.
@@ -74,13 +74,12 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
 6. **A `View<T>` must not outlive its `Snapshot`, and must never be stored.** It holds the
    snapshot by pointer. Stack only: build it, traverse, drop it. A `View` in a member or a
    container is a fat ref and will pin a version forever.
-7. **`commit_mu_`-protected state (`referrers_`, `by_type_`, `by_field_`, `spine_`,
+7. **`commit_mu_`-protected state (`referrers_`, `by_type_`, `by_key_`, `spine_`,
    `free_slots_`, `next_slot_`, `changelog_`, ...) is touched ONLY from inside
-   `try_commit()`, by whichever thread currently holds `commit_mu_`.** This is exactly the
-   single-writer sibling's writer-private state, in the same shape — it's now protected by
-   an actual mutex instead of being single-threaded by convention, which is strictly safer,
-   not a rewrite. Do not read or write it from anywhere else, and do not add a second lock
-   that could be held instead of `commit_mu_` while touching it.
+   `try_commit()`, by whichever thread currently holds `commit_mu_`.** It is writer-private
+   state, made safe for multiple writer threads by an actual mutex rather than by any
+   single-threaded convention. Do not read or write it from anywhere else, and do not add a
+   second lock that could be held instead of `commit_mu_` while touching it.
 8. **Cascade delete is resolved once, at commit time, never eagerly.**
    `Transaction::remove()` only records an intent (a real `Id`, added to
    `remove_intents_`) or, for a same-transaction local create, cancels it outright when
@@ -95,16 +94,15 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
    referenced-or-not scan is a one-shot linear walk of the transaction's own overlay, not
    an index, and it decides only WHERE the remove resolves, never what it fans out to.)
    See DESIGN.md.
-9. **Reconciliation of `referrers_`/`by_field_` for an update must run AFTER the object is
+9. **Reconciliation of `referrers_`/`by_key_` for an update must run AFTER the object is
    fully written, never before.** `Transaction::update()` hands back a mutable pointer to a
    clone the caller may write to any number of times, in any order, before commit;
    `Model::apply_update()` reconciles once, at apply time, against that final value. The
    cascade BFS's own nulling step (`Model::clone_for_cascade_null` + `null_ref()`) follows
    the same rule: reconcile is called by the caller, immediately after `null_ref()`, never
    inside the clone/install helper itself. Reconciling before the mutation lands is a
-   guaranteed no-op that leaves a phantom (or missing) edge in the reverse index — this
-   exact bug class has already been hit once in the single-writer sibling project; don't
-   reintroduce it here.
+   guaranteed no-op that leaves a phantom (or missing) edge in the reverse index — this bug
+   class is easy to reintroduce by accident; don't.
 10. **Lock order: `commit_mu_` → `ver_mu_` → `reap_mu_`, never reversed** — except the
     reaper's own `reap_mu_` → `ver_mu_`, and `release_version`, which takes them
     sequentially (not nested) to avoid the cycle. `snapshot()` and `Transaction`-building
@@ -114,15 +112,15 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
 ## Things that look like improvements but are not
 
 - **"Why not use `shared_ptr<const ObjectBase>` in `Chunk` instead of raw pointers?"**
-  Because copying a chunk would then mean 256 atomic refcount increments. At 1M objects
+  Because copying a chunk would then mean 4,096 atomic refcount increments. At 1M objects
   and 100 commits/sec with scattered writes, that is millions of atomic RMWs per second
   and it is what kills the design. Chunks hold raw pointers so a chunk copy is a memcpy.
   Lifetime is handled by the version watermark instead. **Do not "simplify" this.**
 - **"Why not let every transaction apply independently, in parallel, and merge the
   results?"** That requires `referrers_` (and every other index) to become a mergeable,
   per-transaction structure — real complexity, and it reintroduces exactly the shared-
-  mutable-state problem the single-writer sibling avoided by having only one writer. This
-  design instead makes transaction *building* free of shared state entirely, and serializes
+  mutable-state problem this design avoids by serializing the apply step behind one lock.
+  This design instead makes transaction *building* free of shared state entirely, and serializes
   only the (comparatively cheap, change-proportional) apply step behind `commit_mu_`. See
   DESIGN.md's "What this buys, and what it costs."
 - **"Why not resolve cascade fan-out inside `Transaction::remove()`, so the caller finds out
@@ -137,10 +135,8 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
   cheaper isolation level — not a bug to be fixed toward serializability. Document the
   write-skew possibility; don't silently strengthen (or weaken) the guarantee.
 - **"Why not let `Model::create/update/remove/commit` coexist with `Transaction`, for
-  backward compatibility with code written against the single-writer API?"** Two APIs
-  writing the same shared state is how invariant 7 gets violated by accident. There is no
-  single-writer caller in this project to be backward-compatible with — it's a fresh
-  project. Don't add it.
+  a simpler direct-write path?"** Two APIs writing the same shared state is how invariant 7
+  gets violated by accident. No caller needs a direct-write path. Don't add it.
 - **"Why not make `Ref<T>` self-dereferencing (`ref->field`)?"** A fat ref would have to
   carry a snapshot pointer, so every stored ref would silently pin a snapshot alive and
   stall the reaper. `Ref<T>` is 8 bytes; you resolve through a snapshot. Deliberate.
@@ -167,7 +163,7 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
   length 488. `Coarse` alone remains a real, defensible tradeoff in both cases. See
   `examples/lookup_type_tuning_demo.cpp` and `examples/key_lookup_type_tuning_demo.cpp` to
   re-run the numbers if this is ever reconsidered.
-- **Don't add gtest/Catch2.** The harness in `tests/tests.cpp` is deliberately
+- **Don't add gtest/Catch2.** The harness in `tests/test_harness.h` is deliberately
   dependency-free so the project builds anywhere with no network.
 
 ## Known scope boundaries (not TODOs to silently "fix")
@@ -177,12 +173,10 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
   is fully parallel; applying is not. `examples/commit_bench.cpp` has a thread-count sweep
   that demonstrates this — expect sub-linear scaling, not linear.
 - The reverse index (`referrers_`) still scans linearly per target (`vector<RefEdge>` with
-  `find_if`), same as the single-writer sibling. A hub object with many referrers makes each
-  mutate of one of them O(referrer count). Unaffected by this project's redesign; would
-  benefit both projects equally if fixed.
+  `find_if`). A hub object with many referrers makes each mutate of one of them O(referrer
+  count).
 - Cascade fan-out from a single `remove()` intent is still unbounded and invisible to the
-  caller until `try_commit()` returns. A two-phase plan/inspect/apply API is the natural fix,
-  same as the single-writer sibling's own TODO list.
+  caller until `try_commit()` returns. A two-phase plan/inspect/apply API is the natural fix.
 
 ## Working style in this repo
 
@@ -198,9 +192,9 @@ tests/tests.cpp         dependency-free harness (no gtest/Catch2 -- keep it that
   null) together**, keep field tags stable, and add a cascade test. A ref that
   `define_references` doesn't report is invisible to the reverse index AND to `RefRemapper`
   — integrity breaks silently, and a local-id create can also silently fail to remap.
-- **Every new invariant gets a test in `tests/tests.cpp`.** The concurrency stress test
-  (`concurrent_stress_many_writer_threads_hammering_try_commit_never_corrupts_referrers_or_leaks_a_dangling_ref`)
-  is the one that matters most; extend it rather than writing a new one where you can.
+- **Every new invariant gets a test under `tests/`.** The concurrency stress test
+  (`concurrent_stress_many_writer_threads_hammering_try_commit_never_corrupts_referrers_or_leaks_a_dangling_ref`
+  in `tests/test_concurrency_stress.cpp`) is the one that matters most; extend it rather than writing a new one where you can.
 - **A `CommitResult` with `status != Committed` means the `Transaction` you passed in is
   spent** — its local overlay was already moved from during apply. Don't try to reuse it;
   `begin()` a fresh one.

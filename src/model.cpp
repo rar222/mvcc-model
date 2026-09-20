@@ -2017,10 +2017,9 @@ std::optional<Model::IntegrityError> Model::apply_update(
     changes_.push_back({id, ChangeKind::Updated, raw->tag()});
     log(PopChanges{});
 
-    // Unlike the single-writer design this project's sibling uses, `raw` is
-    // already fully written by the time we get here (the caller finished
-    // writing to it back when building the Transaction) -- so reconciliation
-    // runs immediately, not in a later deferred pass. This MUST happen before
+    // `raw` is already fully written by the time we get here (the caller
+    // finished writing to it while building the Transaction) -- so
+    // reconciliation runs immediately. This MUST happen before
     // remove_raw()'s cascade BFS runs (see try_commit()'s phase order): a
     // same-transaction "repoint away from X, then delete X" needs referrers_
     // already updated, or the repointed-away-from object would incorrectly
@@ -2038,11 +2037,7 @@ ObjectBase* Model::clone_for_cascade_null(Id id, bool keep_undo) {
     // and minus reconciliation, which the caller does AFTER null_ref(), not
     // here: reconciling before the field is actually nulled would compare
     // two identical objects and be a silent no-op, then nothing would ever
-    // fix up referrers_ once the field really does change. (This exact
-    // ordering mistake -- reconcile before the caller's write lands -- is
-    // why the single-writer sibling project defers reconciliation to a
-    // separate pass in the first place; here, deferring to "right after
-    // null_ref(), same call site" is simpler and just as correct.)
+    // fix up referrers_ once the field really does change.
     const ObjectBase* cur = peek_raw(id);
     if (!cur) return nullptr;
 

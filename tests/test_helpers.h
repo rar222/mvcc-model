@@ -123,10 +123,7 @@ Ref<Order> make_order(Model& m, const std::string& code, Ref<Account> account,
                       Opt<Order> parent = Opt<Order>{}, std::int64_t qty = 1);
 
 /// Runs `f(T*)` inside a fresh Transaction against `r` and commits. `f`
-/// writes through the returned pointer exactly like the single-writer
-/// sibling's `m.update(r)->field = x;`, just batched into an explicit call
-/// here since there's no privileged writer thread to hand a bare pointer to
-/// across statements.
+/// writes through the pointer Transaction::update() returns.
 template <class T, class F>
 void update_field(Model& m, Ref<T> r, F&& f) {
     Transaction txn = m.begin();
@@ -137,8 +134,7 @@ void update_field(Model& m, Ref<T> r, F&& f) {
 }
 
 /// Records a remove() intent for `r` and commits, returning the full resolved
-/// kill count (including cascade). Mirrors the single-writer sibling's
-/// `m.remove(r)` return value, just resolved one commit later.
+/// kill count (including cascade).
 template <class T>
 std::size_t remove_and_commit(Model& m, Ref<T> r) {
     Transaction txn = m.begin();

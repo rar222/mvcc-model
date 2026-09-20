@@ -9,10 +9,9 @@
 //   cmake --preset asan  (use-after-free -- did the reaper free too early?)
 //   cmake --preset tsan  (races between concurrent writers/readers)
 //
-// Unlike its single-writer sibling project, this demo's writer log is
-// expected to show BOTH successful commits AND observed conflicts: a demo
-// that never exercises the conflict path hasn't proven anything about a
-// multi-writer design.
+// The writer log is expected to show BOTH successful commits AND observed
+// conflicts: a demo that never exercises the conflict path hasn't proven
+// anything about a multi-writer design.
 
 #include <algorithm>
 #include <atomic>
@@ -263,13 +262,12 @@ int main() {
     }
     std::printf("seeded %zu accounts, %zu orders\n", accounts.size(), orders.size());
 
-    // Demonstrate an integrity failure before the concurrent phase. Unlike
-    // the single-writer sibling project, nothing is validated until
-    // try_commit()'s apply phase -- building a transaction never touches
-    // shared state, so there is nothing to roll back afterward on the
-    // caller's side. try_commit() rejects the whole transaction as Invalid
-    // (no exceptions in this project -- see CLAUDE.md) and unwinds everything
-    // it had applied, DOOMED included.
+    // Demonstrate an integrity failure before the concurrent phase. Nothing
+    // is validated until try_commit()'s apply phase -- building a transaction
+    // never touches shared state, so there is nothing to roll back afterward
+    // on the caller's side. try_commit() rejects the whole transaction as
+    // Invalid (no exceptions in this project -- see CLAUDE.md) and unwinds
+    // everything it had applied, DOOMED included.
     {
         const std::size_t before = m.snapshot().size();
         Transaction bad_txn = m.begin();
