@@ -534,7 +534,7 @@
     <p>
       <code>publish_now()</code> bumps <code>version_</code> to 2 and builds a fresh <code>Root</code>.
       <code>r-&gt;spine = spine_</code> copies the <em>vector</em> &mdash; one <code>shared_ptr</code> handle
-      per chunk, O(chunks touched), never O(objects). For this model, that's a single pointer: slot 0 now
+      per chunk, O(total chunks), never O(objects). For this model, that's a single pointer: slot 0 now
       names <code>Chunk 0'</code>. <code>Model::root_</code> is swapped to <code>r</code> atomically; every
       <code>Snapshot</code> taken from this point on sees version 2. <code>Root v1</code> is not modified,
       not decremented, not touched &mdash; it simply keeps existing, held alive by whatever still references
@@ -662,7 +662,7 @@
         <tr>
           <td class="what">Every other chunk</td>
           <td><span class="pill shared">shared</span></td>
-          <td>Untouched <code>shared_ptr&lt;Chunk&gt;</code> entries carry over into the new <code>Root</code> unchanged &mdash; not read, not copied. At 1M objects that's roughly 250 chunks sharing structure while one changes.</td>
+          <td>Untouched <code>shared_ptr&lt;Chunk&gt;</code> entries carry over into the new <code>Root</code> unchanged &mdash; the chunk itself is never read or copied, only its handle. At 1M objects that's roughly 250 chunks sharing structure while one changes.</td>
         </tr>
         <tr>
           <td class="what">The spine vector</td>
@@ -700,9 +700,10 @@
       always allocates room for all 4096 slots whether they're full or not, a trie <code>Node</code>
       with 3 real children allocates for 3. Each level consumes 5 bits of a 64-bit hash, so descending
       one level means shifting 5 bits further in; a child slot holds either another <code>Node</code>
-      (keep descending) or a <code>Leaf</code> (the actual entry). Two keys whose hash agrees on every
-      5-bit slice consumed so far land in the same slot and share a <code>Leaf</code> via a short
-      collision chain, rather than forcing the trie a level deeper for just the two of them.
+      (keep descending) or a <code>Leaf</code> (the actual entry). Two keys whose hashes agree on the
+      slices consumed so far are pushed one level deeper, into a new child <code>Node</code>, until
+      their hash bits differ. Only when the hash bits run out &mdash; two keys with the identical
+      64-bit hash &mdash; do they share a <code>Leaf</code> through a collision chain.
     </p>
     <figure>
       <div class="diagram-wrap">
@@ -790,7 +791,7 @@
           <rect x="580" y="212" width="230" height="60" rx="8" fill="none" stroke="currentColor" stroke-opacity="0.5" stroke-dasharray="4 3"/>
           <text x="695" y="232" text-anchor="middle" fill="currentColor" font-weight="600">leaf, chained (rare)</text>
           <line x1="580" y1="252" x2="810" y2="252" stroke="currentColor" stroke-opacity="0.3"/>
-          <text x="695" y="266" text-anchor="middle" fill="currentColor" fill-opacity="0.65" font-size="10.5">2 keys sharing every hash slice so far</text>
+          <text x="695" y="266" text-anchor="middle" fill="currentColor" fill-opacity="0.65" font-size="10.5">2 keys with the same 64-bit hash</text>
         </g>
       </svg>
       </div>
@@ -923,7 +924,7 @@
         <tr>
           <td class="what">Collisions</td>
           <td>never &mdash; <code>Id::index</code> is exact by construction</td>
-          <td>rare: same-hash-prefix entries share a <code>Leaf</code> via a short chain</td>
+          <td>rare: only entries with the identical 64-bit hash share a <code>Leaf</code>, via a short chain</td>
         </tr>
       </tbody>
     </table>
